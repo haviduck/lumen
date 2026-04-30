@@ -2593,50 +2593,17 @@ class _FileTreeState extends State<_FileTree> {
                 Expanded(
                   child: Text(
                     dirName,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 12.5,
-                      color: DuckColors.fgPrimary,
+                      color: ignored
+                          ? DuckColors.fgMuted
+                          : DuckColors.fgPrimary,
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
-                if (ignored) const _GitIgnoredBadge(),
               ],
             ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _GitIgnoredBadge extends StatelessWidget {
-  const _GitIgnoredBadge();
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: S.explorerGitIgnoredTooltip,
-      child: Container(
-        width: 14,
-        height: 14,
-        margin: const EdgeInsets.only(left: 8),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: DuckColors.accentDuck.withValues(alpha: 0.14),
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: DuckColors.accentDuck.withValues(alpha: 0.45),
-            width: 0.5,
-          ),
-        ),
-        child: const Text(
-          S.explorerGitIgnoredBadge,
-          style: TextStyle(
-            color: DuckColors.accentDuck,
-            fontSize: 9,
-            height: 1.0,
-            fontWeight: FontWeight.w700,
           ),
         ),
       ),
@@ -2775,14 +2742,13 @@ class _FileItemRowState extends State<_FileItemRow> {
                     fileName,
                     style: TextStyle(
                       fontSize: 12.5,
-                      color: isActive
-                          ? DuckColors.fgPrimary
-                          : DuckColors.fgMuted,
+                      color: widget.ignored
+                          ? DuckColors.fgMuted
+                          : DuckColors.fgPrimary,
                     ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
-                if (widget.ignored) const _GitIgnoredBadge(),
               ],
             ),
           ),

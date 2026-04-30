@@ -392,11 +392,20 @@ class GeminiService {
           final obj = jsonDecode(data) as Map<String, dynamic>;
           final candidates = obj['candidates'] as List<dynamic>?;
           if (candidates == null || candidates.isEmpty) continue;
-          final parts =
-              candidates[0]['content']?['parts'] as List<dynamic>? ?? [];
+          final candidate = candidates[0] as Map<String, dynamic>;
+          final parts = candidate['content']?['parts'] as List<dynamic>? ?? [];
           for (final p in parts) {
             final t = p['text'] as String?;
             if (t != null && t.isNotEmpty) yield t;
+          }
+          // Truncation marker — `finishReason: MAX_TOKENS` means the
+          // model hit `maxOutputTokens` (we send 16384) before its
+          // natural stop. Surface a hidden marker so the controller
+          // can auto-continue. Hidden in markdown; chat parser only
+          // matches LUMEN_TOOL / LUMEN_ERR.
+          final finishReason = candidate['finishReason'] as String?;
+          if (finishReason == 'MAX_TOKENS') {
+            yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
           }
           // Stop on safety block.
           final feedback = obj['promptFeedback'];

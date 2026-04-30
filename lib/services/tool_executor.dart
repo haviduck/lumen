@@ -1,3 +1,4 @@
+import 'ollama_service.dart' show CancellationToken;
 import 'timeline_recorder.dart';
 import 'tool_registry.dart';
 
@@ -20,11 +21,6 @@ class ToolPassResult {
   final bool hasToolCalls;
   final String toolFeedback;
 
-  /// Base64-encoded images produced by tools during this pass. The chat
-  /// loop forwards them as `images:` on the next user-feedback message
-  /// so the multimodal model can react to them on the next turn.
-  final List<String> imageAttachments;
-
   /// Tools that actually executed during this pass (in source order).
   /// Read by `ChatController.sendMessage` to build a deterministic
   /// summary line for the per-chat tasks.md.
@@ -34,10 +30,8 @@ class ToolPassResult {
     this.processedResponse,
     this.hasToolCalls,
     this.toolFeedback, {
-    List<String> imageAttachments = const [],
     List<FiredTool> firedTools = const [],
-  }) : imageAttachments = List.unmodifiable(imageAttachments),
-       firedTools = List.unmodifiable(firedTools);
+  }) : firedTools = List.unmodifiable(firedTools);
 }
 
 /// Walks the LLM response, looks for tool-call patterns, executes them,
@@ -71,6 +65,11 @@ class ToolExecutor {
   TimelineRecorder? recorder;
   bool allowWritesOutsideWorkspace;
 
+  /// Optional cancel handle propagated to every [ToolInvocation] this
+  /// executor builds. RUN_CMD (and any future long-running tool body)
+  /// uses it to abort a hung subprocess when the user clicks Stop.
+  CancellationToken? cancelToken;
+
   ToolExecutor({
     required this.workspaceDir,
     required this.approver,
@@ -78,6 +77,7 @@ class ToolExecutor {
     this.onToolOutput,
     this.recorder,
     this.allowWritesOutsideWorkspace = false,
+    this.cancelToken,
   }) : enabledTools =
            enabledTools ??
            ToolRegistry.all
@@ -108,7 +108,6 @@ class ToolExecutor {
     String processed = normalized;
     bool hasToolCalls = false;
     final feedback = StringBuffer();
-    final attachments = <String>[];
     final fired = <FiredTool>[];
 
     for (final tool in ToolRegistry.all) {
@@ -125,9 +124,9 @@ class ToolExecutor {
           // mechanism — they just call `inv.approver(label, detail)`
           // exactly like before.
           approver: (label, detail) => approver(tool.id, label, detail),
-          attachImage: attachments.add,
           allowWritesOutsideWorkspace: allowWritesOutsideWorkspace,
           onOutput: onToolOutput,
+          cancelToken: cancelToken,
         );
         // Pre-snapshot the file the tool will touch (if any). Cheap —
         // when the file already has a baseline / head this is a no-op;
@@ -136,7 +135,27 @@ class ToolExecutor {
         // recorder; capture failures must never break tool dispatch.
         await recorder?.beforeTool(tool, raw);
         final result = await tool.execute(inv);
-        feedback.writeln(result);
+        // Make failures impossible to gloss over. We've observed
+        // models (Gemma cloud especially) reading a tool_result that
+        // says `EDIT_FILE foo.scss: Error: SEARCH block not found`
+        // and then claiming success in the next message. Wrapping
+        // failed lines in `[FAILED]` and a `! action required`
+        // suffix makes the failure structurally distinct from
+        // success lines that might sit next to it in the same
+        // result batch.
+        final isFailure = _looksLikeFailure(result);
+        if (isFailure) {
+          feedback.writeln('[FAILED] $result');
+          feedback.writeln(
+            '! action required: the tool above did NOT execute. Do '
+            'not claim it succeeded. Either fix the call (re-read '
+            'the file with READ_FILE_RANGE so your SEARCH block '
+            'matches exactly) or tell the user why this can\'t be '
+            'done.',
+          );
+        } else {
+          feedback.writeln(result);
+        }
         // Post-snapshot. Tagged with the chat correlation IDs the
         // controller set on `TimelineService` before this pass —
         // i.e. (sessionId, turnId, messageId) — so the future
@@ -152,13 +171,54 @@ class ToolExecutor {
       }
     }
 
+    // **Salvage pass for malformed blocks.** Catches `<<<EDIT_FILE…>>>
+    // …<<<END_EDIT>>>` (and friends) where the strict per-tool regex
+    // (post-relaxed-separators) STILL rejected the inner structure
+    // — typically because SEARCH or REPLACE markers are missing
+    // entirely or are spelled differently. Without this, the raw
+    // body would leak as prose. Replacing with a `malformed`
+    // marker mirrors the streaming-side preview so the chat surface
+    // stays consistent before vs. after the executor runs.
+    //
+    // **Auto-retry contract:** when salvage replaces anything we
+    // (a) flip `hasToolCalls = true` so the chat loop runs another
+    // iteration and (b) push a corrective-syntax feedback line
+    // into `pass.toolFeedback` per malformed block. The model gets
+    // told exactly what shape was missing and the canonical example
+    // it should have followed — small models recover on the second
+    // round once they see the right syntax instead of the void.
+    final salvage = _SalvageOutcome.from(processed);
+    processed = salvage.cleanedContent;
+    if (salvage.malformedCount > 0) {
+      hasToolCalls = true;
+      feedback.write(salvage.feedback);
+    }
+
     return ToolPassResult(
       processed,
       hasToolCalls,
       feedback.toString(),
-      imageAttachments: attachments,
       firedTools: fired,
     );
+  }
+
+  static String? _toolIdForName(String toolName) {
+    for (final tool in ToolRegistry.all) {
+      if (tool.name == toolName) return tool.id;
+    }
+    return null;
+  }
+
+  /// True when a tool's textual result represents a non-successful
+  /// outcome. Mirrors `_friendlyReplacement`'s status detection so a
+  /// row's chat-card status and its `<tool_result>` framing always
+  /// agree. Conservative — only triggers on the explicit error words
+  /// our tool bodies emit (`Error:`, `Failed`, `Denied`), so a
+  /// stdout that happens to contain "error" in passing isn't tagged.
+  static bool _looksLikeFailure(String result) {
+    return result.contains('Error:') ||
+        result.contains('Failed') ||
+        result.contains('Denied');
   }
 
   /// Pre-pass that normalizes a chunk of LLM output so the
@@ -223,10 +283,7 @@ class ToolExecutor {
   /// parser splits on this, rendering prose as `MarkdownBody` and
   /// markers as widgets.
   String _friendlyReplacement(AgentTool tool, Match m, String rawResult) {
-    final isError =
-        rawResult.contains('Error:') ||
-        rawResult.contains('Failed') ||
-        rawResult.contains('Denied');
+    final isError = _looksLikeFailure(rawResult);
     // Most tools use capture group 1 as the relevant target. MOVE_FILE is the
     // exception: group 1 is the source and group 2 is the destination. If we
     // only encode the source, the chat card tries to open the old path after a
@@ -279,9 +336,67 @@ class ToolExecutor {
         return '(git diff)';
       case 'run_cmd':
         return '(Ran: `$firstArg`)';
-      case 'snapshot_url':
-        return '(Snapshot: `$firstArg`)';
+      case 'verify':
+        return '(Verified workspace)';
     }
     return '($toolId `$firstArg`)';
+  }
+}
+
+/// Result of the executor's malformed-block salvage pass.
+///
+/// - [cleanedContent] is the response with every malformed block
+///   replaced by a `<!-- LUMEN_TOOL:…|malformed -->` marker so the
+///   chat panel renders the warning chip instead of leaking the
+///   raw body.
+/// - [malformedCount] is the number of replaced blocks. When > 0
+///   the caller flips `hasToolCalls = true` so the chat loop
+///   continues for another iteration with the corrective feedback.
+/// - [feedback] is the model-facing corrective text — one entry
+///   per malformed block, each pulling the canonical syntax
+///   straight from `ToolRegistry` so the example never drifts.
+///
+/// Kept as a value type so `ToolExecutor.run` can fold it back into
+/// [ToolPassResult] cleanly without smuggling a half-dozen fields
+/// through positional args.
+class _SalvageOutcome {
+  final String cleanedContent;
+  final int malformedCount;
+  final String feedback;
+
+  const _SalvageOutcome._(
+    this.cleanedContent,
+    this.malformedCount,
+    this.feedback,
+  );
+
+  static _SalvageOutcome from(String content) {
+    final salvage = RegExp(
+      r'<<<(CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):\s*(.*?)\s*>>>'
+      r'(?:.*?)'
+      r'<<<END_(?:FILE|EDIT|APPEND)>>>',
+      dotAll: true,
+    );
+    var count = 0;
+    final fb = StringBuffer();
+    final cleaned = content.replaceAllMapped(salvage, (m) {
+      final toolName = m.group(1)!;
+      final firstArg = (m.group(2) ?? '').trim();
+      final id = ToolExecutor._toolIdForName(toolName);
+      if (id == null) return m.group(0)!;
+      count++;
+      final tool = ToolRegistry.byId(id);
+      final example = tool?.syntaxExample ?? '<<<$toolName: …>>>';
+      fb.writeln(
+        '$toolName $firstArg: MALFORMED — the call structure was '
+        'rejected by the parser and was NOT executed. Re-issue it '
+        'using this exact syntax (mind the newline between every '
+        'marker, no extra blank lines, no markdown code fences):\n'
+        '$example\n',
+      );
+      final encoded = Uri.encodeComponent(firstArg);
+      return '\n<!-- LUMEN_TOOL:$id|$encoded|malformed -->\n';
+    });
+    return _SalvageOutcome._(cleaned, count, fb.toString());
   }
 }

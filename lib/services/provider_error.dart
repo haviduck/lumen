@@ -39,6 +39,13 @@ enum ProviderErrorKind {
   serverError,
   timeout,
   unauthorized,
+  /// HTTP 400 — request body invalid for this model (wrong parameter
+  /// shape, removed field, etc.). Distinct from `unauthorized` because
+  /// the user CAN'T fix this in Settings — it's a client-code bug
+  /// surfaced as an Anthropic / OpenAI / Gemini schema mismatch. The
+  /// raw error text is what the user / agent needs to see, so the
+  /// card auto-expands details for this kind.
+  badRequest,
   notFound,
   network,
   unknown,
@@ -62,6 +69,11 @@ class ProviderError {
     ProviderErrorKind.network => true,
     ProviderErrorKind.unknown => true,
     ProviderErrorKind.unauthorized => false,
+    // 400s are client-code bugs (wrong field shape, deprecated param);
+    // retrying the same body fails the same way. The user wants to
+    // see the actual error and either change models or wait for a
+    // Lumen update.
+    ProviderErrorKind.badRequest => false,
     ProviderErrorKind.notFound => false,
   };
 
@@ -71,6 +83,7 @@ class ProviderError {
     ProviderErrorKind.serverError => S.providerErrorServer,
     ProviderErrorKind.timeout => S.providerErrorTimeout,
     ProviderErrorKind.unauthorized => S.providerErrorAuth,
+    ProviderErrorKind.badRequest => S.providerErrorBadRequest,
     ProviderErrorKind.notFound => S.providerErrorNotFound,
     ProviderErrorKind.network => S.providerErrorNetwork,
     ProviderErrorKind.unknown => S.providerErrorUnknown,
@@ -82,6 +95,7 @@ class ProviderError {
     ProviderErrorKind.serverError => S.providerErrorServerBody,
     ProviderErrorKind.timeout => S.providerErrorTimeoutBody,
     ProviderErrorKind.unauthorized => S.providerErrorAuthBody,
+    ProviderErrorKind.badRequest => S.providerErrorBadRequestBody,
     ProviderErrorKind.notFound => S.providerErrorNotFoundBody,
     ProviderErrorKind.network => S.providerErrorNetworkBody,
     ProviderErrorKind.unknown => S.providerErrorUnknownBody,
@@ -173,11 +187,24 @@ class ProviderError {
             rawDetail: trimmed,
           );
         }
-        // Other 4xx — generic auth/permission framing is the safest
-        // default since 4xx implies caller-side issue.
+        // 400 = malformed request body. Distinct from 401/403 because
+        // the user can't fix it in Settings — Lumen sent the wrong
+        // shape. Telling them "Authentication failed" sends them
+        // chasing a non-existent credential bug (see the Opus 4.7
+        // adaptive-thinking migration: legacy `thinking.type.enabled`
+        // returns 400 even though API key is fine).
+        if (code == 400) {
+          return ProviderError(
+            kind: ProviderErrorKind.badRequest,
+            rawDetail: trimmed,
+          );
+        }
+        // Other 4xx — fall through to `badRequest` rather than auth.
+        // 405/409/410/422 are all "caller sent something wrong",
+        // not "credentials rejected".
         if (code >= 400 && code < 500) {
           return ProviderError(
-            kind: ProviderErrorKind.unauthorized,
+            kind: ProviderErrorKind.badRequest,
             rawDetail: trimmed,
           );
         }

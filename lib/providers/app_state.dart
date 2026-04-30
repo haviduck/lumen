@@ -126,6 +126,7 @@ class AppState extends ChangeNotifier {
   static const Set<String> _fsWatcherIgnore = <String>{
     'node_modules',
     '.git',
+    '.gitnexus',
     '.dart_tool',
     'build',
     'dist',
@@ -180,6 +181,11 @@ class AppState extends ChangeNotifier {
   bool _reduceMotion = false;
   bool _reduceTransparency = false;
   bool _allowAgentOutsideWorkspaceWrites = false;
+  // When true, the chat controller runs the workspace analyzer (dart
+  // analyze / tsc --noEmit / ruff check) once at the end of any turn
+  // that touched source files but didn't call VERIFY itself. See
+  // `_kAgentAutoVerifyAfterEdits` for the rationale.
+  bool _autoVerifyAfterEdits = true;
 
   // Quick AI-chat panel collapse — independent of `viewMode`. The
   // user wants a one-click toggle without leaving normal layout
@@ -208,6 +214,8 @@ class AppState extends ChangeNotifier {
   // GitNexus integration master switch — see `_kGitNexusEnabled`
   // doc in `PreferencesService` for the full off-state contract.
   bool _gitnexusEnabled = true;
+  bool _gitnexusAutoWiki = false;
+  String _gitnexusWikiModel = '';
 
   String? get currentDirectory => _currentDirectory;
   List<File> get openFiles => _openFiles;
@@ -244,6 +252,7 @@ class AppState extends ChangeNotifier {
   bool get reduceTransparency => _reduceTransparency;
   bool get allowAgentOutsideWorkspaceWrites =>
       _allowAgentOutsideWorkspaceWrites;
+  bool get autoVerifyAfterEdits => _autoVerifyAfterEdits;
   bool get chatHidden => _chatHidden;
   String get settingsInitialCategory => _settingsInitialCategory;
   int get settingsOpenRevision => _settingsOpenRevision;
@@ -257,6 +266,8 @@ class AppState extends ChangeNotifier {
   String get syncthingDefaultLandingPath => _syncthingDefaultLandingPath;
 
   bool get gitnexusEnabled => _gitnexusEnabled;
+  bool get gitnexusAutoWiki => _gitnexusAutoWiki;
+  String get gitnexusWikiModel => _gitnexusWikiModel;
 
   AppState() {
     chat = ChatController(
@@ -368,8 +379,15 @@ class AppState extends ChangeNotifier {
     _reduceTransparency = await prefs.getReduceTransparency();
     _allowAgentOutsideWorkspaceWrites = await prefs
         .getAgentAllowOutsideWorkspaceWrites();
+    _autoVerifyAfterEdits = await prefs.getAgentAutoVerifyAfterEdits();
     _chatHidden = await prefs.getChatHidden();
     _gitnexusEnabled = await prefs.getGitNexusEnabled();
+    _gitnexusAutoWiki = await prefs.getGitNexusAutoWiki();
+    _gitnexusWikiModel = await prefs.getGitNexusWikiModel();
+    gitnexus.setWikiPreferences(
+      autoWikiAfterAnalyze: _gitnexusAutoWiki,
+      model: _gitnexusWikiModel,
+    );
     await gitnexus.setEnabled(_gitnexusEnabled);
     _syncthingEnabled = await prefs.getSyncthingEnabled();
     _syncthingAutoShare = await prefs.getSyncthingAutoShare();
@@ -377,8 +395,7 @@ class AppState extends ChangeNotifier {
     _syncthingIgnorePerms = await prefs.getSyncthingIgnorePerms();
     _syncthingWriteStignore = await prefs.getSyncthingWriteStignore();
     _syncthingVersioningPreset = await prefs.getSyncthingVersioningPreset();
-    _syncthingDefaultLandingPath =
-        await prefs.getSyncthingDefaultLandingPath();
+    _syncthingDefaultLandingPath = await prefs.getSyncthingDefaultLandingPath();
     final stEndpoint = await prefs.getSyncthingEndpoint();
     final stApiKey = await prefs.getSyncthingApiKey();
     syncthing.configure(baseUrl: stEndpoint, apiKey: stApiKey);
@@ -405,6 +422,13 @@ class AppState extends ChangeNotifier {
   Future<void> setAllowAgentOutsideWorkspaceWrites(bool v) async {
     _allowAgentOutsideWorkspaceWrites = v;
     await prefs.setAgentAllowOutsideWorkspaceWrites(v);
+    notifyListeners();
+  }
+
+  Future<void> setAutoVerifyAfterEdits(bool v) async {
+    if (_autoVerifyAfterEdits == v) return;
+    _autoVerifyAfterEdits = v;
+    await prefs.setAgentAutoVerifyAfterEdits(v);
     notifyListeners();
   }
 
@@ -748,24 +772,45 @@ class AppState extends ChangeNotifier {
       messageId,
       legacyMessageId: legacyMessageId,
     );
-    final ws = _currentDirectory;
-    if (ws != null) {
-      for (final rel in result.touchedRelPaths) {
-        final abs = p.join(ws, rel.replaceAll('/', p.separator));
-        final file = File(abs);
-        if (await file.exists()) {
-          try {
-            resyncOpenFileFromDisk(abs, await file.readAsString());
-          } catch (_) {
-            // Binary or unreadable file; leave any open editor tab alone.
-          }
-        } else {
-          noteEntityDeleted(abs);
-        }
-      }
-      refreshDirectory();
-    }
+    await _resyncTouchedPaths(result.touchedRelPaths);
     return result.message;
+  }
+
+  /// Cursor / Antigravity-style "revert to before this message" applied
+  /// at chat scope. Truncates the active session at [index] (so the
+  /// pivot message and every message after it are gone) and restores
+  /// every agent file change tied to the dropped assistant messages
+  /// in one chronological pass. Returns the [ChatRevertOutcome] so
+  /// callers can pre-fill the composer / show a contextual toast.
+  ///
+  /// This is the user-bubble surface for revert; the assistant-bubble
+  /// surface still routes through [restoreTimelineChangesForMessage]
+  /// because that one is "undo just this turn's file changes" (no
+  /// chat truncation), which Cursor surfaces as the assistant-bubble
+  /// "Restore" affordance.
+  Future<ChatRevertOutcome> revertChatToBeforeMessage(int index) async {
+    final outcome = await chat.revertToBeforeMessage(index, timeline);
+    await _resyncTouchedPaths(outcome.touchedRelPaths);
+    return outcome;
+  }
+
+  Future<void> _resyncTouchedPaths(List<String> rels) async {
+    final ws = _currentDirectory;
+    if (ws == null || rels.isEmpty) return;
+    for (final rel in rels) {
+      final abs = p.join(ws, rel.replaceAll('/', p.separator));
+      final file = File(abs);
+      if (await file.exists()) {
+        try {
+          resyncOpenFileFromDisk(abs, await file.readAsString());
+        } catch (_) {
+          // Binary or unreadable file; leave any open editor tab alone.
+        }
+      } else {
+        noteEntityDeleted(abs);
+      }
+    }
+    refreshDirectory();
   }
 
   /// Update editor bookkeeping after a file or folder has been moved on disk.
@@ -1030,8 +1075,7 @@ class AppState extends ChangeNotifier {
         // discard the user's in-progress edits — the user's
         // typing wins, the agent's write is on disk only until
         // they save (and overwrite it themselves).
-        if (_fileContents.containsKey(event.path) &&
-            !isFileDirty(event.path)) {
+        if (_fileContents.containsKey(event.path) && !isFileDirty(event.path)) {
           unawaited(_resyncOpenBufferFromDisk(event.path));
         }
       }
@@ -1121,6 +1165,22 @@ class AppState extends ChangeNotifier {
     _gitnexusEnabled = enabled;
     await prefs.setGitNexusEnabled(enabled);
     await gitnexus.setEnabled(enabled);
+    notifyListeners();
+  }
+
+  Future<void> updateGitNexusWikiSettings({
+    required bool autoWiki,
+    required String wikiModel,
+  }) async {
+    final normalizedModel = wikiModel.trim();
+    _gitnexusAutoWiki = autoWiki;
+    _gitnexusWikiModel = normalizedModel;
+    await prefs.setGitNexusAutoWiki(autoWiki);
+    await prefs.setGitNexusWikiModel(normalizedModel);
+    gitnexus.setWikiPreferences(
+      autoWikiAfterAnalyze: autoWiki,
+      model: normalizedModel,
+    );
     notifyListeners();
   }
 
@@ -1217,8 +1277,7 @@ class AppState extends ChangeNotifier {
       }
 
       // 2. Default ignores — one-shot.
-      final alreadyWritten =
-          await prefs.getSyncthingDefaultIgnoresWritten();
+      final alreadyWritten = await prefs.getSyncthingDefaultIgnoresWritten();
       if (!alreadyWritten) {
         final ok = await syncthing.setDefaultIgnores(kLumenDefaultStignore);
         if (ok) {

@@ -43,7 +43,6 @@ dependencies:
   shared_preferences: ^2.5.5
   re_editor: ^0.8.0
   re_highlight: ^0.0.3
-  flutter_fancy_tree_view: ^1.6.0
   desktop_drop: ^0.7.1
   xterm: ^4.0.0
   flutter_pty: ^0.4.2

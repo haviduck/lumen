@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'handoff_service.dart';
 import 'lumen_workspace_config.dart';
 
 /// Reads/writes `.lumen/rules.md` at both global and workspace scope.
@@ -56,6 +57,14 @@ practical, and specific to this project.
   and mention it.
 ''';
 
+  /// Workspace stub for brand-new workspaces — same body as
+  /// [_workspaceDefaultStub] plus the chat-handoff receive rule so
+  /// the system works out of the box. Existing workspaces get the
+  /// rule auto-appended on first `/handoff` via
+  /// [HandoffService.ensureRuleInstalled].
+  static String get workspaceDefaultStub =>
+      '$_workspaceDefaultStub\n${HandoffService.ruleBlock}\n';
+
   Future<File> globalRulesFile() async {
     final base = await getApplicationSupportDirectory();
     await LumenWorkspaceConfig.ensureDir(base.path);
@@ -71,7 +80,7 @@ practical, and specific to this project.
   Future<File> ensureWorkspaceRulesFile(String workspacePath) async {
     await LumenWorkspaceConfig.ensureDir(workspacePath);
     final f = workspaceRulesFile(workspacePath);
-    if (!await f.exists()) await f.writeAsString(_workspaceDefaultStub);
+    if (!await f.exists()) await f.writeAsString(workspaceDefaultStub);
     return f;
   }
 

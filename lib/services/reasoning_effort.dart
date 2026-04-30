@@ -139,16 +139,64 @@ Slow down and think carefully before answering. Specifically:
     };
   }
 
-  /// Anthropic `thinking.budget_tokens`. Returns null for [off] (caller
-  /// should omit the `thinking` block entirely). Min budget is 1024
-  /// per Anthropic's docs; we pick comfortable defaults that are well
-  /// under the model's `max_tokens` ceiling so the response itself
-  /// doesn't get starved.
+  /// Anthropic `thinking.budget_tokens` — **legacy** explicit-budget
+  /// shape used by Opus 4.0 / 4.5 / 4.6 and Sonnet 4.0 / 4.5 / 4.6.
+  /// Returns null for [off] (caller should omit the `thinking` block
+  /// entirely). Min budget is 1024 per Anthropic's docs; we pick
+  /// comfortable defaults that are well under the model's `max_tokens`
+  /// ceiling so the response itself doesn't get starved.
+  ///
+  /// **Do not use this for Opus 4.7+** — those models require the
+  /// adaptive shape (see [usesAdaptiveThinking] /
+  /// [anthropicAdaptiveEffort]). Sending `thinking.type.enabled` to
+  /// Opus 4.7 returns a 400.
   static int? anthropicBudget(ReasoningEffort effort) {
     return switch (effort) {
       ReasoningEffort.off => null,
       ReasoningEffort.standard => 4096,
       ReasoningEffort.deep => 16384,
+    };
+  }
+
+  /// True when [rawModel] uses Anthropic's **adaptive** extended-thinking
+  /// API (`thinking: {type: "adaptive"}` + `output_config.effort`),
+  /// introduced with Claude Opus 4.7 (April 2026). The legacy
+  /// `thinking.type.enabled` + `budget_tokens` shape is rejected with a
+  /// 400 on these models.
+  ///
+  /// Match list is intentionally explicit rather than "anything past
+  /// 4.6" — Anthropic's model-id versioning is non-monotonic enough
+  /// (Sonnet 4.5 shipped between Opus 4.5 and Opus 4.6) that a
+  /// substring on `>= 4.7` is a footgun. Add new families here as they
+  /// land. Conservative on uncertainty: an unknown model gets the
+  /// legacy shape, which still works on every pre-4.7 Claude.
+  static bool usesAdaptiveThinking({required String rawModel}) {
+    final lower = rawModel.toLowerCase();
+    if (lower.contains('haiku')) return false;
+    return lower.contains('opus-4-7') ||
+        lower.contains('opus-5') ||
+        lower.contains('sonnet-4-7') ||
+        lower.contains('sonnet-5');
+  }
+
+  /// Anthropic adaptive `output_config.effort` value. Returns null for
+  /// [off] — caller should also omit the `thinking` block in that case
+  /// to get the model's natural baseline behaviour without paying
+  /// for any extended-thinking tokens.
+  ///
+  /// The mapping reflects what the dial *means* to the user:
+  ///   - standard → `medium` ("the model uses moderate thinking; may
+  ///     skip thinking for simple queries"). Anthropic's recommended
+  ///     default-tradeoff for Opus 4.7 workloads.
+  ///   - deep     → `xhigh` ("always thinks deeply with extended
+  ///     exploration", Opus 4.7-only). `high` is already the model's
+  ///     baseline, so picking `high` for the user's "Deep" toggle
+  ///     would be a no-op.
+  static String? anthropicAdaptiveEffort(ReasoningEffort effort) {
+    return switch (effort) {
+      ReasoningEffort.off => null,
+      ReasoningEffort.standard => 'medium',
+      ReasoningEffort.deep => 'xhigh',
     };
   }
 

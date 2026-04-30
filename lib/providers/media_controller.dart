@@ -445,6 +445,50 @@ class MediaController extends ChangeNotifier {
     }
   }
 
+  /// Permission handler used by the Teams `Webview` widget.
+  ///
+  /// Microsoft Teams Web needs `getUserMedia` (mic + camera) to make calls,
+  /// `notifications` for incoming-call toasts, and `clipboardRead` for paste-
+  /// in-meeting. WebView2's default is to ignore the request unless a host
+  /// callback responds, so calls silently fail without this. We auto-allow
+  /// only on Microsoft-owned hosts (Teams + the SSO redirect chain through
+  /// `login.microsoftonline.com` / `microsoft.com`) — that way we never grant
+  /// mic/cam to whatever a redirect happens to land on.
+  ///
+  /// Note: this only covers the WebView2 / browser-level permission. The
+  /// user still has to (a) allow desktop apps to use mic/cam in Windows
+  /// privacy settings, and (b) accept Teams' own in-app device prompt the
+  /// first time they join a call.
+  static Future<WebviewPermissionDecision> handleTeamsPermission(
+    String url,
+    WebviewPermissionKind kind,
+    bool isUserInitiated,
+  ) async {
+    final lower = url.toLowerCase();
+    final isMicrosoftHost =
+        lower.contains('teams.cloud.microsoft') ||
+        lower.contains('teams.microsoft.com') ||
+        lower.contains('login.microsoftonline.com') ||
+        lower.contains('login.microsoft.com') ||
+        lower.contains('.office.com') ||
+        lower.contains('.office365.com') ||
+        lower.contains('.sharepoint.com');
+    if (!isMicrosoftHost) {
+      return WebviewPermissionDecision.deny;
+    }
+    switch (kind) {
+      case WebviewPermissionKind.microphone:
+      case WebviewPermissionKind.camera:
+      case WebviewPermissionKind.notifications:
+      case WebviewPermissionKind.clipboardRead:
+        return WebviewPermissionDecision.allow;
+      case WebviewPermissionKind.geoLocation:
+      case WebviewPermissionKind.otherSensors:
+      case WebviewPermissionKind.unknown:
+        return WebviewPermissionDecision.deny;
+    }
+  }
+
   void _onLoadingState(LoadingState state) {
     if (state != LoadingState.navigationCompleted) return;
     if (isYoutube) {

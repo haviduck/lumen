@@ -4,11 +4,13 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
+import '../l10n/strings.dart';
 import '../services/anthropic_service.dart';
 import '../services/github_models_service.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/external_tool_loader.dart';
 import '../services/gemini_service.dart';
+import '../services/model_capabilities.dart';
 import '../services/ollama_service.dart';
 import '../services/preferences_service.dart';
 import '../services/provider_error.dart';
@@ -20,6 +22,94 @@ import '../services/timeline_service.dart';
 import '../services/tool_executor.dart';
 import '../services/tool_registry.dart';
 import '../services/workspace_skills_service.dart';
+
+/// Matches a single COMPLETE Lumen tool-call block in a streaming
+/// buffer. Used by the agent loop to enforce single-tool-per-iteration
+/// discipline on **every** provider — none of the provider services
+/// (`anthropic_service.dart`, `gemini_service.dart`,
+/// `github_models_service.dart`, `ollama_service.dart`) actually use
+/// native function/tool calling APIs. They all just stream plain text
+/// containing `<<<TOOL: args>>>` markers which the executor regex-parses.
+///
+/// Without single-tool truncation, a model can stream
+/// `<<<EDIT_FILE>>>...` then `<<<RUN_CMD: …>>>` in one response, and the
+/// executor will run all of them sequentially with no chance for the
+/// model to react to earlier tool results before deciding the next
+/// step — i.e. cascading hallucination on what those tools returned.
+///
+/// Two shapes:
+///   1. **Multi-line block** — `<<<EDIT_FILE: foo.dart>>>` … `<<<END_EDIT>>>`
+///      and the CREATE_FILE / MULTI_EDIT / APPEND_FILE variants.
+///   2. **Single-line tool** — `<<<TOOL_NAME: args>>>`. The negative
+///      lookahead excludes multi-line openers so we don't break
+///      streaming on their *opening* `>>>` (which would orphan the
+///      file body that follows).
+///
+/// The tool-name set deliberately mirrors the salvage regex in
+/// `tool_executor.dart` rather than importing it — keeps the
+/// dependency arrow pointing the right way (controller → executor,
+/// not back). If a fifth multi-line tool appears, sync both lists.
+///
+/// Pre-existing limitation: this matcher (like the executor's own
+/// pattern) is code-fence-blind. A model that writes
+/// `<<<EDIT_FILE: …>>>` inside a markdown code block will trip both.
+/// Not regressing anything; if this becomes a real problem the fix
+/// belongs at the executor layer (strip fenced ranges before
+/// matching).
+///
+/// Lazy `.*?>>>` rather than `[^>]*>>>` because legitimate args carry
+/// `>` characters — `<<<RUN_CMD: ls > out.txt>>>`, redirects in
+/// `git diff > file`, etc. Lazy quantifier finds the *first* closing
+/// `>>>` triplet which is the right boundary in practice; a tool arg
+/// that itself contains `>>>` is pathological and matches the
+/// executor's own behaviour anyway.
+final RegExp _kCompleteToolCall = RegExp(
+  r'<<<(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):.*?>>>'
+  r'.*?'
+  r'<<<END_(?:FILE|EDIT|APPEND)>>>'
+  r'|'
+  r'<<<(?!(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):)'
+  r'[A-Z_]+:.*?>>>',
+  dotAll: true,
+);
+
+/// Find the end-offset of the first complete tool-call block in
+/// [buffer], optionally restricted to scanning from [start] onward.
+///
+/// `start` is a perf knob, not a correctness knob: callers track the
+/// position of the first `<<<` opener they've ever seen in the
+/// growing stream buffer and pass it here, so this scan skips the
+/// preamble prose. `allMatches(buffer, start)` is equivalent to
+/// scanning the whole buffer when `start <= firstOpenerOffset`
+/// because the regex requires `<<<` and there can be no match before
+/// the first opener by definition. Saves quadratic work on streams
+/// with long preambles.
+///
+/// Uses `allMatches(buffer, start).iterator` rather than
+/// `firstMatch` because Dart's `RegExp.firstMatch` doesn't take a
+/// start index — `allMatches` does, and the iterator is lazy so we
+/// only materialise the first hit.
+int? _firstCompleteToolCallEnd(String buffer, [int start = 0]) {
+  if (start < 0) start = 0;
+  if (start >= buffer.length) return null;
+  final it = _kCompleteToolCall.allMatches(buffer, start).iterator;
+  return it.moveNext() ? it.current.end : null;
+}
+
+/// Hidden marker yielded by every provider service when the upstream
+/// API signals the response was cut at the model's output token cap.
+/// (Ollama `done_reason:length`, Anthropic `stop_reason:max_tokens`,
+/// Gemini `finishReason:MAX_TOKENS`, OpenAI / GitHub Models
+/// `finish_reason:length`.) The controller scans for this marker
+/// post-streaming, strips it from the assistant content, and treats
+/// the iteration as "model wants to continue" — auto-continuing once
+/// per turn instead of leaving the user hanging at the strip.
+///
+/// Tolerant of whitespace inside the comment so a yield that lands
+/// across a chunk boundary still matches.
+final RegExp _kTruncatedLengthRe = RegExp(
+  r'<!--\s*LUMEN_TRUNCATED:length\s*-->\s*',
+);
 
 /// In-flight approval request shown to the user.
 ///
@@ -81,6 +171,12 @@ class QueuedPrompt {
   final List<String> openFilePaths;
   final DateTime queuedAt;
 
+  /// Optional short label shown in the user bubble — see
+  /// [PersistedMessage.displayContent]. Forwarded through the queue
+  /// so a `/handoff` enqueued during generation still renders as a
+  /// chip when it's eventually drained.
+  final String? displayText;
+
   QueuedPrompt({
     required this.id,
     required this.text,
@@ -90,17 +186,111 @@ class QueuedPrompt {
     required this.activeFilePath,
     required this.openFilePaths,
     required this.queuedAt,
+    this.displayText,
   });
+}
+
+/// Outcome of [ChatController.revertToBeforeMessage]. Bundles the
+/// timeline restore result and the chat-side state changes so the
+/// caller can both show a single coherent toast AND drive UI side
+/// effects (pre-fill the composer, resync open editor buffers).
+class ChatRevertOutcome {
+  /// True when there were file changes and they all restored cleanly,
+  /// OR when the revert was chat-only (no file changes to undo). Only
+  /// false when the timeline failed mid-restore.
+  final bool ok;
+
+  /// Human-readable summary surfaced to the user as a toast.
+  final String message;
+
+  /// Workspace-relative paths whose on-disk content changed during
+  /// the restore. Caller resyncs any matching open editor buffers and
+  /// closes tabs whose underlying file got deleted.
+  final List<String> touchedRelPaths;
+
+  /// How many chat messages were dropped (the pivot message + every
+  /// message after it). Used in the toast for context.
+  final int removedMessageCount;
+
+  /// True when the revert also dropped pending queued prompts. The UI
+  /// surfaces this so the user knows the queue was wiped (queued
+  /// prompts are composer-side state from before the revert and would
+  /// otherwise leak across a fresh re-send).
+  final bool droppedQueuedPrompts;
+
+  /// Pre-fill text for the composer when the user clicked revert on
+  /// their own bubble. Null for assistant-bubble reverts (Cursor only
+  /// pre-fills the prompt that was the boundary of the revert).
+  final String? composerPrefill;
+
+  const ChatRevertOutcome._({
+    required this.ok,
+    required this.message,
+    required this.touchedRelPaths,
+    required this.removedMessageCount,
+    required this.droppedQueuedPrompts,
+    required this.composerPrefill,
+  });
+
+  const ChatRevertOutcome._empty({required this.ok, required this.message})
+    : touchedRelPaths = const <String>[],
+      removedMessageCount = 0,
+      droppedQueuedPrompts = false,
+      composerPrefill = null;
 }
 
 /// Owns chat sessions, message generation, tool execution, multimodal
 /// payloads, persistence, cancellation and approval prompts.
 class ChatController extends ChangeNotifier {
   /// Hard cap on tool-use iterations per user request. Hoisted to a
-  /// class-level constant so the system prompt can advertise the limit
-  /// to the model (`$maxIters` interpolation) and the generation loop
-  /// can enforce it from the same source of truth.
-  static const int maxIters = 5;
+  /// class-level constant so the generation loop can enforce it from
+  /// a single source of truth. (We intentionally do NOT advertise this
+  /// number to the model anymore — telling the agent "you have 25
+  /// iterations" makes weaker models pad the work to fit the budget.
+  /// Better to let them stop when the task is done.)
+  ///
+  /// Was 5. Raised to 25 because text-protocol single-tool-per-response
+  /// (every provider in this codebase) means a real "redesign this
+  /// component" task wants ~10–15 tool calls (recon → reads → edits →
+  /// VERIFY → fix → re-VERIFY). The cancel button + runaway-loop guard
+  /// + per-tool approval are the actual safety net; the iteration cap
+  /// is just a backstop for genuinely runaway models.
+  static const int maxIters = 25;
+
+  /// How many recent messages to always send verbatim in the API
+  /// payload. Beyond this, the middle of the conversation is replaced
+  /// with a one-line ellipsis marker so token cost on long sessions
+  /// stays bounded. The first user message is always kept too — the
+  /// original ask is load-bearing context for any follow-up turn.
+  ///
+  /// 40 picked empirically: a turn with 8 tool calls expands to
+  /// ~16 messages (assistant + tool_result pair per call), so 40
+  /// covers ~2.5 full turns of recent activity. Below that and the
+  /// model loses thread on multi-step tasks; above and Claude /
+  /// cloud Ollama prompt tokens balloon on hour-long sessions.
+  static const int _kHistoryKeepRecent = 40;
+
+  /// Tool ids that count as "edited the workspace this turn" for the
+  /// purposes of the auto-verify gate (see `_runGenerationLoop` →
+  /// auto-verify). Kept in sync with the file-mutation tools in
+  /// `ToolRegistry`. read_file / read_file_range / list_dir / tree
+  /// / search_text / glob / find_file / git_status / git_diff /
+  /// check_url are intentionally excluded — they cannot have
+  /// introduced lint or type errors. run_cmd is also
+  /// excluded because what it changed is opaque from this side
+  /// (could be a server start, a test run, or a destructive shell
+  /// op); the trade-off is that an unattended `cargo build` won't
+  /// trigger auto-verify, but the alternative — auto-verifying after
+  /// every shell call — would slow the loop on every dev session
+  /// the agent ever runs.
+  static const Set<String> _editToolIds = {
+    'create_file',
+    'edit_file',
+    'multi_edit',
+    'append_file',
+    'move_file',
+    'delete_file',
+  };
 
   final OllamaService ollama;
   final GeminiService gemini;
@@ -242,6 +432,32 @@ class ChatController extends ChangeNotifier {
   DateTime? _generationStartedAt;
   DateTime? _lastChunkAt;
 
+  // ---- empty-response detection (Ollama "model just stops" guard) ----
+  // Set in `_runGenerationLoop` finally{} when the just-finished turn
+  // produced effectively no aggregated content and fired no tools and
+  // wasn't cancelled / errored. This is the "Ollama silently emits
+  // done:true with empty content" failure mode the user reported —
+  // the stream closes cleanly, `isGenerating` flips to false, the
+  // streaming progress bar disappears, and there is nothing visible
+  // on screen because the live assistant message has zero body.
+  // Surfaced via `lastTurnLooksEmpty`; the chat panel renders
+  // `EmptyResponseStrip` while the flag is true, offering a Continue
+  // button that calls `continueLastTurn()`. We do NOT auto-retry —
+  // a silent infinite loop hides genuine "the model is broken on
+  // this prompt" signal. Cleared in `sendMessage`, `retryLastTurn`,
+  // `continueLastTurn`, and via `dismissEmptyResponseHint()`.
+  //
+  // Reset condition: any new generation start clears it; we set it
+  // only at the *end* of a turn, never partway.
+  bool _lastTurnLooksEmpty = false;
+  // Workspace context captured at the time the empty turn ended so
+  // `continueLastTurn()` re-runs against the same workspace the
+  // empty turn was attempted in (the user may have switched
+  // workspaces between the empty response and clicking Continue).
+  String? _emptyTurnWorkspacePath;
+  String? _emptyTurnActiveFilePath;
+  List<String>? _emptyTurnOpenFilePaths;
+
   // ---- last-prompt cache (for the retry chip on provider errors) ----
   // The retry chip on `ProviderErrorCard` re-supplies workspace
   // context fresh from `AppState`, so we don't bother caching paths
@@ -307,6 +523,55 @@ class ChatController extends ChangeNotifier {
     final last = _lastChunkAt;
     if (last == null || !_isGenerating) return null;
     return DateTime.now().difference(last);
+  }
+
+  /// True when the most recently completed turn ended with no visible
+  /// content, no tool calls, no cancellation, and no provider error —
+  /// i.e. the Ollama "stream closed but nothing happened" failure
+  /// mode. The chat panel shows an "empty response — continue?"
+  /// strip while this is set so the user can nudge the model with
+  /// one click instead of typing a follow-up by hand.
+  bool get lastTurnLooksEmpty => _lastTurnLooksEmpty;
+
+  /// Clear the "empty response" hint without sending a new prompt.
+  /// Used by the dismiss button on `EmptyResponseStrip`.
+  void dismissEmptyResponseHint() {
+    if (!_lastTurnLooksEmpty) return;
+    _lastTurnLooksEmpty = false;
+    _emptyTurnWorkspacePath = null;
+    _emptyTurnActiveFilePath = null;
+    _emptyTurnOpenFilePaths = null;
+    notifyListeners();
+  }
+
+  /// Re-run the generation loop after the previous turn returned
+  /// empty. Sends a synthetic "Continue." user message visibly into
+  /// the chat (so the user knows what got nudged) and re-uses the
+  /// workspace context captured at the time the empty turn ended.
+  ///
+  /// No-op when not in the empty-response state, when already
+  /// generating, or when the chat session was somehow cleared.
+  /// We keep it bounded by treating the empty-flag as one-shot —
+  /// it gets cleared on entry, so a second empty response in a
+  /// row prompts the user again rather than auto-retrying forever.
+  Future<void> continueLastTurn() async {
+    if (!_lastTurnLooksEmpty || _isGenerating || _current == null) return;
+    final ws = _emptyTurnWorkspacePath;
+    final active = _emptyTurnActiveFilePath;
+    final open = _emptyTurnOpenFilePaths;
+    _lastTurnLooksEmpty = false;
+    _emptyTurnWorkspacePath = null;
+    _emptyTurnActiveFilePath = null;
+    _emptyTurnOpenFilePaths = null;
+    notifyListeners();
+    await sendMessage(
+      'Continue. If the previous task is complete, say so explicitly '
+      'and stop. Do not redo prior work.',
+      workspacePath: ws,
+      activeFilePath: active,
+      openFilePaths: open,
+      displayText: 'Continue',
+    );
   }
 
   /// Read-only view of the user's queued prompts (entries that landed
@@ -785,6 +1050,18 @@ class ChatController extends ChangeNotifier {
     );
   }
 
+  /// True when the currently selected model can accept inline image
+  /// inputs. Used to suppress the chat composer's image-attach
+  /// affordance for text-only models so the user doesn't paste an
+  /// image the model will silently ignore.
+  bool get currentModelSupportsVision {
+    final (provider, rawModel) = _splitModel(_selectedModel);
+    return ModelCapabilities.supportsVision(
+      provider: provider,
+      rawModel: rawModel,
+    );
+  }
+
   void toggleTool(String id) {
     if (_enabledTools.contains(id)) {
       _enabledTools.remove(id);
@@ -1170,6 +1447,119 @@ class ChatController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Cursor / Antigravity-style "revert to before this message".
+  ///
+  /// Truncates the active session at [index] (so the message at
+  /// [index] *and* every message after it are removed) and restores
+  /// every agent file change tied to the assistant messages that are
+  /// being dropped. Returns a [_RevertOutcome] describing what
+  /// happened so the caller (AppState / UI) can show a toast and
+  /// resync open editor buffers.
+  ///
+  /// Cancels in-flight generation first — reverting *while* a turn is
+  /// streaming is exactly the moment users want this feature most
+  /// (the agent went off the rails, kill it). We wait briefly for the
+  /// generation loop to finalise its `finally{}` block so the persist
+  /// race between this truncation and the streaming chunk persist
+  /// doesn't reintroduce a half-killed message.
+  ///
+  /// Returns the gathered ids + truncated user message text so the UI
+  /// can pre-fill the composer (matching Cursor's "edit and re-send"
+  /// affordance — clicking revert on your own bubble lets you tweak
+  /// the prompt and try again).
+  Future<ChatRevertOutcome> revertToBeforeMessage(
+    int index,
+    TimelineService? timeline,
+  ) async {
+    if (_current == null) {
+      return const ChatRevertOutcome._empty(
+        ok: false,
+        message: 'No active chat session.',
+      );
+    }
+    final session = _current!;
+    if (index < 0 || index >= session.messages.length) {
+      return const ChatRevertOutcome._empty(
+        ok: false,
+        message: 'Message index out of range.',
+      );
+    }
+
+    // Cancel any in-flight generation. Wait briefly for the loop to
+    // settle so the streaming persist doesn't race our truncation.
+    if (_isGenerating) {
+      cancelGeneration();
+      var waited = 0;
+      while (_isGenerating && waited < 40) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        waited++;
+      }
+    }
+
+    // Snapshot the user message we're rewinding to (its text feeds
+    // the composer pre-fill). We capture this BEFORE truncation
+    // because we'll mutate the messages list below.
+    final pivotMessage = session.messages[index];
+    final pivotIsUser = pivotMessage.role == 'user';
+    final composerPrefill = pivotIsUser
+        ? (pivotMessage.displayContent != null &&
+                  pivotMessage.displayContent!.trim().isNotEmpty
+              ? pivotMessage.displayContent!
+              : pivotMessage.content)
+        : null;
+
+    // Gather messageIds for every assistant message being removed —
+    // those are the only entries the timeline tagged with chat
+    // correlation. Also build the legacy `<sessionId>@<micros>` ids
+    // for older journals that pre-date `PersistedMessage.id`.
+    final removed = session.messages.sublist(index);
+    final messageIds = <String>{};
+    final legacyIds = <String>{};
+    for (final m in removed) {
+      if (m.role != 'assistant') continue;
+      messageIds.add(m.id);
+      legacyIds.add('${session.id}@${m.timestamp.microsecondsSinceEpoch}');
+    }
+
+    // Restore file changes. Empty set is fine — the timeline returns
+    // an "ok: false, no changes" result we just translate into a
+    // chat-only revert message.
+    TimelineBulkRestoreResult? timelineResult;
+    if (timeline != null && (messageIds.isNotEmpty || legacyIds.isNotEmpty)) {
+      timelineResult = await timeline.restoreMessagesChanges(
+        messageIds,
+        legacyMessageIds: legacyIds,
+      );
+    }
+
+    // Truncate the chat. The session-list ordering / persisted JSON
+    // and the in-memory `messages` are the single source of truth for
+    // what the LLM will see on the next turn (api messages are built
+    // freshly each send), so this one mutation is enough.
+    session.messages.removeRange(index, session.messages.length);
+    await _persistCurrent();
+
+    // Drop transient prompt queue / pending images / references too —
+    // those are composer-side state from BEFORE the revert; leaving
+    // them dangling would surprise the user when their next send
+    // includes leftover attachments from a different intent.
+    final hadQueue = _promptQueue.isNotEmpty;
+    _promptQueue.clear();
+    notifyListeners();
+
+    final fileSummary = timelineResult == null
+        ? 'no file changes recorded'
+        : timelineResult.message.toLowerCase().replaceFirst('.', '');
+    return ChatRevertOutcome._(
+      ok: timelineResult?.ok ?? true,
+      message: S.chatRewindResultMessage(removed.length, fileSummary),
+      touchedRelPaths: timelineResult?.touchedRelPaths ?? const <String>[],
+      removedMessageCount: removed.length,
+      droppedQueuedPrompts: hadQueue,
+      composerPrefill: composerPrefill,
+    );
+  }
+
   Future<void> appendUserText(String text) async {
     if (_current == null) await newSession();
     _current!.messages.add(PersistedMessage(role: 'user', content: text));
@@ -1346,6 +1736,13 @@ class ChatController extends ChangeNotifier {
     if (_isGenerating || _current == null) return;
     final session = _current!;
     if (session.messages.isEmpty) return;
+    // A retry abandons whatever the prior empty-response hint was
+    // about — the failed assistant message is being removed below,
+    // so the strip would dangle on stale state.
+    _lastTurnLooksEmpty = false;
+    _emptyTurnWorkspacePath = null;
+    _emptyTurnActiveFilePath = null;
+    _emptyTurnOpenFilePaths = null;
     // Walk backward to the last assistant message and check it
     // ended in a marker. If it did, drop it.
     int trailingAssistantIdx = -1;
@@ -1373,6 +1770,7 @@ class ChatController extends ChangeNotifier {
     String? workspacePath,
     String? activeFilePath,
     List<String>? openFilePaths,
+    String? displayText,
   }) async {
     final trimmed = text.trim();
     if (trimmed.isEmpty &&
@@ -1396,6 +1794,7 @@ class ChatController extends ChangeNotifier {
         workspacePath: workspacePath,
         activeFilePath: activeFilePath,
         openFilePaths: openFilePaths ?? const [],
+        displayText: displayText,
       );
       _pendingImages.clear();
       _pendingReferences.clear();
@@ -1424,19 +1823,33 @@ class ChatController extends ChangeNotifier {
       content: trimmed,
       imagesBase64: attachedImages,
       references: attachedReferences,
+      displayContent: displayText,
     );
     session.messages.add(userMsg);
     session.updatedAt = DateTime.now();
 
     if (session.messages.length == 1) {
-      session.title = persistence.deriveTitleFromMessage(trimmed);
-      unawaited(_summarizeTitleInBackground(session, trimmed));
+      // Title derives from the *display* text when the message is a
+      // hidden-prompt slash command — otherwise the chat would be
+      // titled with a wall of agent instructions instead of "/handoff".
+      final titleSeed = displayText?.trim().isNotEmpty == true
+          ? displayText!.trim()
+          : trimmed;
+      session.title = persistence.deriveTitleFromMessage(titleSeed);
+      unawaited(_summarizeTitleInBackground(session, titleSeed));
     }
     await _persistCurrent();
 
     // Cache the user message for the retry chip — workspace context
     // is re-read from AppState on retry, no need to cache it here.
     _lastUserMessageForRetry = userMsg;
+    // Sending a new prompt always clears any leftover empty-response
+    // hint — that flag describes the *previous* turn, and we are
+    // replacing the previous turn's outcome with a new request.
+    _lastTurnLooksEmpty = false;
+    _emptyTurnWorkspacePath = null;
+    _emptyTurnActiveFilePath = null;
+    _emptyTurnOpenFilePaths = null;
 
     await _runGenerationLoop(
       workspacePath: workspacePath,
@@ -1455,6 +1868,7 @@ class ChatController extends ChangeNotifier {
     required String? workspacePath,
     required String? activeFilePath,
     required List<String> openFilePaths,
+    String? displayText,
   }) {
     final id = 'q_${++_nextQueueId}';
     _promptQueue.add(
@@ -1467,6 +1881,7 @@ class ChatController extends ChangeNotifier {
         activeFilePath: activeFilePath,
         openFilePaths: List.unmodifiable(openFilePaths),
         queuedAt: DateTime.now(),
+        displayText: displayText,
       ),
     );
     return id;
@@ -1497,6 +1912,7 @@ class ChatController extends ChangeNotifier {
       workspacePath: next.workspacePath,
       activeFilePath: next.activeFilePath,
       openFilePaths: next.openFilePaths,
+      displayText: next.displayText,
     );
   }
 
@@ -1561,46 +1977,31 @@ class ChatController extends ChangeNotifier {
     String? capturedTurnId;
 
     try {
+      // Tight workspace context. We deliberately do NOT dump a 50-entry
+      // root listing anymore — most of those slots are noise (`build/`,
+      // `.dart_tool/`, `.gitnexus/`, …) and the model can `<<<TREE: .>>>`
+      // if it actually needs to see the layout. Active file + open tabs
+      // are the bits the user genuinely wants the agent to be aware of
+      // ("redesign the sidebar" implicitly means the file the user is
+      // looking at).
       String workspaceContext = 'No workspace open.';
       if (workspacePath != null) {
-        try {
-          final dir = Directory(workspacePath);
-          final entries = dir.listSync().take(50).toList();
-          entries.sort((a, b) {
-            final aDir = a is Directory;
-            final bDir = b is Directory;
-            if (aDir != bDir) return aDir ? -1 : 1;
-            return a.path
-                .split(Platform.pathSeparator)
-                .last
-                .toLowerCase()
-                .compareTo(
-                  b.path.split(Platform.pathSeparator).last.toLowerCase(),
-                );
-          });
-          final names = entries
-              .map(
-                (e) =>
-                    '${e is Directory ? "[DIR] " : ""}${e.path.split(Platform.pathSeparator).last}',
-              )
-              .join('\n  ');
-          final ctxBuf = StringBuffer();
-          ctxBuf.writeln('Workspace: $workspacePath');
-          ctxBuf.writeln('Root contents:\n  $names');
-          if (activeFilePath != null) {
-            ctxBuf.writeln(
-              'Active file (user is currently editing): $activeFilePath',
-            );
-          }
-          if (openFilePaths != null && openFilePaths.isNotEmpty) {
-            ctxBuf.writeln(
-              'Open files in editor tabs: ${openFilePaths.join(', ')}',
-            );
-          }
-          workspaceContext = ctxBuf.toString().trimRight();
-        } catch (e) {
-          workspaceContext = 'Error reading workspace: $e';
+        final ctxBuf = StringBuffer();
+        ctxBuf.writeln('Working directory: $workspacePath');
+        if (activeFilePath != null) {
+          ctxBuf.writeln(
+            'Active file (user is currently looking at this): '
+            '$activeFilePath',
+          );
         }
+        if (openFilePaths != null && openFilePaths.isNotEmpty) {
+          final shown = openFilePaths.take(20).join(', ');
+          final trailing = openFilePaths.length > 20
+              ? ' (+${openFilePaths.length - 20} more)'
+              : '';
+          ctxBuf.writeln('Open editor tabs: $shown$trailing');
+        }
+        workspaceContext = ctxBuf.toString().trimRight();
       }
 
       final compiledRules = await rules.compileForPrompt(workspacePath);
@@ -1626,12 +2027,17 @@ class ChatController extends ChangeNotifier {
           .join('\n');
       final allowOutsideWorkspaceWrites = await prefs
           .getAgentAllowOutsideWorkspaceWrites();
+      // Pref read once up-front. Mid-turn changes don't take effect
+      // until the next user message, mirroring how the
+      // `allowOutsideWorkspaceWrites` flag is captured. This prevents
+      // a Settings save mid-stream from changing behaviour mid-turn.
+      final autoVerifyEnabled = await prefs.getAgentAutoVerifyAfterEdits();
 
       // ─────────────────────────────────────────────────────────
       //   Conversation continuity — anti "redo previous prompt"
       //   bias.
       // ─────────────────────────────────────────────────────────
-      // Two real-world bug reports drove this:
+      // Driven by two real-world bug reports:
       //   1. User asks for X, agent does X, conversation ends. Hours
       //      later they say "hi" and the model picks up X again from
       //      scratch because the long history makes it look unfinished.
@@ -1640,50 +2046,12 @@ class ChatController extends ChangeNotifier {
       //      the conversation context is dominated by the original
       //      request.
       //
-      // Three layered defences:
-      //   A. **Continuity rule** in the system prompt itself —
-      //      explicit "messages above the latest user message are
-      //      HISTORY" instruction.
-      //   B. **Tasks log injection** — pull the per-chat
-      //      `<id>.tasks.md` into the prompt (last 30 entries) so
-      //      the model has a concrete "what's already done" list.
-      //   C. **Time-gap escalation** — if the most recent prior
-      //      assistant message is more than 30 minutes old (relative
-      //      to *now*, not the just-added user msg), prepend a
-      //      louder "this conversation resumed after a long pause"
-      //      note. Models are dramatically worse at honouring (A)
-      //      alone after a session resume.
-      String tasksLog = '';
-      try {
-        final raw = await persistence.loadTasks(session.id);
-        if (raw.trim().isNotEmpty) {
-          // Trim to the last ~30 task lines so we don't blow tokens
-          // on a chat that's been going for weeks. Header / comment
-          // lines are filtered out — only the actual `- [x] ...`
-          // entries are useful in-prompt.
-          final entries = raw
-              .split('\n')
-              .where((line) => line.startsWith('- ['))
-              .toList();
-          final tail = entries.length > 30
-              ? entries.sublist(entries.length - 30)
-              : entries;
-          if (tail.isNotEmpty) {
-            tasksLog = tail.join('\n');
-          }
-        }
-      } catch (_) {
-        /* tasks read is best-effort */
-      }
-
-      // Time-gap detection: previous assistant message age. We look
-      // at the most recent assistant message that exists BEFORE the
-      // current latest-user-message — its age vs. now signals a
-      // resumed-after-pause turn. Walking backward from the end
-      // works for both the sendMessage path (user msg was just
-      // appended) and the retryLastTurn path (failed assistant got
-      // removed; user msg now sits at the tail with the prior
-      // assistant earlier in history).
+      // We used to layer THREE defences (continuity rule + tasks-log
+      // injection + time-gap escalation). The tasks-log block was
+      // counter-productive: dumping the last 30 completed items as
+      // "do NOT redo these" still primed weaker models to keep
+      // expanding scope, and it bloated every iteration. Dropped it.
+      // The continuity rule + an optional time-gap notice is enough.
       bool resumedAfterPause = false;
       for (int j = session.messages.length - 2; j >= 0; j--) {
         final m = session.messages[j];
@@ -1694,27 +2062,10 @@ class ChatController extends ChangeNotifier {
         }
       }
 
-      final continuityBlock = '''
-## Conversation continuity (read this first)
-Messages above the most recent user message are HISTORY. Tools have
-already executed; files have already been written; work has already
-been done in those turns. Treat that history as **completed**.
-
-- Only respond to the LATEST user message.
-- If the latest message is a greeting, acknowledgement, or unclear,
-  ASK what the user wants to do next. Do NOT re-execute prior
-  requests "to be helpful".
-- Re-attempt prior work ONLY when the user explicitly asks
-  ("redo X", "try again", "the file is missing — rebuild it").
-${resumedAfterPause ? '- **Session resumed after a long pause** — the previous reply was sent over 30 minutes ago. Be especially careful not to pick up where the prior turn left off. The user is starting a new ask, even if it looks brief.\n' : ''}${tasksLog.isNotEmpty ? '\n### Already completed in this conversation\nDo NOT redo any of these unless the user explicitly asks. They are HISTORICAL.\n\n$tasksLog\n' : ''}''';
-
-      // **Reasoning effort prompt fallback** — when the active model
-      // doesn't accept a native reasoning param (Ollama, older OpenAI
-      // chat models, Claude Haiku, Gemini 2.0), inject a system-prompt
-      // directive instead. When native IS supported, we trust the API
-      // knob and skip the suffix to avoid double-incentivising
-      // verbosity (the model is already thinking harder; nagging it
-      // into being thorough on top of that just burns tokens).
+      // Reasoning-effort prompt fallback for providers/models that
+      // don't accept a native reasoning param (Ollama, older OpenAI,
+      // Claude Haiku, Gemini 2.0). When native IS supported, we trust
+      // the API knob and skip the suffix.
       final effort = session.reasoningEffort;
       final (selectedProvider, selectedRawModel) = _splitModel(_selectedModel);
       final effortIsNative = ReasoningEffortHelper.modelSupportsNative(
@@ -1722,92 +2073,117 @@ ${resumedAfterPause ? '- **Session resumed after a long pause** — the previous
         rawModel: selectedRawModel,
       );
       final effortBlock = (!effortIsNative && effort != ReasoningEffort.off)
-          ? '${ReasoningEffortHelper.promptDirectiveFor(effort)}\n'
+          ? '${ReasoningEffortHelper.promptDirectiveFor(effort)}\n\n'
+          : '';
+
+      // Provider-neutral system prompt. **Every** provider in this
+      // codebase uses the same `<<<TOOL>>>` text protocol — we don't
+      // call native function/tool APIs anywhere. So discipline rules
+      // apply uniformly; there is no "Claude is special" branch.
+      final pauseLine = resumedAfterPause
+          ? '\n- This session is resuming after a long pause (30+ min). '
+                'The user is starting a new ask, even if it looks brief — '
+                'do NOT pick up where the previous turn left off.'
           : '';
 
       final systemPrompt =
           '''You are Lumen, the AI coding assistant built into the Lumen IDE.
-You are an expert software engineer working as the user's pair programmer.
-Not a Q&A bot — propose plans, execute, verify, and report back.
-$continuityBlock
-$effortBlock## Workspace
-Working directory: ${workspacePath ?? 'None'}
+You are a senior software engineer working as the user's pair programmer.
+Not a Q&A bot — propose, execute, verify, and report back concisely.
+
+## Conversation continuity
+Treat messages above the latest user message as HISTORY. Tools already
+ran; files were already written. Only respond to the LATEST user
+message. If it's a greeting, acknowledgement, or unclear, ask what
+they want next — do NOT re-execute prior requests "to be helpful".$pauseLine
+
+## Workspace
 $workspaceContext
 
-## Workspace conventions
-This project may follow Lumen IDE conventions. Check whether these dirs
-exist (TREE on the workspace root) before assuming they don't:
-- `.lumen/rules.md` — workspace-specific rules. Already merged into
-  the "Project Rules" section below if present; do NOT re-read it.
-- `.lumen/tools/*.json` — external agent tools auto-loaded into your
-  toolbox; you'll see them in the tool list above without doing anything.
-- `.lumen/skills/*.md` — instruction-based **skills** (design system
-  guides, code conventions, domain knowledge). Already injected into
-  the "Workspace skills" section below if present; do NOT re-read
-  them. Skills are READ-ONLY context — do not try to invoke a skill
-  with `<<<>>>`. To CREATE a new skill, write a markdown file with
-  YAML frontmatter (`---\nname:\ntrigger:\n---`) into
-  `.lumen/skills/`.
-- `.agents/knowledgebase.md` — concise project knowledge maintained
-  by you and previous agents. READ it when starting any non-trivial
-  task if it exists. If it is missing and the task reveals useful
-  durable context, CREATE it. UPDATE it after big completions
-  (architecture shifts, new conventions, gotchas worth remembering).
-  Keep entries short, practical, and agent-oriented: facts future
-  agents need, no narrative fluff or changelog noise.
-- `.agents/master_development_plan.md` — long-term roadmap, if present.
-- `.agents/remaining.md` — outstanding TODOs the user is tracking.
-For any non-trivial task, your first move on a fresh chat is usually
-TREE on `.agents/` and `.lumen/` (when they exist) to load context.
-The user expects you to be aware of accumulated project context, not
-start from zero each turn.
+$effortBlock## Tools
+Invoke a tool by emitting its EXACT syntax. The tool runs and you
+receive its output back as `<tool_result>...</tool_result>` content
+on the next turn — that is real output, not user input.
 
-## Workspace write boundary
-${allowOutsideWorkspaceWrites ? 'The user has allowed built-in file mutation tools to write outside the active workspace when they explicitly target an absolute or parent-traversal path. Still prefer workspace-local edits unless the user asks otherwise.' : 'Built-in file mutation tools are configured to reject writes outside the active workspace. You may read outside the workspace for context, but do not create, edit, move, append, or delete files outside the workspace. If you need to do that, ask the user to enable Settings → Rules → Allow agent writes outside workspace for the task.'}
-
-## Your tools
-To use a tool, output its EXACT syntax in your response. You will receive
-the tool's output as feedback in the next message and can continue from there.
-You may chain multiple tool calls in a single response. You have up to
-$maxIters iterations of tool use per request.
+**Discipline (applies to every provider):**
+- Output AT MOST ONE tool call per response. After it, STOP and wait
+  for the `<tool_result>`. Then decide your next step.
+- **Tool calls are the ONLY way real changes happen.** Describing an
+  edit in prose ("I'll update the styles to use a dark gradient...")
+  does NOT modify the file. The user only sees changes that ran
+  through an actual `<<<TOOL>>>` invocation. If you intend to edit,
+  emit the tool call. If you only want to describe what you're
+  about to do, prefix with one short prose line, then emit the
+  tool. Never narrate a completed edit you did not actually issue.
+- Read before editing. Use READ_FILE / READ_FILE_RANGE / SEARCH_TEXT
+  to ground edits in actual code.
+- **For existing files, ALWAYS use EDIT_FILE or MULTI_EDIT. NEVER use
+  CREATE_FILE on a file that exists** — it forces you to retype the
+  entire file, wastes minutes of generation time on big files, and
+  risks dropping content you didn't mean to remove. CREATE_FILE is
+  only for genuinely new files. If you intend a full rewrite, use
+  one MULTI_EDIT with a single search/replace covering the whole
+  body — that still goes through the diff path.
+- A `<tool_result>` line starting with `[FAILED]` means the call did
+  NOT execute. Do not claim success. Re-read the file and retry.
+- After source-code edits, finish with `<<<VERIFY>>>`. If it reports
+  issues, fix them and call VERIFY again.
+- Before starting a dev server / watcher with RUN_CMD, CHECK_URL the
+  expected port first. If reachable, the user already has it running
+  — do NOT spawn a duplicate.
+- ${allowOutsideWorkspaceWrites ? 'Built-in mutation tools may write outside the workspace when explicitly targeted with absolute/parent paths. Prefer in-workspace edits unless the user asks otherwise.' : 'Built-in mutation tools cannot write outside the active workspace. Reads outside are fine. If a write outside is needed, ask the user to enable Settings → Rules → Allow agent writes outside workspace.'}
 
 $toolDocs
 
 ## How to work
-1. **Explore before editing.** When the user asks about code, errors, or
-   anything workspace-related, examine relevant files first. Use TREE for
-   structure, GLOB / FIND_FILE to locate, READ_FILE_RANGE for big-file
-   slices (cheaper than full READ_FILE), SEARCH_TEXT for usages. Never
-   guess file paths or contents — look them up.
-2. **Surgical edits.** Prefer EDIT_FILE over CREATE_FILE for changes to
-   existing files. When you have several edits to the SAME file, batch
-   them with MULTI_EDIT — atomic, fewer round trips, no partial state.
-   Only use CREATE_FILE for new files or full rewrites.
-3. **Refactor safely.** Use MOVE_FILE for renames / relocations.
-   Update import sites afterward (SEARCH_TEXT for the old name).
-4. **Verify changes.** After non-trivial edits use GIT_STATUS to see
-   exactly what touched the working tree, GIT_DIFF to inspect the
-   actual changes. READ_FILE the result if a critical edit needs
-   confirming.
-5. **Be proactive.** If you notice related issues (unused imports,
-   inconsistent naming, missing error handling) while working on the
-   user's request, mention them and offer to fix — don't silently
-   leave them or surprise-fix them.
-6. **Don't apologise** about inability to do things. You have powerful
-   tools. Use them.
-7. **Stay responsive.** Stream a short prose progress line BEFORE
-   firing a tool call so the user can see what you're about to do.
-   Don't open with a dozen tool calls in silence — that reads as
-   "the model is stuck" even when it's working. Between tool
-   iterations, write a one-line summary of what you got back before
-   firing the next batch.
-
-${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n' : ''}${compiledSkills.isNotEmpty ? '\n$compiledSkills\n' : ''}''';
+1. Stay focused on what the user actually asked. Don't broaden scope
+   unprompted, don't run unrelated installs, don't "fix" tangential
+   issues unless they explicitly block the task.
+2. Stream a one-line plan or progress note BEFORE each tool call so
+   the user sees what you're about to do.
+3. When you're done, give a short summary of what changed. Don't
+   re-narrate every tool you ran — the chat already shows those as
+   cards.
+${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules\n' : ''}${compiledSkills.isNotEmpty ? '\n$compiledSkills\n' : ''}''';
 
       final apiMessages = <Map<String, dynamic>>[
         {'role': 'system', 'content': systemPrompt},
       ];
-      for (final m in session.messages) {
+      // **Conversation history pruning.** When a long session crosses
+      // [_kHistoryKeepRecent] messages, we keep the first user
+      // message (the original ask is load-bearing context) plus the
+      // last N, and replace the omitted middle with a single
+      // synthetic user note. This keeps token cost bounded on
+      // hour-long agentic sessions without losing the prompt that
+      // started everything OR the recent window the model needs to
+      // continue. We don't try to summarise the dropped middle —
+      // that would require an LLM round-trip we'd be charging the
+      // user for, and the recent window is already the model's
+      // working memory.
+      final historyMessages = session.messages;
+      Iterable<PersistedMessage> historyToSend;
+      if (historyMessages.length <= _kHistoryKeepRecent) {
+        historyToSend = historyMessages;
+      } else {
+        final first = historyMessages.first;
+        final tail = historyMessages.sublist(
+          historyMessages.length - _kHistoryKeepRecent,
+        );
+        // Synthetic placeholder for the omitted span. Marked clearly
+        // so the model knows context was elided rather than the user
+        // having actually said this.
+        final droppedCount = historyMessages.length - 1 - tail.length;
+        final placeholder = PersistedMessage(
+          role: 'user',
+          content:
+              '(... earlier context elided: $droppedCount messages '
+              'between the original user message and the recent '
+              'window were dropped to keep token usage bounded. '
+              'If you need them, ask the user.)',
+        );
+        historyToSend = [first, placeholder, ...tail];
+      }
+      for (final m in historyToSend) {
         final entry = <String, dynamic>{
           'role': m.role,
           'content': _contentWithReferences(m),
@@ -1836,6 +2212,12 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
         enabledTools: _enabledTools,
         recorder: tlRecorder,
         allowWritesOutsideWorkspace: allowOutsideWrites,
+        // Hand the per-turn cancel token down so RUN_CMD (and any
+        // future long-running tool) can abort a hung subprocess
+        // when the user clicks Stop. Without this, Stop only
+        // interrupts the LLM stream — a `npm start` already in
+        // flight will keep blocking the executor's await forever.
+        cancelToken: _cancelToken,
       );
 
       // Derive a stable `turnId` for this user request. Used to tag
@@ -1871,6 +2253,13 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
       // until done, which is exactly what we're getting away from.
       String aggregated = '';
       bool keepLooping = true;
+      // One-shot per turn — once we auto-verify a turn, we never
+      // re-trigger inside the same turn even if the model edits more
+      // files in its fix-pass without calling VERIFY itself. The
+      // model already saw the auto-verify feedback once; if it
+      // ignores VERIFY twice in a row that's a model behaviour
+      // problem, not something an extra auto-pass will fix.
+      bool autoVerifyAlreadyRan = false;
       int i = 0;
       // Aggregated across all iterations of this user-turn so the
       // tasks.md entry can summarise everything the model touched
@@ -1880,7 +2269,12 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
       // same file — the file path lands in the args list anyway).
       final firedAcrossTurn = <FiredTool>[];
       session.messages.add(PersistedMessage(role: 'assistant', content: ''));
-      final liveIdx = session.messages.length - 1;
+      // Mutable: per-iteration tool image attachments are inserted at
+      // this index and bump it forward, so subsequent `updateLive`
+      // calls keep targeting the live assistant message at its new
+      // position. Closure captures the variable (not the value) so
+      // mutating here is enough — see `updateLive` below.
+      var liveIdx = session.messages.length - 1;
       // Mount the chat context onto the timeline. Every file
       // revision the executor produces while this is set will be
       // tagged with `(sessionId, turnId, messageId)`. Clearing
@@ -1938,29 +2332,114 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
 
       notifyListeners();
 
+      // **Single-tool-per-iteration mode** — for ALL providers.
+      //
+      // Reality check on this codebase: NONE of the provider services
+      // (`anthropic_service.dart`, `gemini_service.dart`,
+      // `github_models_service.dart`, `ollama_service.dart`) actually
+      // use native function/tool calling APIs. They all just stream
+      // plain text containing `<<<TOOL: args>>>` markers which the
+      // executor regex-parses afterwards. So none of them auto-pause
+      // when the model emits a tool call — the model can stream
+      // call → prose → call → prose, and we'd run all three
+      // sequentially with each call's "result" already committed to
+      // by the model based on what it *guessed* the previous would
+      // return. That's the cascading-hallucination failure mode
+      // (visible most often on cloud Ollama models, but the same
+      // architecture exists on every provider).
+      //
+      // Fix: as soon as the first complete tool block lands in the
+      // streaming buffer, close the stream. The executor runs that
+      // one tool, the real result feeds back, the next iteration
+      // starts fresh. Same agent loop, just single-tool discipline
+      // enforced at the wire level for every provider.
+      //
+      // Cost: ~one extra round trip on tasks the model could
+      // legitimately chain (`READ_FILE a` + `READ_FILE b` becomes two
+      // turns). Worth it; correctness > latency, and chained calls
+      // were poisoning the conversation regardless of provider.
+      //
+      // If we ever switch a specific provider to genuinely native
+      // tool calling (Anthropic `tools`, OpenAI `function_call`,
+      // Gemini `tools`), revisit this — at that point we'd want to
+      // disable the cut for that provider and let the API's own
+      // tool-call autopause do the job. Until then: uniform.
+      const cutOnFirstTool = true;
+      int? firstToolEnd;
+
+      // **Auto-continue** — fires AT MOST ONCE per user turn when the
+      // model either (a) produced empty content with no tool calls
+      // ("just stops responding" failure mode the user described
+      // for cloud Ollama) or (b) was cut at the provider's output
+      // token cap (`<!-- LUMEN_TRUNCATED:length -->` marker). We
+      // synthesize a brief continue prompt and re-enter the loop so
+      // the model gets one real recovery attempt before we surface
+      // the user-facing Continue strip. Bounded to one attempt
+      // because: (1) the second empty/truncated turn is a real
+      // signal something is wrong (model context, prompt confusion,
+      // capacity), and silent infinite continues would hide that;
+      // (2) the maxIters cap is the ultimate backstop anyway.
+      bool autoContinuedThisTurn = false;
+
       while (keepLooping && i < maxIters && !_cancelToken!.isCancelled) {
         i++;
+        firstToolEnd = null;
         final iterBuf = StringBuffer();
-        // **Runaway-loop guard** (set during streaming, checked
-        // post-stream). Some models (nemotron-3-super:cloud has been
-        // observed; deepseek-r1 sometimes too) get stuck in a
-        // cycle producing the same 4-6 tool calls hundreds of times
-        // in a single response. We can't trust that maxIters alone
-        // protects us — the loop happens INSIDE one iteration's
-        // stream — so we cap two ways:
-        //   - Total `<<<` markers in this iteration. > 50 means at
-        //     least 25 tool-call open/close brackets, which is way
-        //     past anything a coherent task needs.
-        //   - `<<<RUN_CMD:` count. > 12 means the model is just
-        //     hammering the shell; no legitimate single-turn task
-        //     needs that many.
-        // Either trip → abort streaming, do NOT run the executor on
-        // the iteration's content (the destructive tools never
-        // fire), and end the conversation loop cleanly so the user
-        // can re-prompt with corrective context.
+        // **Runaway-loop guards** (set during streaming, checked
+        // post-stream). Three independent trips:
+        //
+        //   1. **Closeless babble** (most common with single-tool-cut)
+        //      The model emits opening tool markers without ever
+        //      producing a closeable block. `cutOnFirstTool` would
+        //      have bailed on the first complete tool, so accumulating
+        //      many `<<<` with `firstToolEnd` still null = the model
+        //      is stuck repeating partial syntax. 8 markers without
+        //      a closeable block is plenty (a multi-line tool needs
+        //      ≤ 6 markers in normal use).
+        //
+        //   2. **Total marker explosion** — > 80 `<<<` even if some
+        //      are forming valid blocks. This catches MULTI_EDITs
+        //      with absurd hunk counts (legit max ~16 hunks ≈ 50
+        //      markers; >80 means the model is duplicating).
+        //
+        //   3. **Repeated RUN_CMD spam** — > 12 `<<<RUN_CMD:` markers.
+        //      Mostly defensive now (cutOnFirstTool means we exit on
+        //      the first complete RUN_CMD), but cheap to keep as
+        //      belt-and-suspenders for partial-block cases.
+        //
+        // On any trip → abort streaming, do NOT run the executor on
+        // the iteration's content (the destructive tools never fire),
+        // and end the conversation loop cleanly so the user can
+        // re-prompt with corrective context.
         bool runawayDetected = false;
+        String runawayReason = '';
         int markerCount = 0;
         int runCmdCount = 0;
+        // **Tail-scan offsets for `_firstCompleteToolCallEnd`.**
+        //
+        // The complete-tool regex is `<<<...>>>...<<<END_*>>>` (multi-
+        // line block) or `<<<NAME: ...>>>` (single-line). A complete
+        // match cannot start before the FIRST `<<<` we've ever seen,
+        // and cannot finish until at least one `>>>` has landed in
+        // the buffer.
+        //
+        // Without these gates, the loop ran a `dotAll` regex over the
+        // full growing buffer on every chunk, which is quadratic in
+        // the eventual response size. On long EDIT_FILE bodies that
+        // showed up as visible UI stutter (the controller is on the
+        // UI isolate). With them:
+        //   - If the model is still streaming pure prose (no `<<<`
+        //     yet), we don't scan at all.
+        //   - Once a `<<<` has appeared, we scan starting from that
+        //     index forward. Skips re-scanning the preamble on every
+        //     subsequent chunk.
+        //   - We also wait until at least one `>>>` has appeared,
+        //     since no complete call can match before then.
+        // Both are correctness-preserving: `firstMatch(buf, start)`
+        // is equivalent to `firstMatch(buf)` whenever `start` is
+        // ≤ the position of any possible match.
+        int firstOpenerOffset = -1;
+        bool sawClosingTriple = false;
         // Stream this iteration's response into iterBuf, updating
         // the live message's content each chunk.
         await for (final chunk in _generateChatStream(
@@ -1970,6 +2449,7 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
           effort: effort,
         )) {
           if (_cancelToken!.isCancelled) break;
+          final bufLenBeforeChunk = iterBuf.length;
           iterBuf.write(chunk);
           // Stall detector: refresh the last-chunk timestamp so the
           // chat panel can read `silenceDuration` and surface a
@@ -1986,10 +2466,56 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
           // practice (HTTP chunks are >= 1KB; markers are <= 14B).
           markerCount += '<<<'.allMatches(chunk).length;
           runCmdCount += '<<<RUN_CMD:'.allMatches(chunk).length;
-          if (markerCount > 50 || runCmdCount > 12) {
+
+          // Track FIRST opener offset (lowest index of `<<<` ever
+          // seen) and whether any `>>>` has arrived. Both are
+          // O(chunk.length) so the per-chunk cost stays bounded.
+          if (firstOpenerOffset < 0) {
+            final idx = chunk.indexOf('<<<');
+            if (idx >= 0) firstOpenerOffset = bufLenBeforeChunk + idx;
+          }
+          if (!sawClosingTriple && chunk.contains('>>>')) {
+            sawClosingTriple = true;
+          }
+
+          // **Single-tool boundary**. Cheap pre-gates above mean we
+          // skip the heavy regex while the model is in pure prose
+          // OR has only emitted an opener with no `>>>` yet. When
+          // we do scan, we start from the first opener so the
+          // preamble is skipped each time.
+          final buffered = iterBuf.toString();
+          firstToolEnd =
+              cutOnFirstTool && firstOpenerOffset >= 0 && sawClosingTriple
+              ? _firstCompleteToolCallEnd(buffered, firstOpenerOffset)
+              : null;
+          if (firstToolEnd != null) {
+            // First complete tool call landed. Close the stream so
+            // the executor runs ONE tool, feeds the real result back,
+            // and the next iteration starts with grounded context.
+            // The async generator's finally{} closes the http client;
+            // below we truncate the partial buffer to exactly the prose
+            // up to and including the first complete tool block.
+            break;
+          }
+
+          // Trips. Order matters: closeless-babble fires first
+          // because it's the diagnostic signal we care about most;
+          // the total-explosion / RUN_CMD trips are fallbacks.
+          if (markerCount >= 8 && firstToolEnd == null) {
             runawayDetected = true;
-            break; // breaks await-for; the async generator's
-            // finally{} closes the http client.
+            runawayReason =
+                'the model emitted $markerCount opening "<<<" markers '
+                'without ever forming a complete tool block. This is '
+                'the classic "stuck repeating an EDIT_FILE skeleton" '
+                'failure mode for cloud models.';
+            break;
+          }
+          if (markerCount > 80 || runCmdCount > 12) {
+            runawayDetected = true;
+            runawayReason =
+                '"<<<" markers $markerCount× / "<<<RUN_CMD:" '
+                '$runCmdCount× exceeded the per-response cap.';
+            break;
           }
 
           // The live message shows previous-iterations aggregated +
@@ -2007,26 +2533,39 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
         }
         if (runawayDetected) {
           // Don't run the executor — the iteration's content is a
-          // tool-spam loop; we've seen RUN_CMD repeated 12+ times
-          // or `<<<` 50+ times. Append a clear notice so the user
-          // understands what happened and end the conversation
+          // tool-spam loop. Append a clear, actionable notice so the
+          // user understands what happened and end the conversation
           // (the model can't recover from this on its own —
           // re-feeding it the loop just reinforces it).
           if (aggregated.isNotEmpty) aggregated += '\n\n';
           aggregated +=
-              '_(loop detected — the model started repeating tool '
-              'calls (`<<<RUN_CMD:` $runCmdCount× / `<<<` $markerCount×). '
+              '_(loop guard tripped — $runawayReason '
               'Generation aborted before any of this iteration\'s tools '
-              'ran. Try a smaller scope, a different model, or a '
-              'follow-up like "stop trying to recreate flask_app, the '
-              'directory already exists".)_';
+              'ran. Common rescues: tighten the scope ("just edit X.scss, '
+              'leave the rest"), re-prompt with READ_FILE so the model '
+              'sees the actual file contents, switch to a stronger model, '
+              'or rewind via the message menu and try again.)_';
           updateLive(aggregated, forceNotify: true);
           break;
         }
         final raw = iterBuf.toString();
+        // Provider services yield `<!-- LUMEN_TRUNCATED:length -->`
+        // when the upstream API tells them the stream was cut at the
+        // model's output token cap (Ollama `done_reason:length`,
+        // Anthropic `stop_reason:max_tokens`, Gemini
+        // `finishReason:MAX_TOKENS`, OpenAI/GitHub `finish_reason:length`).
+        // We detect once, strip the marker, and let the auto-continue
+        // branch below decide whether to keep the conversation moving.
+        final wasTruncated = _kTruncatedLengthRe.hasMatch(raw);
+        final cleanedRaw = wasTruncated
+            ? raw.replaceAll(_kTruncatedLengthRe, '')
+            : raw;
+        final executableRaw = firstToolEnd == null
+            ? cleanedRaw
+            : cleanedRaw.substring(0, firstToolEnd).trimRight();
         // Run the executor on the raw text. `processedResponse` has
         // tool-call syntax rewritten to friendly placeholders.
-        final pass = await executor.run(raw);
+        final pass = await executor.run(executableRaw);
         firedAcrossTurn.addAll(pass.firedTools);
         if (aggregated.isNotEmpty) aggregated += '\n\n';
         aggregated += pass.processedResponse.trim();
@@ -2039,20 +2578,126 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
           // For the model's history, send the RAW (unprocessed)
           // assistant text — the model needs to see its own tool
           // calls verbatim so the next turn's context lines up.
-          apiMessages.add({'role': 'assistant', 'content': raw});
+          apiMessages.add({'role': 'assistant', 'content': executableRaw});
+          // Tool output is framed as a `<tool_result>` block so the
+          // model can clearly distinguish tool output from genuine
+          // user input. Smaller / quantized cloud models (Qwen-Coder,
+          // Gemma cloud, DeepSeek) routinely treated `Tool Feedback:`
+          // as if the user had pasted code and either commented on
+          // it or expanded scope; the explicit XML-ish framing is a
+          // strong enough signal to fix that without us moving to
+          // native tool-calling APIs.
           final feedback = <String, dynamic>{
             'role': 'user',
-            'content': 'Tool Feedback:\n${pass.toolFeedback}',
+            'content':
+                '<tool_result>\n${pass.toolFeedback.trimRight()}\n'
+                '</tool_result>',
           };
-          // Tools (currently SNAPSHOT_URL) can hand binary content
-          // forward through the executor. Forwarding it on the user
-          // feedback turn is what the multimodal model will see.
-          if (pass.imageAttachments.isNotEmpty) {
-            feedback['images'] = pass.imageAttachments;
-          }
           apiMessages.add(feedback);
         } else {
-          keepLooping = false;
+          // ── Auto-verify gate (Issue: "look for errors before done") ──
+          // The model thinks it's done. Before letting the loop close,
+          // if the user has enabled auto-verify AND this turn edited
+          // source files AND the model never called VERIFY itself,
+          // synthesise a single VERIFY call.
+          //
+          // Smart: we only burn another iteration when VERIFY actually
+          // found issues. A clean VERIFY (or "no analyzer detected")
+          // is recorded visibly in the chat but does NOT round-trip
+          // back to the model — pinging the model just to say "all
+          // clean, you're done" wastes tokens AND was confusing
+          // smaller models into "continuing" the now-complete task.
+          //
+          // Bounded:
+          //   - one auto-verify per turn (`autoVerifyAlreadyRan`)
+          //   - skipped when the model already called VERIFY itself
+          //   - skipped when the workspace has no edits this turn
+          //   - skipped when iteration cap is exhausted
+          if (autoVerifyEnabled &&
+              !autoVerifyAlreadyRan &&
+              !_cancelToken!.isCancelled &&
+              i < maxIters &&
+              firedAcrossTurn.any((f) => _editToolIds.contains(f.id)) &&
+              !firedAcrossTurn.any((f) => f.id == 'verify') &&
+              _enabledTools.contains('verify')) {
+            autoVerifyAlreadyRan = true;
+            const synthetic = '<<<VERIFY>>>';
+            final verifyPass = await executor.run(synthetic);
+            firedAcrossTurn.addAll(verifyPass.firedTools);
+            final processed = verifyPass.processedResponse.trim();
+            if (processed.isNotEmpty) {
+              if (aggregated.isNotEmpty) aggregated += '\n\n';
+              aggregated += processed;
+              updateLive(aggregated, forceNotify: true);
+            }
+            // Heuristic: VERIFY's textual feedback signals "clean"
+            // when it ends with "no analyzer errors." or starts
+            // with "VERIFY: no analyzer detected" (the two ways
+            // the verify body returns "nothing to fix"). Anything
+            // else (analyzer issues, timeout, launch failure)
+            // round-trips so the model can fix.
+            final fb = verifyPass.toolFeedback;
+            final clean = fb.contains('no analyzer errors') ||
+                fb.contains('no analyzer detected');
+            if (clean) {
+              keepLooping = false;
+            } else {
+              apiMessages.add({'role': 'assistant', 'content': synthetic});
+              apiMessages.add({
+                'role': 'user',
+                'content':
+                    '<tool_result>\n${fb.trimRight()}\n</tool_result>\n\n'
+                    '(VERIFY ran automatically because the turn edited '
+                    'source files. The analyzer reported issues — fix '
+                    'them, then call VERIFY again to confirm clean.)',
+              });
+              // Stay in the loop for one more iteration so the model
+              // can react to the analyzer output.
+            }
+          } else if (!autoContinuedThisTurn &&
+              i < maxIters &&
+              (wasTruncated || executableRaw.trim().isEmpty)) {
+            // ── Auto-continue gate ────────────────────────────────
+            // The model either truncated mid-thought (output token
+            // cap) or returned empty (the "just stops" exhaustion
+            // mode on cloud Ollama). Either way we have one free
+            // recovery shot before bothering the user — append the
+            // partial assistant content (if any), nudge with a
+            // reason-specific user message, loop again.
+            autoContinuedThisTurn = true;
+            final reason = wasTruncated ? 'truncation' : 'empty';
+            // Only persist a non-empty assistant turn — Anthropic
+            // 400s on empty assistant content and Gemini's
+            // alternating-roles merge gets confused. The empty
+            // case skips this and just adds back-to-back user
+            // turns (the merge logic in those services handles
+            // consecutive same-role).
+            if (executableRaw.trim().isNotEmpty) {
+              apiMessages.add(
+                {'role': 'assistant', 'content': executableRaw},
+              );
+            }
+            final nudge = wasTruncated
+                ? 'Your previous response was cut at the output '
+                    'token cap before you finished. Continue from '
+                    'where you left off. Prefer EDIT_FILE / '
+                    'MULTI_EDIT over CREATE_FILE so you do not '
+                    'have to retype content you already produced.'
+                : 'Your previous response had no content. Either '
+                    'complete the task with the appropriate tool '
+                    'call (one per response, then wait for '
+                    '<tool_result>), or briefly say what you need '
+                    'from me to proceed. Do not stay silent.';
+            apiMessages.add({'role': 'user', 'content': nudge});
+            if (aggregated.isNotEmpty) aggregated += '\n\n';
+            aggregated +=
+                '_(auto-continued — $reason. The model will get '
+                'one more attempt.)_';
+            updateLive(aggregated, forceNotify: true);
+            // keepLooping stays true; next iteration runs.
+          } else {
+            keepLooping = false;
+          }
         }
       }
 
@@ -2080,6 +2725,36 @@ ${compiledRules.isNotEmpty ? '## Project Rules (always follow)\n$compiledRules\n
           aggregated = ProviderError.marker(err);
           updateLive(aggregated, forceNotify: true);
         }
+      }
+
+      // ── Empty-response detection (Issue: Ollama "model just stops") ──
+      // When the loop ends without cancellation, no tool work, no
+      // provider error, and effectively zero textual content, the
+      // model emitted a clean `done:true` with nothing useful — the
+      // streaming progress bar disappeared and the chat looks frozen.
+      // Set the flag so the chat panel can render `EmptyResponseStrip`
+      // with a Continue button. Capturing workspace context here means
+      // a workspace switch between the empty turn and the user clicking
+      // Continue still resolves to the original context.
+      //
+      // We deliberately match ONLY the truly-zero-content case
+      // (`aggregated.trim().isEmpty`). Anything the model produced —
+      // even a single-word ack like "Done." or "ok" — counts as a
+      // real answer, and surfacing a Continue prompt over the top
+      // of a perfectly valid short reply is worse UX than missing
+      // the rare "model emitted exactly one whitespace character"
+      // failure mode. False negatives are recoverable (user retypes
+      // their request); false positives are noisy.
+      if (!_cancelToken!.isCancelled &&
+          firedAcrossTurn.isEmpty &&
+          !aggregated.contains('<!-- LUMEN_ERR') &&
+          aggregated.trim().isEmpty) {
+        _lastTurnLooksEmpty = true;
+        _emptyTurnWorkspacePath = workspacePath;
+        _emptyTurnActiveFilePath = activeFilePath;
+        _emptyTurnOpenFilePaths = openFilePaths == null
+            ? null
+            : List<String>.unmodifiable(openFilePaths);
       }
 
       session.updatedAt = DateTime.now();

@@ -16,6 +16,7 @@ import 'agent_skills/agent_skills_list.dart';
 import 'common/duck_toast.dart';
 import 'editor/editor_themes.dart';
 import 'gitnexus/daemon_row.dart';
+import 'gitnexus/wiki_row.dart';
 import 'manual_skill_dialog.dart';
 import 'ai_chat/model_management_panel.dart';
 import 'syncthing/syncthing_panels.dart';
@@ -66,6 +67,9 @@ class _SettingsViewState extends State<SettingsView> {
   late bool _reduceMotion;
   late bool _reduceTransparency;
   late bool _allowAgentOutsideWorkspaceWrites;
+  late bool _autoVerifyAfterEdits;
+  late bool _gitnexusAutoWiki;
+  late TextEditingController _gitnexusWikiModelCtrl;
   late TextEditingController _globalRulesCtrl;
   late TextEditingController _workspaceRulesCtrl;
   bool _rulesLoaded = false;
@@ -149,6 +153,9 @@ class _SettingsViewState extends State<SettingsView> {
     _reduceMotion = a.reduceMotion;
     _reduceTransparency = a.reduceTransparency;
     _allowAgentOutsideWorkspaceWrites = a.allowAgentOutsideWorkspaceWrites;
+    _autoVerifyAfterEdits = a.autoVerifyAfterEdits;
+    _gitnexusAutoWiki = a.gitnexusAutoWiki;
+    _gitnexusWikiModelCtrl = TextEditingController(text: a.gitnexusWikiModel);
     _globalRulesCtrl = TextEditingController();
     _workspaceRulesCtrl = TextEditingController();
     _active = _categoryFromKey(a.settingsInitialCategory);
@@ -176,6 +183,7 @@ class _SettingsViewState extends State<SettingsView> {
     _githubKeyCtrl.dispose();
     _githubOrgCtrl.dispose();
     _openaiKeyCtrl.dispose();
+    _gitnexusWikiModelCtrl.dispose();
     _globalRulesCtrl.dispose();
     _workspaceRulesCtrl.dispose();
     _stEndpointCtrl.dispose();
@@ -206,6 +214,11 @@ class _SettingsViewState extends State<SettingsView> {
     await a.setReduceTransparency(_reduceTransparency);
     await a.setAllowAgentOutsideWorkspaceWrites(
       _allowAgentOutsideWorkspaceWrites,
+    );
+    await a.setAutoVerifyAfterEdits(_autoVerifyAfterEdits);
+    await a.updateGitNexusWikiSettings(
+      autoWiki: _gitnexusAutoWiki,
+      wikiModel: _gitnexusWikiModelCtrl.text,
     );
     if (_rulesLoaded) {
       await a.rules.writeGlobal(_globalRulesCtrl.text);
@@ -1041,6 +1054,12 @@ class _SettingsViewState extends State<SettingsView> {
           onChanged: (v) =>
               setState(() => _allowAgentOutsideWorkspaceWrites = v),
         ),
+        _settingToggle(
+          label: S.settingsAgentAutoVerify,
+          description: S.settingsAgentAutoVerifyDesc,
+          value: _autoVerifyAfterEdits,
+          onChanged: (v) => setState(() => _autoVerifyAfterEdits = v),
+        ),
         _divider(),
         if (!_rulesLoaded)
           const Padding(
@@ -1218,6 +1237,16 @@ class _SettingsViewState extends State<SettingsView> {
               const SizedBox(height: 14),
               _warningBox(S.gitnexusMissingNodeHelp),
             ],
+            const SizedBox(height: 22),
+            _sectionLabel(S.gitnexusWikiSection),
+            const SizedBox(height: 6),
+            GitNexusWikiRow(
+              service: gitnexus,
+              workspaceOpen: state.currentDirectory != null,
+              autoWiki: _gitnexusAutoWiki,
+              modelController: _gitnexusWikiModelCtrl,
+              onAutoWikiChanged: (v) => setState(() => _gitnexusAutoWiki = v),
+            ),
             const SizedBox(height: 22),
             // ── Background services (serve / mcp daemons) ─────────
             _sectionLabel(S.gitnexusServicesSection),

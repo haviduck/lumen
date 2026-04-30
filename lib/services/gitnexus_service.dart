@@ -19,6 +19,8 @@ enum GitNexusStatus {
   failed,
 }
 
+enum GitNexusWikiStatus { idle, running, generated, failed }
+
 /// Who started the serve daemon currently observable on
 /// [kGitNexusServePort].
 ///
@@ -48,8 +50,8 @@ const Duration _kProbeInterval = Duration(seconds: 10);
 /// parallel, so worst-case wall time is one timeout window.
 const Duration _kProbeTimeout = Duration(milliseconds: 1500);
 
-/// Manages GitNexus subprocesses against a Lumen workspace. Three
-/// distinct lifecycles, three different ownership models — read
+/// Manages GitNexus subprocesses against a Lumen workspace. Four
+/// distinct lifecycles, different ownership models — read
 /// carefully before changing anything:
 ///
 ///   1. **analyze** (workspace-scoped, one-shot).
@@ -58,7 +60,13 @@ const Duration _kProbeTimeout = Duration(milliseconds: 1500);
 ///      tied to a single workspace. The icon's primary `status`
 ///      reflects this job (running / indexed / failed).
 ///
-///   2. **serve** (machine-wide, long-running, *adoptable*).
+///   2. **wiki** (workspace-scoped, one-shot).
+///      `npx gitnexus wiki` in the active workspace, generates
+///      LLM-backed docs from the existing graph, exits. Killed on
+///      `bindWorkspace` because it is tied to a single workspace.
+///      May be auto-triggered after analyze only when the user opts in.
+///
+///   3. **serve** (machine-wide, long-running, *adoptable*).
 ///      `npx gitnexus serve` on `127.0.0.1:4747`. Serves the
 ///      **global** indexed-repo registry — NOT a single workspace —
 ///      so a single instance per machine is correct, and starting
@@ -70,7 +78,7 @@ const Duration _kProbeTimeout = Duration(milliseconds: 1500);
 ///      kill it in `dispose`) — that's intentional. If the user
 ///      wants it gone they flip the switch off.
 ///
-///   3. **mcp** (per-window, long-running, *not* adoptable).
+///   4. **mcp** (per-window, long-running, *not* adoptable).
 ///      `npx gitnexus mcp` (stdio). Pipes don't cross process
 ///      boundaries cleanly so adoption doesn't apply. Most AI hosts
 ///      (Claude Desktop, Cursor) spawn their own on demand; this
@@ -87,6 +95,15 @@ class GitNexusService extends ChangeNotifier {
   DateTime? _lastRunAt;
   int? _lastExitCode;
   String _analyzeOutput = '';
+  bool _autoWikiAfterAnalyze = false;
+  String _wikiModel = '';
+
+  // ── wiki (one-shot, workspace-scoped) ─────────────────────────────
+  Process? _wikiProcess;
+  GitNexusWikiStatus _wikiStatus = GitNexusWikiStatus.idle;
+  DateTime? _lastWikiAt;
+  int? _wikiExitCode;
+  String _wikiOutput = '';
 
   // ── serve daemon (HTTP server, machine-wide, adoptable) ───────────
   Process? _serveProcess;
@@ -149,6 +166,7 @@ class GitNexusService extends ChangeNotifier {
       _probeTimer?.cancel();
       _probeTimer = null;
       await stop();
+      await stopWiki();
       await stopServe();
       await stopMcp();
       _serveOwnership = DaemonOwnership.none;
@@ -162,6 +180,7 @@ class GitNexusService extends ChangeNotifier {
   // ── public API ────────────────────────────────────────────────────
   String? get workspacePath => _workspacePath;
   GitNexusStatus get status => _status;
+  GitNexusWikiStatus get wikiStatus => _wikiStatus;
 
   /// True while the analyze (one-shot indexer) job is running. Kept
   /// under the legacy `isRunning` name because every call site that
@@ -184,6 +203,7 @@ class GitNexusService extends ChangeNotifier {
 
   /// True while the persistent stdio MCP server is up in this window.
   bool get mcpRunning => _mcpProcess != null;
+  bool get wikiRunning => _wikiProcess != null;
 
   /// True briefly between toggle-on and process-spawned. Used by the
   /// settings UI to render a transient spinner so the toggle doesn't
@@ -193,16 +213,35 @@ class GitNexusService extends ChangeNotifier {
 
   bool get hasNpx => _hasNpx;
   DateTime? get lastRunAt => _lastRunAt;
+  DateTime? get lastWikiAt => _lastWikiAt;
   int? get lastExitCode => _lastExitCode;
+  int? get wikiLastExitCode => _wikiExitCode;
   int? get serveLastExitCode => _serveExitCode;
   int? get mcpLastExitCode => _mcpExitCode;
   int get servePort => kGitNexusServePort;
+  bool get autoWikiAfterAnalyze => _autoWikiAfterAnalyze;
+  String get wikiModel => _wikiModel;
 
   /// Tail of the analyze job's combined stdout/stderr. Capped at
   /// ~16 KB internally with a stable end window.
   String get outputTail => _tail(_analyzeOutput, 4000);
+  String get wikiOutputTail => _tail(_wikiOutput, 4000);
   String get serveOutputTail => _tail(_serveOutput, 4000);
   String get mcpOutputTail => _tail(_mcpOutput, 4000);
+
+  void setWikiPreferences({
+    required bool autoWikiAfterAnalyze,
+    required String model,
+  }) {
+    final normalizedModel = model.trim();
+    if (_autoWikiAfterAnalyze == autoWikiAfterAnalyze &&
+        _wikiModel == normalizedModel) {
+      return;
+    }
+    _autoWikiAfterAnalyze = autoWikiAfterAnalyze;
+    _wikiModel = normalizedModel;
+    notifyListeners();
+  }
 
   Future<void> bindWorkspace(String? path) async {
     if (_workspacePath == path) return;
@@ -215,9 +254,13 @@ class GitNexusService extends ChangeNotifier {
     //   - mcp is per-window but doesn't bind to any workspace path
     //     either; nothing changes for it on a workspace swap.
     await stop();
+    await stopWiki();
     _workspacePath = path;
     _analyzeOutput = '';
+    _wikiOutput = '';
     _lastExitCode = null;
+    _wikiExitCode = null;
+    _wikiStatus = GitNexusWikiStatus.idle;
     await refreshStatus();
     // Re-probe so the icon picks up an externally-running serve as
     // soon as a workspace opens.
@@ -295,6 +338,9 @@ class GitNexusService extends ChangeNotifier {
       _lastExitCode = code;
       _status = code == 0 ? GitNexusStatus.indexed : GitNexusStatus.failed;
       notifyListeners();
+      if (code == 0 && _autoWikiAfterAnalyze && _wikiProcess == null) {
+        unawaited(generateWiki());
+      }
     } catch (e) {
       _analyzeProcess = null;
       _lastExitCode = -1;
@@ -327,6 +373,80 @@ class GitNexusService extends ChangeNotifier {
       _appendAnalyze('\nFailed to clean GitNexus index: $e\n');
       notifyListeners();
     }
+  }
+
+  // ── wiki ─────────────────────────────────────────────────────────
+  Future<void> generateWiki({String? model, bool force = false}) async {
+    if (!_enabled) return;
+    final ws = _workspacePath;
+    if (ws == null || ws.isEmpty || _wikiProcess != null) return;
+    _hasNpx = await _probeNpx();
+    if (!_hasNpx) {
+      _wikiStatus = GitNexusWikiStatus.failed;
+      _appendWiki(
+        'Node.js / npx was not found on PATH.\n'
+        'Install Node.js from https://nodejs.org/ and restart Lumen.',
+      );
+      notifyListeners();
+      return;
+    }
+
+    _wikiStatus = GitNexusWikiStatus.running;
+    _lastWikiAt = DateTime.now();
+    _wikiExitCode = null;
+    _wikiOutput = '';
+    notifyListeners();
+
+    try {
+      await _ensureGitRepo(ws);
+      final effectiveModel = (model ?? _wikiModel).trim();
+      final args = [
+        'gitnexus',
+        'wiki',
+        if (force) '--force',
+        if (effectiveModel.isNotEmpty) ...['--model', effectiveModel],
+      ];
+      _appendWiki('> npx ${args.join(' ')}\n');
+      final process = await Process.start(
+        'npx',
+        args,
+        workingDirectory: ws,
+        runInShell: true,
+      );
+      _wikiProcess = process;
+      notifyListeners();
+
+      process.stdout
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .listen(_appendWiki);
+      process.stderr
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .listen(_appendWiki);
+
+      final code = await process.exitCode;
+      _wikiProcess = null;
+      _wikiExitCode = code;
+      _wikiStatus = code == 0
+          ? GitNexusWikiStatus.generated
+          : GitNexusWikiStatus.failed;
+      notifyListeners();
+    } catch (e) {
+      _wikiProcess = null;
+      _wikiExitCode = -1;
+      _wikiStatus = GitNexusWikiStatus.failed;
+      _appendWiki('\nFailed to launch GitNexus wiki: $e\n');
+      notifyListeners();
+    }
+  }
+
+  Future<void> stopWiki() async {
+    final proc = _wikiProcess;
+    if (proc == null) return;
+    _appendWiki('\n> stop requested\n');
+    proc.kill();
+    _wikiProcess = null;
+    _wikiStatus = GitNexusWikiStatus.failed;
+    notifyListeners();
   }
 
   // ── serve daemon (adoptable) ──────────────────────────────────────
@@ -579,6 +699,7 @@ class GitNexusService extends ChangeNotifier {
         label: 'Agent knowledgebase',
         path: p.join(ws, '.agents', 'knowledgebase.md'),
       ),
+      (label: 'GitNexus wiki', path: p.join(ws, '.gitnexus', 'wiki')),
       (label: 'Claude context', path: p.join(ws, 'CLAUDE.md')),
       (label: 'Agent context', path: p.join(ws, 'AGENTS.md')),
     ];
@@ -604,7 +725,9 @@ class GitNexusService extends ChangeNotifier {
   Future<void> _probeServeAndUpdate() async {
     if (!_enabled) return;
     if (_probeInFlight) return;
-    if (_serveProcess != null) return; // owned: probe can't tell us anything new
+    if (_serveProcess != null) {
+      return; // owned: probe can't tell us anything new
+    }
     _probeInFlight = true;
     try {
       final alive = await _probeServe();
@@ -669,11 +792,11 @@ class GitNexusService extends ChangeNotifier {
       return (pid: null, processName: null);
     }
     try {
-      final result = await Process.run(
-        'netstat',
-        const ['-ano', '-p', 'TCP'],
-        runInShell: true,
-      ).timeout(const Duration(seconds: 5));
+      final result = await Process.run('netstat', const [
+        '-ano',
+        '-p',
+        'TCP',
+      ], runInShell: true).timeout(const Duration(seconds: 5));
       for (final line in const LineSplitter().convert(
         result.stdout.toString(),
       )) {
@@ -688,11 +811,13 @@ class GitNexusService extends ChangeNotifier {
         if (pid == null) continue;
         String? name;
         try {
-          final proc = await Process.run(
-            'tasklist',
-            ['/FI', 'PID eq $pid', '/FO', 'CSV', '/NH'],
-            runInShell: true,
-          ).timeout(const Duration(seconds: 5));
+          final proc = await Process.run('tasklist', [
+            '/FI',
+            'PID eq $pid',
+            '/FO',
+            'CSV',
+            '/NH',
+          ], runInShell: true).timeout(const Duration(seconds: 5));
           final m = RegExp(
             r'^"([^"]+)"',
           ).firstMatch(proc.stdout.toString().trim());
@@ -713,11 +838,11 @@ class GitNexusService extends ChangeNotifier {
   Future<bool> _killPid(int pid) async {
     if (!Platform.isWindows) return false;
     try {
-      final result = await Process.run(
-        'taskkill',
-        ['/F', '/PID', '$pid'],
-        runInShell: true,
-      ).timeout(const Duration(seconds: 8));
+      final result = await Process.run('taskkill', [
+        '/F',
+        '/PID',
+        '$pid',
+      ], runInShell: true).timeout(const Duration(seconds: 8));
       return result.exitCode == 0;
     } catch (_) {
       return false;
@@ -770,6 +895,15 @@ class GitNexusService extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _appendWiki(String chunk) {
+    if (chunk.isEmpty) return;
+    _wikiOutput += chunk;
+    if (_wikiOutput.length > 16000) {
+      _wikiOutput = _wikiOutput.substring(_wikiOutput.length - 16000);
+    }
+    notifyListeners();
+  }
+
   void _appendServe(String chunk) {
     if (chunk.isEmpty) return;
     _serveOutput += chunk;
@@ -803,6 +937,7 @@ class GitNexusService extends ChangeNotifier {
     // service was rewritten to avoid. Users can stop it explicitly
     // via the Settings toggle when they actually mean to.
     _analyzeProcess?.kill();
+    _wikiProcess?.kill();
     _mcpProcess?.kill();
     super.dispose();
   }

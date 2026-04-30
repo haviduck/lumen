@@ -22,10 +22,17 @@ import '../../theme/app_theme.dart';
 ///
 ///     <!-- LUMEN_TOOL:<id>|<percent-encoded-arg>|<status> -->
 ///
-/// `status` is `ok`, `err` or `pending`. The marker is anchored on
-/// its own paragraph (newline padding on both sides) so splitting on
-/// it produces clean prose chunks without orphan whitespace at the
-/// segment boundary.
+/// `status` is `ok`, `err`, `pending`, or `malformed`. The marker is
+/// anchored on its own paragraph (newline padding on both sides) so
+/// splitting on it produces clean prose chunks without orphan whitespace
+/// at the segment boundary.
+///
+/// `malformed` is emitted when the tool-shaped block exists in the
+/// model's response (opener + closer present) but the inner structure
+/// doesn't conform to the strict per-tool regex (e.g. EDIT_FILE
+/// without SEARCH/REPLACE). The executor cannot run it, so we surface
+/// a warning chip instead of letting the raw body leak through as
+/// prose.
 sealed class ChatSegment {
   const ChatSegment();
 }
@@ -39,14 +46,33 @@ class ToolSegment extends ChatSegment {
   final String toolId;
   final String firstArg;
   final String status;
-  bool get ok => status != 'err';
+  bool get ok => status == 'ok';
   bool get pending => status == 'pending';
+  bool get failed => status == 'err';
+  bool get malformed => status == 'malformed';
 
   const ToolSegment({
     required this.toolId,
     required this.firstArg,
     required this.status,
   });
+}
+
+/// Cluster of consecutive [ToolSegment]s that share the same
+/// action label, tool kind, and final status. Rendered as a single
+/// collapsible card so a turn that touched 12 files surfaces as
+/// "Read 12 files" rather than 12 stacked rows.
+///
+/// Grouping happens AFTER raw segment parsing in
+/// [parseChatSegments] — see [_groupConsecutiveTools] for the
+/// exact bucketing rules. Singletons (groups of 1) and pairs are
+/// always passed through as plain [ToolSegment]s; only 3+
+/// consecutive same-action calls get grouped, because savings
+/// below that threshold don't justify hiding individual paths
+/// behind a collapse.
+class ToolGroupSegment extends ChatSegment {
+  final List<ToolSegment> tools;
+  const ToolGroupSegment(this.tools);
 }
 
 /// Rendered when the controller swapped a turn's raw error text for a
@@ -68,13 +94,18 @@ class ProviderErrorSegment extends ChatSegment {
 /// so a chat turn that contains BOTH (rare but possible: the agent
 /// fired a tool, the next iteration overloaded the provider) renders
 /// in source order — tool card, prose, error card.
+///
+/// After raw parsing, runs of 3+ consecutive [ToolSegment]s sharing
+/// the same action label / kind / status get collapsed into a single
+/// [ToolGroupSegment]. This is what turns "10 file reads" into a
+/// single expandable "Read 10 files" card instead of a stack of 10.
 List<ChatSegment> parseChatSegments(String content) {
-  final out = <ChatSegment>[];
+  final raw = <ChatSegment>[];
   // Combined matcher — alternation between LUMEN_TOOL and LUMEN_ERR.
   // Group 1-3 = tool fields; group 4-5 = error fields. Either
   // half is null for any given match.
   final re = RegExp(
-    r'<!--\s*LUMEN_TOOL:([a-z_]+)\|([^|]*)\|(ok|err|pending)\s*-->'
+    r'<!--\s*LUMEN_TOOL:([a-z_]+)\|([^|]*)\|(ok|err|pending|malformed)\s*-->'
     r'|'
     r'<!--\s*LUMEN_ERR:([a-z_]+)\|([^|]*)\s*-->',
     multiLine: true,
@@ -84,11 +115,11 @@ List<ChatSegment> parseChatSegments(String content) {
     if (m.start > cursor) {
       final prose = content.substring(cursor, m.start);
       if (prose.trim().isNotEmpty) {
-        out.add(ProseSegment(prose));
+        raw.add(ProseSegment(prose));
       }
     }
     if (m.group(1) != null) {
-      out.add(
+      raw.add(
         ToolSegment(
           toolId: m.group(1)!,
           firstArg: Uri.decodeComponent(m.group(2)!),
@@ -97,17 +128,78 @@ List<ChatSegment> parseChatSegments(String content) {
       );
     } else if (m.group(4) != null) {
       final err = ProviderError.fromMarkerMatch(m);
-      if (err != null) out.add(ProviderErrorSegment(err));
+      if (err != null) raw.add(ProviderErrorSegment(err));
     }
     cursor = m.end;
   }
   if (cursor < content.length) {
     final tail = content.substring(cursor);
     if (tail.trim().isNotEmpty) {
-      out.add(ProseSegment(tail));
+      raw.add(ProseSegment(tail));
     }
   }
+  return _groupConsecutiveTools(raw);
+}
+
+/// Walk a flat segment list and collapse runs of consecutive
+/// [ToolSegment]s into [ToolGroupSegment]s when they meet the
+/// grouping bar:
+///
+/// - **Same action label** (`Read`, `Edited`, `Searched`, …). Mixing
+///   "Read foo" with "Edited foo" stays as two segments.
+/// - **Same `_ToolKind`**. fileOps and inspections never group
+///   across boundaries.
+/// - **Status is consistent**: pending tools never group with
+///   completed ones, errored tools form their own groups so the
+///   bad-news count stays visible at a glance.
+/// - **Run length ≥ 3**. Two-of-a-kind stays as two cards — the
+///   collapsed header + an expand interaction is heavier than just
+///   showing the second card.
+/// - **Commands (RUN_CMD) never group.** A shell command is
+///   meaningful by itself; collapsing them would hide the actual
+///   command line.
+List<ChatSegment> _groupConsecutiveTools(List<ChatSegment> input) {
+  if (input.isEmpty) return input;
+  final out = <ChatSegment>[];
+  var i = 0;
+  while (i < input.length) {
+    final seg = input[i];
+    if (seg is! ToolSegment || !_groupable(seg)) {
+      out.add(seg);
+      i++;
+      continue;
+    }
+    final action = _actionLabel(seg);
+    final kind = _kindFor(seg.toolId);
+    final status = seg.status;
+    final batch = <ToolSegment>[seg];
+    var j = i + 1;
+    while (j < input.length) {
+      final next = input[j];
+      if (next is! ToolSegment) break;
+      if (!_groupable(next)) break;
+      if (_kindFor(next.toolId) != kind) break;
+      if (next.status != status) break;
+      if (_actionLabel(next) != action) break;
+      batch.add(next);
+      j++;
+    }
+    if (batch.length >= 3) {
+      out.add(ToolGroupSegment(List.unmodifiable(batch)));
+    } else {
+      out.addAll(batch);
+    }
+    i = j;
+  }
   return out;
+}
+
+/// Tools eligible for collapsing into a [ToolGroupSegment]. We
+/// keep `command`-kind tools out — RUN_CMD carries meaningful
+/// payload that the user wants to scan, not bury.
+bool _groupable(ToolSegment seg) {
+  final kind = _kindFor(seg.toolId);
+  return kind == _ToolKind.fileOp || kind == _ToolKind.inspection;
 }
 
 /// Strip markers from a body and replace with the friendly plain-text
@@ -116,14 +208,18 @@ List<ChatSegment> parseChatSegments(String content) {
 /// are stripped in one pass.
 String stripMarkersForCopy(String content) {
   final toolRe = RegExp(
-    r'<!--\s*LUMEN_TOOL:([a-z_]+)\|([^|]*)\|(ok|err|pending)\s*-->',
+    r'<!--\s*LUMEN_TOOL:([a-z_]+)\|([^|]*)\|(ok|err|pending|malformed)\s*-->',
     multiLine: true,
   );
   final errRe = ProviderError.markerRegExp;
   var s = content.replaceAllMapped(toolRe, (m) {
     final id = m.group(1)!;
     final arg = Uri.decodeComponent(m.group(2)!);
-    final ok = m.group(3) != 'err';
+    final status = m.group(3)!;
+    final ok = status == 'ok' || status == 'pending';
+    if (status == 'malformed') {
+      return '($id `$arg` malformed — not executed)';
+    }
     return ToolExecutor.friendlyTextForMarker(id, arg, ok);
   });
   s = s.replaceAllMapped(errRe, (m) {
@@ -137,6 +233,26 @@ String stripMarkersForCopy(String content) {
 /// streaming. Tool execution still receives the raw model output after the
 /// stream completes; this only hides noisy `<<<...>>>` syntax from the UI and
 /// swaps it for the same card markers the final executor pass emits.
+///
+/// Three layered passes, ordered specifically so each catches what
+/// the previous missed:
+///
+/// 1. **Per-tool complete-pattern matching.** `tool.pattern.allMatches`
+///    on every registered tool. Replaces fully-formed calls with
+///    `pending` markers (after the executor runs the post-stream
+///    pass these become `ok`/`err`).
+/// 2. **Salvage pass for malformed blocks.** Catches the case where
+///    BOTH the opener and the closer are present but the inner
+///    structure rejected step 1's strict regex (e.g. an EDIT_FILE
+///    body without SEARCH/REPLACE markers, or extra blank lines
+///    breaking the literal `\n` separators). Without this pass the
+///    entire raw body — often hundreds of lines of code — leaks
+///    through as prose into the chat. Replaces with a `malformed`
+///    marker so the user sees the failed attempt without the dump.
+/// 3. **Trailing incomplete openers.** A `<<<EDIT_FILE: …>>>` at the
+///    tail of the stream with no closer yet (still typing). Replaces
+///    with a `pending` marker so the partial body stays hidden until
+///    the close arrives or the stream ends.
 String streamingToolPreview(String rawContent) {
   var content = _normalizeForToolPreview(rawContent);
 
@@ -151,9 +267,41 @@ String streamingToolPreview(String rawContent) {
     }
   }
 
+  content = _replaceMalformedBlockTool(content);
   content = _replaceIncompleteBlockTool(content);
   content = _replaceIncompleteInlineTool(content);
   return content;
+}
+
+/// Catch tool-shaped blocks where opener AND closer are both present
+/// but step 1's strict per-tool regex rejected them. Replaces the
+/// entire span (including the body) with a `malformed` marker so
+/// the raw block — which often contains the exact code the model
+/// was trying to insert — never reaches `MarkdownBody`.
+///
+/// **The bug this fixes:** the strict EDIT_FILE pattern requires
+/// `<<<EDIT_FILE: x>>>\n<<<SEARCH>>>\n…\n<<<REPLACE>>>\n…\n<<<END_EDIT>>>`.
+/// When the model emits an EDIT_FILE that's structurally off (no
+/// SEARCH/REPLACE markers, surplus blank lines, or even just
+/// `\r\n` line endings the literal `\n` doesn't match), step 1
+/// fails. The previous fallback only fired when the closer was
+/// missing — so a malformed but "complete-looking" block leaked
+/// the entire raw body into the rendered chat as prose. Reported
+/// in user feedback as "the model just dumps code into the chat".
+String _replaceMalformedBlockTool(String content) {
+  final salvage = RegExp(
+    r'<<<(CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):\s*(.*?)\s*>>>'
+    r'(?:.*?)'
+    r'<<<END_(?:FILE|EDIT|APPEND)>>>',
+    dotAll: true,
+  );
+  return content.replaceAllMapped(salvage, (m) {
+    final toolName = m.group(1)!;
+    final firstArg = (m.group(2) ?? '').trim();
+    final id = _toolIdForName(toolName);
+    if (id == null) return m.group(0)!;
+    return _toolMarker(id, firstArg, 'malformed');
+  });
 }
 
 String _toolMarker(String toolId, String firstArg, String status) {
@@ -250,7 +398,6 @@ _ToolKind _kindFor(String toolId) {
     case 'delete_file':
       return _ToolKind.fileOp;
     case 'run_cmd':
-    case 'snapshot_url':
       return _ToolKind.command;
     default:
       return _ToolKind.inspection;
@@ -260,6 +407,7 @@ _ToolKind _kindFor(String toolId) {
 /// One-line action label per tool — what the *card title* says.
 String _actionLabel(ToolSegment segment) {
   if (segment.pending) return _pendingActionLabel(segment.toolId);
+  if (segment.malformed) return S.toolMalformedLabel;
   final toolId = segment.toolId;
   final ok = segment.ok;
   if (!ok) {
@@ -316,8 +464,8 @@ String _actionLabel(ToolSegment segment) {
       return 'git diff';
     case 'run_cmd':
       return 'Ran';
-    case 'snapshot_url':
-      return 'Snapshot';
+    case 'verify':
+      return 'Verified';
     default:
       return toolId;
   }
@@ -407,13 +555,19 @@ IconData _iconForFile(String path) {
 
 // ─── widgets ─────────────────────────────────────────────────────
 
-/// Public dispatcher — picks the right widget per `_ToolKind`.
+/// Public dispatcher — picks the right widget per `_ToolKind` and
+/// status. Malformed segments are routed to a dedicated warning
+/// card regardless of the tool's normal kind: a malformed EDIT_FILE
+/// shouldn't render as a clickable file card pretending it landed.
 class ToolSegmentView extends StatelessWidget {
   final ToolSegment segment;
   const ToolSegmentView({super.key, required this.segment});
 
   @override
   Widget build(BuildContext context) {
+    if (segment.malformed) {
+      return _MalformedToolCard(segment: segment);
+    }
     switch (_kindFor(segment.toolId)) {
       case _ToolKind.fileOp:
         return _FileToolCard(segment: segment);
@@ -422,6 +576,166 @@ class ToolSegmentView extends StatelessWidget {
       case _ToolKind.inspection:
         return _InspectionBadge(segment: segment);
     }
+  }
+}
+
+/// Public dispatcher for grouped tool runs. Renders the collapsed
+/// `Read 12 files` summary header; expanding shows each member as
+/// the same widget [ToolSegmentView] would have produced for it
+/// solo.
+class ToolGroupView extends StatefulWidget {
+  final ToolGroupSegment group;
+  const ToolGroupView({super.key, required this.group});
+
+  @override
+  State<ToolGroupView> createState() => _ToolGroupViewState();
+}
+
+class _ToolGroupViewState extends State<ToolGroupView> {
+  bool _expanded = false;
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final tools = widget.group.tools;
+    final first = tools.first;
+    final kind = _kindFor(first.toolId);
+    final accent = first.failed
+        ? DuckColors.stateError
+        : (first.pending ? DuckColors.accentCyan : DuckColors.accentMint);
+    final headerIcon = kind == _ToolKind.fileOp
+        ? _iconForFileGroup(tools)
+        : _iconForInspection(first.toolId);
+    final action = _actionLabel(first);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            onEnter: (_) => setState(() => _hover = true),
+            onExit: (_) => setState(() => _hover = false),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: AnimatedContainer(
+                duration: DuckMotion.fast,
+                padding: const EdgeInsets.fromLTRB(10, 7, 10, 7),
+                decoration: BoxDecoration(
+                  color: _hover ? DuckColors.bgRaised : DuckColors.bgDeeper,
+                  borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+                  border: Border.all(
+                    color: _hover
+                        ? DuckColors.accentCyan.withValues(alpha: 0.4)
+                        : DuckColors.glassSeam,
+                    width: 0.5,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    AnimatedRotation(
+                      duration: DuckMotion.fast,
+                      turns: _expanded ? 0.25 : 0.0,
+                      child: const Icon(
+                        Icons.chevron_right,
+                        size: 14,
+                        color: DuckColors.fgMuted,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(headerIcon, size: 14, color: DuckColors.fgMuted),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        S.toolGroupTitle(action, tools.length),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                          color: DuckColors.fgPrimary,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    _ToolStatusBadge(
+                      label: '${tools.length}',
+                      accent: accent,
+                      pending: first.pending,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          AnimatedSize(
+            duration: DuckMotion.fast,
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.topCenter,
+            child: _expanded
+                ? Padding(
+                    padding: const EdgeInsets.only(left: 12, top: 2),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        for (var i = 0; i < tools.length; i++)
+                          KeyedSubtree(
+                            key: ValueKey(
+                              'group-member-${tools[i].toolId}-${tools[i].firstArg}-$i',
+                            ),
+                            child: ToolSegmentView(segment: tools[i]),
+                          ),
+                      ],
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Pick a representative icon for a file-group header. Uses the
+  /// most common extension in the group; falls back to the generic
+  /// "file" glyph when the group spans many extensions.
+  IconData _iconForFileGroup(List<ToolSegment> tools) {
+    final counts = <IconData, int>{};
+    for (final t in tools) {
+      final icon = _iconForFile(t.firstArg);
+      counts[icon] = (counts[icon] ?? 0) + 1;
+    }
+    IconData? best;
+    var bestCount = 0;
+    counts.forEach((icon, count) {
+      if (count > bestCount) {
+        bestCount = count;
+        best = icon;
+      }
+    });
+    return best ?? Icons.insert_drive_file_outlined;
+  }
+}
+
+/// Shared inspection-icon lookup used by both the singleton
+/// [_InspectionBadge] and the grouped [ToolGroupView] header.
+IconData _iconForInspection(String toolId) {
+  switch (toolId) {
+    case 'tree':
+      return Icons.account_tree_outlined;
+    case 'list_dir':
+      return Icons.folder_open_outlined;
+    case 'search_text':
+      return Icons.search;
+    case 'find_file':
+    case 'glob':
+      return Icons.find_in_page_outlined;
+    case 'git_status':
+    case 'git_diff':
+      return Icons.commit_outlined;
+    default:
+      return Icons.visibility_outlined;
   }
 }
 
@@ -444,6 +758,40 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
   bool _showDetails = false;
   bool _retrying = false;
 
+  @override
+  void initState() {
+    super.initState();
+    // Auto-expand details for kinds where the canned body is generic
+    // enough that the raw error is what the user actually needs to
+    // see. Saves a click on the failure modes that previously
+    // rendered as a "barely-visible dark grey square" — the user
+    // had to copy the bubble to find out it was a 400.
+    final kind = widget.error.kind;
+    _showDetails = kind == ProviderErrorKind.badRequest ||
+        kind == ProviderErrorKind.unknown ||
+        kind == ProviderErrorKind.serverError;
+  }
+
+  /// One-line excerpt of the raw detail for the always-visible
+  /// summary row. Strips the friendly preamble that the controller
+  /// added (e.g. `Anthropic API error (400):`) so what remains is
+  /// the actually-useful provider-side message.
+  String _detailExcerpt(String raw) {
+    var s = raw.trim();
+    s = s.replaceFirst(
+      RegExp(
+        r'^(?:Error[:\s]+)?'
+        r'(?:Anthropic|Gemini|GitHub Models|OpenAI|Ollama)'
+        r'\s*API error\s*\(\d+\)\s*:\s*',
+        caseSensitive: false,
+      ),
+      '',
+    );
+    s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (s.length <= 180) return s;
+    return '${s.substring(0, 177)}…';
+  }
+
   Future<void> _retry() async {
     if (_retrying) return;
     setState(() => _retrying = true);
@@ -462,10 +810,16 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
   @override
   Widget build(BuildContext context) {
     final err = widget.error;
+    // `badRequest` is the same severity as auth/notFound from the
+    // user's perspective ("this won't work, do something") so it
+    // shares the red accent rather than the amber one used for
+    // transient cases.
     final accent = err.kind == ProviderErrorKind.unauthorized ||
-            err.kind == ProviderErrorKind.notFound
+            err.kind == ProviderErrorKind.notFound ||
+            err.kind == ProviderErrorKind.badRequest
         ? DuckColors.stateError
         : DuckColors.stateWarn;
+    final excerpt = _detailExcerpt(err.rawDetail);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Container(
@@ -509,6 +863,25 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
                 height: 1.4,
               ),
             ),
+            // Always-visible one-line excerpt of the actual provider
+            // message. Without this the card was a faint warn-bordered
+            // rectangle that felt empty unless the user expanded
+            // details — Opus 4.7's 400 was the exact failure mode
+            // ("dark grey square" per user report). We strip the
+            // generic `<Provider> API error (NNN):` preamble so what
+            // remains is the substantive bit.
+            if (excerpt.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              SelectableText(
+                excerpt,
+                style: const TextStyle(
+                  fontFamily: DuckTheme.monoFont,
+                  fontSize: 11,
+                  color: DuckColors.fgPrimary,
+                  height: 1.4,
+                ),
+              ),
+            ],
             const SizedBox(height: 8),
             Row(
               children: [
@@ -589,6 +962,8 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
         return Icons.timer_off_outlined;
       case ProviderErrorKind.unauthorized:
         return Icons.lock_outline;
+      case ProviderErrorKind.badRequest:
+        return Icons.report_gmailerrorred_outlined;
       case ProviderErrorKind.notFound:
         return Icons.help_outline;
       case ProviderErrorKind.network:
@@ -780,6 +1155,7 @@ class _FileToolCardState extends State<_FileToolCard> {
                       final badge = _ToolStatusBadge(
                         label: action,
                         accent: accent,
+                        pending: s.pending,
                       );
                       return Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -838,9 +1214,9 @@ class _FileToolCardState extends State<_FileToolCard> {
   }
 }
 
-/// Terminal-style card for shell commands and snapshots. Slightly
-/// taller than the file card because the command itself is the
-/// payload — needs more horizontal room for typical command lines.
+/// Terminal-style card for shell commands. Slightly taller than the
+/// file card because the command itself is the payload — needs more
+/// horizontal room for typical command lines.
 class _CommandToolCard extends StatelessWidget {
   final ToolSegment segment;
   const _CommandToolCard({required this.segment});
@@ -879,7 +1255,11 @@ class _CommandToolCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            _ToolStatusBadge(label: _actionLabel(segment), accent: accent),
+            _ToolStatusBadge(
+              label: _actionLabel(segment),
+              accent: accent,
+              pending: segment.pending,
+            ),
           ],
         ),
       ),
@@ -887,40 +1267,109 @@ class _CommandToolCard extends StatelessWidget {
   }
 }
 
-class _ToolStatusBadge extends StatelessWidget {
+/// Tiny accent-tinted pill that doubles as the status indicator
+/// inside file/command cards. Adds a subtle 1Hz breath to the
+/// background opacity when [pending] is true so the user can see
+/// at a glance which tools are still in flight, without the
+/// visual cost of a full spinner / shimmer overlay.
+///
+/// Cost: one [AnimationController] only when pending. In the
+/// finished-message case the badge is a plain [StatelessWidget]
+/// equivalent (no ticker), so persisted history doesn't allocate
+/// hundreds of controllers for old turns.
+class _ToolStatusBadge extends StatefulWidget {
   final String label;
   final Color accent;
+  final bool pending;
 
-  const _ToolStatusBadge({required this.label, required this.accent});
+  const _ToolStatusBadge({
+    required this.label,
+    required this.accent,
+    this.pending = false,
+  });
 
   @override
-  Widget build(BuildContext context) {
+  State<_ToolStatusBadge> createState() => _ToolStatusBadgeState();
+}
+
+class _ToolStatusBadgeState extends State<_ToolStatusBadge>
+    with SingleTickerProviderStateMixin {
+  AnimationController? _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.pending) _ensureController();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ToolStatusBadge oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.pending && _ctrl == null) {
+      _ensureController();
+    } else if (!widget.pending && _ctrl != null) {
+      _ctrl?.dispose();
+      _ctrl = null;
+    }
+  }
+
+  void _ensureController() {
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _ctrl?.dispose();
+    super.dispose();
+  }
+
+  Widget _pill(double alpha) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
       decoration: BoxDecoration(
-        color: accent.withValues(alpha: 0.15),
+        color: widget.accent.withValues(alpha: alpha),
         borderRadius: BorderRadius.circular(DuckTheme.radiusS),
       ),
       child: Text(
-        label,
+        widget.label,
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: TextStyle(
           fontSize: 10,
           fontWeight: FontWeight.w600,
-          color: accent,
+          color: widget.accent,
           letterSpacing: 0.3,
         ),
       ),
     );
   }
+
+  @override
+  Widget build(BuildContext context) {
+    final ctrl = _ctrl;
+    if (ctrl == null) return _pill(0.15);
+    return AnimatedBuilder(
+      animation: ctrl,
+      builder: (_, _) {
+        final t = Curves.easeInOut.transform(ctrl.value);
+        // Breathe between 0.10 and 0.28 — wide enough to read as
+        // "alive", not so wide it strobes.
+        final alpha = 0.10 + (0.18 * t);
+        return _pill(alpha);
+      },
+    );
+  }
 }
 
 /// Compact pill for read-only inspection ops. Doesn't deserve a full
-/// card — these are "the agent looked at something" not "the agent
-/// changed something". Multiple inspection badges in a row wrap
-/// naturally because the parent message column wraps via Wrap when
-/// rendering.
+/// card — these are "the agent looked at something", not "the agent
+/// changed something". When 3+ consecutive inspections share the
+/// same action, [parseChatSegments] collapses them into a
+/// [ToolGroupSegment] and renders the [ToolGroupView] header
+/// instead, so a long search-spam turn doesn't blow up the column.
 class _InspectionBadge extends StatelessWidget {
   final ToolSegment segment;
   const _InspectionBadge({required this.segment});
@@ -939,12 +1388,20 @@ class _InspectionBadge extends StatelessWidget {
         decoration: BoxDecoration(
           color: DuckColors.bgChip,
           borderRadius: BorderRadius.circular(999),
-          border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+          border: Border.all(
+            color: segment.pending
+                ? DuckColors.accentCyan.withValues(alpha: 0.45)
+                : DuckColors.glassSeam,
+            width: 0.5,
+          ),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(_iconForInspection(segment.toolId), size: 11, color: accent),
+            if (segment.pending)
+              const _PendingDot()
+            else
+              Icon(_iconForInspection(segment.toolId), size: 11, color: accent),
             const SizedBox(width: 5),
             Text(
               _actionLabel(segment),
@@ -976,23 +1433,171 @@ class _InspectionBadge extends StatelessWidget {
       ),
     );
   }
+}
 
-  IconData _iconForInspection(String toolId) {
-    switch (toolId) {
-      case 'tree':
-        return Icons.account_tree_outlined;
-      case 'list_dir':
-        return Icons.folder_open_outlined;
-      case 'search_text':
-        return Icons.search;
-      case 'find_file':
-      case 'glob':
-        return Icons.find_in_page_outlined;
-      case 'git_status':
-      case 'git_diff':
-        return Icons.commit_outlined;
-      default:
-        return Icons.visibility_outlined;
+/// Three-dot loading glyph used inside the compact inspection
+/// badge instead of a static icon when a tool is still in flight.
+/// Cheaper than wrapping the whole badge in a shimmer; the dots
+/// occupy the icon slot exactly so layout doesn't shift when a
+/// pending inspection completes.
+class _PendingDot extends StatefulWidget {
+  const _PendingDot();
+
+  @override
+  State<_PendingDot> createState() => _PendingDotState();
+}
+
+class _PendingDotState extends State<_PendingDot>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 11,
+      height: 11,
+      child: AnimatedBuilder(
+        animation: _ctrl,
+        builder: (_, _) {
+          return CustomPaint(
+            painter: _PendingDotPainter(t: _ctrl.value),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _PendingDotPainter extends CustomPainter {
+  final double t;
+  _PendingDotPainter({required this.t});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..style = PaintingStyle.fill;
+    const dotR = 1.2;
+    final cy = size.height / 2;
+    for (var i = 0; i < 3; i++) {
+      final phase = (t + i * 0.18) % 1.0;
+      final wave = (phase < 0.5)
+          ? Curves.easeInOut.transform(phase * 2)
+          : Curves.easeInOut.transform((1 - phase) * 2);
+      final alpha = 0.30 + 0.55 * wave;
+      paint.color = DuckColors.accentCyan.withValues(alpha: alpha);
+      final cx = 1.5 + i * 4.0;
+      canvas.drawCircle(Offset(cx, cy), dotR, paint);
     }
+  }
+
+  @override
+  bool shouldRepaint(covariant _PendingDotPainter old) => old.t != t;
+}
+
+/// Yellow warning card surfaced when the parser detected a
+/// tool-shaped block in the model's output but the inner structure
+/// rejected the strict per-tool regex. The block will NOT execute
+/// — neither here in the UI nor in `ToolExecutor.run` — so we
+/// surface a "model tried to do this, but the call is malformed"
+/// chip instead of letting the raw body leak into the chat as
+/// hundreds of lines of code.
+///
+/// Displayed inline in the conversation flow alongside other tool
+/// segments. Tapping the help glyph opens a tooltip explaining
+/// what went wrong; tapping anywhere else is a no-op (there's
+/// nothing to navigate to — the call never ran).
+class _MalformedToolCard extends StatelessWidget {
+  final ToolSegment segment;
+  const _MalformedToolCard({required this.segment});
+
+  @override
+  Widget build(BuildContext context) {
+    final tool = ToolRegistry.byId(segment.toolId);
+    final toolLabel = tool?.name ?? segment.toolId.toUpperCase();
+    final summary = segment.firstArg.trim().isEmpty
+        ? toolLabel
+        : '$toolLabel: ${segment.firstArg.trim()}';
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Tooltip(
+        message: S.toolMalformedTooltip(toolLabel),
+        waitDuration: const Duration(milliseconds: 350),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+          decoration: BoxDecoration(
+            color: DuckColors.bgDeeper,
+            borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+            border: Border(
+              left: const BorderSide(color: DuckColors.stateWarn, width: 2),
+              top: BorderSide(
+                color: DuckColors.stateWarn.withValues(alpha: 0.25),
+                width: 0.5,
+              ),
+              right: BorderSide(
+                color: DuckColors.stateWarn.withValues(alpha: 0.25),
+                width: 0.5,
+              ),
+              bottom: BorderSide(
+                color: DuckColors.stateWarn.withValues(alpha: 0.25),
+                width: 0.5,
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.warning_amber_rounded,
+                size: 14,
+                color: DuckColors.stateWarn,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      S.toolMalformedTitle,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: DuckColors.stateWarn,
+                        letterSpacing: 0.2,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      summary,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: DuckTheme.monoFont,
+                        fontSize: 11,
+                        color: DuckColors.fgMuted,
+                        height: 1.3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Icon(
+                Icons.help_outline,
+                size: 13,
+                color: DuckColors.fgSubtle,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

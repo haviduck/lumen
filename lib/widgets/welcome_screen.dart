@@ -10,6 +10,8 @@ import '../theme/app_theme.dart';
 import 'common/ambient_background.dart';
 import 'common/duck_toast.dart';
 import 'gitnexus_dialog.dart';
+import 'llm_providers_setup_dialog.dart';
+import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
 
 class WelcomeScreen extends StatelessWidget {
@@ -39,11 +41,37 @@ class WelcomeScreen extends StatelessWidget {
   /// Each `context.mounted` guard handles the case where the user
   /// bails by closing the app mid-wizard — the next dialog is
   /// suppressed cleanly.
+  ///
+  /// Step order (each step is independently skippable):
+  ///
+  ///   1. **Ollama setup** — first-run only. Detects whether the
+  ///      `ollama` CLI is installed and the daemon is reachable;
+  ///      shows download/run/pull/signin instructions when not.
+  ///   2. **LLM providers** — first-run only. Lets the user paste
+  ///      API keys for cloud providers (Gemini, Claude, GitHub
+  ///      Models, OpenAI) so the rest of the wizard (skill
+  ///      generator) actually has an LLM to call.
+  ///   3. **Skill generator** — asks an LLM to bootstrap
+  ///      `.lumen/tools/` and `.lumen/skills/` for this project.
+  ///   4. **GitNexus** — `npx gitnexus analyze` the workspace.
+  ///   5. **Syncthing** — share with already-paired devices.
+  ///
+  /// Steps 1 and 2 only fire when `_isLumenFirstRun` returns true so
+  /// repeat users (who already have at least one provider working)
+  /// don't get nagged on every new project. Steps 3-5 always offer
+  /// — they're per-workspace concerns, not per-installation ones.
   Future<void> _runNewProjectWizard(
     BuildContext context,
     AppState state,
     String path,
   ) async {
+    final firstRun = await _isLumenFirstRun(state);
+    if (context.mounted && firstRun) {
+      await showOllamaSetupDialog(context);
+    }
+    if (context.mounted && firstRun) {
+      await showLlmProvidersSetupDialog(context);
+    }
     if (context.mounted) {
       await showSkillGeneratorDialog(context, workspacePath: path);
     }
@@ -53,6 +81,23 @@ class WelcomeScreen extends StatelessWidget {
     if (context.mounted) {
       await _promptSyncthingIfNeeded(context, state, path);
     }
+  }
+
+  /// Heuristic for "is this the user's first time using Lumen?". We
+  /// say yes when *no* provider looks usable — every cloud API key
+  /// is empty AND the local Ollama daemon doesn't respond. Any one
+  /// of those being truthy is enough evidence that the user has
+  /// already configured Lumen at some point, and we skip the
+  /// onboarding-style steps to avoid nagging repeat users every
+  /// time they open a new project.
+  Future<bool> _isLumenFirstRun(AppState state) async {
+    final hasAnyKey = state.geminiApiKey.isNotEmpty ||
+        state.anthropicApiKey.isNotEmpty ||
+        state.githubModelsApiKey.isNotEmpty ||
+        state.openaiApiKey.isNotEmpty;
+    if (hasAnyKey) return false;
+    final ollamaUp = await state.ollamaService.isReachable();
+    return !ollamaUp;
   }
 
   Future<void> _createNewProject(BuildContext context) async {

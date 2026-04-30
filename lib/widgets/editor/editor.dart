@@ -20,12 +20,14 @@ import '../common/fast_popup_menu.dart';
 import '../common/media_pane_chrome.dart';
 import '../menu_bar.dart';
 import '../settings_view.dart';
+import '../common/duck_toast.dart';
 import 'autocomplete_overlay.dart';
 import 'binary_preview.dart';
 import 'editor_themes.dart';
 import 'indent_guides.dart';
 import 'markdown_preview.dart';
 import 'recent_edits_overlay.dart';
+import 'unsaved_changes_dialog.dart';
 
 class Editor extends StatefulWidget {
   const Editor({super.key});
@@ -91,12 +93,109 @@ class _EditorState extends State<Editor> {
     appState.setActiveFile(file);
   }
 
-  void _closeFile(AppState appState, File file) {
+  /// Close a single tab. If the buffer has unsaved changes, prompt
+  /// the user (Save / Don't Save / Cancel) before destroying state.
+  ///
+  /// Returns true if the file was closed, false if the user cancelled
+  /// or if the save attempt failed and we kept the tab open. Callers
+  /// that loop over multiple files (Close Others / Close All) check
+  /// the return value and abort the rest of the batch on a cancel —
+  /// "Cancel" should mean "stop closing things", not "skip this one
+  /// and move on".
+  Future<bool> _closeFile(AppState appState, File file) async {
+    if (appState.isFileDirty(file.path)) {
+      final choice =
+          await showUnsavedChangesDialog(context, file: file);
+      if (!mounted) return false;
+      switch (choice) {
+        case UnsavedChangesChoice.cancel:
+          return false;
+        case UnsavedChangesChoice.save:
+          final saved = await _saveBeforeClose(appState, file);
+          if (!mounted) return false;
+          if (!saved) return false;
+        case UnsavedChangesChoice.discard:
+          break;
+      }
+    }
     setState(() {
       if (_primaryPath == file.path) _primaryPath = null;
       if (_secondaryPath == file.path) _secondaryPath = null;
     });
     appState.closeFile(file);
+    return true;
+  }
+
+  /// Save handler used by the close-confirm flow. Routes named files
+  /// through `saveFileByPath` and untitled files through a save-as
+  /// name prompt (mirrors menu_bar's File → Save behaviour for
+  /// untitled tabs). Returns true on success — false either
+  /// represents a write error or the user dismissing the save-as
+  /// prompt without picking a name. Caller treats false as "abort
+  /// the close, leave the tab open".
+  Future<bool> _saveBeforeClose(AppState appState, File file) async {
+    if (AppState.isUntitledTab(file.path)) {
+      final name = await _promptSaveAsName();
+      if (name == null || name.trim().isEmpty) return false;
+      final dir = appState.currentDirectory ?? '.';
+      final realPath = '$dir${Platform.pathSeparator}${name.trim()}';
+      final ok = await appState.saveUntitledAs(file.path, realPath);
+      if (!mounted) return ok;
+      if (!ok) {
+        showDuckToast(context, S.error);
+        return false;
+      }
+      appState.refreshDirectory();
+      return true;
+    }
+    await appState.saveFileByPath(file.path);
+    return !appState.isFileDirty(file.path);
+  }
+
+  Future<String?> _promptSaveAsName() async {
+    String name = '';
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DuckColors.bgRaised,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+          side: const BorderSide(color: DuckColors.border, width: 0.5),
+        ),
+        title: const Text(
+          S.unsavedDialogSaveAs,
+          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+        ),
+        content: SizedBox(
+          width: 320,
+          child: TextField(
+            autofocus: true,
+            style: const TextStyle(fontSize: 13),
+            decoration: const InputDecoration(
+              hintText: 'filename.dart',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (v) => name = v,
+            onSubmitted: (v) => Navigator.pop(ctx, v),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(S.cancel),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, name),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: DuckColors.accentCyan,
+              foregroundColor: DuckColors.bgDeepest,
+            ),
+            child: const Text(S.unsavedDialogSave),
+          ),
+        ],
+      ),
+    );
   }
 
   void _toggleSplitView(AppState appState) {
@@ -190,159 +289,265 @@ class _EditorState extends State<Editor> {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, appState, child) {
-        _syncPaneAssignments(appState);
-
-        final focusedPath = _focusedPath;
-        final isMarkdown = _isMarkdownFile(appState, focusedPath);
-        final showingPreview =
-            focusedPath != null && _markdownPreviewing.contains(focusedPath);
-
-        final emptyEditor =
-            appState.openFiles.isEmpty || appState.activeFile == null;
-
-        Widget editorBody = emptyEditor
-            ? Container(
-                // Even with no file open, paint the editor area at
-                // `editorBg` (== Cursor's `editor.background`) so it
-                // reads as a different surface from the sidebars.
-                // Cursor's `editorGroup.emptyBackground` is actually
-                // sidebar-color (`#191c22`) — matching that exactly
-                // made the empty state visually merge with the file
-                // explorer / chat panel, which the user (rightly)
-                // flagged as confusing on the side-by-side
-                // comparison. We diverge here on purpose.
-                color: DuckColors.editorBg,
-                child: const Center(child: _DuckQuip()),
-              )
-            : Column(
-                children: [
-                  _EditorTabBar(
-                    appState: appState,
-                    onActivate: (file) => _activateFile(appState, file),
-                    onClose: (file) => _closeFile(appState, file),
-                    onCloseOthers: (file) => _closeOthers(appState, file),
-                    onCloseToRight: (file) => _closeFilesAfter(appState, file),
-                    onCloseAll: () => _closeAll(appState),
-                    onSplitLeft: (file) => _splitToPane(appState, file, 0),
-                    onSplitRight: (file) => _splitToPane(appState, file, 1),
-                    splitView: _splitView,
-                    onToggleSplitView: () => _toggleSplitView(appState),
-                    showingMarkdownPreview: showingPreview,
-                    isMarkdownFile: isMarkdown,
-                    onFind: () => appState.ideActions.find(),
-                    onToggleMarkdownPreview: () {
-                      if (focusedPath == null) return;
-                      setState(() {
-                        if (showingPreview) {
-                          _markdownPreviewing.remove(focusedPath);
-                        } else {
-                          _markdownPreviewing.add(focusedPath);
-                        }
-                      });
-                    },
-                  ),
-                  Expanded(
-                    child: _splitView
-                        ? MultiSplitViewTheme(
-                            data: MultiSplitViewThemeData(
-                              dividerThickness: 1,
-                              dividerHandleBuffer: 8,
-                              dividerPainter: DividerPainters.background(
-                                color: DuckColors.glassSeam,
-                                highlightedColor: DuckColors.accentCyan
-                                    .withValues(alpha: 0.4),
-                              ),
-                            ),
-                            child: MultiSplitView(
-                              axis: Axis.horizontal,
-                              initialAreas: [
-                                Area(
-                                  flex: 0.5,
-                                  builder: (context, area) =>
-                                      _buildPane(appState, 0, _primaryPath),
-                                ),
-                                Area(
-                                  flex: 0.5,
-                                  builder: (context, area) =>
-                                      _buildPane(appState, 1, _secondaryPath),
-                                ),
-                              ],
-                            ),
-                          )
-                        : _buildPane(appState, 0, _primaryPath),
-                  ),
-                ],
-              );
-
-        // Teams owns the editor-side media slot when active, while normal
-        // watch-media can still render in chat. If Teams is not active, the
-        // user may opt normal media into the editor split as before.
-        return Consumer<MediaController>(
-          builder: (context, media, _) {
-            final editorSlot = media.hasTeams
-                ? MediaSlot.teams
-                : MediaSlot.watch;
-            final showMediaInEditor =
-                media.hasTeams ||
-                (media.hasMedia && media.placement == MediaPlacement.editor);
-            if (!showMediaInEditor) return editorBody;
-            return MultiSplitViewTheme(
-              data: MultiSplitViewThemeData(
-                dividerThickness: 1,
-                dividerHandleBuffer: 8,
-                dividerPainter: DividerPainters.background(
-                  color: DuckColors.glassSeam,
-                  highlightedColor: DuckColors.accentCyan.withValues(
-                    alpha: 0.4,
-                  ),
-                ),
+    // Outer scaffold only needs to know whether to wrap the editor in a
+    // Teams/YouTube split. Anything that depends on AppState moves into
+    // method tear-offs (`_buildIdeBodyArea`, `_buildPaneArea0/1`,
+    // `_buildMediaArea`) so the *closures* stored inside `Area`
+    // objects don't capture stale values.
+    //
+    // Why: `multi_split_view` 3.6.1 only consumes `initialAreas` once
+    // (in `initState`); on every parent rebuild `didUpdateWidget`
+    // hands the existing `Area` list back to a freshly-constructed
+    // `MultiSplitViewController`. So a closure like
+    // `(_, _) => editorBody` captured the empty-state `editorBody`
+    // from the very first frame and never updated when the user
+    // clicked a file in the explorer. Tear-offs of instance methods
+    // stay bound to `this` (a stable reference); invoking the stored
+    // builder dispatches to the current method body, which reads
+    // fresh state via `context.watch<AppState>()`.
+    return Consumer<MediaController>(
+      builder: (context, media, _) {
+        final showMediaInEditor =
+            media.hasTeams ||
+            (media.hasMedia && media.placement == MediaPlacement.editor);
+        if (!showMediaInEditor) {
+          // No Teams / no docked watch-media — render the editor body
+          // directly. Pulling AppState happens inside `_buildIdeBody`.
+          return _buildIdeBody(context);
+        }
+        return MultiSplitViewTheme(
+          data: MultiSplitViewThemeData(
+            dividerThickness: 1,
+            dividerHandleBuffer: 8,
+            dividerPainter: DividerPainters.background(
+              color: DuckColors.glassSeam,
+              highlightedColor: DuckColors.accentCyan.withValues(
+                alpha: 0.4,
               ),
-              child: MultiSplitView(
-                axis: Axis.horizontal,
-                initialAreas: [
-                  Area(flex: 0.6, builder: (_, _) => editorBody),
-                  Area(
-                    flex: 0.4,
-                    builder: (_, _) =>
-                        _EditorMediaPane(media: media, slot: editorSlot),
-                  ),
-                ],
-              ),
-            );
-          },
+            ),
+          ),
+          child: MultiSplitView(
+            axis: Axis.horizontal,
+            initialAreas: [
+              Area(flex: 0.6, builder: _buildIdeBodyArea),
+              Area(flex: 0.4, builder: _buildMediaArea),
+            ],
+          ),
         );
       },
     );
   }
 
+  /// Method-tear-off wrapper around [_buildIdeBody] used as a stable
+  /// `Area.builder`. See [build] for the captured-closure landmine
+  /// this defends against.
+  Widget _buildIdeBodyArea(BuildContext context, Area area) {
+    return _buildIdeBody(context);
+  }
+
+  Widget _buildMediaArea(BuildContext context, Area area) {
+    final media = context.watch<MediaController>();
+    final slot = media.hasTeams ? MediaSlot.teams : MediaSlot.watch;
+    return _EditorMediaPane(media: media, slot: slot);
+  }
+
+  /// The "IDE body" — tab bar + active pane(s). Reads `AppState`
+  /// fresh via `context.watch` so it stays reactive whether it's
+  /// rendered directly or as the left half of the Teams/YouTube
+  /// split.
+  Widget _buildIdeBody(BuildContext context) {
+    final appState = context.watch<AppState>();
+    _syncPaneAssignments(appState);
+
+    final focusedPath = _focusedPath;
+    final isMarkdown = _isMarkdownFile(appState, focusedPath);
+    final showingPreview =
+        focusedPath != null && _markdownPreviewing.contains(focusedPath);
+
+    final emptyEditor =
+        appState.openFiles.isEmpty || appState.activeFile == null;
+
+    if (emptyEditor) {
+      return Container(
+        // Even with no file open, paint the editor area at
+        // `editorBg` (== Cursor's `editor.background`) so it
+        // reads as a different surface from the sidebars.
+        // Cursor's `editorGroup.emptyBackground` is actually
+        // sidebar-color (`#191c22`) — matching that exactly
+        // made the empty state visually merge with the file
+        // explorer / chat panel, which the user (rightly)
+        // flagged as confusing on the side-by-side
+        // comparison. We diverge here on purpose.
+        color: DuckColors.editorBg,
+        child: const Center(child: _DuckQuip()),
+      );
+    }
+
+    return Column(
+      children: [
+        _EditorTabBar(
+          appState: appState,
+          onActivate: (file) => _activateFile(appState, file),
+          onClose: (file) => _closeFile(appState, file),
+          onCloseOthers: (file) => _closeOthers(appState, file),
+          onCloseToRight: (file) => _closeFilesAfter(appState, file),
+          onCloseAll: () => _closeAll(appState),
+          onSplitLeft: (file) => _splitToPane(appState, file, 0),
+          onSplitRight: (file) => _splitToPane(appState, file, 1),
+          splitView: _splitView,
+          onToggleSplitView: () => _toggleSplitView(appState),
+          showingMarkdownPreview: showingPreview,
+          isMarkdownFile: isMarkdown,
+          onFind: () => appState.ideActions.find(),
+          onToggleMarkdownPreview: () {
+            if (focusedPath == null) return;
+            setState(() {
+              if (showingPreview) {
+                _markdownPreviewing.remove(focusedPath);
+              } else {
+                _markdownPreviewing.add(focusedPath);
+              }
+            });
+          },
+        ),
+        Expanded(
+          child: _splitView
+              ? MultiSplitViewTheme(
+                  data: MultiSplitViewThemeData(
+                    dividerThickness: 1,
+                    dividerHandleBuffer: 8,
+                    dividerPainter: DividerPainters.background(
+                      color: DuckColors.glassSeam,
+                      highlightedColor: DuckColors.accentCyan
+                          .withValues(alpha: 0.4),
+                    ),
+                  ),
+                  child: MultiSplitView(
+                    axis: Axis.horizontal,
+                    initialAreas: [
+                      // Tear-offs again — same captured-closure
+                      // hazard as the outer Teams split.
+                      Area(flex: 0.5, builder: _buildPaneArea0),
+                      Area(flex: 0.5, builder: _buildPaneArea1),
+                    ],
+                  ),
+                )
+              : _buildPane(appState, 0, _primaryPath),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPaneArea0(BuildContext context, Area area) {
+    final appState = context.watch<AppState>();
+    return _buildPane(appState, 0, _primaryPath);
+  }
+
+  Widget _buildPaneArea1(BuildContext context, Area area) {
+    final appState = context.watch<AppState>();
+    return _buildPane(appState, 1, _secondaryPath);
+  }
+
   // ── Tab context menu actions ──────────────────────────────────────────
 
-  void _closeOthers(AppState appState, File anchor) {
+  Future<void> _closeOthers(AppState appState, File anchor) async {
     final keep = anchor.path;
     final toClose = appState.openFiles
         .where((f) => f.path != keep)
         .toList(growable: false);
-    for (final f in toClose) {
-      _closeFile(appState, f);
-    }
+    await _closeBatch(appState, toClose);
   }
 
-  void _closeFilesAfter(AppState appState, File anchor) {
+  Future<void> _closeFilesAfter(AppState appState, File anchor) async {
     final files = appState.openFiles;
     final idx = files.indexWhere((f) => f.path == anchor.path);
     if (idx < 0) return;
     final toClose = files.sublist(idx + 1).toList(growable: false);
-    for (final f in toClose) {
-      _closeFile(appState, f);
-    }
+    await _closeBatch(appState, toClose);
   }
 
-  void _closeAll(AppState appState) {
+  Future<void> _closeAll(AppState appState) async {
     final files = appState.openFiles.toList(growable: false);
-    for (final f in files) {
-      _closeFile(appState, f);
+    await _closeBatch(appState, files);
+  }
+
+  /// Shared batch-close path used by Close Others / Close to Right /
+  /// Close All. Three-stage flow:
+  ///
+  ///   1. Partition the batch into clean and dirty.
+  ///   2. If any are dirty, ask once with the batch dialog
+  ///      (`Save All` / `Don't Save` / `Cancel`).
+  ///   3. Close everything in `toClose` (clean files first, then the
+  ///      dirty ones honouring the user's choice).
+  ///
+  /// "Save All" writes named dirty buffers via `saveFileByPath`; any
+  /// dirty UNTITLED tabs in the batch are left open afterwards (we
+  /// don't want a sequential save-as picker firing N times for a
+  /// "Close All" of 6 untitled scratch buffers). The user is told
+  /// via toast what happened. Use Save As manually first if you
+  /// want untitled tabs persisted.
+  ///
+  /// Cancel aborts the entire batch — clean files in the batch are
+  /// also kept open. This is intentional: the user clicked Cancel,
+  /// they want everything as-is.
+  Future<void> _closeBatch(AppState appState, List<File> toClose) async {
+    if (toClose.isEmpty) return;
+    final dirty = toClose
+        .where((f) => appState.isFileDirty(f.path))
+        .toList(growable: false);
+    final clean = toClose
+        .where((f) => !appState.isFileDirty(f.path))
+        .toList(growable: false);
+
+    var keepUntitled = <File>[];
+
+    if (dirty.isNotEmpty) {
+      final choice = await showBatchUnsavedChangesDialog(
+        context,
+        dirtyFiles: dirty,
+      );
+      if (!mounted) return;
+      switch (choice) {
+        case BatchUnsavedChangesChoice.cancel:
+          return;
+        case BatchUnsavedChangesChoice.saveAll:
+          for (final f in dirty) {
+            if (AppState.isUntitledTab(f.path)) {
+              // Skip — sequential save-as pickers would be hostile
+              // UX. Track separately so the toast is accurate even
+              // when an untitled save-as somewhere in the batch
+              // succeeded via a different path.
+              keepUntitled.add(f);
+              continue;
+            }
+            await appState.saveFileByPath(f.path);
+          }
+          if (!mounted) return;
+        case BatchUnsavedChangesChoice.discardAll:
+          break;
+      }
+    }
+
+    setState(() {
+      for (final f in toClose) {
+        if (keepUntitled.any((u) => u.path == f.path)) continue;
+        if (_primaryPath == f.path) _primaryPath = null;
+        if (_secondaryPath == f.path) _secondaryPath = null;
+      }
+    });
+
+    final closeOrder = [
+      ...clean,
+      ...dirty.where((d) => !keepUntitled.any((u) => u.path == d.path)),
+    ];
+    for (final f in closeOrder) {
+      appState.closeFile(f);
+    }
+    if (keepUntitled.isNotEmpty && mounted) {
+      showDuckToast(
+        context,
+        S.unsavedBatchUntitledSkipped(keepUntitled.length),
+      );
     }
   }
 
@@ -387,14 +592,23 @@ class _EditorMediaPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final permissionRequested = slot == MediaSlot.teams
+        ? MediaController.handleTeamsPermission
+        : null;
     final body = media.isAspectLockedFor(slot)
         ? Center(
             child: AspectRatio(
               aspectRatio: 16 / 9,
-              child: Webview(media.webviewFor(slot)),
+              child: Webview(
+                media.webviewFor(slot),
+                permissionRequested: permissionRequested,
+              ),
             ),
           )
-        : Webview(media.webviewFor(slot));
+        : Webview(
+            media.webviewFor(slot),
+            permissionRequested: permissionRequested,
+          );
     return Container(
       color: DuckColors.bgDeepest,
       child: Column(

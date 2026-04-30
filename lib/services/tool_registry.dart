@@ -1,10 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
-import 'snapshot_service.dart';
+import 'ollama_service.dart' show CancellationToken;
 
 /// Definition of a single agent tool. The agent uses [syntaxExample] in
 /// its system prompt and we parse the response with [pattern].
@@ -23,9 +24,8 @@ class AgentTool {
   final bool isExternal;
 
   /// Returns the textual feedback for the LLM. The runner invokes this with
-  /// a [ToolInvocation] that exposes workspace context, an [approver] for
-  /// gated tools, and an [attachImage] side-channel for tools that want to
-  /// hand binary content (base64 PNG/JPEG) into the next API turn.
+  /// a [ToolInvocation] that exposes workspace context and an [approver]
+  /// for gated tools.
   final Future<String> Function(ToolInvocation inv) execute;
 
   const AgentTool({
@@ -47,23 +47,27 @@ class ToolInvocation {
   final Future<bool> Function(String label, String detail) approver;
   final bool allowWritesOutsideWorkspace;
 
-  /// Side-channel for tools that produce image output (e.g. SNAPSHOT_URL).
-  /// The base64-encoded PNG/JPEG ends up on the next user-feedback message
-  /// so the multimodal model receives it on the next turn.
-  final void Function(String base64) attachImage;
-
   /// Optional callback for live output from long-running tools. When set,
   /// the tool can push incremental chunks (stdout/stderr lines) as they
   /// arrive, so the UI shows progress in real time.
   final void Function(String chunk)? onOutput;
 
+  /// Optional cancellation handle. Long-running tool bodies (RUN_CMD)
+  /// race their work against [CancellationToken.whenCancelled] so the
+  /// chat's "Stop" button can interrupt a hung subprocess. Without
+  /// this the executor's `await tool.execute(inv)` blocks forever
+  /// when a server command never closes its stdout (`npm start`,
+  /// `vite dev`, …) and the user has no way out short of killing
+  /// the whole IDE.
+  final CancellationToken? cancelToken;
+
   ToolInvocation({
     required this.match,
     required this.workspaceDir,
     required this.approver,
-    required this.attachImage,
     this.allowWritesOutsideWorkspace = false,
     this.onOutput,
+    this.cancelToken,
   });
 }
 
@@ -102,11 +106,21 @@ class ToolRegistry {
     AgentTool(
       id: 'create_file',
       name: 'CREATE_FILE',
-      description: 'Create or overwrite a file with the given content.',
+      description:
+          'Create a NEW file with the given content. Will overwrite '
+          'an existing file at the same path, but you should almost '
+          'never want that — for changes to existing files, use '
+          'EDIT_FILE or MULTI_EDIT instead. Rewriting a 200-line file '
+          'with CREATE_FILE costs you minutes of generation time per '
+          'turn and risks dropping content you did not mean to remove.',
       syntaxExample:
           '<<<CREATE_FILE: filename.ext>>>\nfile contents go here\n<<<END_FILE>>>',
+      // Tolerant separator: `\s*?\n` between the opener and the body
+      // accepts CRLF, blank lines, and indented markers. The content
+      // capture itself stays bounded by `\n?<<<END_FILE>>>` so a
+      // body's trailing newline isn't silently stripped.
       pattern: RegExp(
-        r'<<<CREATE_FILE:\s*(.*?)\s*>>>\n(.*?)\n?<<<END_FILE>>>',
+        r'<<<CREATE_FILE:\s*(.*?)\s*>>>\s*?\n(.*?)\n?\s*?<<<END_FILE>>>',
         dotAll: true,
       ),
       execute: (inv) async {
@@ -139,8 +153,21 @@ class ToolRegistry {
           'exactly (including whitespace/indentation).',
       syntaxExample:
           '<<<EDIT_FILE: filename.ext>>>\n<<<SEARCH>>>\nexact text to find\n<<<REPLACE>>>\nreplacement text\n<<<END_EDIT>>>',
+      // Tolerant separators between markers (`\s*?\n` accepts CRLF,
+      // an extra blank line, or indented markers) but content
+      // captures stay anchored by `\n` boundaries so trailing
+      // whitespace inside SEARCH / REPLACE bodies isn't stripped —
+      // some `EDIT_FILE` calls genuinely need to match a line that
+      // ends in spaces. Smaller / quirky models (Nemotron, gemma
+      // variants) routinely emit one of these whitespace
+      // variations; the strict `\n` requirement turned them all
+      // into "malformed" without any benefit.
       pattern: RegExp(
-        r'<<<EDIT_FILE:\s*(.*?)\s*>>>\n<<<SEARCH>>>\n(.*?)\n<<<REPLACE>>>\n(.*?)\n<<<END_EDIT>>>',
+        r'<<<EDIT_FILE:\s*(.*?)\s*>>>\s*?\n\s*?<<<SEARCH>>>\s*?\n'
+        r'(.*?)'
+        r'\n\s*?<<<REPLACE>>>\s*?\n'
+        r'(.*?)'
+        r'\n\s*?<<<END_EDIT>>>',
         dotAll: true,
       ),
       execute: (inv) async {
@@ -196,8 +223,12 @@ class ToolRegistry {
           'round trips, safer transactional semantics.',
       syntaxExample:
           '<<<MULTI_EDIT: filename.ext>>>\n<<<SEARCH>>>\nold text 1\n<<<REPLACE>>>\nnew text 1\n<<<NEXT>>>\n<<<SEARCH>>>\nold text 2\n<<<REPLACE>>>\nnew text 2\n<<<END_EDIT>>>',
+      // Outer wrapper is intentionally permissive — the inner
+      // SEARCH/REPLACE/NEXT structure is parsed below in `execute`,
+      // and the chunk-level regex over there gets the same
+      // tolerant-separator treatment.
       pattern: RegExp(
-        r'<<<MULTI_EDIT:\s*(.+?)\s*>>>\n(.*?)\n?<<<END_EDIT>>>',
+        r'<<<MULTI_EDIT:\s*(.+?)\s*>>>\s*?\n(.*?)\n?\s*?<<<END_EDIT>>>',
         dotAll: true,
       ),
       execute: (inv) async {
@@ -216,11 +247,17 @@ class ToolRegistry {
             return 'MULTI_EDIT $fileName: Error: file does not exist.';
           }
           // Split on `<<<NEXT>>>` separators; each chunk holds one
-          // SEARCH/REPLACE pair.
-          final chunks = body.split(RegExp(r'\n<<<NEXT>>>\n'));
+          // SEARCH/REPLACE pair. Tolerant of CRLF, blank padding
+          // around the `<<<NEXT>>>` marker, and indentation —
+          // matches how the outer EDIT_FILE pattern is forgiving.
+          final chunks = body.split(RegExp(r'\s*?\n\s*?<<<NEXT>>>\s*?\n\s*?'));
           final edits = <({String search, String replace})>[];
           final chunkRe = RegExp(
-            r'<<<SEARCH>>>\n(.*?)\n<<<REPLACE>>>\n(.*?)$',
+            r'<<<SEARCH>>>\s*?\n'
+            r'(.*?)'
+            r'\n\s*?<<<REPLACE>>>\s*?\n'
+            r'(.*?)'
+            r'\s*$',
             dotAll: true,
           );
           for (var i = 0; i < chunks.length; i++) {
@@ -274,7 +311,7 @@ class ToolRegistry {
       syntaxExample:
           '<<<APPEND_FILE: filename.ext>>>\ncontent to append\n<<<END_APPEND>>>',
       pattern: RegExp(
-        r'<<<APPEND_FILE:\s*(.*?)\s*>>>\n(.*?)\n?<<<END_APPEND>>>',
+        r'<<<APPEND_FILE:\s*(.*?)\s*>>>\s*?\n(.*?)\n?\s*?<<<END_APPEND>>>',
         dotAll: true,
       ),
       execute: (inv) async {
@@ -847,10 +884,134 @@ class ToolRegistry {
       },
     ),
     AgentTool(
+      id: 'check_url',
+      name: 'CHECK_URL',
+      description:
+          'Probe whether a URL or host:port is reachable, without '
+          'starting anything. Use BEFORE any RUN_CMD that starts a '
+          'dev server — if the port is already open, the user has '
+          'it running already; do not spawn a duplicate.',
+      syntaxExample:
+          '<<<CHECK_URL: http://localhost:3000>>> '
+          '(also accepts localhost:3000, 5173, https://example.com)',
+      pattern: RegExp(r'<<<CHECK_URL:\s*(.*?)\s*>>>'),
+      execute: (inv) async {
+        final raw = inv.match.group(1)!.trim();
+        if (raw.isEmpty) {
+          return 'CHECK_URL: Failed (empty target).';
+        }
+        // Three input shapes: "http(s)://host[:port]/path", bare
+        // "host:port", or a bare port like "3000". Resolve to
+        // (host, port, scheme?) for the actual probe — the full
+        // URL is preserved in `raw` for the HTTP stage so we
+        // don't need to reconstruct path/query manually.
+        String host;
+        int port;
+        String? scheme;
+        try {
+          if (raw.startsWith('http://') || raw.startsWith('https://')) {
+            final u = Uri.parse(raw);
+            scheme = u.scheme;
+            host = u.host.isEmpty ? 'localhost' : u.host;
+            port = u.hasPort
+                ? u.port
+                : (scheme == 'https' ? 443 : 80);
+          } else if (RegExp(r'^\d+$').hasMatch(raw)) {
+            host = 'localhost';
+            port = int.parse(raw);
+          } else {
+            // host:port form
+            final colon = raw.lastIndexOf(':');
+            if (colon < 0) {
+              return 'CHECK_URL $raw: Failed (no port specified).';
+            }
+            host = raw.substring(0, colon);
+            port = int.parse(raw.substring(colon + 1));
+          }
+        } catch (e) {
+          return 'CHECK_URL $raw: Failed to parse target — $e';
+        }
+
+        // Stage 1: TCP connect with 2s timeout. If the port is
+        // closed we can answer immediately; no need to attempt
+        // an HTTP round-trip that would just fail.
+        final swTcp = Stopwatch()..start();
+        try {
+          final sock = await Socket.connect(host, port,
+              timeout: const Duration(seconds: 2));
+          final tcpMs = swTcp.elapsedMilliseconds;
+          await sock.close();
+          if (scheme == null) {
+            return 'CHECK_URL $raw: Reachable. TCP connect to '
+                '$host:$port succeeded in ${tcpMs}ms. '
+                'Something is listening — likely the user already '
+                'has the app running. Do NOT spawn a duplicate '
+                'server.';
+          }
+        } on SocketException catch (e) {
+          return 'CHECK_URL $raw: Closed. TCP connect to $host:$port '
+              'failed (${e.osError?.message ?? e.message}). '
+              'Nothing is listening — safe to start a server here.';
+        } on TimeoutException {
+          return 'CHECK_URL $raw: Timed out connecting to '
+              '$host:$port (2s). Likely closed or firewalled — '
+              'safe to start a server here.';
+        } catch (e) {
+          return 'CHECK_URL $raw: TCP probe failed — $e';
+        }
+
+        // Stage 2: HTTP HEAD when the input had a scheme. Falls
+        // back to GET if HEAD returns 405 — some dev servers
+        // (Vite without explicit support) only handle GET.
+        final swHttp = Stopwatch()..start();
+        try {
+          final client = HttpClient()
+            ..connectionTimeout = const Duration(seconds: 2);
+          try {
+            HttpClientRequest req;
+            try {
+              req = await client.headUrl(Uri.parse(raw));
+            } catch (_) {
+              req = await client.getUrl(Uri.parse(raw));
+            }
+            final res = await req.close().timeout(
+                  const Duration(seconds: 3),
+                );
+            // Drain the body so the connection can be closed
+            // cleanly; we don't need the bytes.
+            await res.drain<void>();
+            return 'CHECK_URL $raw: Reachable. '
+                'HTTP ${res.statusCode} ${res.reasonPhrase} '
+                'in ${swHttp.elapsedMilliseconds}ms. '
+                'Something is serving on $host:$port — likely '
+                'the user already has the app running. Do NOT '
+                'spawn a duplicate server.';
+          } finally {
+            client.close(force: true);
+          }
+        } catch (e) {
+          // TCP succeeded but HTTP didn't — port is open but
+          // not speaking HTTP (or it's slow / wrong protocol).
+          // Still report it as "reachable" because a duplicate
+          // server start would still collide on the port.
+          return 'CHECK_URL $raw: Port $host:$port is OPEN but did '
+              'not respond to HTTP within 3s ($e). Whatever owns '
+              'the port may not be the right app — but starting '
+              'a new server on the same port WILL fail with '
+              'EADDRINUSE. Ask the user.';
+        }
+      },
+    ),
+    AgentTool(
       id: 'run_cmd',
       name: 'RUN_CMD',
       description:
-          'Run a shell command in the workspace. Requires user approval (unless auto-approve is on).',
+          'Run a shell command in the workspace. Requires user '
+          'approval. For long-running processes (dev servers, '
+          'watchers): CHECK_URL the expected port FIRST so you do '
+          'not spawn a duplicate. The call soft-times-out at ~25s; '
+          'a "detached, still running" result is success, not '
+          'failure — the process keeps running in the background.',
       syntaxExample: '<<<RUN_CMD: command to run>>>',
       pattern: RegExp(r'<<<RUN_CMD:\s*(.*?)\s*>>>'),
       requiresApproval: true,
@@ -863,9 +1024,45 @@ class ToolRegistry {
         if (!approved) {
           return 'RUN_CMD $cmd: Denied by user.';
         }
+
+        // ── Long-running command handling ────────────────────────
+        //
+        // RUN_CMD has historically `await`ed `Future.wait([stdoutDone,
+        // stderrDone])` followed by `process.exitCode`. That blocks
+        // forever for daemon-style commands (`npm start`, `vite`,
+        // `python -m http.server`, …) because their stdout never
+        // closes. The chat's executor loop sat hung on a single
+        // tool call; the Stop button could not interrupt because
+        // the await had no cancellation point inside it.
+        //
+        // Three escape hatches now race the natural completion:
+        //
+        //   (a) **User cancellation** via [ToolInvocation.cancelToken]
+        //       — Stop button immediately wins, subprocess is killed,
+        //       partial stdout is returned with a `cancelled` marker.
+        //
+        //   (b) **Soft timeout** at [_runCmdSoftTimeout] (default 25s)
+        //       — process is detached (kept running), partial stdout
+        //       is returned with a `detached` marker so the agent
+        //       can proceed without waiting on the daemon.
+        //
+        //   (c) **Ready-pattern detection** — known "server up" lines
+        //       (`Server is running`, `Listening on`, `Local:`,
+        //       `ready in`, …) trigger an early detach after 500ms
+        //       of post-ready quiescence, so a fast-starting Vite or
+        //       Express server doesn't block the loop for the full
+        //       soft-timeout window.
+        //
+        // When detach happens we **leave the subprocess running**
+        // (no kill) so the user's app stays up. The stdout listener
+        // is intentionally not cancelled — its only side effect is
+        // appending to a buffer we no longer hold a reference to,
+        // which becomes garbage. There is a known orphan-process
+        // risk if Lumen exits without the OS reaping these; we
+        // treat it as acceptable for now (the user can kill via
+        // Task Manager) and may add an explicit job-object /
+        // process-group reaper later.
         try {
-          // Use Process.start for live streaming output instead of
-          // Process.run which blocks until the command finishes.
           final process = await Process.start(
             Platform.isWindows ? 'cmd.exe' : 'bash',
             Platform.isWindows ? ['/c', cmd] : ['-c', cmd],
@@ -874,59 +1071,136 @@ class ToolRegistry {
 
           final stdoutBuf = StringBuffer();
           final stderrBuf = StringBuffer();
+          final readyDetected = Completer<void>();
+          DateTime lastReadyHit = DateTime.fromMillisecondsSinceEpoch(0);
 
-          // Stream stdout to the live output callback.
-          final stdoutDone = process.stdout
+          void scanForReady(String chunk) {
+            if (readyDetected.isCompleted) return;
+            if (_serverReadyPattern.hasMatch(chunk)) {
+              lastReadyHit = DateTime.now();
+              // Wait 500ms of post-ready quiescence before
+              // declaring "ready" — the agent gets the helpful
+              // "Local: http://..." line + any immediate
+              // follow-up logs in the same flush.
+              Timer(const Duration(milliseconds: 500), () {
+                if (readyDetected.isCompleted) return;
+                final sinceHit =
+                    DateTime.now().difference(lastReadyHit);
+                if (sinceHit >= const Duration(milliseconds: 500)) {
+                  readyDetected.complete();
+                }
+              });
+            }
+          }
+
+          final stdoutSub = process.stdout
               .transform(const SystemEncoding().decoder)
               .listen((chunk) {
                 stdoutBuf.write(chunk);
                 inv.onOutput?.call(chunk);
-              })
-              .asFuture();
-
-          // Stream stderr to the live output callback.
-          final stderrDone = process.stderr
+                scanForReady(chunk);
+              });
+          final stderrSub = process.stderr
               .transform(const SystemEncoding().decoder)
               .listen((chunk) {
                 stderrBuf.write(chunk);
                 inv.onOutput?.call(chunk);
-              })
-              .asFuture();
+                // Some dev tools (Vite, webpack) emit "ready"
+                // banners on stderr. Scan there too.
+                scanForReady(chunk);
+              });
 
-          // Wait for both streams to finish, then the exit code.
-          await Future.wait([stdoutDone, stderrDone]);
-          await process.exitCode;
+          final processDone = process.exitCode;
+          final softTimeout = Future<void>.delayed(_runCmdSoftTimeout);
+          final cancelled = inv.cancelToken?.whenCancelled ??
+              // No token attached: a future that never resolves
+              // so it doesn't win the race.
+              Completer<void>().future;
 
+          var didCancel = false;
+          var didTimeout = false;
+          var didReady = false;
+          int? exitCode;
+
+          await Future.any<void>([
+            processDone.then((c) {
+              exitCode = c;
+            }),
+            cancelled.then((_) {
+              didCancel = true;
+            }),
+            softTimeout.then((_) {
+              didTimeout = true;
+            }),
+            readyDetected.future.then((_) {
+              didReady = true;
+            }),
+          ]);
+
+          if (didCancel) {
+            try {
+              process.kill(ProcessSignal.sigterm);
+              // Give the process 200ms to exit cleanly, then
+              // sigkill if it didn't.
+              await Future<void>.delayed(const Duration(milliseconds: 200));
+              process.kill(ProcessSignal.sigkill);
+            } catch (_) {}
+            await stdoutSub.cancel();
+            await stderrSub.cancel();
+            final out = _cap(stdoutBuf.toString());
+            final err = _cap(stderrBuf.toString());
+            return 'RUN_CMD $cmd: cancelled by user.\n'
+                'STDOUT-so-far:\n$out\nSTDERR-so-far:\n$err';
+          }
+
+          if (didReady || didTimeout) {
+            // Detach: process keeps running. We DO NOT cancel
+            // the stream subscriptions — the listeners' only
+            // observable effect is appending to buffers we
+            // discard, and cancelling them risks orphaning
+            // unflushed bytes. The subscriptions die naturally
+            // when the process eventually exits.
+            final out = _cap(stdoutBuf.toString());
+            final err = _cap(stderrBuf.toString());
+            final reason = didReady
+                ? 'detected ready signal in output'
+                : 'soft-timed-out after ${_runCmdSoftTimeout.inSeconds}s';
+            return 'RUN_CMD $cmd: detached, still running '
+                '($reason). The process keeps running in the '
+                'background. STDOUT-so-far:\n$out\n'
+                'STDERR-so-far:\n$err';
+          }
+
+          // Normal completion.
+          await stdoutSub.cancel();
+          await stderrSub.cancel();
           final stdout = _cap(stdoutBuf.toString());
           final stderr = _cap(stderrBuf.toString());
-          return 'RUN_CMD $cmd:\nSTDOUT:\n$stdout\nSTDERR:\n$stderr';
+          final tail = exitCode == 0
+              ? ''
+              : ' (exit code: $exitCode)';
+          return 'RUN_CMD $cmd:$tail\nSTDOUT:\n$stdout\nSTDERR:\n$stderr';
         } catch (e) {
           return 'RUN_CMD $cmd: Error: $e';
         }
       },
     ),
     AgentTool(
-      id: 'snapshot_url',
-      name: 'SNAPSHOT_URL',
+      id: 'verify',
+      name: 'VERIFY',
       description:
-          'Capture a screenshot of a URL via the in-process WebView2 and feed '
-          'the PNG back as an image on the next turn.',
-      syntaxExample: '<<<SNAPSHOT_URL: https://example.com>>>',
-      pattern: RegExp(r'<<<SNAPSHOT_URL:\s*(.*?)\s*>>>'),
-      defaultEnabled: false,
-      execute: (inv) async {
-        final url = inv.match.group(1)!;
-        final result = await SnapshotService.instance.capture(url);
-        if (result.ok && result.base64Png != null) {
-          inv.attachImage(result.base64Png!);
-          final extra = result.savedPath != null
-              ? ' Saved a debug copy to ${result.savedPath}.'
-              : '';
-          return 'SNAPSHOT_URL $url: ${result.message}$extra '
-              'The PNG is attached to this message — read it directly.';
-        }
-        return 'SNAPSHOT_URL $url: Failed — ${result.message}';
-      },
+          'Run the workspace static analyzer / type-checker / linter '
+          'and return a digest. No arguments. Auto-detects the '
+          'toolchain (pubspec.yaml → dart analyze, tsconfig.json → '
+          'tsc, package.json → eslint, pyproject/requirements → ruff '
+          'or pyflakes). Call after source edits before declaring '
+          'done. If the result says "no analyzer detected" or '
+          '"dependencies are not installed" — STOP calling VERIFY '
+          'for this workspace; either run RUN_CMD with the project\'s '
+          'actual check command or skip verification.',
+      syntaxExample: '<<<VERIFY>>>',
+      pattern: RegExp(r'<<<VERIFY\s*>>>'),
+      execute: _executeVerify,
     ),
   ];
 
@@ -934,6 +1208,7 @@ class ToolRegistry {
   static const _treeIgnore = <String>{
     'node_modules',
     '.git',
+    '.gitnexus',
     '.dart_tool',
     'build',
     'dist',
@@ -1163,6 +1438,413 @@ class ToolRegistry {
     return '${s.substring(0, max)}\n… (truncated)';
   }
 
+  /// Tighter cap for VERIFY output — analyzer dumps can be long
+  /// (tens of thousands of lines on a fresh codebase), and the
+  /// model only needs the first chunk to start fixing. 3 KB is
+  /// roughly 60 lines of `dart analyze` output, which is
+  /// usually enough to pinpoint the highest-priority issues.
+  static String _capVerify(String s) {
+    const max = 3 * 1024;
+    if (s.length <= max) return s;
+    return '${s.substring(0, max)}\n… (verify output truncated; '
+        'fix the issues above first, then call VERIFY again to see '
+        'the rest)';
+  }
+
+  /// Body for the `verify` tool. Auto-detects the workspace toolchain
+  /// from marker files and dispatches to the appropriate analyzer.
+  /// Returns a stable digest the model can act on — error count first,
+  /// then a capped tail of stdout/stderr.
+  ///
+  /// Detection priority (first match wins):
+  ///   1. `pubspec.yaml`                     → `dart analyze`
+  ///   2. `tsconfig.json`                    → `tsc --noEmit`
+  ///   3. `package.json` (no tsconfig)       → `eslint .`
+  ///   4. `pyproject.toml` / `setup.py` /
+  ///      `requirements.txt`                 → `ruff check` → fallback
+  ///                                           `python -m pyflakes`
+  ///   5. anything else                      → "no analyzer detected"
+  ///
+  /// The 60-second outer timeout is intentionally generous — `dart
+  /// analyze` on a multi-thousand-file Flutter project routinely
+  /// takes 20-30s on first run because it's also fetching package
+  /// summaries. Running through `cmd.exe /c` on Windows mirrors
+  /// `runExternalCommand` so PATH-resolved tools (`dart`, `npx`,
+  /// `python`) work the same as the user's terminal.
+  static Future<String> _executeVerify(ToolInvocation inv) async {
+    final ws = inv.workspaceDir;
+    if (ws == null || ws.isEmpty) {
+      return 'VERIFY: Failed (no workspace open).';
+    }
+    final root = Directory(ws);
+    if (!root.existsSync()) {
+      return 'VERIFY: Failed (workspace directory does not exist: $ws).';
+    }
+
+    bool hasFile(String name) => File(p.join(ws, name)).existsSync();
+    bool hasDir(String name) => Directory(p.join(ws, name)).existsSync();
+
+    // Toolchain dispatch. **Order matters** — `pubspec.yaml` wins
+    // over JS markers because Flutter projects routinely include a
+    // `package.json` for tooling (e.g. linters, husky) without that
+    // implying tsc is the right verifier. Python comes last because
+    // its markers (`requirements.txt`) leak into a lot of mixed-
+    // language repos as a runner-config file rather than a real
+    // Python project.
+    if (hasFile('pubspec.yaml')) {
+      // `dart analyze` defaults to --fatal-warnings ON and infos
+      // NOT fatal, which is exactly what we want for a "is this
+      // safe to call done?" check. There is no `--no-fatal-infos`
+      // flag — passing it returns exit code 64 ("unrecognised
+      // option") and the user sees a confusing analyzer-failed
+      // message instead of analyzer output.
+      final result = await _runVerify(
+        runner: 'dart',
+        args: const ['analyze'],
+        ws: ws,
+        label: 'dart analyze',
+      );
+      return result ??
+          'VERIFY (dart analyze): Failed to launch — `dart` is not on '
+              'PATH. Install the Dart/Flutter SDK or run your check '
+              'command via RUN_CMD instead.';
+    }
+
+    if (hasFile('tsconfig.json')) {
+      return await _runJsVerify(
+        ws: ws,
+        binName: 'tsc',
+        binArgs: const ['--noEmit', '--pretty', 'false'],
+        action: 'tsc --noEmit',
+        hasNodeModules: hasDir('node_modules'),
+      );
+    }
+
+    if (hasFile('package.json')) {
+      return await _runJsVerify(
+        ws: ws,
+        binName: 'eslint',
+        binArgs: const ['.'],
+        action: 'eslint .',
+        hasNodeModules: hasDir('node_modules'),
+      );
+    }
+
+    if (hasFile('pyproject.toml') ||
+        hasFile('setup.py') ||
+        hasFile('requirements.txt')) {
+      // ruff is the fast modern default; pyflakes is the universal
+      // fallback because it ships with most stdlib-adjacent Python
+      // installs (or is one `pip install pyflakes` away). We try
+      // ruff first and only fall back if ruff fails to launch
+      // (binary missing) — a non-zero exit from ruff is real
+      // analyzer output, not a missing-tool error.
+      final ruffResult = await _runVerify(
+        runner: 'ruff',
+        args: const ['check', '.'],
+        ws: ws,
+        label: 'ruff check',
+      );
+      if (ruffResult != null) return ruffResult;
+      final pyflakesResult = await _runVerify(
+        runner: 'python',
+        args: const ['-m', 'pyflakes', '.'],
+        ws: ws,
+        label: 'python -m pyflakes',
+      );
+      return pyflakesResult ??
+          'VERIFY (python -m pyflakes): Failed to launch — neither '
+              '`ruff` nor `python -m pyflakes` is available. Install '
+              'one (`pip install ruff`) or run your check command '
+              'via RUN_CMD instead.';
+    }
+
+    return 'VERIFY: no analyzer detected for this workspace '
+        '(no pubspec.yaml, tsconfig.json, package.json, '
+        'pyproject.toml, setup.py, or requirements.txt at the '
+        'root). Use RUN_CMD with the project-specific check '
+        'command instead.';
+  }
+
+  /// JS/TS analyzer dispatch. Tries, in order:
+  ///   1. **Direct local binary** (`node_modules/.bin/<bin>(.cmd|.bat|.ps1)`).
+  ///      This is the fastest, most reliable path — bypasses the
+  ///      package manager entirely and just runs whatever the user
+  ///      already has installed. Works even when `npx` / `pnpm` /
+  ///      `yarn` aren't on PATH globally.
+  ///   2. **Package-manager exec** (`pnpm exec` / `yarn run` /
+  ///      `bun x` / `npx --no-install`), picked from the lockfile
+  ///      so we don't try `npx` on a pnpm repo (where dev binaries
+  ///      aren't in npx's lookup tree).
+  ///   3. **Actionable error** explaining what to do — usually
+  ///      "run `<pm> install` first," because the most common cause
+  ///      of getting here on a real project is that the user
+  ///      cloned it and hasn't installed deps yet.
+  ///
+  /// **Why this exists:** prior versions hard-jumped to the
+  /// package-manager exec, which on Windows would surface as
+  /// `'tsc' is not recognized as an internal or external command`
+  /// (cmd.exe stderr) every time the user worked on a TS project
+  /// without globally-installed `npx`. The same project would have
+  /// `node_modules\.bin\tsc.cmd` sitting right there waiting.
+  static Future<String> _runJsVerify({
+    required String ws,
+    required String binName,
+    required List<String> binArgs,
+    required String action,
+    required bool hasNodeModules,
+  }) async {
+    if (!hasNodeModules) {
+      // No `node_modules` = deps haven't been installed. Trying to
+      // run the analyzer is guaranteed to fail noisily; tell the
+      // user what to do instead. This is the "annoying & useless"
+      // failure mode the original implementation kept producing.
+      final pm = _detectJsPackageManager(ws);
+      return 'VERIFY ($action): no `node_modules/` in this workspace '
+          '— dependencies are not installed. Run `$pm install` first, '
+          'then call VERIFY again. (Or use RUN_CMD with your '
+          'project\'s actual check command.)';
+    }
+
+    final localBin = _localJsBin(ws: ws, binName: binName);
+    if (localBin != null) {
+      final result = await _runVerify(
+        runner: localBin,
+        args: binArgs,
+        ws: ws,
+        label: 'node_modules/.bin/$binName ${binArgs.join(' ')}'.trim(),
+      );
+      if (result != null) return result;
+      // Local bin existed but launch claimed missing — extremely
+      // unusual (corrupted shim?). Fall through to package-manager
+      // exec rather than declaring failure.
+    }
+
+    final pmRunner = _jsPackageManagerRunner(ws);
+    final pmResult = await _runVerify(
+      runner: pmRunner.runner,
+      args: [...pmRunner.prefix, binName, ...binArgs],
+      ws: ws,
+      label: '${pmRunner.label} $binName ${binArgs.join(' ')}'.trim(),
+    );
+    if (pmResult != null) return pmResult;
+
+    return 'VERIFY ($action): $binName is not installed in this '
+        'workspace. The lockfile is `${pmRunner.lockfile}` but '
+        '`node_modules/.bin/$binName` is missing. Run '
+        '`${pmRunner.label} install` to install it, or use RUN_CMD '
+        'with your actual check command.';
+  }
+
+  /// Resolve the path to a locally-installed JS binary in the
+  /// workspace's `node_modules/.bin/`. Tries each platform-appropriate
+  /// extension (Windows ships `.cmd` shims; some setups also have
+  /// `.bat` / `.ps1`; POSIX has the bare name). Returns null if none
+  /// of the candidates exist on disk — the caller falls back to a
+  /// package-manager exec invocation.
+  static String? _localJsBin({required String ws, required String binName}) {
+    final binDir = p.join(ws, 'node_modules', '.bin');
+    final candidates = Platform.isWindows
+        ? <String>[
+            p.join(binDir, '$binName.cmd'),
+            p.join(binDir, '$binName.bat'),
+            p.join(binDir, '$binName.ps1'),
+            p.join(binDir, binName),
+          ]
+        : <String>[p.join(binDir, binName)];
+    for (final c in candidates) {
+      if (File(c).existsSync()) return c;
+    }
+    return null;
+  }
+
+  /// Pick a friendly package-manager name from the workspace
+  /// lockfile. Used purely for user-facing strings ("run `pnpm
+  /// install`"); the actual exec dispatch goes through
+  /// [_jsPackageManagerRunner].
+  static String _detectJsPackageManager(String ws) {
+    if (File(p.join(ws, 'pnpm-lock.yaml')).existsSync()) return 'pnpm';
+    if (File(p.join(ws, 'yarn.lock')).existsSync()) return 'yarn';
+    if (File(p.join(ws, 'bun.lockb')).existsSync() ||
+        File(p.join(ws, 'bun.lock')).existsSync()) {
+      return 'bun';
+    }
+    return 'npm';
+  }
+
+  /// Resolve the package-manager exec runner to use as a fallback
+  /// when the local bin lookup misses. Lockfile-driven so a pnpm
+  /// project doesn't get an `npx` invocation that can't see its
+  /// `node_modules/.pnpm/` content-addressed store.
+  static _JsPmRunner _jsPackageManagerRunner(String ws) {
+    if (File(p.join(ws, 'pnpm-lock.yaml')).existsSync()) {
+      return _JsPmRunner(
+        runner: Platform.isWindows ? 'pnpm.cmd' : 'pnpm',
+        prefix: const ['exec', '--'],
+        label: 'pnpm exec',
+        lockfile: 'pnpm-lock.yaml',
+      );
+    }
+    if (File(p.join(ws, 'yarn.lock')).existsSync()) {
+      return _JsPmRunner(
+        runner: Platform.isWindows ? 'yarn.cmd' : 'yarn',
+        // `yarn run -- <bin>` works on classic Yarn AND Yarn Berry;
+        // `yarn exec` differs between the two.
+        prefix: const ['run', '--'],
+        label: 'yarn run',
+        lockfile: 'yarn.lock',
+      );
+    }
+    if (File(p.join(ws, 'bun.lockb')).existsSync() ||
+        File(p.join(ws, 'bun.lock')).existsSync()) {
+      return _JsPmRunner(
+        runner: Platform.isWindows ? 'bun.exe' : 'bun',
+        prefix: const ['x', '--'],
+        label: 'bun x',
+        lockfile: 'bun.lock',
+      );
+    }
+    return _JsPmRunner(
+      runner: Platform.isWindows ? 'npx.cmd' : 'npx',
+      prefix: const ['--no-install', '--'],
+      label: 'npx',
+      lockfile: 'package-lock.json',
+    );
+  }
+
+  /// Spawns the analyzer process. Returns `null` when the binary
+  /// is missing (caller falls back to a different runner); returns
+  /// a populated digest string on either success OR analyzer error
+  /// (a non-zero exit code is *expected* output, not a tool failure
+  /// — the whole point of VERIFY is to surface those).
+  ///
+  /// Output cap is applied per-stream so a noisy stdout cannot
+  /// crowd out a one-line stderr that contains the actual error.
+  static Future<String?> _runVerify({
+    required String runner,
+    required List<String> args,
+    required String ws,
+    required String label,
+  }) async {
+    try {
+      final ProcessResult res;
+      if (Platform.isWindows) {
+        // Wrap through cmd.exe /c so PATH-resolved shims (`npx.cmd`,
+        // `dart.bat`, `python.exe` from a venv) all work. Direct
+        // Process.run on `npx` (no extension) refuses to find the
+        // .cmd shim on some Windows shells.
+        final joined = [runner, ...args].map(_quoteForCmd).join(' ');
+        res = await Process.run(
+          'cmd.exe',
+          ['/c', joined],
+          workingDirectory: ws,
+        ).timeout(const Duration(seconds: 60));
+      } else {
+        res = await Process.run(
+          runner,
+          args,
+          workingDirectory: ws,
+        ).timeout(const Duration(seconds: 60));
+      }
+
+      final stdout = _capVerify(res.stdout?.toString() ?? '');
+      final stderr = _capVerify(res.stderr?.toString() ?? '');
+
+      // **cmd.exe missing-binary detection.** When the wrapped
+      // command isn't on PATH, cmd.exe itself runs successfully (no
+      // ProcessException) and exits with code 1 (or 9009 in some
+      // shells), printing one of these signatures to stderr/stdout:
+      //   - "'<bin>' is not recognized as an internal or external command"
+      //   - "command not found: <bin>"
+      //   - "The system cannot find the file specified."
+      // Without this check the user kept getting "analyzer reported
+      // issues (exit code 1)" with the missing-bin string buried
+      // in stderr — confusing because there are no real issues, the
+      // tool just isn't installed. Returning null lets the caller
+      // fall back (local bin → pkg-mgr exec → actionable message).
+      if (res.exitCode != 0 && _looksLikeMissingBinary(stdout, stderr)) {
+        return null;
+      }
+
+      final clean = stdout.isEmpty && stderr.isEmpty;
+      final exitTag = res.exitCode == 0
+          ? 'no analyzer errors'
+          : 'analyzer reported issues (exit code ${res.exitCode})';
+      if (clean && res.exitCode == 0) {
+        return 'VERIFY ($label): $exitTag.';
+      }
+      final body = StringBuffer('VERIFY ($label): $exitTag.\n');
+      if (stdout.isNotEmpty) body.writeln('STDOUT:\n$stdout');
+      if (stderr.isNotEmpty) body.writeln('STDERR:\n$stderr');
+      return body.toString().trimRight();
+    } on TimeoutException {
+      return 'VERIFY ($label): Timed out after 60s. The analyzer is '
+          'unusually slow on this workspace; consider running it '
+          'manually via RUN_CMD with a tighter scope.';
+    } catch (e) {
+      // Heuristic: distinguish "binary missing" (which we want the
+      // caller to handle so we can fall back, e.g. ruff → pyflakes)
+      // from genuine launch errors. Dart's `Process.run` raises
+      // `ProcessException` with a message like "The system cannot
+      // find the file specified" / "No such file or directory"
+      // when the binary itself isn't on PATH. We return null in
+      // that case so the caller can try another runner.
+      final msg = e.toString().toLowerCase();
+      final missing = msg.contains('no such file') ||
+          msg.contains('cannot find the file') ||
+          msg.contains('not recognized') ||
+          msg.contains('not found');
+      if (missing) return null;
+      return 'VERIFY ($label): Error launching analyzer: $e';
+    }
+  }
+
+  /// Pattern-match a process's stdout/stderr for "the binary doesn't
+  /// exist" rather than "the binary ran and reported issues." Hits
+  /// the well-known signatures from cmd.exe (Windows), bash, zsh,
+  /// fish, and the package managers' own missing-bin messages.
+  static bool _looksLikeMissingBinary(String stdout, String stderr) {
+    final combined = '$stdout\n$stderr'.toLowerCase();
+    return combined.contains('is not recognized as an internal or external') ||
+        combined.contains('is not recognized as the name of') ||
+        combined.contains('command not found') ||
+        combined.contains('no such file or directory') ||
+        combined.contains('cannot find the file specified') ||
+        // npx / pnpm both phrase this as "could not determine ..."
+        // when they can't resolve the requested binary.
+        combined.contains('could not determine executable to run') ||
+        // pnpm-specific: when the requested package isn't installed,
+        // pnpm 8+ emits this exact phrase to stderr.
+        combined.contains('command "') &&
+            combined.contains('" not found');
+  }
+
+  /// How long [RUN_CMD] waits before declaring a command "long-running"
+  /// and detaching the process so the executor loop can move on.
+  /// Tuned by trial: 25s comfortably covers `npm install` /
+  /// `flutter pub get` / one-shot builds, while still catching real
+  /// daemon-style commands (`npm start`, `vite`) within the soft
+  /// window — most dev servers print their "Local: …" banner well
+  /// under 10s, so the ready-pattern path will usually win first.
+  static const Duration _runCmdSoftTimeout = Duration(seconds: 25);
+
+  /// Lines that mean "the dev server / watcher / REPL is up and
+  /// idle". Matched on stdout AND stderr because Vite, webpack-dev-
+  /// server and a few others log their banner to stderr. **Case
+  /// insensitive**, deliberately broad — over-detection just
+  /// triggers an early detach (which is exactly what we want for
+  /// daemon-style commands), under-detection falls back to the
+  /// 25s soft timeout. The list grows as we observe new patterns
+  /// in the wild rather than enumerating every framework upfront.
+  static final RegExp _serverReadyPattern = RegExp(
+    r'(server\s+is?\s+running|listening\s+on|now\s+listening|'
+    r'started\s+server\s+on|local:\s*https?://|ready\s+in\s+\d+|'
+    r'compiled\s+successfully|webpack\s+compiled|app\s+listening|'
+    r'server\s+started|nest\s+application\s+successfully\s+started|'
+    r'serving\s+at\s+http|running\s+at\s+http)',
+    caseSensitive: false,
+  );
+
   static String _quoteForCmd(String s) {
     if (s.isEmpty) return '""';
     if (RegExp(r'[\s"&|<>^]').hasMatch(s)) {
@@ -1227,3 +1909,21 @@ class ToolRegistry {
 /// Convenience: encode a `Map<String, dynamic>` of a tool definition the
 /// same way the loader does. Handy for tests.
 String encodeToolDefinition(Map<String, dynamic> def) => jsonEncode(def);
+
+/// Resolved JS package-manager exec command for a workspace, used as
+/// VERIFY's fallback path when a local `node_modules/.bin` shim isn't
+/// present. The split between `runner` (binary to invoke) and `prefix`
+/// (args before the user's bin name) lets the caller compose a
+/// complete command without knowing which package manager ran.
+class _JsPmRunner {
+  final String runner;
+  final List<String> prefix;
+  final String label;
+  final String lockfile;
+  const _JsPmRunner({
+    required this.runner,
+    required this.prefix,
+    required this.label,
+    required this.lockfile,
+  });
+}

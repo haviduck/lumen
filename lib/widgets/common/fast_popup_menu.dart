@@ -106,71 +106,93 @@ class _InstantPopupBody<T> extends StatelessWidget {
       removeRight: true,
       child: CustomSingleChildLayout(
         delegate: _MenuLayout(route.position),
-        // PopupMenuItem internally uses InkWell, which asserts a
-        // Material ancestor. Popup routes render at the Navigator's
-        // overlay layer — that path doesn't carry the Scaffold's
-        // Material down. Wrap the body in a transparent Material so
-        // the assertion is satisfied without visually competing with
-        // our own dark popup styling. (Caught by the chat history
-        // dropdown crash; latent for every other showFastMenu caller.)
-        child: Material(
-          type: MaterialType.transparency,
-          // Theme override compresses the default `PopupMenuItem`
-          // height (48 → 30) and tightens its horizontal padding so
-          // the right-click menu doesn't have huge vertical gaps
-          // between items. Applies to all `PopupMenuItem`s rendered
-          // inside this popup body — every callsite of `showFastMenu`
-          // benefits without each having to pass per-item overrides.
-          child: Theme(
-            data: Theme.of(context).copyWith(
-              popupMenuTheme: PopupMenuThemeData(
-                color: DuckColors.bgRaised,
-                surfaceTintColor: Colors.transparent,
-                textStyle: const TextStyle(
-                  fontSize: 12,
-                  color: DuckColors.fgPrimary,
-                ),
-                labelTextStyle: WidgetStateProperty.all(
-                  const TextStyle(
-                    fontSize: 12,
-                    color: DuckColors.fgPrimary,
-                  ),
-                ),
-              ),
+        // The widget tree below is structurally load-bearing:
+        //
+        //   Container(solid bgRaised + border + shadow)
+        //     └ ClipRRect (so ink ripples respect the rounded corners)
+        //       └ Material(type: transparency)   ← hosts InkWell ink
+        //         └ Theme(hover/focus/splash overrides)
+        //           └ items
+        //
+        // Why this order matters: PopupMenuItem renders an `InkWell`
+        // internally, which paints hover / focus / splash on the
+        // nearest `Material` ancestor. If the Container with the
+        // solid `bgRaised` color sits BELOW the Material in z-order
+        // (i.e. is a parent of the Material) the ink draws on top of
+        // the bg and is visible. The previous arrangement had Material
+        // wrapping Container — Material's ink layer was drawn FIRST
+        // and the Container's opaque bg was painted over it, silently
+        // hiding every hover effect. Don't re-invert this nesting.
+        child: Container(
+          decoration: BoxDecoration(
+            color: DuckColors.bgRaised,
+            borderRadius: BorderRadius.circular(6),
+            // Match the rest of our chrome: 0.5px hairline at
+            // `border` (#272C36) instead of the previous 1px
+            // `#2d3139` which read bright on the deep-dark
+            // surface (the user-flagged "white border").
+            border: Border.all(
+              color: DuckColors.border,
+              width: 0.5,
             ),
-            child: Container(
-              decoration: BoxDecoration(
-                color: DuckColors.bgRaised,
-                borderRadius: BorderRadius.circular(6),
-                // Match the rest of our chrome: 0.5px hairline at
-                // `border` (#272C36) instead of the previous 1px
-                // `#2d3139` which read bright on the deep-dark
-                // surface (the user-flagged "white border").
-                border: Border.all(
-                  color: DuckColors.border,
-                  width: 0.5,
-                ),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Color(0x60000000),
-                    blurRadius: 12,
-                    offset: Offset(0, 4),
-                  ),
-                ],
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x60000000),
+                blurRadius: 12,
+                offset: Offset(0, 4),
               ),
-              clipBehavior: Clip.antiAlias,
-              child: ConstrainedBox(
-                // Dropdown is wider than the previous 56-step
-                // `IntrinsicWidth`. 200px reads more like a real
-                // menu and gives labels room to breathe; the
-                // intrinsic width still grows past this for
-                // longer items.
-                constraints: const BoxConstraints(minWidth: 200),
-                child: IntrinsicWidth(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: ListBody(
-                      children: route.items.toList(),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: Material(
+              type: MaterialType.transparency,
+              child: Theme(
+                // `PopupMenuItem` renders an `InkWell` internally for
+                // hover / focus / splash, which all fall back to the
+                // inherited theme. Flutter's dark default for
+                // `hoverColor` is `Colors.white.withOpacity(0.04)` —
+                // invisible against our `bgRaised` (#1E2127) surface.
+                // Override those tokens so right-click context menus
+                // and the GitNexus dropdown actually show a hover
+                // state. Applied via `Theme.copyWith` so every
+                // callsite of `showFastMenu` benefits without
+                // per-item plumbing.
+                data: Theme.of(context).copyWith(
+                  hoverColor: DuckColors.bgRaisedHi,
+                  focusColor: DuckColors.bgRaisedHi,
+                  highlightColor:
+                      DuckColors.bgRaisedHi.withValues(alpha: 0.6),
+                  splashColor:
+                      DuckColors.bgRaisedHi.withValues(alpha: 0.4),
+                  popupMenuTheme: PopupMenuThemeData(
+                    color: DuckColors.bgRaised,
+                    surfaceTintColor: Colors.transparent,
+                    textStyle: const TextStyle(
+                      fontSize: 12,
+                      color: DuckColors.fgPrimary,
+                    ),
+                    labelTextStyle: WidgetStateProperty.all(
+                      const TextStyle(
+                        fontSize: 12,
+                        color: DuckColors.fgPrimary,
+                      ),
+                    ),
+                  ),
+                ),
+                child: ConstrainedBox(
+                  // Dropdown is wider than the previous 56-step
+                  // `IntrinsicWidth`. 200px reads more like a real
+                  // menu and gives labels room to breathe; the
+                  // intrinsic width still grows past this for
+                  // longer items.
+                  constraints: const BoxConstraints(minWidth: 200),
+                  child: IntrinsicWidth(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: ListBody(
+                        children: route.items.toList(),
+                      ),
                     ),
                   ),
                 ),

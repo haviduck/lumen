@@ -107,23 +107,58 @@ class AnthropicService {
 
     // **Extended thinking** — Claude Opus 4+ / Sonnet 4+ accept a
     // `thinking` block that allocates internal reasoning tokens before
-    // the model emits user-visible text. When enabled, Anthropic
-    // requires `temperature == 1` (any other value 400s with
-    // `temperature may only be set to 1 when thinking is enabled`),
-    // so we override the caller's temperature here. Haiku and older
-    // 3.x models silently reject the param — the helper's
-    // [modelSupportsNative] returns false for them, and the controller
-    // is supposed to gate this call. If we ever get called with a
-    // non-supporting model we still skip cleanly because budget==null.
+    // the model emits user-visible text. Anthropic requires
+    // `temperature == 1` whenever a thinking block is present (any
+    // other value 400s with `temperature may only be set to 1 when
+    // thinking is enabled`), so we override the caller's temperature
+    // for both the adaptive and legacy shapes below.
+    //
+    // Two API shapes coexist:
+    //
+    //   1. **Adaptive** (Opus 4.7+, ~Apr 2026): `thinking: {type:
+    //      "adaptive"}` + `output_config: {effort: "low"|"medium"|
+    //      "high"|"xhigh"|"max"}`. The model picks the budget itself;
+    //      `budget_tokens` is REJECTED with a 400 on these models.
+    //   2. **Legacy** (Opus 4.0–4.6, Sonnet 4.0–4.6): `thinking: {type:
+    //      "enabled", budget_tokens: <int>}`. Unknown to Opus 4.7.
+    //
+    // [ReasoningEffortHelper.usesAdaptiveThinking] dispatches between
+    // the two; defaults to legacy on unknown models so older Claudes
+    // still work. [modelSupportsNative] gates Haiku / 3.x out from
+    // both paths.
     if (effort != null && effort != ReasoningEffort.off) {
       final supports = ReasoningEffortHelper.modelSupportsNative(
         provider: 'claude',
         rawModel: model,
       );
-      final budget = ReasoningEffortHelper.anthropicBudget(effort);
-      if (supports && budget != null && budget < maxTokens) {
-        body['thinking'] = {'type': 'enabled', 'budget_tokens': budget};
-        body['temperature'] = 1.0;
+      if (supports) {
+        if (ReasoningEffortHelper.usesAdaptiveThinking(rawModel: model)) {
+          final effortStr =
+              ReasoningEffortHelper.anthropicAdaptiveEffort(effort);
+          if (effortStr != null) {
+            body['thinking'] = {'type': 'adaptive'};
+            body['output_config'] = {'effort': effortStr};
+            body['temperature'] = 1.0;
+          }
+        } else {
+          final budget = ReasoningEffortHelper.anthropicBudget(effort);
+          if (budget != null) {
+            // Anthropic requires `max_tokens > thinking.budget_tokens`.
+            // The previous `budget < maxTokens` check silently DROPPED
+            // the thinking block when Deep (16384) tied with maxTokens
+            // (16384) — model behaved like vanilla Opus, no warning.
+            // Bump max_tokens above the budget instead so the user
+            // gets what they asked for.
+            if (budget >= (body['max_tokens'] as int)) {
+              body['max_tokens'] = budget + 8192;
+            }
+            body['thinking'] = {
+              'type': 'enabled',
+              'budget_tokens': budget,
+            };
+            body['temperature'] = 1.0;
+          }
+        }
       }
     }
     return body;
@@ -242,6 +277,21 @@ class AnthropicService {
             if (deltaType == 'text_delta' || deltaType.isEmpty) {
               final text = delta['text'] as String? ?? '';
               if (text.isNotEmpty) yield text;
+            }
+          } else if (type == 'message_delta') {
+            // Final-message envelope. `delta.stop_reason` is one of
+            // `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`.
+            // When `max_tokens` we hit Anthropic's hard cap mid-
+            // response — the model has more to say. Surface a hidden
+            // marker so the controller can auto-continue. The
+            // marker is on its own line with comments around it so
+            // markdown ignores it; the chat parser doesn't match
+            // LUMEN_TRUNCATED (different matcher than LUMEN_TOOL /
+            // LUMEN_ERR), only the controller's post-stream scan does.
+            final delta = obj['delta'] as Map<String, dynamic>? ?? {};
+            final stopReason = delta['stop_reason'] as String?;
+            if (stopReason == 'max_tokens') {
+              yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
             }
           } else if (type == 'error') {
             final error = obj['error'] as Map<String, dynamic>? ?? {};

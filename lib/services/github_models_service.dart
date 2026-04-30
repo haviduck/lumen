@@ -219,10 +219,17 @@ class GitHubModelsService {
           final obj = jsonDecode(data) as Map<String, dynamic>;
           final choices = obj['choices'] as List<dynamic>? ?? const [];
           if (choices.isEmpty) continue;
-          final delta =
-              choices.first['delta'] as Map<String, dynamic>? ?? const {};
+          final choice = choices.first as Map<String, dynamic>;
+          final delta = choice['delta'] as Map<String, dynamic>? ?? const {};
           final text = delta['content'] as String? ?? '';
           if (text.isNotEmpty) yield text;
+          // OpenAI-compatible truncation signal: `finish_reason: 'length'`
+          // on the final chunk means we hit `max_tokens`. Surface a
+          // hidden marker so the controller can auto-continue.
+          final finishReason = choice['finish_reason'] as String?;
+          if (finishReason == 'length') {
+            yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
+          }
         } catch (e) {
           debugPrint('GitHub Models stream parse error: $e');
         }

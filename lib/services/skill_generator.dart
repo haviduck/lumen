@@ -323,7 +323,7 @@ RULES (apply to both kinds)
 - DO NOT duplicate built-in agent tool ids:
   create_file, edit_file, multi_edit, append_file, move_file, read_file,
   read_file_range, list_dir, tree, search_text, find_file, glob,
-  delete_file, git_status, git_diff, run_cmd, snapshot_url.
+  delete_file, git_status, git_diff, run_cmd, verify.
 
 TOOL-ONLY RULES
 - "pattern" must be a valid regex with capture groups for any args.

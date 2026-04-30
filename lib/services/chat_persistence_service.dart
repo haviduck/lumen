@@ -104,12 +104,20 @@ class PersistedMessage {
   final List<ChatReference> references; // attached file/folder references
   final DateTime timestamp;
 
+  /// Optional short label rendered in the chat bubble *instead of*
+  /// [content]. The model still receives the full [content] — only
+  /// the UI presentation changes. Currently set by slash commands
+  /// (e.g. `/handoff`) so the user sees a tidy `/handoff` chip
+  /// instead of the multi-paragraph prompt the agent actually reads.
+  final String? displayContent;
+
   PersistedMessage({
     String? id,
     required this.role,
     required this.content,
     this.imagesBase64 = const [],
     this.references = const [],
+    this.displayContent,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now(),
        id = id ?? _generateId();
@@ -120,6 +128,7 @@ class PersistedMessage {
     'content': content,
     'images': imagesBase64,
     'references': references.map((r) => r.toJson()).toList(),
+    if (displayContent != null) 'display': displayContent,
     'ts': timestamp.toIso8601String(),
   };
 
@@ -137,6 +146,7 @@ class PersistedMessage {
           .map((e) => ChatReference.fromJson(Map<String, dynamic>.from(e)))
           .where((r) => r.path.isNotEmpty)
           .toList(),
+      displayContent: j['display'] as String?,
       timestamp: ts,
     );
   }

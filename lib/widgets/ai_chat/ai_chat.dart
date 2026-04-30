@@ -17,17 +17,21 @@ import '../../providers/chat_controller.dart';
 import '../../providers/media_controller.dart';
 import '../../services/chat_persistence_service.dart';
 import '../../services/reasoning_effort.dart';
-import '../../services/timeline_models.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
+import '../common/image_lightbox.dart';
 import '../common/media_pane_chrome.dart';
-import '../overlays/snapshot_host.dart';
 import 'approval_card.dart';
 import 'chat_tab_strip.dart';
+import 'empty_response_strip.dart';
 import 'message_bubble.dart';
 import 'queued_prompts_strip.dart';
+import 'slash_commands/handoff_command.dart';
+import 'slash_commands/push_command.dart';
+import 'slash_commands/slash_command.dart';
+import 'slash_commands/slash_command_picker.dart';
 import 'stall_warning.dart';
 
 class AiChat extends StatefulWidget {
@@ -41,10 +45,32 @@ class _ComposerPasteIntent extends Intent {
   const _ComposerPasteIntent();
 }
 
+/// Snapshot of "what would the chat-rewind chip on this user bubble
+/// actually undo if clicked". Cheap to recompute on every rebuild —
+/// the timeline lookup is a linear pass over an in-memory list.
+class _ChatRewindData {
+  /// Sum of agent-tool timeline entries across every assistant
+  /// message at or after the pivot user message. Drives the count
+  /// shown in the chip.
+  final int fileChangeCount;
+
+  /// Number of messages strictly *after* the pivot user message —
+  /// these will be removed alongside the pivot itself when the user
+  /// confirms. Surfaced in the tooltip / dialog so the user knows
+  /// exactly how much chat history disappears.
+  final int followupMessageCount;
+
+  const _ChatRewindData({
+    required this.fileChangeCount,
+    required this.followupMessageCount,
+  });
+}
+
 class _AiChatState extends State<AiChat> {
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   final FocusNode _focus = FocusNode();
+  final SlashCommandPickerController _slash = SlashCommandPickerController();
   ChatController? _listenedChat;
   bool _referenceDragOver = false;
 
@@ -63,6 +89,74 @@ class _AiChatState extends State<AiChat> {
   void initState() {
     super.initState();
     _scroll.addListener(_onScroll);
+    _input.addListener(_onComposerTextChanged);
+    _slash.addTapListener(_onSlashCommandPicked);
+    _registerSlashCommands();
+  }
+
+  /// Slash-command registry is process-wide; registering here is
+  /// idempotent (later calls overwrite by name) so safe to do on every
+  /// `_AiChatState` mount.
+  void _registerSlashCommands() {
+    SlashCommandRegistry.register(HandoffCommand());
+    SlashCommandRegistry.register(PushCommand());
+  }
+
+  /// Re-evaluate slash-picker state on every keystroke. Cheap — the
+  /// picker controller short-circuits when the input does not start
+  /// with `/`.
+  void _onComposerTextChanged() {
+    if (!mounted) return;
+    _slash.updateFromInput(_input.text, overlayContext: context);
+  }
+
+  /// Tap-handler bridge: when the user clicks a command in the picker
+  /// overlay, route it through the same execution path as a keyboard
+  /// pick.
+  void _onSlashCommandPicked(SlashCommand cmd) {
+    unawaited(_runSlashCommand(cmd));
+  }
+
+  /// Execute [cmd], optionally clear the composer, and (if the
+  /// command produced expanded text) push it through the normal
+  /// `ChatController.sendMessage` pipeline so it walks the same
+  /// queue/persist/generation path as a hand-typed message.
+  ///
+  /// The expanded prompt is sent as the message *content* (so the
+  /// model reads it) but the user bubble shows a compact `/cmd`
+  /// label via [PersistedMessage.displayContent] — the user is not
+  /// forced to scroll past a wall of agent instructions in their own
+  /// chat history.
+  Future<void> _runSlashCommand(SlashCommand cmd) async {
+    if (!mounted) return;
+    final appState = context.read<AppState>();
+    final chat = appState.chat;
+    final raw = _input.text;
+    final parsed = SlashCommandInput.tryParse(raw);
+    final args = parsed?.args ?? '';
+    final ctx = SlashCommandContext(
+      buildContext: context,
+      chat: chat,
+      appState: appState,
+      args: args,
+    );
+    final result = await cmd.run(ctx);
+    if (!mounted) return;
+    if (result.clearComposer) {
+      _input.clear();
+    }
+    final text = result.textToSend;
+    if (text != null && text.isNotEmpty) {
+      final display = args.isEmpty ? '/${cmd.name}' : '/${cmd.name} $args';
+      chat.sendMessage(
+        text,
+        workspacePath: appState.currentDirectory,
+        activeFilePath: appState.activeFile?.path,
+        openFilePaths: appState.openFiles.map((f) => f.path).toList(),
+        displayText: display,
+      );
+      _forceScrollToEnd();
+    }
   }
 
   @override
@@ -70,20 +164,51 @@ class _AiChatState extends State<AiChat> {
     super.didChangeDependencies();
     final chat = context.read<AppState>().chat;
     if (identical(_listenedChat, chat)) return;
-    _listenedChat?.removeListener(_consumeComposerInsertions);
+    _listenedChat?.removeListener(_onChatNotify);
     _listenedChat = chat;
-    chat.addListener(_consumeComposerInsertions);
+    chat.addListener(_onChatNotify);
+    // Initial sync: drain composer insertions and pin the list to
+    // the bottom on first mount / tab-switch. Streaming flag is
+    // false here intentionally — fresh mounts use the smooth
+    // animateTo branch instead of the streaming jumpTo branch.
     _consumeComposerInsertions();
+    _autoScrollIfPinned(streaming: false);
   }
 
   @override
   void dispose() {
-    _listenedChat?.removeListener(_consumeComposerInsertions);
+    _listenedChat?.removeListener(_onChatNotify);
     _scroll.removeListener(_onScroll);
+    _input.removeListener(_onComposerTextChanged);
+    _slash.removeTapListener(_onSlashCommandPicked);
+    _slash.dispose();
     _input.dispose();
     _scroll.dispose();
     _focus.dispose();
     super.dispose();
+  }
+
+  /// Single fan-out callback wired to [ChatController.addListener].
+  /// Replaces the older pattern of doing autoscroll work from inside
+  /// `build()`.
+  ///
+  /// Why not in build? `_buildMessageList` used to call
+  /// `_autoScrollIfPinned` as a side effect every time the panel
+  /// rebuilt — and the panel rebuilds at ~30Hz during streaming
+  /// because of the throttled `notifyListeners`. Each call schedules
+  /// a `WidgetsBinding.instance.addPostFrameCallback` that fires a
+  /// `ScrollController.jumpTo(maxScrollExtent)`. That stacked up
+  /// scroll-position writes on top of layout work that was already
+  /// expensive (markdown reparse + segment regexes), starving the
+  /// raster thread on fast-streaming models. Hooking into the
+  /// controller's notify directly fires the autoscroll exactly when
+  /// new content actually lands — no per-build overhead.
+  void _onChatNotify() {
+    if (!mounted) return;
+    _consumeComposerInsertions();
+    final chat = _listenedChat;
+    if (chat == null) return;
+    _autoScrollIfPinned(streaming: chat.isGenerating);
   }
 
   void _onScroll() {
@@ -321,89 +446,83 @@ class _AiChatState extends State<AiChat> {
                 border: const Border(
                   left: BorderSide(color: DuckColors.glassSeam, width: 0.5),
                 ),
-                child: Stack(
+                child: Column(
                   children: [
-                    Column(
-                      children: [
-                        // Media player only renders here when the user
-                        // has selected `MediaPlacement.chat`. When the
-                        // placement is `editor`, the editor area
-                        // hosts the same `Webview()` instead.
-                        Consumer<MediaController>(
-                          builder: (context, media, _) {
-                            if (!media.hasMedia ||
-                                media.placement != MediaPlacement.chat) {
-                              return const SizedBox.shrink();
-                            }
-                            return _buildChatMediaPanel(media);
-                          },
+                    // Media player only renders here when the user
+                    // has selected `MediaPlacement.chat`. When the
+                    // placement is `editor`, the editor area
+                    // hosts the same `Webview()` instead.
+                    Consumer<MediaController>(
+                      builder: (context, media, _) {
+                        if (!media.hasMedia ||
+                            media.placement != MediaPlacement.chat) {
+                          return const SizedBox.shrink();
+                        }
+                        return _buildChatMediaPanel(media);
+                      },
+                    ),
+                    ChatTabStrip(chat: chat),
+                    // When every chat tab is closed there's no
+                    // session to type into — rendering the
+                    // composer below an empty message list reads
+                    // as broken. Replace the entire body with a
+                    // centered "No chat open" placeholder + a
+                    // primary "New chat" button + the model
+                    // picker. The user lands somewhere actionable
+                    // instead of staring at a stranded text box.
+                    if (chat.openTabs.isEmpty)
+                      Expanded(
+                        child: _EmptyChatPlaceholder(
+                          chat: chat,
+                          onNewChat: () => chat.newSession(
+                            workspacePath: appState.currentDirectory,
+                          ),
                         ),
-                        ChatTabStrip(chat: chat),
-                        // When every chat tab is closed there's no
-                        // session to type into — rendering the
-                        // composer below an empty message list reads
-                        // as broken. Replace the entire body with a
-                        // centered "No chat open" placeholder + a
-                        // primary "New chat" button + the model
-                        // picker. The user lands somewhere actionable
-                        // instead of staring at a stranded text box.
-                        if (chat.openTabs.isEmpty)
-                          Expanded(
-                            child: _EmptyChatPlaceholder(
-                              chat: chat,
-                              onNewChat: () => chat.newSession(
-                                workspacePath: appState.currentDirectory,
-                              ),
-                            ),
-                          )
-                        else ...[
-                          Expanded(child: _buildMessageList(chat)),
-                          if (chat.isGenerating)
-                            const Padding(
-                              padding: EdgeInsets.symmetric(horizontal: 16.0),
-                              child: LinearProgressIndicator(minHeight: 2),
-                            ),
-                          // Stall warning — surfaces once the model
-                          // has been silent for ~30s. Internal 1Hz
-                          // ticker; widget short-circuits to
-                          // SizedBox.shrink when below threshold.
-                          StallWarningStrip(controller: chat),
-                          // Pending approval strip — docked above the
-                          // input, like Cursor's "Run command? [yes/no]"
-                          // strip. Only renders when the controller has
-                          // a pending request. Stays compact (single
-                          // row by default; expandable to show full
-                          // multi-line commands).
-                          if (chat.pendingApproval != null)
-                            ApprovalStrip(
-                              controller: chat,
-                              approval: chat.pendingApproval!,
-                            ),
-                          // Audit banner — when the most recent silent
-                          // approval is fresh (≤30s), surface a tiny
-                          // "X auto-approved by Y" strip so the user
-                          // sees what just bypassed the gate.
-                          _buildSilentApprovalBanner(chat),
-                          // Queued-prompts strip — only renders when
-                          // the user has typed follow-ups while the
-                          // current generation was still in flight.
-                          QueuedPromptsStrip(controller: chat),
-                          if (chat.pendingImages.isNotEmpty ||
-                              chat.pendingReferences.isNotEmpty)
-                            _buildAttachmentStrip(chat),
-                          _buildInput(appState, chat),
-                        ],
-                      ],
-                    ),
-                    // Invisible registrant — owns the off-stage Webview the
-                    // SNAPSHOT_URL tool reaches into via SnapshotService.
-                    const Positioned(
-                      left: 0,
-                      top: 0,
-                      width: 0,
-                      height: 0,
-                      child: SnapshotHost(),
-                    ),
+                      )
+                    else ...[
+                      Expanded(child: _buildMessageList(chat)),
+                      if (chat.isGenerating)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 16.0),
+                          child: LinearProgressIndicator(minHeight: 2),
+                        ),
+                      // Stall warning — surfaces once the model
+                      // has been silent for ~30s. Internal 1Hz
+                      // ticker; widget short-circuits to
+                      // SizedBox.shrink when below threshold.
+                      StallWarningStrip(controller: chat),
+                      // Empty-response strip — surfaces after a
+                      // turn ends with no visible content / tools
+                      // / errors. Distinct from the stall strip
+                      // (stall = mid-stream silence; empty =
+                      // post-completion). Two buttons: Continue
+                      // (re-prompts the model) and Dismiss.
+                      EmptyResponseStrip(controller: chat),
+                      // Pending approval strip — docked above the
+                      // input, like Cursor's "Run command? [yes/no]"
+                      // strip. Only renders when the controller has
+                      // a pending request. Stays compact (single
+                      // row by default; expandable to show full
+                      // multi-line commands).
+                      if (chat.pendingApproval != null)
+                        ApprovalStrip(
+                          controller: chat,
+                          approval: chat.pendingApproval!,
+                        ),
+                      // Audit banner — when the most recent silent
+                      // approval is fresh (≤30s), surface a tiny
+                      // "X auto-approved by Y" strip so the user
+                      // sees what just bypassed the gate.
+                      _buildSilentApprovalBanner(chat),
+                      // Queued-prompts strip — only renders when
+                      // the user has typed follow-ups while the
+                      // current generation was still in flight.
+                      QueuedPromptsStrip(controller: chat),
+                      if (chat.pendingImages.isNotEmpty ||
+                          chat.pendingReferences.isNotEmpty)
+                        _buildAttachmentStrip(chat),
+                      _buildInput(appState, chat),
+                    ],
                   ],
                 ),
               );
@@ -450,12 +569,10 @@ class _AiChatState extends State<AiChat> {
   Widget _buildMessageList(ChatController chat) {
     final appState = context.read<AppState>();
     final msgs = chat.messages;
-    // Auto-stick to the bottom while content is appearing. Mode
-    // depends on whether we're mid-stream (use jumpTo for smooth
-    // chunk-by-chunk follow) or just landed a fresh message.
-    // `_userScrolledAway` short-circuits both cases — see
-    // `_autoScrollIfPinned` doc.
-    _autoScrollIfPinned(streaming: chat.isGenerating);
+    // Autoscroll is driven by [_onChatNotify] (controller listener)
+    // rather than from inside build — keeping side effects out of
+    // build was a measurable win on fast streams. See the listener's
+    // docstring for the full rationale.
     // SelectionArea wraps the entire list so the user can drag-select
     // across multiple message bubbles and Ctrl+C the whole range.
     // Each `MessageBubble` deliberately uses non-selectable Text /
@@ -482,20 +599,63 @@ class _AiChatState extends State<AiChat> {
               chat.isGenerating && isLast && m.role == 'assistant';
           final legacyMessageId =
               '${chat.currentSession?.id}@${m.timestamp.microsecondsSinceEpoch}';
-          final restoreEntries = m.role == 'assistant'
-              ? appState.timeline.entriesForMessage(
-                  m.id,
-                  legacyMessageId: legacyMessageId,
-                )
-              : const <TimelineEntry>[];
+
+          // Two restore surfaces:
+          //  - assistant bubble → "undo just this turn's file changes"
+          //    (no chat truncation). Counts entries for THIS message.
+          //  - user bubble → Cursor / Antigravity-style "rewind chat
+          //    to before I sent this". Counts the union of entries
+          //    for every assistant message AT or AFTER this user
+          //    message PLUS the number of follow-up messages that
+          //    will be removed.
+          final BubbleRestoreScope scope;
+          final int restoreCount;
+          final int followupCount;
+          final VoidCallback? onRestore;
+          if (m.role == 'user') {
+            scope = BubbleRestoreScope.chatRewind;
+            final gathered = _gatherChatRewindData(
+              appState,
+              chat,
+              msgs,
+              index,
+            );
+            restoreCount = gathered.fileChangeCount;
+            followupCount = gathered.followupMessageCount;
+            // Show the chip when there's *anything* to revert — file
+            // changes or just messages. Don't show on the trailing
+            // user bubble that has nothing after it (nothing to
+            // rewind to).
+            final canRewind = !isStreaming &&
+                (restoreCount > 0 || followupCount > 0);
+            onRestore = canRewind
+                ? () => _confirmAndRewindChat(
+                      appState,
+                      index,
+                      gathered,
+                    )
+                : null;
+          } else {
+            scope = BubbleRestoreScope.assistantTurn;
+            final entries = appState.timeline.entriesForMessage(
+              m.id,
+              legacyMessageId: legacyMessageId,
+            );
+            restoreCount = entries.length;
+            followupCount = 0;
+            onRestore = entries.isNotEmpty && !isStreaming
+                ? () => _restoreMessageChanges(appState, m, legacyMessageId)
+                : null;
+          }
+
           return MessageBubble(
             message: m,
             isUser: m.role == 'user',
             isStreaming: isStreaming,
-            restoreChangeCount: restoreEntries.length,
-            onRestore: restoreEntries.isNotEmpty && !isStreaming
-                ? () => _restoreMessageChanges(appState, m, legacyMessageId)
-                : null,
+            restoreChangeCount: restoreCount,
+            restoreScope: scope,
+            restoreFollowupMessages: followupCount,
+            onRestore: onRestore,
             onEdit: m.role == 'user'
                 ? () => _editMessageDialog(chat, index)
                 : null,
@@ -504,6 +664,86 @@ class _AiChatState extends State<AiChat> {
         },
       ),
     );
+  }
+
+  /// Compute the data the user-bubble revert chip needs: how many
+  /// agent file changes will be reverted, and how many messages will
+  /// be removed from the chat. We walk every message at index
+  /// `>= userIndex`; assistants contribute file-change entries, the
+  /// pivot user message itself contributes only to the truncation
+  /// count.
+  _ChatRewindData _gatherChatRewindData(
+    AppState appState,
+    ChatController chat,
+    List<PersistedMessage> msgs,
+    int userIndex,
+  ) {
+    var fileChangeCount = 0;
+    final followups = msgs.length - userIndex - 1;
+    for (var i = userIndex; i < msgs.length; i++) {
+      final m = msgs[i];
+      if (m.role != 'assistant') continue;
+      final legacy =
+          '${chat.currentSession?.id}@${m.timestamp.microsecondsSinceEpoch}';
+      fileChangeCount += appState.timeline
+          .entriesForMessage(m.id, legacyMessageId: legacy)
+          .length;
+    }
+    return _ChatRewindData(
+      fileChangeCount: fileChangeCount,
+      followupMessageCount: followups,
+    );
+  }
+
+  /// Confirm + execute a Cursor / Antigravity-style chat rewind.
+  /// Truncates the session at [userIndex] (so the pivot user message
+  /// AND every message after it are gone), restores all agent file
+  /// changes from the dropped messages, pre-fills the composer with
+  /// the user's prompt text, and re-focuses it so the user can edit
+  /// and re-send in one stroke.
+  Future<void> _confirmAndRewindChat(
+    AppState appState,
+    int userIndex,
+    _ChatRewindData data,
+  ) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DuckColors.bgRaised,
+        title: const Text(S.chatRewindConfirmTitle),
+        content: Text(
+          S.chatRewindConfirmBody(
+            data.fileChangeCount,
+            data.followupMessageCount + 1,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text(S.cancel),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: DuckColors.accentDuck,
+              foregroundColor: DuckColors.bgDeepest,
+            ),
+            child: const Text(S.chatRewindAction),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final outcome = await appState.revertChatToBeforeMessage(userIndex);
+    if (!mounted) return;
+    if (outcome.composerPrefill != null) {
+      _input.text = outcome.composerPrefill!;
+      _input.selection = TextSelection.fromPosition(
+        TextPosition(offset: _input.text.length),
+      );
+      _focus.requestFocus();
+    }
+    showDuckToast(context, outcome.message);
   }
 
   Future<void> _restoreMessageChanges(
@@ -702,6 +942,27 @@ class _AiChatState extends State<AiChat> {
   Widget _buildInput(AppState appState, ChatController chat) {
     void send() {
       final text = _input.text;
+      // Slash-command path: intercept BEFORE the empty-input guard so
+      // a bare `/handoff` (with no other content) still runs even
+      // when there are no pending refs/images. The picker may or may
+      // not be open here — pressing Enter always tries to resolve a
+      // slash if the input parses as one.
+      if (_slash.isOpen) {
+        final picked = _slash.pickHighlighted();
+        if (picked != null) {
+          unawaited(_runSlashCommand(picked));
+          return;
+        }
+      }
+      final parsed = SlashCommandInput.tryParse(text);
+      if (parsed != null && parsed.name.isNotEmpty) {
+        final exact = SlashCommandRegistry.findExact(parsed.name);
+        if (exact != null) {
+          unawaited(_runSlashCommand(exact));
+          return;
+        }
+      }
+
       if (text.trim().isEmpty &&
           chat.pendingImages.isEmpty &&
           chat.pendingReferences.isEmpty) {
@@ -714,8 +975,6 @@ class _AiChatState extends State<AiChat> {
         activeFilePath: appState.activeFile?.path,
         openFilePaths: appState.openFiles.map((f) => f.path).toList(),
       );
-      // Send always snaps to bottom — user just typed something,
-      // they want to see it land. Resets `_userScrolledAway`.
       _forceScrollToEnd();
     }
 
@@ -800,7 +1059,9 @@ class _AiChatState extends State<AiChat> {
   }
 
   Widget _buildComposerBox(ChatController chat, VoidCallback send) {
-    return AnimatedContainer(
+    return CompositedTransformTarget(
+      link: _slash.layerLink,
+      child: AnimatedContainer(
       duration: DuckMotion.fast,
       curve: DuckMotion.standard,
       decoration: BoxDecoration(
@@ -836,6 +1097,9 @@ class _AiChatState extends State<AiChat> {
               },
               child: Focus(
                 onKeyEvent: (node, event) {
+                  if (_slash.onKey(event) == SlashKeyHandling.handled) {
+                    return KeyEventResult.handled;
+                  }
                   if (event is KeyDownEvent &&
                       event.logicalKey == LogicalKeyboardKey.enter) {
                     if (!HardwareKeyboard.instance.isShiftPressed) {
@@ -984,6 +1248,7 @@ class _AiChatState extends State<AiChat> {
           ),
         ],
       ),
+      ),
     );
   }
 }
@@ -1053,47 +1318,62 @@ class _PendingImageChip extends StatelessWidget {
       bytes = null;
     }
 
-    return Container(
-      width: 64,
-      height: 64,
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        color: DuckColors.bgChip,
-        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-        border: Border.all(color: DuckColors.border, width: 0.5),
-      ),
-      child: Stack(
-        children: [
-          Positioned.fill(
-            child: bytes == null
-                ? const Icon(
-                    Icons.image_not_supported_outlined,
-                    size: 18,
-                    color: DuckColors.fgSubtle,
-                  )
-                : Image.memory(bytes, fit: BoxFit.cover),
+    return Tooltip(
+      message: S.imageLightboxOpenHint,
+      waitDuration: const Duration(milliseconds: 350),
+      child: MouseRegion(
+        cursor: bytes == null
+            ? SystemMouseCursors.basic
+            : SystemMouseCursors.click,
+        child: Container(
+          width: 64,
+          height: 64,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: DuckColors.bgChip,
+            borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+            border: Border.all(color: DuckColors.border, width: 0.5),
           ),
-          Positioned(
-            top: 3,
-            right: 3,
-            child: InkWell(
-              onTap: onRemove,
-              borderRadius: BorderRadius.circular(999),
-              child: Container(
-                padding: const EdgeInsets.all(2),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.62),
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: bytes == null
+                    ? const Icon(
+                        Icons.image_not_supported_outlined,
+                        size: 18,
+                        color: DuckColors.fgSubtle,
+                      )
+                    : GestureDetector(
+                        onTap: () => ImageLightbox.show(
+                          context,
+                          base64Image: base64Image,
+                        ),
+                        child: Image.memory(bytes, fit: BoxFit.cover),
+                      ),
+              ),
+              Positioned(
+                top: 3,
+                right: 3,
+                child: InkWell(
+                  onTap: onRemove,
                   borderRadius: BorderRadius.circular(999),
-                ),
-                child: const Icon(
-                  Icons.close,
-                  size: 12,
-                  color: DuckColors.fgPrimary,
+                  child: Container(
+                    padding: const EdgeInsets.all(2),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.62),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: const Icon(
+                      Icons.close,
+                      size: 12,
+                      color: DuckColors.fgPrimary,
+                    ),
+                  ),
                 ),
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }

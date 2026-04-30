@@ -72,6 +72,17 @@ class PreferencesService {
   static const String _kChatHidden = 'ui.chatHidden';
   static const String _kAgentAllowOutsideWorkspaceWrites =
       'agent.allowOutsideWorkspaceWrites';
+  // When true (default), `_runGenerationLoop` runs the workspace
+  // analyzer (Dart / Flutter / Node / Python) once at the end of any
+  // turn that touched source files but never called VERIFY itself.
+  // Errors found are fed back as one extra tool-feedback round so the
+  // model can fix them before the turn closes — see
+  // `chat_controller.dart` § auto-verify and `tool_registry.dart`
+  // § verify tool. The setting is workspace-agnostic; the verify
+  // tool itself decides whether the workspace has a runnable
+  // analyzer (no analyzer = no-op).
+  static const String _kAgentAutoVerifyAfterEdits =
+      'agent.autoVerifyAfterEdits';
   // List of tool ids the user has clicked "Always allow" on. Each
   // entry bypasses the approval card per-tool — distinct from the
   // global `agent.autoApproveCommands` flag, which is a master
@@ -95,6 +106,8 @@ class PreferencesService {
   // installed Node or never want the integration can turn it off and
   // forget about it.
   static const String _kGitNexusEnabled = 'gitnexus.enabled';
+  static const String _kGitNexusAutoWiki = 'gitnexus.autoWiki';
+  static const String _kGitNexusWikiModel = 'gitnexus.wikiModel';
 
   Future<SharedPreferences> get _p => SharedPreferences.getInstance();
 
@@ -200,6 +213,19 @@ class PreferencesService {
       (await _p).getBool(_kAgentAllowOutsideWorkspaceWrites) ?? false;
   Future<void> setAgentAllowOutsideWorkspaceWrites(bool v) async =>
       (await _p).setBool(_kAgentAllowOutsideWorkspaceWrites, v);
+
+  /// Default-on: end-of-turn verify runs after any edit-heavy turn
+  /// where the model didn't call VERIFY itself. False positives are
+  /// rare (a Flutter project always has `dart analyze`; a Node project
+  /// always has `tsc --noEmit` if `tsconfig.json` exists; the verify
+  /// tool gracefully no-ops in workspaces without an analyzer), so
+  /// defaulting to on costs a few seconds for the common case in
+  /// exchange for catching the type errors smaller local models
+  /// routinely miss.
+  Future<bool> getAgentAutoVerifyAfterEdits() async =>
+      (await _p).getBool(_kAgentAutoVerifyAfterEdits) ?? true;
+  Future<void> setAgentAutoVerifyAfterEdits(bool v) async =>
+      (await _p).setBool(_kAgentAutoVerifyAfterEdits, v);
 
   Future<String> getEditorTheme() async {
     final p = await _p;
@@ -443,6 +469,16 @@ class PreferencesService {
       (await _p).getBool(_kGitNexusEnabled) ?? true;
   Future<void> setGitNexusEnabled(bool v) async =>
       (await _p).setBool(_kGitNexusEnabled, v);
+
+  Future<bool> getGitNexusAutoWiki() async =>
+      (await _p).getBool(_kGitNexusAutoWiki) ?? false;
+  Future<void> setGitNexusAutoWiki(bool v) async =>
+      (await _p).setBool(_kGitNexusAutoWiki, v);
+
+  Future<String> getGitNexusWikiModel() async =>
+      (await _p).getString(_kGitNexusWikiModel) ?? '';
+  Future<void> setGitNexusWikiModel(String v) async =>
+      (await _p).setString(_kGitNexusWikiModel, v.trim());
 
   // --- Syncthing ---
   Future<bool> getSyncthingEnabled() async =>

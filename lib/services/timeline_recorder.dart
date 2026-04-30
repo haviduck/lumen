@@ -73,13 +73,22 @@ class TimelineRecorder {
     if (ws == null) return;
     try {
       final paths = _resolveTargets(tool.id, match, ws);
-      // Reserve BEFORE ensuring the baseline — the baseline call
-      // itself goes through `recordWrite(origin: baseline)`, which
-      // is fine because the reservation only blocks
-      // `origin != agentTool` writes for agent-controlled paths
-      // *during this tool invocation*. The baseline's content is
-      // the pre-edit hash; the agent's post-edit hash is different,
-      // so they don't collide on the dedup `_inFlight` key.
+      // Reserve BEFORE ensuring the baseline — the FS watcher only
+      // races us once the *agent's* write hits disk, which can't
+      // happen until `tool.execute` runs after this. Reserving
+      // first means any racing fsEvent capture for that path is
+      // suppressed; the agent's afterTool capture wins.
+      //
+      // The baseline call itself goes through
+      // `recordWrite(origin: baseline)` and would be blocked by
+      // the same reservation guard if it weren't explicitly
+      // exempted in `TimelineService.recordWrite`. Without that
+      // exemption the baseline is silently dropped, the head stays
+      // null, and the agent's post-edit recordWrite is mis-tagged
+      // as `create` instead of `modify` — which makes the
+      // per-message restore feature *delete* the file the user
+      // only wanted to roll back. See `recordWrite` for the
+      // explicit baseline exemption.
       for (final abs in [...paths.before, ...paths.after]) {
         timeline.reserveForAgent(abs);
       }

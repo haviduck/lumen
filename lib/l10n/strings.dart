@@ -102,6 +102,33 @@ class S {
   static const String explorerOpenTeams = 'Open Microsoft Teams';
   static const String menuBarToggleChat = 'Toggle AI chat panel';
 
+  // Unsaved-changes confirm prompts (dirty tab close).
+  // Single-tab variant — `displayName` is the basename for named
+  // files or "Untitled" for tabs that have never been saved.
+  static String unsavedDialogTitle(String displayName) =>
+      'Save changes to $displayName?';
+  static const String unsavedDialogBody =
+      'Your changes will be lost if you don\'t save them.';
+  static const String unsavedDialogSave = 'Save';
+  static const String unsavedDialogSaveAs = 'Save As…';
+  static const String unsavedDialogDontSave = 'Don\'t Save';
+  static const String unsavedDialogUntitledLabel = 'Untitled';
+  // Toast surfaced when the user picked Save in a batch close but
+  // an untitled tab couldn't be auto-saved (we leave it open
+  // instead of guessing a filename).
+  static String unsavedBatchUntitledSkipped(int count) => count == 1
+      ? '1 untitled tab kept open — save it manually with Save As first.'
+      : '$count untitled tabs kept open — save them manually with Save As first.';
+  // Batch variant — fired when Close Others / Close to Right /
+  // Close All would discard multiple dirty buffers.
+  static String unsavedBatchTitle(int count) =>
+      'Save changes to $count file${count == 1 ? '' : 's'}?';
+  static const String unsavedBatchBody =
+      'These files have unsaved changes. They will be lost if you don\'t save.';
+  static const String unsavedBatchSaveAll = 'Save All';
+  static const String unsavedBatchDontSave = 'Don\'t Save';
+  static String unsavedBatchMore(int extra) => '+ $extra more…';
+
   // Skill generator (new-project skills bootstrap).
   static const String skillsTitle = 'Set up agent skills & tools?';
   static const String skillsBody =
@@ -144,6 +171,12 @@ class S {
   static const String providerErrorAuthBody =
       'The provider rejected your API key or token. Check the credential '
       'in Settings → AI/Chat for the relevant provider.';
+  static const String providerErrorBadRequest = 'Request rejected';
+  static const String providerErrorBadRequestBody =
+      'The provider returned 400 Bad Request — the request body was '
+      'invalid for this model. This often happens after a model API '
+      'change (e.g. a new model expects a different parameter shape). '
+      'See the raw error below for the exact field.';
   static const String providerErrorNotFound = 'Model not available';
   static const String providerErrorNotFoundBody =
       'The provider says this model isn\'t accessible to your account. '
@@ -167,6 +200,16 @@ class S {
       'No tokens for ${seconds}s — the model may be stuck. Use Stop and try the prompt again if it doesn\'t recover.';
   static const String chatStallStop = 'Stop';
 
+  // Empty-response strip — surfaces after a turn ends with no visible
+  // content, no tool calls, no error. Common Ollama failure mode where
+  // the stream closes cleanly but the model produced nothing useful.
+  static const String chatEmptyResponseTitle =
+      'Model returned an empty response';
+  static const String chatEmptyResponseBody =
+      'The stream closed without any visible output. This sometimes happens with Ollama models when context shifts or the model stalls. Continue to nudge it, or dismiss to send your own follow-up.';
+  static const String chatEmptyResponseContinue = 'Continue';
+  static const String chatEmptyResponseDismiss = 'Dismiss';
+
   // Queued prompts (composed while the agent is still generating).
   static const String chatQueuedHeader = 'Queued';
   static const String chatQueuedHint =
@@ -180,6 +223,36 @@ class S {
       count == 1 ? 'Restore 1 file change' : 'Restore $count file changes';
   static String chatRestoreConfirmBody(int count) =>
       'This will revert $count file timeline change(s) made by this assistant message. A pre-restore snapshot is captured first where possible.';
+
+  // Chat rewind (Cursor / Antigravity-style "revert to before this
+  // message"). Surfaced on USER bubbles. Restores file changes AND
+  // truncates the chat so the LLM never sees the rolled-back turn on
+  // the next send.
+  static const String chatRewindConfirmTitle = 'Revert chat to this point?';
+  static String chatRewindTooltip(int fileCount, int messageCount) {
+    final files = fileCount == 0
+        ? 'no file changes'
+        : (fileCount == 1 ? '1 file change' : '$fileCount file changes');
+    final msgs = messageCount == 1 ? '1 message' : '$messageCount messages';
+    return 'Revert $files and remove $msgs from the chat';
+  }
+
+  static String chatRewindConfirmBody(int fileCount, int messageCount) {
+    final files = fileCount == 0
+        ? 'No file changes recorded.'
+        : (fileCount == 1
+              ? '1 file change will be reverted.'
+              : '$fileCount file changes will be reverted.');
+    final msgs = messageCount == 1 ? '1 message' : '$messageCount messages';
+    return '$files $msgs (this prompt and everything after) will be removed from the chat so the next reply starts fresh. A pre-restore snapshot is captured first where possible.';
+  }
+
+  static const String chatRewindAction = 'Revert';
+  static String chatRewindResultMessage(int messages, String fileSummary) {
+    final m = messages == 1 ? '1 message' : '$messages messages';
+    return 'Reverted: $fileSummary, removed $m.';
+  }
+
   static const String skillsConfigureTitle = 'What kind of project is this?';
   static const String skillsConfigureBody =
       'Pick one or more archetypes so the generated tools match what '
@@ -232,6 +305,81 @@ class S {
       'subscription, nothing leaves your own machines.';
   static const String settingsSyncthingLinkLabel = 'syncthing.net';
 
+  // Ollama onboarding (new-project wizard step). Detects whether the
+  // `ollama` CLI is installed and the local API is reachable, and
+  // walks the user through download/run/pull/signin if anything is
+  // missing.
+  static const String ollamaSetupTitle = 'Set up Ollama for local LLMs';
+  static const String ollamaSetupBody =
+      'Ollama runs open-weights models locally on your machine — '
+      'private, offline, no API key. Lumen can use it as a chat '
+      'provider alongside any cloud providers you add later.';
+  static const String ollamaSetupChecking = 'Checking for Ollama…';
+  static const String ollamaSetupCheck = 'Check for Ollama';
+  static const String ollamaSetupRetry = 'Retry check';
+  static const String ollamaSetupSkip = 'Skip';
+  static const String ollamaSetupContinue = 'Continue';
+  // States.
+  static const String ollamaStateReadyTitle = 'Ollama is ready';
+  static const String ollamaStateReadyBody =
+      'The Ollama daemon responded on localhost. Lumen will surface '
+      'every model you have pulled in the chat picker.';
+  static const String ollamaStateInstalledNotRunningTitle =
+      'Ollama is installed but not running';
+  static const String ollamaStateInstalledNotRunningBody =
+      'The `ollama` CLI is on your PATH but the local API at '
+      'http://localhost:11434 didn\'t respond. Start the Ollama '
+      'desktop app (or run `ollama serve` in a terminal), then hit '
+      'Retry check.';
+  static const String ollamaStateMissingTitle = 'Ollama is not installed';
+  static const String ollamaStateMissingBody =
+      'Lumen couldn\'t find the `ollama` CLI on your PATH. Install '
+      'it from the link below — it\'s a one-click installer on every '
+      'platform — and come back to this wizard when it\'s done.';
+  static const String ollamaDownloadLabel = 'ollama.com/download';
+  // Post-install / next-step tips.
+  static const String ollamaNextStepsTitle = 'Once Ollama is installed';
+  static const String ollamaNextStepLocal =
+      'Pull a local model from a terminal:';
+  static const String ollamaNextStepLocalCmd =
+      'ollama pull llama3.1   # or any model you want';
+  static const String ollamaNextStepCloudIntro =
+      'For Ollama Cloud (turbo / hosted) models you also need to '
+      'sign in once with your account so Lumen can reach the cloud '
+      'endpoints:';
+  static const String ollamaNextStepCloudCmd = 'ollama signin';
+  static const String ollamaNextStepCloudHint =
+      'Run that in a real terminal — the prompt opens a browser '
+      'window for SSO. Lumen can\'t do this for you because the '
+      'browser hand-off has to happen against your own session.';
+  static const String ollamaCopyCommand = 'Copy';
+  static const String ollamaCopiedToast = 'Command copied to clipboard.';
+
+  // LLM providers onboarding (new-project wizard step). Lets a
+  // first-time user paste API keys for each cloud provider next to a
+  // toggle that enables it. Mirrors the Settings screen but stripped
+  // down to the fields that matter on day one.
+  static const String llmProvidersTitle = 'Connect LLM providers';
+  static const String llmProvidersBody =
+      'Lumen aggregates models from multiple providers. Toggle on '
+      'the ones you want to use and paste their API keys — you can '
+      'always change these later in Settings → AI / Chat.';
+  static const String llmProvidersSkip = 'Skip';
+  static const String llmProvidersSave = 'Save & continue';
+  static const String llmProvidersSavedToast = 'Provider settings saved.';
+  static const String llmProvidersOllamaHint =
+      'Local — no API key. Endpoint defaults to http://localhost:11434.';
+  static const String llmProvidersGeminiHint =
+      'Get a free API key at aistudio.google.com.';
+  static const String llmProvidersClaudeHint =
+      'Get an API key at console.anthropic.com.';
+  static const String llmProvidersGithubHint =
+      'GitHub PAT with the Models: read scope (NOT GitHub Copilot).';
+  static const String llmProvidersOpenaiHint =
+      'OpenAI placeholder — saved for when the integration ships.';
+  static const String llmProvidersApiKeyHint = 'Paste API key…';
+  static const String llmProvidersAlreadySetSuffix = ' (already set)';
+
   // GitNexus onboarding (new-project wizard step).
   static const String gitnexusTitle = 'Set up GitNexus?';
   static const String gitnexusBody =
@@ -277,6 +425,30 @@ class S {
   static const String gitnexusInstalledFiles = 'Installed context files';
   static const String gitnexusOutput = 'Last output';
   static const String gitnexusAnalyzeOutputLabel = 'Analyze output';
+  static const String gitnexusWikiSection = 'Wiki';
+  static const String gitnexusWikiTitle = 'Code wiki';
+  static const String gitnexusWikiDesc =
+      'Generate LLM-powered module documentation from the GitNexus graph. '
+      'This may use API credits depending on your GitNexus LLM config.';
+  static const String gitnexusWikiGenerate = 'Generate wiki';
+  static const String gitnexusWikiStop = 'Stop wiki';
+  static const String gitnexusWikiOpenFolder = 'Open wiki folder';
+  static const String gitnexusWikiModelLabel = 'Model override';
+  static const String gitnexusWikiModelHint = 'leave empty for default';
+  static const String gitnexusWikiAuto = 'Auto-regenerate after re-index';
+  static const String gitnexusWikiAutoDesc =
+      'When enabled, a successful Analyze run automatically starts '
+      '`npx gitnexus wiki`. Leave off unless you are comfortable spending '
+      'LLM tokens on wiki refreshes.';
+  static const String gitnexusWikiOutputLabel = 'Wiki output';
+  static const String gitnexusWikiNoWorkspace =
+      'Open a workspace before generating a wiki.';
+  static const String gitnexusWikiIdle = 'Idle';
+  static const String gitnexusWikiRunning = 'Generating...';
+  static const String gitnexusWikiGenerated = 'Generated';
+  static const String gitnexusWikiFailed = 'Failed';
+  static const String gitnexusWikiNoOutput = '(no output yet)';
+  static String gitnexusWikiGeneratedAt(String value) => 'Generated $value';
 
   // Master kill-switch.
   static const String gitnexusMasterToggleTitle = 'Enable GitNexus integration';
@@ -408,8 +580,28 @@ class S {
       'Cannot undo because the moved item is missing.';
   static const String explorerRedoSourceMissing =
       'Cannot redo because the original item is missing.';
-  static const String explorerGitIgnoredBadge = 'i';
-  static const String explorerGitIgnoredTooltip = 'Ignored by .gitignore';
+
+  // Slash commands
+  static const String slashHandoffDescription =
+      'Write a chat-to-chat handoff so a fresh chat can pick up where you left off.';
+  static const String slashHandoffNoWorkspace =
+      'Open a workspace before creating a handoff.';
+  static const String slashHandoffRuleInstalled =
+      'Installed handoff receive rule in .lumen/rules.md';
+
+  static const String slashPushDescription =
+      'Stage everything, commit with a message, and push to the remote.';
+  static const String slashPushUsage =
+      'Usage: /push <commit message> — message is required.';
+  static const String slashPushNoWorkspace = 'Open a workspace before pushing.';
+  static const String slashPushNotRepo =
+      'This workspace is not a git repository.';
+  static const String slashPushStarting = 'Pushing…';
+  static const String slashPushNothingToCommit =
+      'Nothing to commit — working tree is clean.';
+  static const String slashPushCommitFailed = 'Commit failed';
+  static const String slashPushPushFailed = 'Push failed';
+  static const String slashPushDone = 'Pushed.';
 
   // Editor
   static const String editorNoFileOpen = 'No file open';
@@ -607,6 +799,11 @@ class S {
   static String chatImagesAttached(int count) =>
       count == 1 ? '1 image attached' : '$count images attached';
 
+  // In-chat image lightbox (click any chat image to open).
+  static const String imageLightboxCloseTooltip = 'Close';
+  static const String imageLightboxResetTooltip = 'Reset zoom';
+  static const String imageLightboxOpenHint = 'Click to view full size';
+
   // Tool approval
   static const String toolApprovalTitle = 'Agent wants to run a command';
   static const String toolApprovalAllowOnce = 'Allow once';
@@ -661,6 +858,45 @@ class S {
   static const String toolPendingAppend = 'Appending';
   static const String toolPendingSearch = 'Searching';
   static const String toolPendingInspect = 'Inspecting';
+
+  /// Single-line label for a malformed-tool warning card. Surfaced
+  /// when the parser detected a tool-shaped block (`<<<EDIT_FILE…>>>`)
+  /// but the inner structure rejected the strict per-tool regex.
+  static const String toolMalformedLabel = 'Malformed';
+  static const String toolMalformedTitle = 'Tool call malformed';
+  static String toolMalformedTooltip(String toolName) =>
+      'The model emitted $toolName but the call structure is invalid, '
+      'so it was not executed. Ask the model to retry — or switch to '
+      'a stronger model if it keeps producing the same shape.';
+
+  /// Header label for a collapsed run of consecutive same-action
+  /// tool calls — e.g. "Read 12 files", "Searched 5 times". The
+  /// `action` argument is the past-tense verb [_actionLabel] would
+  /// have produced for a single call.
+  static String toolGroupTitle(String action, int count) {
+    if (action.toLowerCase() == 'read') {
+      return 'Read $count files';
+    }
+    if (action.toLowerCase() == 'edited') {
+      return 'Edited $count files';
+    }
+    if (action.toLowerCase() == 'created') {
+      return 'Created $count files';
+    }
+    if (action.toLowerCase() == 'listed') {
+      return 'Listed $count directories';
+    }
+    if (action.toLowerCase() == 'searched') {
+      return 'Searched $count times';
+    }
+    if (action.toLowerCase() == 'found') {
+      return 'Found across $count queries';
+    }
+    if (action.toLowerCase() == 'glob') {
+      return 'Globbed $count patterns';
+    }
+    return '$action $count×';
+  }
 
   // Settings
   static const String settingsTitle = 'Settings';
@@ -784,6 +1020,9 @@ class S {
       'Allow agent writes outside workspace';
   static const String settingsAgentOutsideWorkspaceWritesDesc =
       'When off, built-in file tools cannot create, edit, move, append, or delete outside the active workspace. Reading outside the workspace is still allowed. Shell commands remain separately approval-gated.';
+  static const String settingsAgentAutoVerify = 'Auto-verify after edits';
+  static const String settingsAgentAutoVerifyDesc =
+      'When on, the workspace analyzer (dart analyze, tsc --noEmit, eslint, ruff check) runs once at the end of any turn that edited source files but didn\'t call VERIFY. Errors are fed back as one extra round so the model can fix them before the turn closes. Costs ~2-30s per edit-heavy turn depending on workspace size.';
 
   // Settings view — Rules
   static const String settingsRulesDesc =

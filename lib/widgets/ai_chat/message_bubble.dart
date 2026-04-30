@@ -9,7 +9,21 @@ import '../../services/chat_persistence_service.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/duck_toast.dart';
+import '../common/image_lightbox.dart';
 import 'tool_segments.dart';
+
+/// What kind of revert the [_RestoreChip] is offering — drives the
+/// tooltip wording and the visible chip label so user-bubble vs
+/// assistant-bubble reverts read distinctly.
+///
+/// - [assistantTurn] is "undo just this turn's file changes" (Cursor's
+///   assistant-bubble Restore). Always carries `count > 0` because
+///   without changes the chip wouldn't be shown.
+/// - [chatRewind] is the user-bubble "rewind chat to right before I
+///   sent this" — restores file changes AND truncates the chat. Can
+///   be shown with `count == 0` when there are no file changes but
+///   subsequent messages still exist to truncate.
+enum BubbleRestoreScope { assistantTurn, chatRewind }
 
 /// Single chat bubble in the AI chat panel.
 ///
@@ -32,7 +46,20 @@ class MessageBubble extends StatefulWidget {
   final VoidCallback? onEdit;
   final VoidCallback? onDelete;
   final VoidCallback? onRestore;
+
+  /// File-change count surfaced in the [_RestoreChip] when
+  /// [onRestore] is non-null. Allowed to be 0 ONLY when
+  /// [restoreScope] is [BubbleRestoreScope.chatRewind] — that scope
+  /// also reverts subsequent messages, so the chip is meaningful
+  /// even with zero file deltas.
   final int restoreChangeCount;
+  final BubbleRestoreScope restoreScope;
+
+  /// Number of follow-up messages that will be removed by a
+  /// `chatRewind` revert. Zero for assistant-turn reverts. Used in
+  /// the tooltip so the user sees "this will also remove N replies"
+  /// before clicking.
+  final int restoreFollowupMessages;
 
   /// Set to `true` for the assistant message that is currently
   /// being streamed in. Enables:
@@ -51,6 +78,8 @@ class MessageBubble extends StatefulWidget {
     this.onDelete,
     this.onRestore,
     this.restoreChangeCount = 0,
+    this.restoreScope = BubbleRestoreScope.assistantTurn,
+    this.restoreFollowupMessages = 0,
     this.isStreaming = false,
   });
 
@@ -61,11 +90,38 @@ class MessageBubble extends StatefulWidget {
 class _MessageBubbleState extends State<MessageBubble> {
   bool _hover = false;
 
+  // Render-cache for the renderable preview + parsed segments. Both
+  // operations are pure functions of the message content (plus the
+  // streaming flag for the preview). The chat panel rebuilds the live
+  // bubble at ~30Hz during streaming; without this cache, we'd re-run
+  // ~25 full-string regex scans (one per registered tool inside
+  // `streamingToolPreview`) and another regex scan inside
+  // `parseChatSegments` for *every* rebuild on a growing buffer.
+  // That was the main UI-isolate stutter source on fast streams.
+  // The cache key is the raw content + streaming flag for the
+  // renderable, and the renderable string itself for segments.
+  // Identical strings hit by reference equality first (Dart strings
+  // are canonicalised when interned but otherwise we rely on the
+  // append-only nature of streaming — the new content reference
+  // won't match the previous one and we recompute).
+  String? _cachedRawForRender;
+  bool? _cachedStreamingForRender;
+  String? _cachedRenderable;
+
+  String? _cachedSegmentsSource;
+  List<ChatSegment>? _cachedSegments;
+
   Future<void> _copy() async {
     // Strip the structured `<!-- LUMEN_TOOL:... -->` markers and
     // restore the friendly plain-text rendering — paste-to-other-app
-    // shouldn't dump HTML comments at the user.
-    final clean = stripMarkersForCopy(widget.message.content);
+    // shouldn't dump HTML comments at the user. For slash-command
+    // user bubbles the visible label is the source of truth (the
+    // verbose underlying prompt is plumbing the user shouldn't have
+    // to paste anywhere).
+    final source = widget.isUser && widget.message.displayContent != null
+        ? widget.message.displayContent!
+        : widget.message.content;
+    final clean = stripMarkersForCopy(source);
     await Clipboard.setData(ClipboardData(text: clean));
     if (!mounted) return;
     showDuckToast(context, S.chatMessageCopied);
@@ -80,20 +136,55 @@ class _MessageBubbleState extends State<MessageBubble> {
   ///
   /// Counts triple-backtick *runs* (not individual backticks). An
   /// odd count means we're currently inside a fence.
+  ///
+  /// Memoised on `(rawContent, isStreaming)` so the heavy
+  /// `streamingToolPreview` regex sweep doesn't run on every panel
+  /// rebuild — only when the content or streaming state actually
+  /// changed since the last call.
   String _renderableContent() {
-    final content = widget.isStreaming
-        ? streamingToolPreview(widget.message.content)
-        : widget.message.content;
-    if (!widget.isStreaming) return content;
-    final fenceCount = RegExp(r'```').allMatches(content).length;
-    if (fenceCount.isOdd) {
-      // Newline guard: if the unclosed fence is on the same line
-      // as the trailing chunk (e.g. mid-token), prepending a
-      // newline before the closing fence keeps the parser happy.
-      final needsNewline = !content.endsWith('\n');
-      return '$content${needsNewline ? '\n' : ''}```';
+    final raw = widget.message.content;
+    final streaming = widget.isStreaming;
+    if (_cachedRawForRender == raw &&
+        _cachedStreamingForRender == streaming &&
+        _cachedRenderable != null) {
+      return _cachedRenderable!;
     }
-    return content;
+
+    final String result;
+    if (!streaming) {
+      result = raw;
+    } else {
+      final preview = streamingToolPreview(raw);
+      final fenceCount = RegExp(r'```').allMatches(preview).length;
+      if (fenceCount.isOdd) {
+        // Newline guard: if the unclosed fence is on the same line
+        // as the trailing chunk (e.g. mid-token), prepending a
+        // newline before the closing fence keeps the parser happy.
+        final needsNewline = !preview.endsWith('\n');
+        result = '$preview${needsNewline ? '\n' : ''}```';
+      } else {
+        result = preview;
+      }
+    }
+
+    _cachedRawForRender = raw;
+    _cachedStreamingForRender = streaming;
+    _cachedRenderable = result;
+    return result;
+  }
+
+  /// Cached `parseChatSegments` — same memoisation strategy as
+  /// [_renderableContent]. The segment parse is cheaper than the
+  /// preview but still a full-string regex scan; on a stable bubble
+  /// it should be a free read across rebuilds.
+  List<ChatSegment> _segmentsFor(String content) {
+    if (_cachedSegmentsSource == content && _cachedSegments != null) {
+      return _cachedSegments!;
+    }
+    final segs = parseChatSegments(content);
+    _cachedSegmentsSource = content;
+    _cachedSegments = segs;
+    return segs;
   }
 
   @override
@@ -128,9 +219,12 @@ class _MessageBubbleState extends State<MessageBubble> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (widget.onRestore != null &&
-                        widget.restoreChangeCount > 0) ...[
+                        (widget.restoreChangeCount > 0 ||
+                            widget.restoreFollowupMessages > 0)) ...[
                       _RestoreChip(
                         count: widget.restoreChangeCount,
+                        scope: widget.restoreScope,
+                        followupMessageCount: widget.restoreFollowupMessages,
                         onTap: widget.onRestore!,
                       ),
                       const SizedBox(width: 4),
@@ -147,15 +241,40 @@ class _MessageBubbleState extends State<MessageBubble> {
   }
 
   Widget _buildUserMessage() {
+    // `displayContent` overrides `content` for rendering only — the
+    // model still receives the full `content`. Currently set by
+    // slash commands so the bubble shows e.g. `/handoff` instead of
+    // a multi-paragraph instruction prompt.
+    final hasDisplayOverride =
+        widget.message.displayContent != null &&
+        widget.message.displayContent!.trim().isNotEmpty;
+    final visibleText = hasDisplayOverride
+        ? widget.message.displayContent!
+        : widget.message.content;
+
+    // **User-bubble shell.**
+    //
+    // Cursor / Antigravity-style: a quiet dark card with a hairline
+    // border and softened corners. Earlier versions rendered as a
+    // hard-edged accent-cyan left bar (vibrant, but stylistically
+    // out of step with the rest of the surface chrome and starved
+    // the bubble of horizontal space for chip overlays). Switching
+    // to a uniform border + radius:
+    //   - matches the file-explorer / approval / queued-prompts
+    //     panels visually (DuckGlass surface vocabulary);
+    //   - leaves clean inner margin for the floating Revert / Copy
+    //     chips, which previously tightroped against the bubble's
+    //     hard right edge;
+    //   - drops a `Color(0xFF1e2229)` literal that violated the
+    //     "no raw color literals" theming rule.
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 4),
+      margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: const BoxDecoration(
-        color: Color(0xFF1e2229),
-        border: Border(
-          left: BorderSide(color: DuckColors.accentCyan, width: 2),
-        ),
+      decoration: BoxDecoration(
+        color: DuckColors.bgDeeper,
+        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        border: Border.all(color: DuckColors.glassSeam, width: 0.5),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -165,19 +284,19 @@ class _MessageBubbleState extends State<MessageBubble> {
               spacing: 6,
               runSpacing: 6,
               children: widget.message.imagesBase64.map((b64) {
+                Uint8List? decoded;
                 try {
-                  return ClipRRect(
-                    borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                    child: Image.memory(
-                      base64Decode(b64),
-                      width: 96,
-                      height: 96,
-                      fit: BoxFit.cover,
-                    ),
-                  );
+                  decoded = base64Decode(b64);
                 } catch (_) {
                   return const SizedBox.shrink();
                 }
+                return _ChatImageThumb(
+                  base64Image: b64,
+                  decoded: decoded,
+                  caption: visibleText.trim().isEmpty
+                      ? null
+                      : visibleText.trim(),
+                );
               }).toList(),
             ),
             const SizedBox(height: 6),
@@ -192,21 +311,19 @@ class _MessageBubbleState extends State<MessageBubble> {
             ),
             const SizedBox(height: 6),
           ],
-          // Plain Text — selection is delegated to the upstream
-          // SelectionArea so the user can drag across bubbles.
-          if (widget.message.content.trim().isNotEmpty)
+          if (visibleText.trim().isNotEmpty)
             Padding(
-              // Right-padded so the floating copy chip doesn't overlap
-              // the text on short messages.
               padding: const EdgeInsets.only(right: 28),
-              child: Text(
-                widget.message.content,
-                style: const TextStyle(
-                  fontSize: 13,
-                  color: DuckColors.fgPrimary,
-                  height: 1.5,
-                ),
-              ),
+              child: hasDisplayOverride
+                  ? _SlashCommandLabel(text: visibleText)
+                  : Text(
+                      visibleText,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        color: DuckColors.fgPrimary,
+                        height: 1.5,
+                      ),
+                    ),
             ),
         ],
       ),
@@ -220,8 +337,17 @@ class _MessageBubbleState extends State<MessageBubble> {
     // landed as italic-text placeholders (`*(Edited file: foo)*`)
     // alongside prose; now they're chrome — clickable cards for file
     // ops, terminal-styled cards for commands, pill badges for
-    // read-only inspection.
-    final segments = parseChatSegments(_renderableContent());
+    // read-only inspection. Runs of 3+ same-action calls collapse
+    // into a [ToolGroupSegment] rendered by `ToolGroupView`.
+    //
+    // **Stable keys** are essential here. Without them, when a
+    // chunk arrives mid-stream and the segment list shifts (a new
+    // tool just landed at the tail), Flutter recycles the existing
+    // `_FileToolCardState` / `_ToolGroupViewState` instances onto
+    // different segments — visible as a hover / expanded flicker.
+    // Keying by (segment-kind + ordinal index + identifying field)
+    // pins each widget to its segment across rebuilds.
+    final segments = _segmentsFor(_renderableContent());
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 4),
@@ -229,15 +355,8 @@ class _MessageBubbleState extends State<MessageBubble> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (final seg in segments)
-            if (seg is ProseSegment)
-              _buildProse(seg.text)
-            else if (seg is ToolSegment)
-              SelectionContainer.disabled(child: ToolSegmentView(segment: seg))
-            else if (seg is ProviderErrorSegment)
-              SelectionContainer.disabled(
-                child: ProviderErrorCard(error: seg.error),
-              ),
+          for (var i = 0; i < segments.length; i++)
+            _segmentWidget(segments[i], i),
           if (widget.isStreaming) ...[
             const SizedBox(height: 2),
             const _StreamingCursor(),
@@ -245,6 +364,60 @@ class _MessageBubbleState extends State<MessageBubble> {
         ],
       ),
     );
+  }
+
+  Widget _segmentWidget(ChatSegment seg, int index) {
+    if (seg is ProseSegment) {
+      return KeyedSubtree(
+        key: ValueKey('prose-$index'),
+        child: _buildProse(seg.text),
+      );
+    }
+    // Selection model: we do NOT wrap tool/group/error segments in
+    // `SelectionContainer.disabled` anymore. We used to, so that
+    // cross-bubble drag-select via the outer `SelectionArea`
+    // skipped tool cards. But mid-stream rebuilds (every chunk
+    // changes segment indices when prose grows / a tool resolves)
+    // would unmount a `SelectionContainer.disabled` subtree
+    // *between* the SelectionArea delegate's `_flushAdditions` and
+    // its `_compareScreenOrder` microtask, blowing up with
+    // `Cannot get renderObject of inactive element` (visible
+    // first on Opus 4.7 — its first chunk is fast enough that two
+    // segment-list rebuilds land in the same frame). The fix is
+    // structural: don't introduce SelectionContainers whose shape
+    // we can't keep stable across streaming. Side effect: dragging
+    // a selection across a bubble now also picks up the small
+    // text inside tool cards (status / tool name / file path).
+    // Acceptable — copy-paste of a few extra labels is a much
+    // smaller papercut than the chat panel crashing.
+    if (seg is ToolSegment) {
+      return KeyedSubtree(
+        key: ValueKey('tool-$index-${seg.toolId}-${seg.firstArg}'),
+        child: ToolSegmentView(segment: seg),
+      );
+    }
+    if (seg is ToolGroupSegment) {
+      // Group key includes count so adding another member to the
+      // tail doesn't invalidate the expand/collapse state
+      // pointlessly — but DOES invalidate it when a new group
+      // appears at the same index (which is the right behaviour:
+      // the user's current expand/collapse choice belongs to the
+      // *previous* group, not the new one that took its slot).
+      final first = seg.tools.first;
+      return KeyedSubtree(
+        key: ValueKey(
+          'group-$index-${first.toolId}-${first.status}-${seg.tools.length}',
+        ),
+        child: ToolGroupView(group: seg),
+      );
+    }
+    if (seg is ProviderErrorSegment) {
+      return KeyedSubtree(
+        key: ValueKey('err-$index-${seg.error.kind}'),
+        child: ProviderErrorCard(error: seg.error),
+      );
+    }
+    return const SizedBox.shrink();
   }
 
   Widget _buildProse(String text) {
@@ -278,6 +451,81 @@ class _MessageBubbleState extends State<MessageBubble> {
           borderRadius: BorderRadius.circular(DuckTheme.radiusS),
           border: const Border(
             left: BorderSide(color: DuckColors.accentMint, width: 3),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 96x96 chat-bubble image preview that opens [ImageLightbox] on
+/// click. Used by both user-sent attachments and tool-injected
+/// snapshot bubbles. Shows a soft hover ring and tooltip so the
+/// click affordance is discoverable — without it users miss the
+/// fact that the thumbnail is interactive.
+class _ChatImageThumb extends StatefulWidget {
+  final String base64Image;
+  final Uint8List decoded;
+  final String? caption;
+
+  const _ChatImageThumb({
+    required this.base64Image,
+    required this.decoded,
+    this.caption,
+  });
+
+  @override
+  State<_ChatImageThumb> createState() => _ChatImageThumbState();
+}
+
+class _ChatImageThumbState extends State<_ChatImageThumb> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: S.imageLightboxOpenHint,
+      waitDuration: const Duration(milliseconds: 350),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hover = true),
+        onExit: (_) => setState(() => _hover = false),
+        child: GestureDetector(
+          onTap: () => ImageLightbox.show(
+            context,
+            base64Image: widget.base64Image,
+            caption: widget.caption,
+          ),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+              border: Border.all(
+                color: _hover
+                    ? DuckColors.accentCyan.withValues(alpha: 0.7)
+                    : DuckColors.border,
+                width: _hover ? 1.2 : 0.5,
+              ),
+              boxShadow: _hover
+                  ? [
+                      BoxShadow(
+                        color: DuckColors.accentCyan.withValues(alpha: 0.18),
+                        blurRadius: 6,
+                        spreadRadius: 0.5,
+                      ),
+                    ]
+                  : null,
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+              child: Image.memory(
+                widget.decoded,
+                width: 96,
+                height: 96,
+                fit: BoxFit.cover,
+                filterQuality: FilterQuality.medium,
+              ),
+            ),
           ),
         ),
       ),
@@ -325,8 +573,15 @@ class _MessageReferenceChip extends StatelessWidget {
 
 class _RestoreChip extends StatefulWidget {
   final int count;
+  final BubbleRestoreScope scope;
+  final int followupMessageCount;
   final VoidCallback onTap;
-  const _RestoreChip({required this.count, required this.onTap});
+  const _RestoreChip({
+    required this.count,
+    required this.scope,
+    required this.followupMessageCount,
+    required this.onTap,
+  });
 
   @override
   State<_RestoreChip> createState() => _RestoreChipState();
@@ -335,10 +590,27 @@ class _RestoreChip extends StatefulWidget {
 class _RestoreChipState extends State<_RestoreChip> {
   bool _innerHover = false;
 
+  String _tooltip() {
+    switch (widget.scope) {
+      case BubbleRestoreScope.assistantTurn:
+        return S.chatRestoreFilesTooltip(widget.count);
+      case BubbleRestoreScope.chatRewind:
+        return S.chatRewindTooltip(
+          widget.count,
+          widget.followupMessageCount,
+        );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    // chat-rewind reverts CAN run with zero file-change count (the
+    // chat truncation alone is reason enough). In that case we drop
+    // the numeric label and show only the icon so the chip doesn't
+    // read as "0 changes".
+    final showCount = widget.count > 0;
     return Tooltip(
-      message: S.chatRestoreFilesTooltip(widget.count),
+      message: _tooltip(),
       waitDuration: const Duration(milliseconds: 400),
       child: MouseRegion(
         onEnter: (_) => setState(() => _innerHover = true),
@@ -348,7 +620,7 @@ class _RestoreChipState extends State<_RestoreChip> {
           onTap: widget.onTap,
           child: Container(
             height: 24,
-            padding: const EdgeInsets.symmetric(horizontal: 7),
+            padding: EdgeInsets.symmetric(horizontal: showCount ? 7 : 5),
             decoration: BoxDecoration(
               color: _innerHover
                   ? DuckColors.bgRaisedHi.withValues(alpha: 0.9)
@@ -364,15 +636,17 @@ class _RestoreChipState extends State<_RestoreChip> {
                   size: 13,
                   color: DuckColors.accentDuck,
                 ),
-                const SizedBox(width: 4),
-                Text(
-                  '${widget.count}',
-                  style: const TextStyle(
-                    color: DuckColors.fgMuted,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
+                if (showCount) ...[
+                  const SizedBox(width: 4),
+                  Text(
+                    '${widget.count}',
+                    style: const TextStyle(
+                      color: DuckColors.fgMuted,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
@@ -487,6 +761,55 @@ class _StreamingCursorState extends State<_StreamingCursor>
           color: DuckColors.accentMint,
           borderRadius: BorderRadius.circular(1.5),
         ),
+      ),
+    );
+  }
+}
+
+/// Compact pill rendering for a user bubble whose visible content is
+/// a slash-command label (e.g. `/handoff`) standing in for a much
+/// longer prompt that the model receives but the user shouldn't have
+/// to scroll past. Visually distinct from a normal user message so it
+/// reads as "I invoked a command" rather than "I typed this text".
+class _SlashCommandLabel extends StatelessWidget {
+  final String text;
+
+  const _SlashCommandLabel({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: DuckColors.bgRaisedHi.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+        border: Border.all(
+          color: DuckColors.accentCyan.withValues(alpha: 0.35),
+          width: 0.5,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.terminal,
+            size: 12,
+            color: DuckColors.accentCyan,
+          ),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 12,
+                color: DuckColors.fgPrimary,
+                fontFamily: DuckTheme.monoFont,
+                fontWeight: FontWeight.w600,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
       ),
     );
   }

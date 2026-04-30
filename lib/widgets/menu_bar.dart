@@ -15,8 +15,10 @@ import 'common/duck_glass.dart';
 import 'common/duck_toast.dart';
 import 'common/media_url_prompt.dart';
 import 'gitnexus_dialog.dart';
+import 'llm_providers_setup_dialog.dart';
 import 'lock_screen.dart';
 import 'manual_skill_dialog.dart';
+import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
 
 class DuckMenuBar extends StatelessWidget {
@@ -652,15 +654,23 @@ Future<String?> _promptNewFileName(BuildContext context) async {
 
 /// New-project wizard sequence used by the menu bar's "Open Folder"
 /// when the chosen folder is being opened for the first time. Mirrors
-/// `welcome_screen.dart::_runNewProjectWizard` step-for-step. Each
-/// dialog has its own Skip / Cancel button so the user can bail at
-/// any point — `context.mounted` guards bridge the gap if they close
-/// the app mid-flow.
+/// `welcome_screen.dart::_runNewProjectWizard` step-for-step — keep
+/// the two in sync if you change either. Each dialog has its own
+/// Skip / Cancel button so the user can bail at any point;
+/// `context.mounted` guards bridge the gap if they close the app
+/// mid-flow.
 Future<void> _runNewProjectWizardFromMenu(
   BuildContext context,
   AppState state,
   String path,
 ) async {
+  final firstRun = await _isLumenFirstRun(state);
+  if (context.mounted && firstRun) {
+    await showOllamaSetupDialog(context);
+  }
+  if (context.mounted && firstRun) {
+    await showLlmProvidersSetupDialog(context);
+  }
   if (context.mounted) {
     await showSkillGeneratorDialog(context, workspacePath: path);
   }
@@ -670,6 +680,21 @@ Future<void> _runNewProjectWizardFromMenu(
   if (context.mounted) {
     await _promptSyncthingIfNeeded(context, state, path);
   }
+}
+
+/// First-run heuristic shared with `welcome_screen.dart`. True when
+/// no provider has any credential set AND Ollama isn't reachable —
+/// i.e. the user has nothing configured. Used to gate the onboarding
+/// steps (Ollama setup, LLM providers) so repeat users don't see
+/// them on every new project.
+Future<bool> _isLumenFirstRun(AppState state) async {
+  final hasAnyKey = state.geminiApiKey.isNotEmpty ||
+      state.anthropicApiKey.isNotEmpty ||
+      state.githubModelsApiKey.isNotEmpty ||
+      state.openaiApiKey.isNotEmpty;
+  if (hasAnyKey) return false;
+  final ollamaUp = await state.ollamaService.isReachable();
+  return !ollamaUp;
 }
 
 /// Shows a one-time prompt asking if the user wants to share this project

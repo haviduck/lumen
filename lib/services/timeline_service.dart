@@ -77,6 +77,7 @@ class TimelineService extends ChangeNotifier {
   /// `path_provider` /  Flutter foundation).
   static const Set<String> _ignoreSegs = <String>{
     '.git',
+    '.gitnexus',
     '.dart_tool',
     'node_modules',
     'build',
@@ -319,7 +320,17 @@ class TimelineService extends ChangeNotifier {
     // (because `ReadDirectoryChangesW` notifies extremely fast)
     // and the entry lands as `fsEvent`, breaking the recent-edits
     // tracker's `origin == agentTool` filter.
+    //
+    // `baseline` is deliberately exempt: the recorder calls
+    // `ensureBaseline` from `beforeTool` *after* it has already
+    // reserved the path so the FS watcher can't race in. Without
+    // this exemption the baseline gets silently dropped, the head
+    // for the file stays null, and the agent's post-edit
+    // `recordWrite` gets misclassified as `create` instead of
+    // `modify` — which makes the per-message restore feature
+    // *delete* the file the user only wanted to roll back.
     if (origin != TimelineOrigin.agentTool &&
+        origin != TimelineOrigin.baseline &&
         _agentReserved.contains(_normalizeRel(rel))) {
       return null;
     }
@@ -730,20 +741,63 @@ class TimelineService extends ChangeNotifier {
     String messageId, {
     String? legacyMessageId,
   }) async {
+    return restoreMessagesChanges(
+      <String>{messageId},
+      legacyMessageIds: legacyMessageId != null
+          ? <String>{legacyMessageId}
+          : null,
+    );
+  }
+
+  /// Bulk-revert agent operations across multiple chat messages in one
+  /// transaction. Used by the per-USER-message revert path: when the
+  /// user clicks "revert" on their bubble at index N, we collect the
+  /// ids of every assistant message at index >= N+1 and walk *all*
+  /// their `agentTool` entries newest-first as a single chronologically
+  /// ordered list.
+  ///
+  /// **Why a multi-id surface instead of a loop of single-id calls?**
+  /// Per-entry revert order matters when multiple messages mutated the
+  /// same file: each `modify` writes back its own `prevHash`, which is
+  /// the previous in-journal hash for that path. If we walked message
+  /// A first and then message B, but B's earliest entry referenced
+  /// content that A's revert had just clobbered, we'd end up with a
+  /// frankenstein file. Walking all matching entries newest-first
+  /// (which is the in-memory order of `_entries`) guarantees each
+  /// `prevHash` is restored against the state the journal recorded at
+  /// the time of that entry — which is the only ordering that works
+  /// regardless of how many messages or how many edits per file.
+  Future<TimelineBulkRestoreResult> restoreMessagesChanges(
+    Set<String> messageIds, {
+    Set<String>? legacyMessageIds,
+  }) async {
     if (!isReady) {
       return const TimelineBulkRestoreResult(
         ok: false,
         message: 'Timeline not bound to a workspace.',
       );
     }
-    final entries = entriesForMessage(
-      messageId,
-      legacyMessageId: legacyMessageId,
-    );
+    if (messageIds.isEmpty &&
+        (legacyMessageIds == null || legacyMessageIds.isEmpty)) {
+      return const TimelineBulkRestoreResult(
+        ok: false,
+        message: 'No file changes were recorded for this revert.',
+      );
+    }
+    final entries = _entries
+        .where(
+          (e) =>
+              e.origin == TimelineOrigin.agentTool &&
+              e.messageId != null &&
+              (messageIds.contains(e.messageId) ||
+                  (legacyMessageIds != null &&
+                      legacyMessageIds.contains(e.messageId))),
+        )
+        .toList(growable: false);
     if (entries.isEmpty) {
       return const TimelineBulkRestoreResult(
         ok: false,
-        message: 'No file changes were recorded for this message.',
+        message: 'No file changes were recorded for this revert.',
       );
     }
 
@@ -791,6 +845,24 @@ class TimelineService extends ChangeNotifier {
 
     switch (entry.op) {
       case TimelineOp.create:
+        // Defensive: a `create` entry SHOULD only exist for genuinely
+        // new files — but legacy / corrupted journals can mis-tag a
+        // modify as a create (notably when `ensureBaseline` was
+        // dropped by the agent-reservation guard before the fix).
+        // If the journal has any earlier non-delete history for this
+        // path, the file pre-existed — restore the prior content
+        // instead of silently deleting user data.
+        final prior = _priorRestorableEntry(entry);
+        if (prior != null) {
+          await snapshotIfPresent(abs);
+          await _writeBlobToPath(
+            prior.newHash,
+            abs,
+            note:
+                'Chat restore reverted create using prior history (${prior.id})',
+          );
+          return;
+        }
         await snapshotIfPresent(abs);
         final type = await FileSystemEntity.type(abs);
         if (type == FileSystemEntityType.file) {
@@ -805,11 +877,19 @@ class TimelineService extends ChangeNotifier {
         }
         return;
       case TimelineOp.modify:
-        await snapshotIfPresent(abs);
+        // A modify entry always carries a `prevHash` in healthy
+        // journals — that's the whole point of the op. If it's
+        // missing the journal is corrupt and we have no original
+        // content to restore. Throw so the caller surfaces a
+        // failure in the toast rather than deleting the file (which
+        // would compound a corruption bug into actual data loss).
         if (entry.prevHash.isEmpty) {
-          if (await File(abs).exists()) await File(abs).delete();
-          return;
+          throw StateError(
+            'modify entry ${entry.id} has no prevHash; refusing to delete '
+            '${entry.relPath} blindly',
+          );
         }
+        await snapshotIfPresent(abs);
         await _writeBlobToPath(
           entry.prevHash,
           abs,
@@ -843,6 +923,30 @@ class TimelineService extends ChangeNotifier {
         }
         return;
     }
+  }
+
+  /// Returns the most recent entry for `entry.relPath` strictly older
+  /// than `entry` whose content we can restore (non-delete op, blob
+  /// hash present). Used by the chat-restore path to detect a
+  /// `create` entry that's actually masking a `modify` (legacy bad
+  /// data left behind by the pre-fix `ensureBaseline` skip), so we
+  /// can roll back to real content instead of deleting the file.
+  ///
+  /// If the most recent prior entry is itself a delete, the file was
+  /// genuinely absent at the moment of `entry`, so the `create` is
+  /// real and the caller should fall through to the delete branch.
+  TimelineEntry? _priorRestorableEntry(TimelineEntry entry) {
+    TimelineEntry? best;
+    for (final e in _entries) {
+      if (e.id == entry.id) continue;
+      if (e.relPath != entry.relPath) continue;
+      if (!e.when.isBefore(entry.when)) continue;
+      if (best == null || e.when.isAfter(best.when)) best = e;
+    }
+    if (best == null) return null;
+    if (best.op == TimelineOp.delete) return null;
+    if (best.newHash.isEmpty) return null;
+    return best;
   }
 
   Future<void> _writeBlobToPath(
