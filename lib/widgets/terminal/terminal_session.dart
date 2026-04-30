@@ -47,8 +47,20 @@ class TerminalSession {
   /// the one originally requested (auto-fallback).
   final void Function(ShellSpec shell, String reason)? onShellSwitched;
 
+  /// Fired with the OS-level child PID once the shell process is
+  /// actually live (PTY or fallback path). The process manager's
+  /// `LumenProcessTracker` listens here so the "Lumen-spawned"
+  /// filter chip is accurate. Optional so tests / unit harnesses
+  /// can omit it.
+  final void Function(int pid)? onPidStarted;
+
+  /// Fired when the session is disposed so the tracker can drop
+  /// the PID. Paired with [onPidStarted].
+  final void Function(int pid)? onPidEnded;
+
   Pty? _pty;
   Process? _proc;
+  int? _trackedPid;
   bool _disposed = false;
   bool _usingFallback = false;
   ShellSpec? _activeShell;
@@ -63,6 +75,8 @@ class TerminalSession {
     required this.title,
     required this.workingDirectory,
     this.onShellSwitched,
+    this.onPidStarted,
+    this.onPidEnded,
   }) {
     terminal = Terminal();
     controller = TerminalController();
@@ -151,6 +165,13 @@ class TerminalSession {
         columns: terminal.viewWidth,
         rows: terminal.viewHeight,
       );
+      // Right after the FFI call succeeded is the only moment we
+      // can be sure of the child's identity. Hand the PID off to
+      // the process-manager tracker so descendant tooling
+      // (npm/node/python spawned inside this shell) can be
+      // flagged as Lumen-spawned. Failures here are swallowed —
+      // bookkeeping should never abort a terminal start.
+      _announcePid(_pty?.pid);
     } catch (e) {
       terminal.write(
         '\x1b[33m[PTY init failed for ${shell.label}: $e]\x1b[0m\r\n',
@@ -232,6 +253,7 @@ class TerminalSession {
         // empty — see the long comment on the PTY path.
         includeParentEnvironment: true,
       );
+      _announcePid(_proc?.pid);
 
       _proc!.stdout
           .transform(utf8.decoder)

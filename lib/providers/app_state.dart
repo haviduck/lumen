@@ -13,6 +13,7 @@ import '../services/gemini_service.dart';
 import '../services/gitnexus_service.dart';
 import '../services/github_models_service.dart';
 import '../services/ide_actions.dart';
+import '../services/lumen_process_tracker.dart';
 import '../services/ollama_service.dart';
 import '../services/preferences_service.dart';
 import '../services/recent_edits_tracker.dart';
@@ -39,11 +40,21 @@ class AppState extends ChangeNotifier {
   /// detects it and renders `SettingsView` instead of a code pane.
   static const String settingsSentinel = '__settings__';
 
+  /// Sentinel file path for the process manager virtual tab. Same
+  /// pattern as `settingsSentinel`: a fake path that the editor pane
+  /// detects and routes to `ProcessManagerView` instead of trying to
+  /// open a code editor.
+  static const String processManagerSentinel = '__process_manager__';
+
   /// Prefix for untitled (unsaved) tabs created with Ctrl+T.
   static const String untitledPrefix = '__untitled__';
 
   /// Returns `true` when the given path is the settings sentinel.
   static bool isSettingsTab(String? path) => path == settingsSentinel;
+
+  /// Returns `true` when the given path is the process manager sentinel.
+  static bool isProcessManagerTab(String? path) =>
+      path == processManagerSentinel;
 
   /// Returns `true` when the given path is an untitled (unsaved) tab.
   static bool isUntitledTab(String? path) =>
@@ -66,6 +77,13 @@ class AppState extends ChangeNotifier {
   final ChatPersistenceService _persistence = ChatPersistenceService();
   final RulesService rules = RulesService();
   final IdeActions ideActions = IdeActions();
+  // Tracks PIDs that Lumen explicitly spawned (terminal PTYs, agent
+  // tool processes) so the process manager can offer a
+  // "Lumen-spawned" filter that's actually accurate. See
+  // `services/lumen_process_tracker.dart` for the descendant-walk
+  // logic. Owned here because the lifetime is workspace-independent
+  // — terminals can outlive a workspace switch.
+  final LumenProcessTracker lumenProcesses = LumenProcessTracker();
   final BackupService backups = BackupService();
   final SyncthingService syncthing = SyncthingService();
   final GitNexusService gitnexus = GitNexusService();
@@ -622,6 +640,26 @@ class AppState extends ChangeNotifier {
       _savedFileContents[settingsSentinel] = '';
     }
     _activeFile = _openFiles.firstWhere((f) => f.path == settingsSentinel);
+    notifyListeners();
+  }
+
+  /// Opens the process manager as a virtual tab. Mirrors
+  /// `openSettingsTab` exactly: we materialise a sentinel `File`
+  /// under [processManagerSentinel] so the editor pane's tab strip
+  /// has something to render, and the editor switches to
+  /// `ProcessManagerView` when the active path matches the
+  /// sentinel. Re-opening focuses the existing tab instead of
+  /// stacking duplicates.
+  void openProcessManagerTab() {
+    final sentinel = File(processManagerSentinel);
+    if (!_openFiles.any((f) => f.path == processManagerSentinel)) {
+      _openFiles.add(sentinel);
+      _fileContents[processManagerSentinel] = '';
+      _savedFileContents[processManagerSentinel] = '';
+    }
+    _activeFile = _openFiles.firstWhere(
+      (f) => f.path == processManagerSentinel,
+    );
     notifyListeners();
   }
 

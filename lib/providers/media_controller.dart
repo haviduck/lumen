@@ -5,6 +5,9 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_windows/webview_windows.dart';
 
+import '../services/extension_provisioner.dart';
+import 'media_scripts.dart';
+
 /// Where the watch-media `Webview` is rendered.
 ///
 /// - `chat`   — embedded at the top of the AI chat panel, scaled
@@ -245,6 +248,46 @@ class MediaController extends ChangeNotifier {
     try {
       if (!_webviewInitialized) {
         await webview.initialize();
+        // Don't let pages spawn new OS windows on `target=_blank`
+        // / `window.open(...)`. `sameWindow` routes the popup back
+        // into this same Webview2 instance — keeps SSO redirects
+        // and "open in new tab" links working without flashing a
+        // detached browser window over the IDE.
+        try {
+          await webview
+              .setPopupWindowPolicy(WebviewPopupWindowPolicy.sameWindow);
+        } catch (_) {}
+        // Load uBlock Origin Lite (MV3) from the bundled asset. uBOL
+        // does the heavy lifting: in-stream YouTube ads, network
+        // trackers, cosmetic filters, popup *content* once a popup is
+        // open. The JS hook below covers what uBOL cannot — preventing
+        // the popup itself from spawning (uBOL only blocks the URL it
+        // would have loaded, the OS window can still flash). They are
+        // complementary, not redundant.
+        //
+        // Failure mode: if provisioning or loading the extension
+        // fails (asset missing, runtime too old, IO error) we silently
+        // continue without it. Ads come back; the popup hook still
+        // works. Don't promote this to a hard error — IDE shouldn't
+        // refuse to render a webview because ad-blocking degraded.
+        try {
+          final extPath = await ExtensionProvisioner.ensureUblockLite();
+          if (extPath != null) {
+            await webview.addBrowserExtension(extPath);
+          }
+        } catch (e) {
+          debugPrint('uBOL load failed (non-fatal): $e');
+        }
+        // Early script: hook `window.open` to refuse non-user-gesture
+        // calls (kills popunder ads). Self-gates off Twitch (per user
+        // preference — Twitch player legitimately uses window.open for
+        // chat-popout) and Teams (defensive — Teams uses a separate
+        // WebviewController anyway). Don't drop the gates without
+        // rebuilding context.
+        try {
+          await webview
+              .addScriptToExecuteOnDocumentCreated(kPopupSuppressionScript);
+        } catch (_) {}
         _webviewInitialized = true;
       }
       _loadingSub ??= webview.loadingState.listen(_onLoadingState);
@@ -269,6 +312,14 @@ class MediaController extends ChangeNotifier {
     try {
       if (!_teamsWebviewInitialized) {
         await teamsWebview.initialize();
+        // See `play()` — block Teams' "pop out chat / call" buttons
+        // from spawning new OS windows. `sameWindow` reroutes the
+        // popup into this same Webview2 instance, which Teams
+        // handles gracefully (popped-out view just loads in place).
+        try {
+          await teamsWebview
+              .setPopupWindowPolicy(WebviewPopupWindowPolicy.sameWindow);
+        } catch (_) {}
         _teamsWebviewInitialized = true;
       }
       _teamsLoadingSub ??= teamsWebview.loadingState.listen((state) {
@@ -492,7 +543,13 @@ class MediaController extends ChangeNotifier {
   void _onLoadingState(LoadingState state) {
     if (state != LoadingState.navigationCompleted) return;
     if (isYoutube) {
-      webview.executeScript(_youtubeWatchCleanupJs).catchError((Object e) {
+      // YT chrome stripping (masthead / sidebar / comments / ad-surface
+      // selectors). Unrelated to network-level ad blocking — uBOL kills
+      // the ad delivery, this CSS keeps the watch page looking like a
+      // pane-sized player. Brittle: YT renames these custom-element
+      // selectors a few times a year. Failure is graceful (unstyled
+      // watch page, still a working player).
+      webview.executeScript(kYoutubeWatchCleanupJs).catchError((Object e) {
         debugPrint('youtube cleanup script failed: $e');
         return null;
       });
@@ -506,44 +563,6 @@ class MediaController extends ChangeNotifier {
       _applyMute();
     }
   }
-
-  /// CSS injection that strips the YouTube watch page down to the
-  /// player. Brittle by nature — YouTube rewrites these custom-element
-  /// selectors a few times a year — but failure is graceful: the
-  /// user sees the unstyled watch page, which is still a fully
-  /// functional player.
-  static const String _youtubeWatchCleanupJs = r'''
-(function() {
-  var css = `
-    ytd-masthead, #masthead, #masthead-container,
-    ytd-watch-next-secondary-results-renderer,
-    #related, #secondary, #secondary-inner,
-    ytd-comments, #comments, #below, ytd-merch-shelf-renderer,
-    ytd-popup-container, tp-yt-iron-overlay-backdrop { display: none !important; }
-    html, body, ytd-app, ytd-page-manager,
-    ytd-watch-flexy, #primary, #primary-inner,
-    #player-container-outer, #player-container-inner,
-    #player-container, #player, ytd-player, #movie_player {
-      background: #000 !important;
-    }
-    #player-container-outer, #player-container-inner,
-    #player-container, #player, ytd-player, #movie_player, video {
-      width: 100% !important;
-      height: 100vh !important;
-      max-height: 100vh !important;
-      margin: 0 !important;
-      padding: 0 !important;
-    }
-    body { overflow: hidden !important; }
-  `;
-  var existing = document.getElementById('lumen-yt-cleanup');
-  if (existing) existing.remove();
-  var s = document.createElement('style');
-  s.id = 'lumen-yt-cleanup';
-  s.textContent = css;
-  (document.head || document.documentElement).appendChild(s);
-})();
-''';
 
   @override
   void dispose() {

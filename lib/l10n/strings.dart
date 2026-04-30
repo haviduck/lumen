@@ -806,6 +806,7 @@ class S {
 
   // Tool approval
   static const String toolApprovalTitle = 'Agent wants to run a command';
+  static const String toolApprovalAccept = 'Accept';
   static const String toolApprovalAllowOnce = 'Allow once';
   static const String toolApprovalAllowAlways = 'Allow always';
   static const String toolApprovalAlwaysRun = 'Always run';

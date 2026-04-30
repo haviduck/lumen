@@ -5,28 +5,30 @@ import '../../providers/chat_controller.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 
-/// Pending-approval surface docked above the chat input, modelled
-/// after Cursor / VS Code's terminal-permission prompts:
+/// Small, discrete pending-approval panel docked above the chat input.
 ///
 /// ```
-/// ┌──────────────────────────────────────────────────────────┐
-/// │ ● Run command  npm install …          ⌃▽ Deny  Always  ✓ │
-/// └──────────────────────────────────────────────────────────┘
+/// ┌──────────────────────────────────────────────────┐
+/// │ ● run_cmd  npm install …          accept · deny  │
+/// └──────────────────────────────────────────────────┘
 /// ```
 ///
-/// Single row by default — short commands fit comfortably without
-/// stealing height from the conversation. Multi-line / long
-/// commands are reachable via the chevron, which expands a mono-
-/// font detail block. Layout is intentionally chrome-grade
-/// (toolbar-tier hierarchy, not card-tier): warning-yellow left
-/// rail, condensed text size, no rounded card outline. Earlier
-/// versions used a heavyweight `bgRaisedHi` rounded card that
-/// felt like a popup interrupting the chat.
+/// Design rules:
+///  - Dark background (deepest tier) so it reads as chrome, not a
+///    card / popup. No chunky left rail, no colored fill on the
+///    actions — earlier versions used pill buttons that competed
+///    with the cyan send button for visual weight.
+///  - Actions are plain clickable text links: `accept` (cyan) and
+///    `deny` (red). Hover underlines them. No backgrounds.
+///  - Single row by default; multi-line commands are reachable via
+///    the chevron (expands a mono-font detail block).
+///
+/// "Always allow" was intentionally dropped from the strip to keep
+/// it minimal. Blanket-allow for a tool is still reachable via
+/// Settings → AI/Chat → Always-allowed tools.
 ///
 /// Naming kept as `approval_card.dart` for git-history continuity
-/// even though the export is now `ApprovalStrip` — old name was
-/// already exported from `ai_chat/` so renaming the file would
-/// churn imports across unrelated files.
+/// even though the export is `ApprovalStrip`.
 class ApprovalStrip extends StatefulWidget {
   final ChatController controller;
   final PendingApproval approval;
@@ -53,28 +55,26 @@ class _ApprovalStripState extends State<ApprovalStrip> {
     final controller = widget.controller;
     return Container(
       decoration: const BoxDecoration(
-        color: DuckColors.bgDeeper,
+        color: DuckColors.bgDeepest,
         border: Border(
           top: BorderSide(color: DuckColors.glassSeam, width: 0.5),
-          // Yellow-rail left edge — same affordance the silent-
-          // approval audit banner uses, so "I need to make a
-          // decision" surfaces have a consistent visual language.
-          left: BorderSide(color: DuckColors.stateWarn, width: 2),
         ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+            padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
             child: Row(
               children: [
-                const Icon(Icons.shield_outlined,
-                    size: 13, color: DuckColors.stateWarn),
+                const Icon(
+                  Icons.shield_outlined,
+                  size: 12,
+                  color: DuckColors.stateWarn,
+                ),
                 const SizedBox(width: 8),
-                // Tool label (e.g. RUN_CMD) — small uppercase,
-                // doesn't compete with the command text for
-                // attention.
+                // Tool label (e.g. RUN_CMD) — small uppercase, doesn't
+                // compete with the command text for attention.
                 Text(
                   approval.label,
                   style: const TextStyle(
@@ -85,7 +85,6 @@ class _ApprovalStripState extends State<ApprovalStrip> {
                   ),
                 ),
                 const SizedBox(width: 10),
-                // Inline command preview, mono font, ellipsis.
                 Expanded(
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
@@ -112,49 +111,35 @@ class _ApprovalStripState extends State<ApprovalStrip> {
                     borderRadius:
                         BorderRadius.circular(DuckTheme.radiusS),
                     child: Padding(
-                      padding: const EdgeInsets.all(3),
+                      padding: const EdgeInsets.all(2),
                       child: Icon(
                         _expanded
                             ? Icons.keyboard_arrow_up
                             : Icons.keyboard_arrow_down,
-                        size: 14,
+                        size: 13,
                         color: DuckColors.fgSubtle,
                       ),
                     ),
                   ),
                 ],
-                const SizedBox(width: 8),
-                _StripButton(
-                  label: S.toolApprovalDeny,
-                  onTap: () => controller.respondToApproval(false),
-                  tone: _StripButtonTone.danger,
-                ),
-                const SizedBox(width: 4),
-                _StripButton(
-                  label: approval.toolId == 'run_cmd'
-                      ? S.toolApprovalAlwaysRun
-                      : S.toolApprovalAllowAlways,
-                  onTap: () async {
-                    await controller.setToolAutoApproved(
-                      approval.toolId,
-                      true,
-                    );
-                    controller.respondToApproval(true);
-                  },
-                  tone: _StripButtonTone.muted,
-                ),
-                const SizedBox(width: 4),
-                _StripButton(
-                  label: S.toolApprovalAllowOnce,
+                const SizedBox(width: 12),
+                _LinkAction(
+                  label: S.toolApprovalAccept.toLowerCase(),
+                  color: DuckColors.accentCyan,
                   onTap: () => controller.respondToApproval(true),
-                  tone: _StripButtonTone.primary,
+                ),
+                const _LinkSeparator(),
+                _LinkAction(
+                  label: S.toolApprovalDeny.toLowerCase(),
+                  color: DuckColors.stateError,
+                  onTap: () => controller.respondToApproval(false),
                 ),
               ],
             ),
           ),
-          // Expanded multi-line preview — same mono styling but
-          // stripped of clutter (no inset card / no border) so it
-          // reads as continuous chrome rather than a nested popup.
+          // Expanded multi-line preview — mono styling, no inset card
+          // / no border, reads as continuous chrome rather than a
+          // nested popup.
           if (_expanded && _multiline) ...[
             const Divider(
               height: 1,
@@ -184,78 +169,65 @@ class _ApprovalStripState extends State<ApprovalStrip> {
   }
 }
 
-enum _StripButtonTone { danger, muted, primary }
-
-/// Compact pill-style button used inside the approval strip.
-/// Consciously NOT a Material `TextButton` / `ElevatedButton` because
-/// those bake in vertical padding that bloats the strip's height.
-/// We need ~24px tall to keep the strip toolbar-feeling.
-class _StripButton extends StatefulWidget {
+/// Plain text link with a hover underline. No padding chrome, no
+/// background — the strip reads as chrome, not as a button bar.
+class _LinkAction extends StatefulWidget {
   final String label;
+  final Color color;
   final VoidCallback onTap;
-  final _StripButtonTone tone;
-  const _StripButton({
+
+  const _LinkAction({
     required this.label,
+    required this.color,
     required this.onTap,
-    required this.tone,
   });
 
   @override
-  State<_StripButton> createState() => _StripButtonState();
+  State<_LinkAction> createState() => _LinkActionState();
 }
 
-class _StripButtonState extends State<_StripButton> {
+class _LinkActionState extends State<_LinkAction> {
   bool _hover = false;
-
-  ({Color fg, Color bg, Color hoverBg}) get _palette {
-    switch (widget.tone) {
-      case _StripButtonTone.danger:
-        return (
-          fg: DuckColors.stateError,
-          bg: Colors.transparent,
-          hoverBg: DuckColors.stateError.withValues(alpha: 0.10),
-        );
-      case _StripButtonTone.muted:
-        return (
-          fg: DuckColors.fgMuted,
-          bg: Colors.transparent,
-          hoverBg: DuckColors.bgRaisedHi,
-        );
-      case _StripButtonTone.primary:
-        return (
-          fg: DuckColors.bgDeepest,
-          bg: DuckColors.accentCyan,
-          hoverBg: DuckColors.accentCyan,
-        );
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
-    final p = _palette;
     return MouseRegion(
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
         onTap: widget.onTap,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 100),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-          decoration: BoxDecoration(
-            color: _hover ? p.hoverBg : p.bg,
-            borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+        child: Text(
+          widget.label,
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: widget.color,
+            height: 1.2,
+            decoration:
+                _hover ? TextDecoration.underline : TextDecoration.none,
+            decorationColor: widget.color,
+            decorationThickness: 1.2,
           ),
-          child: Text(
-            widget.label,
-            style: TextStyle(
-              fontSize: 11.5,
-              fontWeight: widget.tone == _StripButtonTone.primary
-                  ? FontWeight.w600
-                  : FontWeight.w500,
-              color: p.fg,
-            ),
-          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LinkSeparator extends StatelessWidget {
+  const _LinkSeparator();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.symmetric(horizontal: 8),
+      child: Text(
+        '·',
+        style: TextStyle(
+          fontSize: 12,
+          color: DuckColors.fgSubtle,
+          height: 1.2,
         ),
       ),
     );

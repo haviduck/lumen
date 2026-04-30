@@ -48,7 +48,8 @@ dependencies:
   flutter_pty: ^0.4.2
   flutter_markdown_plus: ^1.0.3
   youtube_player_iframe: ^5.2.2
-  webview_windows: ^0.4.0
+  webview_windows:
+    path: packages/webview_windows
   archive: ^4.0.9
   crypto: ^3.0.7
   image: ^4.8.0
@@ -79,6 +80,11 @@ flutter:
   # To add assets to your application, add an assets section, like this:
   assets:
     - assets/images/lumen_logo.png
+    # uBlock Origin Lite (MV3) — bundled as a zip and unpacked at first
+    # launch into %LOCALAPPDATA%/Lumen/extensions/ublock-lite/. Loaded
+    # into the shared media WebView2 via `WebviewController.addBrowserExtension`.
+    # See `lib/services/extension_provisioner.dart` for the unpack flow.
+    - assets/extensions/ublock-lite.zip
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
