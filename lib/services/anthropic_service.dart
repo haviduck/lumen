@@ -1,0 +1,372 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
+
+import 'ollama_service.dart' show CancellationToken;
+import 'reasoning_effort.dart';
+
+/// Talks to Anthropic's Claude Messages API.
+///
+/// The rest of Lumen speaks an Ollama-style message shape:
+/// `{role, content, images?}`. This service adapts that shape to
+/// Anthropic's `system` + `messages[].content[]` format while keeping
+/// the same cancellation and streaming behaviour as the other providers.
+class AnthropicService {
+  String apiKey;
+  String baseUrl;
+
+  AnthropicService({
+    this.apiKey = '',
+    this.baseUrl = 'https://api.anthropic.com',
+  });
+
+  static const _anthropicVersion = '2023-06-01';
+
+  Map<String, String> get _headers => {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': _anthropicVersion,
+  };
+
+  Map<String, dynamic> _buildRequestBody(
+    List<Map<String, dynamic>> messages, {
+    required String model,
+    required int maxTokens,
+    double temperature = 0.7,
+    ReasoningEffort? effort,
+  }) {
+    final systemParts = <String>[];
+    final converted = <Map<String, dynamic>>[];
+
+    for (final m in messages) {
+      final role = m['role'] as String;
+      final content = m['content'] as String? ?? '';
+      if (role == 'system') {
+        if (content.isNotEmpty) systemParts.add(content);
+        continue;
+      }
+
+      final blocks = <Map<String, dynamic>>[];
+      if (content.isNotEmpty) {
+        blocks.add({'type': 'text', 'text': content});
+      }
+
+      final images = m['images'] as List<dynamic>? ?? [];
+      for (final img in images) {
+        blocks.add({
+          'type': 'image',
+          'source': {
+            'type': 'base64',
+            'media_type': 'image/png',
+            'data': img as String,
+          },
+        });
+      }
+
+      if (blocks.isEmpty) continue;
+      converted.add({
+        'role': role == 'assistant' ? 'assistant' : 'user',
+        'content': blocks,
+      });
+    }
+
+    // Anthropic is happiest with alternating turns. Tool feedback can
+    // produce consecutive user messages, so merge adjacent same-role turns.
+    final merged = <Map<String, dynamic>>[];
+    for (final msg in converted) {
+      if (merged.isNotEmpty && merged.last['role'] == msg['role']) {
+        (merged.last['content'] as List).addAll(msg['content'] as List);
+      } else {
+        merged.add({
+          'role': msg['role'],
+          'content': List<Map<String, dynamic>>.from(msg['content'] as List),
+        });
+      }
+    }
+
+    if (merged.isNotEmpty && merged.first['role'] != 'user') {
+      merged.insert(0, {
+        'role': 'user',
+        'content': [
+          {'type': 'text', 'text': '(start)'},
+        ],
+      });
+    }
+
+    final body = <String, dynamic>{
+      'model': model,
+      'max_tokens': maxTokens,
+      'temperature': temperature,
+      'messages': merged,
+    };
+    if (systemParts.isNotEmpty) {
+      body['system'] = systemParts.join('\n\n');
+    }
+
+    // **Extended thinking** — Claude Opus 4+ / Sonnet 4+ accept a
+    // `thinking` block that allocates internal reasoning tokens before
+    // the model emits user-visible text. When enabled, Anthropic
+    // requires `temperature == 1` (any other value 400s with
+    // `temperature may only be set to 1 when thinking is enabled`),
+    // so we override the caller's temperature here. Haiku and older
+    // 3.x models silently reject the param — the helper's
+    // [modelSupportsNative] returns false for them, and the controller
+    // is supposed to gate this call. If we ever get called with a
+    // non-supporting model we still skip cleanly because budget==null.
+    if (effort != null && effort != ReasoningEffort.off) {
+      final supports = ReasoningEffortHelper.modelSupportsNative(
+        provider: 'claude',
+        rawModel: model,
+      );
+      final budget = ReasoningEffortHelper.anthropicBudget(effort);
+      if (supports && budget != null && budget < maxTokens) {
+        body['thinking'] = {'type': 'enabled', 'budget_tokens': budget};
+        body['temperature'] = 1.0;
+      }
+    }
+    return body;
+  }
+
+  Future<String> generateChat(
+    List<Map<String, dynamic>> messages, {
+    String model = 'claude-sonnet-4-6',
+    CancellationToken? token,
+    ReasoningEffort? effort,
+  }) async {
+    if (token?.isCancelled == true) return '_(cancelled)_';
+    if (apiKey.isEmpty) return 'Error: No Anthropic API key configured.';
+
+    final client = http.Client();
+    token?.attach(client);
+    try {
+      final body = _buildRequestBody(
+        messages,
+        model: model,
+        maxTokens: 16384,
+        effort: effort,
+      );
+      final res = await client.post(
+        Uri.parse('$baseUrl/v1/messages'),
+        headers: _headers,
+        body: jsonEncode(body),
+      );
+
+      if (token?.isCancelled == true) return '_(cancelled)_';
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final content = data['content'] as List<dynamic>? ?? [];
+        return content
+            .where((block) => block['type'] == 'text')
+            .map((block) => block['text'] as String? ?? '')
+            .join('');
+      }
+      return _formatError(res.statusCode, res.body);
+    } catch (e) {
+      if (token?.isCancelled == true) return '_(cancelled)_';
+      return 'Error connecting to Anthropic: $e';
+    } finally {
+      try {
+        client.close();
+      } catch (_) {}
+    }
+  }
+
+  Stream<String> generateChatStream(
+    List<Map<String, dynamic>> messages, {
+    String model = 'claude-sonnet-4-6',
+    CancellationToken? token,
+    Duration idleTimeout = const Duration(minutes: 3),
+    ReasoningEffort? effort,
+  }) async* {
+    if (token?.isCancelled == true) return;
+    if (apiKey.isEmpty) {
+      yield 'Error: No Anthropic API key configured.';
+      return;
+    }
+
+    final client = http.Client();
+    token?.attach(client);
+    bool timedOut = false;
+    try {
+      final body = _buildRequestBody(
+        messages,
+        model: model,
+        maxTokens: 16384,
+        effort: effort,
+      )..['stream'] = true;
+
+      final req = http.Request('POST', Uri.parse('$baseUrl/v1/messages'))
+        ..headers.addAll(_headers)
+        ..body = jsonEncode(body);
+      final res = await client.send(req);
+      if (res.statusCode != 200) {
+        final err = await res.stream.bytesToString();
+        yield _formatError(res.statusCode, err);
+        return;
+      }
+
+      final lineStream = res.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .timeout(
+            idleTimeout,
+            onTimeout: (sink) {
+              timedOut = true;
+              sink.close();
+            },
+          );
+
+      await for (final line in lineStream) {
+        if (token?.isCancelled == true) return;
+        if (line.isEmpty || !line.startsWith('data: ')) continue;
+        final data = line.substring(6).trim();
+        if (data.isEmpty || data == '[DONE]') continue;
+
+        try {
+          final obj = jsonDecode(data) as Map<String, dynamic>;
+          final type = obj['type'] as String? ?? '';
+          if (type == 'content_block_delta') {
+            // With extended thinking enabled, the SSE stream emits two
+            // delta types: `thinking_delta` (carries `delta.thinking`,
+            // model's internal reasoning) and `text_delta` (carries
+            // `delta.text`, user-visible response). We only forward
+            // `text_delta` — thinking is for the model's benefit, not
+            // the chat panel. Anthropic guarantees thinking blocks
+            // arrive BEFORE text blocks, so by the time `text_delta`
+            // chunks start flowing the model is already past the
+            // reasoning phase.
+            final delta = obj['delta'] as Map<String, dynamic>? ?? {};
+            final deltaType = delta['type'] as String? ?? '';
+            if (deltaType == 'text_delta' || deltaType.isEmpty) {
+              final text = delta['text'] as String? ?? '';
+              if (text.isNotEmpty) yield text;
+            }
+          } else if (type == 'error') {
+            final error = obj['error'] as Map<String, dynamic>? ?? {};
+            final message = error['message'] as String? ?? 'Unknown error';
+            yield 'Anthropic API error: $message';
+            return;
+          }
+        } catch (e) {
+          debugPrint('Anthropic stream parse error: $e');
+        }
+      }
+
+      if (timedOut && token?.isCancelled != true) {
+        yield '\n\n_(generation paused - no response from Anthropic for '
+            '${idleTimeout.inMinutes} min. Network may be stalled - '
+            'send a follow-up to continue.)_\n';
+      }
+    } catch (e) {
+      if (token?.isCancelled == true) return;
+      yield 'Error connecting to Anthropic: $e';
+    } finally {
+      try {
+        client.close();
+      } catch (_) {}
+    }
+  }
+
+  Future<List<String>> getModels() async {
+    if (apiKey.isEmpty) return _defaultModels;
+    try {
+      final res = await http
+          .get(Uri.parse('$baseUrl/v1/models'), headers: _headers)
+          .timeout(const Duration(seconds: 6));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final items = (data['data'] ?? data['models']) as List<dynamic>?;
+        final models = (items ?? const <dynamic>[])
+            .map((m) {
+              if (m is String) return m;
+              if (m is Map<String, dynamic>) return m['id'] as String? ?? '';
+              return '';
+            })
+            .where((id) => id.startsWith('claude-'))
+            .toList();
+        if (models.isNotEmpty) return models;
+      }
+    } catch (e) {
+      debugPrint('Error fetching Anthropic models: $e');
+    }
+    return _defaultModels;
+  }
+
+  Future<bool> isReachable() async {
+    if (apiKey.isEmpty) return false;
+    try {
+      final res = await http
+          .get(Uri.parse('$baseUrl/v1/models'), headers: _headers)
+          .timeout(const Duration(seconds: 5));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<String> summarizeTitle(
+    String firstMessage, {
+    String model = 'claude-haiku-4-5',
+  }) async {
+    if (apiKey.isEmpty) return _fallbackTitle(firstMessage);
+    try {
+      final res = await http
+          .post(
+            Uri.parse('$baseUrl/v1/messages'),
+            headers: _headers,
+            body: jsonEncode({
+              'model': model,
+              'max_tokens': 30,
+              'temperature': 0.2,
+              'system':
+                  'Reply with a 3-6 word title summarizing the user message. No quotes, no punctuation at the end, no preamble.',
+              'messages': [
+                {
+                  'role': 'user',
+                  'content': [
+                    {'type': 'text', 'text': firstMessage},
+                  ],
+                },
+              ],
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final content = data['content'] as List<dynamic>? ?? [];
+        final raw = content
+            .where((block) => block['type'] == 'text')
+            .map((block) => block['text'] as String? ?? '')
+            .join('')
+            .replaceAll(RegExp(r'["`*\n]'), '')
+            .trim();
+        if (raw.isNotEmpty) return raw;
+      }
+    } catch (_) {}
+    return _fallbackTitle(firstMessage);
+  }
+
+  static String _formatError(int statusCode, String body) {
+    try {
+      final err = jsonDecode(body) as Map<String, dynamic>;
+      final error = err['error'] as Map<String, dynamic>?;
+      final msg = error?['message'] as String? ?? body;
+      return 'Anthropic API error ($statusCode): $msg';
+    } catch (_) {
+      return 'Anthropic API error ($statusCode): $body';
+    }
+  }
+
+  static String _fallbackTitle(String firstMessage) {
+    final fallback = firstMessage.trim().replaceAll(RegExp(r'\s+'), ' ');
+    return fallback.length > 40 ? '${fallback.substring(0, 40)}...' : fallback;
+  }
+
+  static const _defaultModels = [
+    'claude-opus-4-7',
+    'claude-sonnet-4-6',
+    'claude-haiku-4-5',
+  ];
+}
