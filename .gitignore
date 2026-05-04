@@ -147,5 +147,5 @@ venv/
 *.sqlite
 *.sqlite-journal
 *.db
-.CLAUDE.md
-.AGENTS.md
+CLAUDE.md
+AGENTS.md
