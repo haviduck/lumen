@@ -20,6 +20,10 @@ migrate_working_dir/
 .stfolder/
 .stignore
 
+# Packaged release artefacts produced by `flutter build windows --release`
+# + the staging step in dist/. Regeneratable; never commit binaries.
+dist/
+
 # Secrets and local environment
 .env
 .env.*

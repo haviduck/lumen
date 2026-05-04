@@ -116,6 +116,116 @@ class ToolRegistry {
     return s.endsWith('\n') ? s.substring(0, s.length - 1) : s;
   }
 
+  /// Stream-based range read. Reads the file line-by-line via
+  /// `openRead().transform(LineSplitter())` and only emits lines
+  /// inside `[start, end]`. Memory footprint is one decoded chunk at
+  /// a time — works on a 9 GiB log the same as a 9 KiB source.
+  ///
+  /// Output caps are still enforced: at most [_kReadMaxLines] lines
+  /// and [_kReadMaxBytes] bytes are emitted, even if the model asked
+  /// for more. A truncation footer names the next call to fetch the
+  /// remainder. This stops a wild `:1-99999999` from blowing the
+  /// context window even though the underlying read is bounded.
+  ///
+  /// Returns the same `READ_FILE <fileName> lines X-Y:\n<body>`
+  /// shape the full-read path uses so the model parses both
+  /// uniformly.
+  static Future<String> _streamReadRange({
+    required String filePath,
+    required String fileName,
+    required int start,
+    required int end,
+    required int fileBytes,
+  }) async {
+    // Hard ceiling for range reads. Way above any realistic source
+    // file or even most logs; exists to refuse a `:1-1` on a 50 GiB
+    // VM disk image rather than spending a minute scanning to line 1.
+    const int rangeFileCeilingBytes = 500 * 1024 * 1024;
+    if (fileBytes > rangeFileCeilingBytes) {
+      final mib = (fileBytes / (1024 * 1024)).toStringAsFixed(1);
+      return 'READ_FILE $fileName: Error: file is $mib MiB '
+          '(range-read ceiling 500 MiB). Use SEARCH_TEXT for content '
+          'lookup or RUN_CMD with `head` / `tail` for a slice.';
+    }
+
+    final wantSize = end - start + 1;
+    // We never emit more than [_kReadMaxLines]; if the model asked
+    // for more, cap the emission window and tell them in the footer.
+    final emitMax = wantSize > _kReadMaxLines ? _kReadMaxLines : wantSize;
+    final emitEndLine = start + emitMax - 1;
+
+    final buf = StringBuffer();
+    var byteBudget = _kReadMaxBytes;
+    var lineNo = 0;
+    var emitted = 0;
+    var byteCapHit = false;
+
+    try {
+      final stream = File(filePath)
+          .openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter());
+      await for (final line in stream) {
+        lineNo++;
+        if (lineNo < start) continue;
+        if (lineNo > emitEndLine) break;
+        // +1 newline + a few bytes for the `<num>|` prefix. Conservative
+        // — the cap is a guardrail, not an exact accounting.
+        final cost = line.length + _kLineNoPad + 2;
+        if (cost > byteBudget) {
+          byteCapHit = true;
+          break;
+        }
+        byteBudget -= cost;
+        buf
+          ..write(lineNo.toString().padLeft(_kLineNoPad))
+          ..write('|')
+          ..writeln(line);
+        emitted++;
+      }
+    } on FormatException {
+      return 'READ_FILE $fileName: Error: file is not valid UTF-8 '
+          '(likely binary). READ_FILE only handles text.';
+    } catch (e) {
+      return 'READ_FILE $fileName: Error: $e';
+    }
+
+    if (emitted == 0) {
+      // Either the file is shorter than `start`, or the requested
+      // range is past EOF, or the very first line in the range
+      // already busted the byte cap.
+      if (byteCapHit) {
+        return 'READ_FILE $fileName: Error: line $start exceeds the '
+            '${_kReadMaxBytes ~/ 1024} KiB display cap. The line is too '
+            'long for inline display — use SEARCH_TEXT for targeted '
+            'lookup or RUN_CMD with `head -c` / `Get-Content -TotalCount` '
+            'to slice within the line.';
+      }
+      return 'READ_FILE $fileName: Empty range (file has $lineNo line'
+          '${lineNo == 1 ? '' : 's'}; requested $start-$end is past EOF).';
+    }
+
+    // Strip the trailing newline writeln just added so the footer (if
+    // any) doesn't introduce a blank line.
+    var body = buf.toString();
+    if (body.endsWith('\n')) {
+      body = body.substring(0, body.length - 1);
+    }
+    final lastEmittedLine = start + emitted - 1;
+    final hitCap = byteCapHit || (emitted >= emitMax && lastEmittedLine < end);
+    if (hitCap) {
+      final reason = byteCapHit
+          ? 'byte cap (${_kReadMaxBytes ~/ 1024} KiB)'
+          : 'line cap ($_kReadMaxLines)';
+      return 'READ_FILE $fileName lines $start-$lastEmittedLine '
+          '(requested $start-$end, capped at $reason):\n'
+          '$body\n'
+          '... (continue with '
+          '`<<<READ_FILE: $fileName:${lastEmittedLine + 1}-$end>>>`)';
+    }
+    return 'READ_FILE $fileName lines $start-$lastEmittedLine:\n$body';
+  }
+
   static String? _resolvePath(
     ToolInvocation inv,
     String rawPath, {
@@ -488,12 +598,14 @@ class ToolRegistry {
           'in EDIT_FILE SEARCH blocks — strip the `<num>|` prefix before '
           'building a SEARCH block; the file itself does NOT contain it. '
           'Append `:start-end` to read a 1-based inclusive line range '
-          '(saves context on large files; ends are clamped, so 1-99999 '
-          'reads to EOF safely). Without a range the response is capped '
-          'at $_kReadMaxLines lines / ${_kReadMaxBytes ~/ 1024} KiB and '
-          'a footer tells you how to fetch the rest. Files larger than '
-          '${_kReadMaxFileBytes ~/ (1024 * 1024)} MiB are refused — use '
-          'SEARCH_TEXT or RUN_CMD for those. The legacy '
+          '(ends are clamped, so 1-99999 reads to EOF safely). The '
+          'response is always capped at $_kReadMaxLines lines / '
+          '${_kReadMaxBytes ~/ 1024} KiB; on truncation a footer tells '
+          'you the exact next call to fetch the remainder. **Range '
+          'reads stream the file** so they work on arbitrarily large '
+          'files — full reads still refuse files larger than '
+          '${_kReadMaxFileBytes ~/ (1024 * 1024)} MiB, but a range '
+          'like `:48000-48050` on a 9 MiB log just works. The legacy '
           '`<<<READ_FILE_RANGE: file:start-end>>>` syntax is still '
           'accepted but `<<<READ_FILE: file:start-end>>>` is preferred.',
       syntaxExample:
@@ -537,12 +649,36 @@ class ToolRegistry {
             return 'READ_FILE $fileName: Error: file does not exist.';
           }
           final fileBytes = await file.length();
+
+          // Range reads use a streaming reader. We never load the
+          // whole file into memory, so the full-read file-size
+          // ceiling does NOT apply here. The model can pull
+          // `:48000-48050` out of a 9 MiB HTML or a 9 GiB log the
+          // same way. The 2000-line / 200 KiB output caps still
+          // protect context if the model asks for `:1-9999999`.
+          if (hasRange) {
+            return await _streamReadRange(
+              filePath: filePath,
+              fileName: fileName,
+              start: start!,
+              end: end!,
+              fileBytes: fileBytes,
+            );
+          }
+
+          // Full-read path. Refuse oversized files since the whole
+          // body would have to be loaded. The error message names a
+          // concrete next call (`:1-2000`) so the model doesn't have
+          // to guess that ranges are the escape hatch.
           if (fileBytes > _kReadMaxFileBytes) {
             final mib = (fileBytes / (1024 * 1024)).toStringAsFixed(1);
             return 'READ_FILE $fileName: Error: file is $mib MiB '
-                '(limit ${_kReadMaxFileBytes ~/ (1024 * 1024)} MiB). Use '
-                'SEARCH_TEXT to find specific content or RUN_CMD with a '
-                'tool like `head` / `tail` for huge files.';
+                '(full-read limit '
+                '${_kReadMaxFileBytes ~/ (1024 * 1024)} MiB). Use a '
+                'range like `<<<READ_FILE: $fileName:1-2000>>>` — '
+                'range reads stream the file and have no size limit. '
+                'For locating content first, `<<<SEARCH_TEXT: pattern '
+                ':glob=$fileName>>>`.';
           }
           final List<String> lines;
           try {
@@ -554,19 +690,6 @@ class ToolRegistry {
           final total = lines.length;
           if (total == 0) {
             return 'READ_FILE $fileName: Empty (0 lines).';
-          }
-
-          if (hasRange) {
-            final fromIdx = (start! - 1).clamp(0, total);
-            final toIdx = end!.clamp(0, total);
-            if (fromIdx >= toIdx) {
-              return 'READ_FILE $fileName: Empty range (file has '
-                  '$total lines).';
-            }
-            final slice = lines.sublist(fromIdx, toIdx);
-            final numbered = _formatNumbered(slice, fromIdx + 1);
-            return 'READ_FILE $fileName lines ${fromIdx + 1}-$toIdx '
-                '(of $total):\n$numbered';
           }
 
           // Full-file read with line + byte caps. Walk lines until

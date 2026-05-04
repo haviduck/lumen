@@ -752,6 +752,23 @@ class S {
   static const String chatModelEnableAll = 'Enable all';
   static const String chatModelDisableAll = 'Disable all';
   static const String chatNoModels = 'No models available';
+
+  /// Short label rendered inline next to a high-hallucination-risk
+  /// model in the picker (chip + dropdown row). Kept under 32 chars
+  /// so it fits next to the model chip without pushing the composer
+  /// chrome around.
+  static const String chatModelHallucinationRiskShort = 'May hallucinate tools';
+
+  /// Longer tooltip / banner copy explaining the risk and pointing
+  /// the user at known-reliable alternatives. Surfaced on hover of
+  /// the warning icon on the model chip and as the popup-menu
+  /// tooltip for risky entries.
+  static const String chatModelHallucinationRiskTooltip =
+      'This model has a known pattern of fabricating tool execution — '
+      'emitting fake tool_result blocks or malformed tool syntax. '
+      'Lumen detects and aborts the cascade, but agentic tasks may '
+      'still fail to complete. For reliable tool use, prefer Claude '
+      '(any), GPT-OSS-120b cloud, or Qwen3-Coder-480b cloud.';
   static const String chatOpenAiSettings = 'Open AI / Chat settings';
   static const String chatEditMessage = 'Edit Message';
   static const String chatDeleteMessage = 'Delete Message';

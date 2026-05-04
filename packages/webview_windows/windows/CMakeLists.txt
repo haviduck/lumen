@@ -36,11 +36,17 @@ if(NOT NUGET)
 endif()
 
 add_custom_target(${PROJECT_NAME}_DEPENDENCIES_DOWNLOAD ALL)
+# DEPENDS is intentionally NOT specified here. The TARGET form of
+# add_custom_command does not accept DEPENDS (CMake silently ignored it
+# pre-3.27; CMP0175 makes it a hard error). Dependency on ${NUGET} is
+# already enforced at configure time by the find_program / file(DOWNLOAD)
+# block above — by the time this PRE_BUILD step fires, nuget.exe is
+# guaranteed to exist on disk. Don't reintroduce DEPENDS without
+# rewriting this as add_custom_command(OUTPUT ...).
 add_custom_command(
   TARGET ${PROJECT_NAME}_DEPENDENCIES_DOWNLOAD PRE_BUILD
   COMMAND ${NUGET} install Microsoft.Windows.ImplementationLibrary -Version ${WIL_VERSION} -ExcludeVersion -OutputDirectory ${CMAKE_BINARY_DIR}/packages
   COMMAND ${NUGET} install Microsoft.Web.WebView2 -Version ${WEBVIEW_VERSION} -ExcludeVersion -OutputDirectory ${CMAKE_BINARY_DIR}/packages
-  DEPENDS ${NUGET}
 )
 
 add_library(${PLUGIN_NAME} SHARED

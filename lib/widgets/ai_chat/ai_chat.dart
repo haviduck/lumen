@@ -16,6 +16,7 @@ import '../../providers/app_state.dart';
 import '../../providers/chat_controller.dart';
 import '../../providers/media_controller.dart';
 import '../../services/chat_persistence_service.dart';
+import '../../services/model_capabilities.dart';
 import '../../services/reasoning_effort.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
@@ -989,11 +990,21 @@ class _AiChatState extends State<AiChat> {
         mainAxisSize: MainAxisSize.min,
         children: [
           // ── Model badge row, above the text box ──
+          //
+          // Layout: [picker] [Spacer] [settings cog]. The picker
+          // self-bounds (its internal LayoutBuilder clamps to 160 px),
+          // so we deliberately do NOT wrap it in `Flexible` /
+          // `Expanded` here — those would hand the picker half the
+          // row width, of which it would only USE 160, leaving a
+          // dead chunk between picker and Spacer. The result was a
+          // settings cog that drifted to ~70% of the row width
+          // instead of hugging the right edge after a panel resize.
+          // Plain widget + Spacer puts the cog at the actual right.
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: Row(
               children: [
-                Flexible(child: _ModelPicker(chat: chat)),
+                _ModelPicker(chat: chat),
                 const Spacer(),
                 Tooltip(
                   message: S.chatOpenAiSettings,
@@ -2256,6 +2267,33 @@ class _ModelPicker extends StatelessWidget {
 
   const _ModelPicker({required this.chat});
 
+  /// Strip the `provider:` prefix so the badge displays only the
+  /// model name. Underlying `chat.selectedModel` keeps the full
+  /// `provider:model` form because routing relies on it; this is
+  /// purely a display tweak. Splits on the FIRST colon only so
+  /// Ollama tags like `llama3:8b` keep their tag in the visible
+  /// label (`llama3:8b`, not `8b` or `llama3`).
+  static String _compactModelLabel(String fullId) {
+    final idx = fullId.indexOf(':');
+    if (idx <= 0 || idx == fullId.length - 1) return fullId;
+    return fullId.substring(idx + 1);
+  }
+
+  /// Whether the `provider:model` id points at a model with a known
+  /// hallucination track record (see
+  /// `ModelCapabilities.hasHighHallucinationRisk`). Splits the id
+  /// the same way `ChatController._splitModel` does so the two
+  /// stay consistent — anything without a `:` is treated as Ollama.
+  static bool _isRisky(String fullId) {
+    final idx = fullId.indexOf(':');
+    final provider = idx > 0 ? fullId.substring(0, idx) : 'ollama';
+    final raw = idx > 0 ? fullId.substring(idx + 1) : fullId;
+    return ModelCapabilities.hasHighHallucinationRisk(
+      provider: provider,
+      rawModel: raw,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final key = GlobalKey();
@@ -2270,9 +2308,21 @@ class _ModelPicker extends StatelessWidget {
     final stale =
         !chat.pickerModels.contains(chat.selectedModel) &&
         chat.availableModels.isNotEmpty;
-    final model = stale
-        ? '${chat.selectedModel} (unavailable)'
-        : chat.selectedModel;
+    final compact = _compactModelLabel(chat.selectedModel);
+    final model = stale ? '$compact (unavailable)' : compact;
+    final isRisky = _isRisky(chat.selectedModel);
+    // Tooltip carries the FULL provider:model so the user can still
+    // identify which provider routes the badge — useful when two
+    // providers expose models with the same short name (e.g. a
+    // llama3 on both Ollama and Groq). Risky models append the
+    // hallucination warning so the chip's tooltip alone tells the
+    // user what's wrong even before they hover the warning icon.
+    final baseTooltip = stale
+        ? '${S.chatModel}: ${chat.selectedModel} (unavailable)'
+        : '${S.chatModel}: ${chat.selectedModel}';
+    final tooltipMessage = isRisky
+        ? '$baseTooltip\n\n${S.chatModelHallucinationRiskTooltip}'
+        : baseTooltip;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2280,7 +2330,7 @@ class _ModelPicker extends StatelessWidget {
             ? constraints.maxWidth.clamp(80.0, 160.0)
             : 160.0;
         return Tooltip(
-          message: S.chatModel,
+          message: tooltipMessage,
           child: MouseRegion(
             cursor: SystemMouseCursors.click,
             child: InkWell(
@@ -2339,6 +2389,23 @@ class _ModelPicker extends StatelessWidget {
                                   ),
                                 ),
                               ),
+                              // Inline warning icon for high-hallucination-risk
+                              // models so the user sees the risk BEFORE picking,
+                              // not just after. Tooltip carries the full
+                              // explanation; the icon alone is the at-a-glance
+                              // signal.
+                              if (_isRisky(m)) ...[
+                                const SizedBox(width: 6),
+                                Tooltip(
+                                  message:
+                                      S.chatModelHallucinationRiskTooltip,
+                                  child: const Icon(
+                                    Icons.warning_amber_rounded,
+                                    size: 13,
+                                    color: DuckColors.stateWarn,
+                                  ),
+                                ),
+                              ],
                             ],
                           ),
                         ),
@@ -2402,6 +2469,19 @@ class _ModelPicker extends StatelessWidget {
                         ),
                       ),
                     ),
+                    // At-a-glance warning when the active model has a
+                    // known hallucination pattern. Outer Tooltip already
+                    // carries the long-form explanation (we appended it
+                    // above when isRisky); the icon is the visible hook
+                    // that gets the user to hover in the first place.
+                    if (isRisky) ...[
+                      const SizedBox(width: 4),
+                      const Icon(
+                        Icons.warning_amber_rounded,
+                        size: 12,
+                        color: DuckColors.stateWarn,
+                      ),
+                    ],
                     const SizedBox(width: 4),
                     const Icon(
                       Icons.expand_more,

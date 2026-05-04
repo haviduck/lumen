@@ -53,12 +53,61 @@ class _ChatTabStripState extends State<ChatTabStrip> {
   void _scheduleScrollToActive() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      final ctx = _activeKey.currentContext;
-      if (ctx == null) return;
+      _scrollActiveIntoView();
+    });
+  }
+
+  /// Two-step scroll. `Scrollable.ensureVisible` is the smooth path —
+  /// it animates the strip so the active tab lands centred. But it's
+  /// a no-op when the active tab's render object hasn't been built
+  /// yet, which is exactly the "many tabs open + new tab appended at
+  /// the end" case the user reported: ReorderableListView's SliverList
+  /// only builds children inside the cache extent, so a tab appended
+  /// well to the right of the current viewport has a null
+  /// `currentContext` immediately after `notifyListeners` rebuilds the
+  /// strip. Fall back to driving the scroll controller directly toward
+  /// the tab's expected position; once the SliverList builds it on the
+  /// next frame, a follow-up ensureVisible refines the alignment.
+  void _scrollActiveIntoView() {
+    final ctx = _activeKey.currentContext;
+    if (ctx != null) {
       Scrollable.ensureVisible(
         ctx,
         // Centre the active tab in the viewport when possible — the
         // others scoot out to the sides (matches Cursor / VS Code).
+        alignment: 0.5,
+        duration: DuckMotion.medium,
+        curve: DuckMotion.standard,
+      );
+      return;
+    }
+    if (!_scrollCtrl.hasClients) return;
+    final tabs = widget.chat.openTabs;
+    final activeId = _lastActiveId;
+    if (activeId == null) return;
+    final idx = tabs.indexWhere((s) => s.id == activeId);
+    if (idx < 0) return;
+    final pos = _scrollCtrl.position;
+    if (idx == tabs.length - 1) {
+      // New tabs always append, so the last-tab branch is the hot path.
+      _scrollCtrl.jumpTo(pos.maxScrollExtent);
+    } else {
+      // Rare path (active is mid-list and outside cache). Estimate from
+      // the tab's min/max width range so we get close enough that the
+      // SliverList builds it, then ensureVisible cleans up below.
+      const double approxTabWidth = 135.0;
+      final target = (idx * approxTabWidth).clamp(
+        pos.minScrollExtent,
+        pos.maxScrollExtent,
+      );
+      _scrollCtrl.jumpTo(target);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final ctx2 = _activeKey.currentContext;
+      if (ctx2 == null) return;
+      Scrollable.ensureVisible(
+        ctx2,
         alignment: 0.5,
         duration: DuckMotion.medium,
         curve: DuckMotion.standard,
