@@ -10,6 +10,7 @@ import 'providers/media_controller.dart';
 import 'services/ide_actions.dart';
 import 'services/language_detector.dart';
 import 'services/recent_edits_tracker.dart';
+import 'services/window_chrome.dart';
 import 'theme/app_colors.dart';
 import 'theme/app_theme.dart';
 import 'widgets/ai_chat/ai_chat.dart';
@@ -24,7 +25,15 @@ import 'widgets/overlays/overlay_host.dart';
 import 'widgets/terminal/terminal_pane.dart';
 import 'widgets/welcome_screen.dart';
 
-void main() {
+Future<void> main() async {
+  // Native-window setup BEFORE the framework binds to a surface size.
+  // `WindowChrome.bootstrap` configures the window for the welcome
+  // panel (~700x560, centred). Later, `RootScreen` calls
+  // `enterWorkspaceLayout` to maximise once the user opens a project.
+  // Idempotent + graceful on unsupported hosts; never crashes boot.
+  WidgetsFlutterBinding.ensureInitialized();
+  await WindowChrome.bootstrap();
+
   runApp(
     MultiProvider(
       providers: [
@@ -62,12 +71,27 @@ class RootScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Consumer<AppState>(
       builder: (context, state, child) {
-        Widget body;
-        if (state.currentDirectory == null) {
+        final Widget body;
+        final bool wantWelcome = state.currentDirectory == null;
+        if (wantWelcome) {
           body = const WelcomeScreen();
         } else {
           body = const _IdeShell();
         }
+        // Native-window size follows macro-state: small panel-sized
+        // window for the welcome screen, maximised for the IDE shell.
+        // We schedule the transition as a post-frame callback so the
+        // resize / maximise IPC never lands inside Flutter's build
+        // phase. `WindowChrome` is internally idempotent — repeat
+        // post-frame calls during the same macro-state short-circuit
+        // before talking to `window_manager`.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (wantWelcome) {
+            WindowChrome.enterWelcomeLayout();
+          } else {
+            WindowChrome.enterWorkspaceLayout();
+          }
+        });
         return Stack(children: [body, if (state.isLocked) const LockScreen()]);
       },
     );

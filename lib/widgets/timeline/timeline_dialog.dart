@@ -166,6 +166,38 @@ class _TimelineDialogState extends State<TimelineDialog> {
     }
   }
 
+  /// Project-wide revert path. Treats the entry's timestamp as the
+  /// chosen point in time and rolls the whole workspace back to that
+  /// moment, regardless of which file the entry refers to.
+  Future<void> _revertProject(
+    TimelineEntry entry,
+    TimelineService svc,
+  ) async {
+    final preview = svc.previewProjectRevertTo(entry.when);
+    if (preview.isNoOp) {
+      showDuckToast(context, S.timelineProjectRevertNoChanges);
+      return;
+    }
+    // Capture the AppState read BEFORE the async confirm dialog so
+    // we don't reach across an async gap to read the inherited
+    // widget tree (the analyzer-flagged
+    // `use_build_context_synchronously` warning).
+    final state = context.read<AppState>();
+    final outcome = await _confirmProjectRevert(entry, preview);
+    if (outcome == null) return;
+    final result = await state.revertProjectToPointInTime(
+      entry.when,
+      deleteFilesCreatedAfter: outcome.deleteCreatedAfter,
+    );
+    if (!mounted) return;
+    showDuckToast(context, result.message);
+    if (result.ok) {
+      // The diff pane's "current" side may now match the revision —
+      // re-fetch so the user sees the synchronised state.
+      await _selectEntry(entry, svc);
+    }
+  }
+
   Future<bool> _confirmRestore(TimelineEntry entry) async {
     final ans = await showDialog<bool>(
       context: context,
@@ -192,6 +224,19 @@ class _TimelineDialogState extends State<TimelineDialog> {
       ),
     );
     return ans == true;
+  }
+
+  Future<_ProjectRevertChoice?> _confirmProjectRevert(
+    TimelineEntry entry,
+    TimelineProjectRevertPreview preview,
+  ) async {
+    return showDialog<_ProjectRevertChoice>(
+      context: context,
+      builder: (ctx) => _ProjectRevertConfirmDialog(
+        entry: entry,
+        preview: preview,
+      ),
+    );
   }
 
   @override
@@ -272,6 +317,11 @@ class _TimelineDialogState extends State<TimelineDialog> {
                         error: _pairError,
                         onRestore: () {
                           if (selected != null) _restore(selected, svc);
+                        },
+                        onRevertProject: () {
+                          if (selected != null) {
+                            _revertProject(selected, svc);
+                          }
                         },
                       ),
                     ),
@@ -745,12 +795,14 @@ class _DiffPane extends StatelessWidget {
   final bool loading;
   final String? error;
   final VoidCallback onRestore;
+  final VoidCallback onRevertProject;
   const _DiffPane({
     required this.entry,
     required this.pair,
     required this.loading,
     required this.error,
     required this.onRestore,
+    required this.onRevertProject,
   });
 
   @override
@@ -832,6 +884,33 @@ class _DiffPane extends StatelessWidget {
                   ],
                 ),
               ),
+              Tooltip(
+                message: S.timelineProjectRevertTooltip,
+                child: OutlinedButton.icon(
+                  onPressed: onRevertProject,
+                  icon: const Icon(Icons.history_toggle_off, size: 16),
+                  label: const Text(S.timelineProjectRevertAction),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: DuckColors.fgPrimary,
+                    side: const BorderSide(
+                      color: DuckColors.borderStrong,
+                      width: 0.8,
+                    ),
+                    textStyle: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
               ElevatedButton.icon(
                 onPressed: onRestore,
                 icon: const Icon(Icons.restore, size: 16),
@@ -965,6 +1044,288 @@ String _humanWhen(DateTime t) {
 }
 
 String _two(int n) => n.toString().padLeft(2, '0');
+
+/// User's choice from the project-revert confirm dialog. Captures
+/// the one toggle that has user-data implications: whether files
+/// created after the chosen revert point should be deleted (true)
+/// or left in place (false). The dialog returns null on cancel.
+class _ProjectRevertChoice {
+  final bool deleteCreatedAfter;
+  const _ProjectRevertChoice({required this.deleteCreatedAfter});
+}
+
+/// Confirm dialog that explains the blast radius of a project-wide
+/// revert. Shows counts grouped by category (rewrite / recreate /
+/// created-after / unrestorable) and exposes the keep-or-delete
+/// toggle when there are post-revert-point files. Defaults to
+/// "Keep" — deletion is opt-in because it's the only destructive
+/// part of the flow.
+class _ProjectRevertConfirmDialog extends StatefulWidget {
+  final TimelineEntry entry;
+  final TimelineProjectRevertPreview preview;
+  const _ProjectRevertConfirmDialog({
+    required this.entry,
+    required this.preview,
+  });
+
+  @override
+  State<_ProjectRevertConfirmDialog> createState() =>
+      _ProjectRevertConfirmDialogState();
+}
+
+class _ProjectRevertConfirmDialogState
+    extends State<_ProjectRevertConfirmDialog> {
+  bool _deleteCreatedAfter = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = widget.preview;
+    final whenLabel =
+        '${_humanWhen(widget.entry.when)} (${widget.entry.when.toLocal()})';
+    return AlertDialog(
+      backgroundColor: DuckColors.bgRaised,
+      title: Text(S.timelineProjectRevertConfirmTitle),
+      content: SizedBox(
+        width: 460,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              whenLabel,
+              style: const TextStyle(
+                color: DuckColors.fgPrimary,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              S.timelineProjectRevertSummary(
+                changed: preview.filesToRewrite.length,
+                recreated: preview.filesToRecreate.length,
+                createdAfter: preview.filesCreatedAfter.length,
+                unrestorable: preview.filesUnrestorable.length,
+              ),
+              style: const TextStyle(
+                color: DuckColors.fgMuted,
+                fontSize: 12,
+              ),
+            ),
+            if (preview.filesToRewrite.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              _RevertFileSection(
+                title: S.timelineProjectRevertChangedFiles,
+                count: preview.filesToRewrite.length,
+                files: preview.filesToRewrite,
+                tint: DuckColors.accentCyan,
+              ),
+            ],
+            if (preview.filesToRecreate.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _RevertFileSection(
+                title: S.timelineProjectRevertRecreatedFiles,
+                count: preview.filesToRecreate.length,
+                files: preview.filesToRecreate,
+                tint: DuckColors.stateOk,
+              ),
+            ],
+            if (preview.filesUnrestorable.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _RevertFileSection(
+                title: S.timelineProjectRevertUnrestorable,
+                count: preview.filesUnrestorable.length,
+                files: preview.filesUnrestorable,
+                tint: DuckColors.stateError,
+              ),
+            ],
+            if (preview.filesCreatedAfter.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              _RevertFileSection(
+                title: S.timelineProjectRevertCreatedAfter,
+                count: preview.filesCreatedAfter.length,
+                files: preview.filesCreatedAfter,
+                tint: DuckColors.accentDuck,
+              ),
+              const SizedBox(height: 6),
+              Text(
+                S.timelineProjectRevertNewFilesPrompt,
+                style: const TextStyle(
+                  color: DuckColors.fgMuted,
+                  fontSize: 11.5,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  _RadioPill(
+                    label: S.timelineProjectRevertKeepNewFiles,
+                    selected: !_deleteCreatedAfter,
+                    tint: DuckColors.stateOk,
+                    onTap: () =>
+                        setState(() => _deleteCreatedAfter = false),
+                  ),
+                  const SizedBox(width: 6),
+                  _RadioPill(
+                    label: S.timelineProjectRevertDeleteNewFiles,
+                    selected: _deleteCreatedAfter,
+                    tint: DuckColors.stateError,
+                    onTap: () =>
+                        setState(() => _deleteCreatedAfter = true),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 16),
+            Text(
+              S.timelineProjectRevertSafetyNote,
+              style: const TextStyle(
+                color: DuckColors.fgSubtle,
+                fontSize: 11,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text(S.cancel),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(
+            context,
+            _ProjectRevertChoice(deleteCreatedAfter: _deleteCreatedAfter),
+          ),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: DuckColors.accentCyan,
+            foregroundColor: DuckColors.bgDeepest,
+          ),
+          child: const Text(S.timelineProjectRevertAction),
+        ),
+      ],
+    );
+  }
+}
+
+class _RevertFileSection extends StatelessWidget {
+  final String title;
+  final int count;
+  final List<String> files;
+  final Color tint;
+  const _RevertFileSection({
+    required this.title,
+    required this.count,
+    required this.files,
+    required this.tint,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = files.take(6).toList(growable: false);
+    final extra = files.length - preview.length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              width: 6,
+              height: 6,
+              decoration: BoxDecoration(color: tint, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              '$title ($count)',
+              style: TextStyle(
+                color: tint,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.4,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Padding(
+          padding: const EdgeInsets.only(left: 14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final f in preview)
+                Text(
+                  f,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: DuckColors.fgMuted,
+                    fontSize: 11,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              if (extra > 0)
+                Text(
+                  '… and $extra more',
+                  style: const TextStyle(
+                    color: DuckColors.fgSubtle,
+                    fontSize: 10.5,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _RadioPill extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final Color tint;
+  final VoidCallback onTap;
+  const _RadioPill({
+    required this.label,
+    required this.selected,
+    required this.tint,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: DuckMotion.fast,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: selected ? tint.withValues(alpha: 0.18) : DuckColors.bgChip,
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: selected
+                  ? tint.withValues(alpha: 0.55)
+                  : DuckColors.glassSeam,
+              width: 0.7,
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color: selected ? tint : DuckColors.fgMuted,
+              fontSize: 11.5,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 /// Convenience — open the dialog. Pre-scopes to the active editor
 /// file when no [relPath] is passed and one is available.

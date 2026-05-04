@@ -828,6 +828,281 @@ class TimelineService extends ChangeNotifier {
     );
   }
 
+  // ── point-in-time project revert (the "PhpStorm Local History" path) ──
+  //
+  // Conceptually: every entry in `journal.ndjson` is a "moment" in the
+  // project's history. Click any moment, project rolls back to its
+  // state at that instant. There's no separate savepoint manifest —
+  // the journal IS the savepoint history because every entry already
+  // has a timestamp + a content hash.
+  //
+  // Algorithm:
+  //   1. For each rel-path the journal knows about, find the most
+  //      recent entry with `entry.when <= when` (the "snapshot
+  //      state"). Compare against the current head (the "live
+  //      state"). The diff between the two is the work list.
+  //   2. Files currently on disk whose snapshot entry was a `delete`
+  //      OR who had no entry <= when at all → "files created after
+  //      `when`". User decides keep-or-delete in the confirm dialog.
+  //   3. Files whose snapshot entry was a write but whose current
+  //      head is a `delete` → "files to recreate" (write the blob).
+  //   4. Files whose hash differs between snapshot and head → write
+  //      the snapshot blob.
+  //
+  // Files Lumen has never tracked (existed on disk forever, never
+  // opened/edited/touched) are completely outside the journal and
+  // are left alone — there's no way to know what their state was at
+  // time T without a content checksum we never took. That's the
+  // expected, safe behaviour: revert only touches files Lumen has
+  // observed at least once.
+
+  /// Preview the project state diff if the user reverted to [when].
+  /// Used by the confirm dialog to show counts before the revert
+  /// actually fires.
+  TimelineProjectRevertPreview previewProjectRevertTo(DateTime when) {
+    final filesToRewrite = <String>[];
+    final filesToRecreate = <String>[];
+    final filesToReDelete = <String>[];
+    final filesCreatedAfter = <String>[];
+    final filesUnrestorable = <String>[];
+
+    if (!isReady) {
+      return TimelineProjectRevertPreview._(
+        when: when,
+        filesToRewrite: filesToRewrite,
+        filesToRecreate: filesToRecreate,
+        filesToReDelete: filesToReDelete,
+        filesCreatedAfter: filesCreatedAfter,
+        filesUnrestorable: filesUnrestorable,
+      );
+    }
+
+    // _entries is newest-first; group per path while keeping order.
+    final perPath = <String, List<TimelineEntry>>{};
+    for (final e in _entries) {
+      perPath.putIfAbsent(e.relPath, () => <TimelineEntry>[]).add(e);
+    }
+
+    for (final mapEntry in perPath.entries) {
+      final rel = mapEntry.key;
+      final list = mapEntry.value; // newest-first
+      // Snapshot entry: newest entry whose `when` <= target time.
+      TimelineEntry? snapshot;
+      for (final e in list) {
+        if (!e.when.isAfter(when)) {
+          snapshot = e;
+          break;
+        }
+      }
+      final head = list.first; // newest overall
+
+      final snapshotExists =
+          snapshot != null && snapshot.op != TimelineOp.delete;
+      final headExists = head.op != TimelineOp.delete;
+
+      if (!snapshotExists && !headExists) {
+        continue;
+      }
+
+      if (!snapshotExists && headExists) {
+        // File was created after `when` (or didn't exist at `when`).
+        filesCreatedAfter.add(rel);
+        continue;
+      }
+
+      if (snapshotExists && !headExists) {
+        // File existed at `when`, has since been deleted. Recreate.
+        if (snapshot.newHash.isNotEmpty || snapshot.prevHash.isNotEmpty) {
+          filesToRecreate.add(rel);
+        } else {
+          filesUnrestorable.add(rel);
+        }
+        continue;
+      }
+
+      // Both exist; compare hashes. (`snapshot` is non-null here —
+      // `snapshotExists` is the carrier predicate, but the analyzer
+      // doesn't follow boolean-aliased null checks through fallthrough
+      // branches, so we assert.)
+      final snap = snapshot!;
+      if (snap.newHash != head.newHash) {
+        if (snap.newHash.isEmpty) {
+          filesUnrestorable.add(rel);
+        } else {
+          filesToRewrite.add(rel);
+        }
+      }
+      // Same hash → no-op, don't list.
+    }
+
+    return TimelineProjectRevertPreview._(
+      when: when,
+      filesToRewrite: filesToRewrite,
+      filesToRecreate: filesToRecreate,
+      filesToReDelete: filesToReDelete,
+      filesCreatedAfter: filesCreatedAfter,
+      filesUnrestorable: filesUnrestorable,
+    );
+  }
+
+  /// Revert the workspace to the state recorded at [when]. Inclusive:
+  /// the moment whose timestamp matches `when` is part of the target
+  /// state.
+  ///
+  /// [deleteFilesCreatedAfter] controls whether files that were
+  /// created after `when` are removed (true) or left in place
+  /// (false). The UI defaults to false (keep) — explicit opt-in
+  /// because deletion is the only destructive part of this flow.
+  ///
+  /// As with [restoreMessagesChanges], every modification snapshots
+  /// the pre-revert state first, so the revert itself is undoable
+  /// from the timeline.
+  Future<TimelineBulkRestoreResult> restoreToPointInTime(
+    DateTime when, {
+    bool deleteFilesCreatedAfter = false,
+  }) async {
+    if (!isReady) {
+      return const TimelineBulkRestoreResult(
+        ok: false,
+        message: 'Timeline not bound to a workspace.',
+      );
+    }
+    final ws = _workspacePath!;
+    final preview = previewProjectRevertTo(when);
+    final touched = <String>{};
+    final failures = <String>[];
+
+    Future<void> writeFromBlob(String rel, String hash, String note) async {
+      final abs = p.join(ws, rel.replaceAll('/', p.separator));
+      final bytes = await readBlob(hash);
+      if (bytes == null) {
+        failures.add('$rel: stored content blob is missing');
+        return;
+      }
+      final f = File(abs);
+      // Snapshot whatever's currently there before we clobber it.
+      if (await f.exists()) {
+        await recordWrite(
+          abs,
+          origin: TimelineOrigin.explorer,
+          note: 'Pre-revert snapshot',
+        );
+      }
+      await f.parent.create(recursive: true);
+      await f.writeAsBytes(bytes, flush: true);
+      await recordWrite(abs, origin: TimelineOrigin.explorer, note: note);
+      touched.add(rel);
+    }
+
+    // 1. Rewrite changed files.
+    for (final rel in preview.filesToRewrite) {
+      try {
+        // Resolve the snapshot entry for this rel again — preview
+        // doesn't carry it.
+        final snapshot = _snapshotEntryFor(rel, when);
+        if (snapshot == null || snapshot.newHash.isEmpty) {
+          failures.add('$rel: no snapshot content');
+          continue;
+        }
+        await writeFromBlob(
+          rel,
+          snapshot.newHash,
+          'Reverted to ${_humanWhen(when)}',
+        );
+      } catch (e) {
+        failures.add('$rel: $e');
+      }
+    }
+
+    // 2. Recreate files that were deleted between `when` and now.
+    for (final rel in preview.filesToRecreate) {
+      try {
+        final snapshot = _snapshotEntryFor(rel, when);
+        if (snapshot == null) {
+          failures.add('$rel: no snapshot content');
+          continue;
+        }
+        // For a non-delete snapshot the content is `newHash`;
+        // for a delete snapshot we'd have skipped this list.
+        final hash = snapshot.newHash;
+        if (hash.isEmpty) {
+          failures.add('$rel: snapshot content is missing');
+          continue;
+        }
+        await writeFromBlob(
+          rel,
+          hash,
+          'Recreated from revert to ${_humanWhen(when)}',
+        );
+      } catch (e) {
+        failures.add('$rel: $e');
+      }
+    }
+
+    // 3. Optionally delete files created after `when`.
+    if (deleteFilesCreatedAfter) {
+      for (final rel in preview.filesCreatedAfter) {
+        try {
+          final abs = p.join(ws, rel.replaceAll('/', p.separator));
+          final f = File(abs);
+          if (await f.exists()) {
+            await recordWrite(
+              abs,
+              origin: TimelineOrigin.explorer,
+              note: 'Pre-revert snapshot (created after revert point)',
+            );
+            await f.delete();
+            await recordDelete(
+              abs,
+              origin: TimelineOrigin.explorer,
+              note: 'Removed by revert to ${_humanWhen(when)}',
+            );
+            touched.add(rel);
+          }
+        } catch (e) {
+          failures.add('$rel: $e');
+        }
+      }
+    }
+
+    notifyListeners();
+
+    final changedCount = touched.length;
+    if (changedCount == 0 && failures.isEmpty) {
+      return TimelineBulkRestoreResult(
+        ok: true,
+        message: 'Project already matches the state at ${_humanWhen(when)}.',
+        touchedRelPaths: const [],
+      );
+    }
+    if (failures.isNotEmpty) {
+      return TimelineBulkRestoreResult(
+        ok: false,
+        message:
+            'Reverted $changedCount file(s) to ${_humanWhen(when)}; '
+            '${failures.length} failed: ${failures.take(3).join('; ')}'
+            '${failures.length > 3 ? '…' : ''}',
+        touchedRelPaths: touched.toList(growable: false),
+      );
+    }
+    return TimelineBulkRestoreResult(
+      ok: true,
+      message:
+          'Reverted $changedCount file(s) to ${_humanWhen(when)}.',
+      touchedRelPaths: touched.toList(growable: false),
+    );
+  }
+
+  /// Most-recent entry for [rel] whose timestamp is <= [when], or null.
+  TimelineEntry? _snapshotEntryFor(String rel, DateTime when) {
+    for (final e in _entries) {
+      if (e.relPath != rel) continue;
+      if (e.when.isAfter(when)) continue;
+      return e;
+    }
+    return null;
+  }
+
   Future<void> _revertEntry(TimelineEntry entry) async {
     final ws = _workspacePath!;
     final abs = p.join(ws, entry.relPath.replaceAll('/', p.separator));
@@ -1327,4 +1602,59 @@ class TimelineBulkRestoreResult {
     required this.message,
     this.touchedRelPaths = const [],
   });
+}
+
+/// Diff preview for [TimelineService.restoreToPointInTime]. Used by
+/// the confirm dialog so the user sees the exact blast radius
+/// (counts + categorised file lists) before committing to the
+/// revert. None of these lists overlap.
+class TimelineProjectRevertPreview {
+  /// Target timestamp of the proposed revert.
+  final DateTime when;
+
+  /// Tracked files whose hash will change. They existed at [when]
+  /// AND exist now, with different content.
+  final List<String> filesToRewrite;
+
+  /// Files that existed at [when] but no longer exist on disk —
+  /// the revert will recreate them from the stored blob.
+  final List<String> filesToRecreate;
+
+  /// Files that were absent at [when] (or already deleted by [when])
+  /// but exist now. Reverting honours the deleted-state for them
+  /// only when the user opts in via `deleteFilesCreatedAfter`.
+  /// Reserved for a future "round-trip a delete" path; populated to
+  /// zero today.
+  final List<String> filesToReDelete;
+
+  /// Files that exist on disk now but had no entry at or before
+  /// [when] (i.e. were created after the revert point). The user
+  /// chooses delete-or-keep in the confirm dialog. Default: keep.
+  final List<String> filesCreatedAfter;
+
+  /// Files whose content blob has been pruned out of the object
+  /// store and can no longer be restored. Surfaced to the user as a
+  /// non-fatal warning.
+  final List<String> filesUnrestorable;
+
+  const TimelineProjectRevertPreview._({
+    required this.when,
+    required this.filesToRewrite,
+    required this.filesToRecreate,
+    required this.filesToReDelete,
+    required this.filesCreatedAfter,
+    required this.filesUnrestorable,
+  });
+
+  /// Total number of files the revert would modify, ignoring the
+  /// optional "delete files created after" toggle.
+  int get changedCount => filesToRewrite.length + filesToRecreate.length;
+
+  /// True when the revert would make zero changes — useful for
+  /// dimming the confirm action.
+  bool get isNoOp =>
+      filesToRewrite.isEmpty &&
+      filesToRecreate.isEmpty &&
+      filesCreatedAfter.isEmpty &&
+      filesUnrestorable.isEmpty;
 }

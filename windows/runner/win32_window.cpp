@@ -26,12 +26,14 @@ constexpr const wchar_t kGetPreferredBrightnessRegKey[] =
   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme";
 
-// Keep debug overflow indicators out of impossible whole-window sizes and,
-// more importantly, keep the IDE usable in release builds. Individual panes
-// still handle narrow splits responsively; this only prevents the native
-// window itself from becoming smaller than a practical desktop IDE shell.
-constexpr int kMinWindowWidth = 900;
-constexpr int kMinWindowHeight = 560;
+// Hard floor so a user can't accidentally drag the window to a 1x1
+// strip. The welcome screen wants a small panel-sized window
+// (~700x560), and the IDE shell handles narrow splits responsively,
+// so there's no point enforcing a "real IDE" minimum here. The
+// welcome→workspace size transition is owned by `window_manager` on
+// the Dart side; this constant just prevents pathological resize.
+constexpr int kMinWindowWidth = 480;
+constexpr int kMinWindowHeight = 360;
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
@@ -157,15 +159,16 @@ bool Win32Window::Create(const std::wstring& title,
 }
 
 bool Win32Window::Show() {
-  // SW_SHOWMAXIMIZED instead of the Flutter-template default
-  // SW_SHOWNORMAL so the window appears maximized on first paint.
-  // Earlier we created at 1280x720 + maximized after the fact in
-  // main.cpp's wWinMain, which produced a visible flash: small
-  // window appears -> loading screen renders inside it -> window
-  // grows to maximized. Showing maximized straight away keeps the
-  // first-paint surface area = monitor size; the redundant post-
-  // create `ShowWindow(SW_MAXIMIZE)` was removed from wWinMain.
-  return ShowWindow(window_handle_, SW_SHOWMAXIMIZED);
+  // SW_SHOWNORMAL — the window opens at the welcome-panel size
+  // chosen in `main.cpp`'s `wWinMain`. The Dart side
+  // (`lib/services/window_chrome.dart`) calls `windowManager.maximize`
+  // when the user opens a workspace, so the IDE shell still ends up
+  // monitor-filling — but only after there's actual IDE chrome to
+  // fill it with. Earlier this was SW_SHOWMAXIMIZED so the welcome
+  // screen launched into an empty maximised window with a tiny
+  // centred panel; that read as "the IDE failed to load" on first
+  // run. Don't reintroduce SW_SHOWMAXIMIZED here.
+  return ShowWindow(window_handle_, SW_SHOWNORMAL);
 }
 
 // static

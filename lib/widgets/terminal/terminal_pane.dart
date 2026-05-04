@@ -196,6 +196,11 @@ class _TerminalPaneState extends State<TerminalPane> {
   }
 
   Future<void> _addSession(String wd, {String? shellOverride}) async {
+    // Resolve the tracker once per session so we don't have to
+    // re-read context inside the callbacks (which run after the
+    // widget might have been disposed). The PID-tracking pair below
+    // is what powers the process manager's "Lumen-spawned" filter.
+    final tracker = context.read<AppState>().lumenProcesses;
     final session = TerminalSession(
       id: 'term_${DateTime.now().microsecondsSinceEpoch}',
       title: 'Terminal ${_sessions.length + 1}',
@@ -209,6 +214,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         // the IDE into cmd.
         showDuckToast(context, '${S.terminalShellSwitched} (${shell.label})');
       },
+      onPidStarted: tracker.register,
+      onPidEnded: tracker.unregister,
     );
     _sessions.add(session);
     setState(() {

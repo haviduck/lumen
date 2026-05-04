@@ -72,6 +72,7 @@ class DuckMenuBar extends StatelessWidget {
                       S.menuOpenFolder,
                       'Ctrl+O',
                     ),
+                    _recentProjectsSubmenu(context, state),
                     _itemWithShortcut(
                       context,
                       'newFile',
@@ -222,6 +223,8 @@ class DuckMenuBar extends StatelessWidget {
                       S.menuKillTerminal,
                       enabled: actions.hasTerminal,
                     ),
+                    _menuDivider,
+                    _item(context, 'processManager', S.menuProcessManager),
                   ]),
                   _submenu(context, S.menuAgent, [
                     _item(
@@ -284,6 +287,50 @@ class DuckMenuBar extends StatelessWidget {
           fontWeight: FontWeight.w400,
           color: DuckColors.fgMuted,
         ),
+      ),
+    );
+  }
+
+  Widget _recentProjectsSubmenu(BuildContext context, AppState state) {
+    final recent = state.recentProjects;
+    return SubmenuButton(
+      menuStyle: _popupStyle,
+      style: _itemStyle,
+      menuChildren: recent.isEmpty
+          ? [_disabledItem(S.noRecentProjects)]
+          : [
+              for (final path in recent)
+                _recentProjectItem(context, path),
+            ],
+      child: Text(
+        S.menuOpenRecent,
+        style: const TextStyle(fontSize: 12, color: DuckColors.fgPrimary),
+      ),
+    );
+  }
+
+  Widget _recentProjectItem(BuildContext context, String path) {
+    return MenuItemButton(
+      style: _itemStyle,
+      onPressed: () => _openRecentProject(context, path),
+      child: SizedBox(
+        width: 320,
+        child: Text(
+          path,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 12, color: DuckColors.fgPrimary),
+        ),
+      ),
+    );
+  }
+
+  Widget _disabledItem(String label) {
+    return MenuItemButton(
+      style: _itemStyle,
+      onPressed: null,
+      child: Text(
+        label,
+        style: const TextStyle(fontSize: 12, color: DuckColors.fgFaint),
       ),
     );
   }
@@ -437,6 +484,11 @@ class DuckMenuBar extends StatelessWidget {
   );
 }
 
+Future<void> _openRecentProject(BuildContext context, String path) async {
+  final state = context.read<AppState>();
+  await state.setDirectory(path);
+}
+
 Future<void> handleMenuAction(BuildContext context, String action) async {
   final state = context.read<AppState>();
   final actions = state.ideActions;
@@ -581,6 +633,9 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
       break;
     case 'killTerm':
       actions.killActiveTerminal();
+      break;
+    case 'processManager':
+      state.openProcessManagerTab();
       break;
     case 'createSkill':
       if (!context.mounted) return;

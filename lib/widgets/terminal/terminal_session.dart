@@ -306,7 +306,25 @@ class TerminalSession {
     try {
       _proc?.kill();
     } catch (_) {}
+    if (_trackedPid != null) {
+      try {
+        onPidEnded?.call(_trackedPid!);
+      } catch (_) {}
+      _trackedPid = null;
+    }
     focusNode.dispose();
     scrollController.dispose();
+  }
+
+  /// Hand a freshly-known child PID to the optional tracker
+  /// callbacks. Centralised so both the PTY and `Process.start`
+  /// fallback paths use the same plumbing — and so the eventual
+  /// `dispose` knows which PID it owns.
+  void _announcePid(int? pid) {
+    if (pid == null || pid <= 0) return;
+    _trackedPid = pid;
+    try {
+      onPidStarted?.call(pid);
+    } catch (_) {}
   }
 }

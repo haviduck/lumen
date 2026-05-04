@@ -1381,54 +1381,75 @@ class _InspectionBadge extends StatelessWidget {
         : segment.ok
         ? DuckColors.fgSubtle
         : DuckColors.stateError;
+    // The badge is rendered inside the agent message bubble's Column,
+    // which gives it the full bubble width as its max constraint.
+    // We use `Align` so the pill shrinks to its content when there's
+    // room — but the inner `firstArg` text is `Flexible` with
+    // ellipsis, so a long argument string (e.g. a SEARCH_TEXT query
+    // that's a sentence) gets truncated to fit the available bubble
+    // width instead of overflowing horizontally. Without the
+    // Flexible wrapper, the Row's `mainAxisSize: min` would let the
+    // inner ConstrainedBox claim its full 200px regardless of
+    // parent — visible as Flutter's yellow-and-black overflow chevron
+    // when the chat panel is narrower than ~300px.
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-        decoration: BoxDecoration(
-          color: DuckColors.bgChip,
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: segment.pending
-                ? DuckColors.accentCyan.withValues(alpha: 0.45)
-                : DuckColors.glassSeam,
-            width: 0.5,
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (segment.pending)
-              const _PendingDot()
-            else
-              Icon(_iconForInspection(segment.toolId), size: 11, color: accent),
-            const SizedBox(width: 5),
-            Text(
-              _actionLabel(segment),
-              style: TextStyle(
-                fontSize: 10.5,
-                fontWeight: FontWeight.w600,
-                color: accent,
-                letterSpacing: 0.3,
-              ),
+      child: Align(
+        alignment: AlignmentDirectional.centerStart,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: DuckColors.bgChip,
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: segment.pending
+                  ? DuckColors.accentCyan.withValues(alpha: 0.45)
+                  : DuckColors.glassSeam,
+              width: 0.5,
             ),
-            if (segment.firstArg.isNotEmpty) ...[
-              const SizedBox(width: 6),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 200),
-                child: Text(
-                  segment.firstArg,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontFamily: DuckTheme.monoFont,
-                    fontSize: 10.5,
-                    color: DuckColors.fgMuted,
-                  ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (segment.pending)
+                const _PendingDot()
+              else
+                Icon(
+                  _iconForInspection(segment.toolId),
+                  size: 11,
+                  color: accent,
+                ),
+              const SizedBox(width: 5),
+              Text(
+                _actionLabel(segment),
+                style: TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w600,
+                  color: accent,
+                  letterSpacing: 0.3,
                 ),
               ),
+              if (segment.firstArg.isNotEmpty) ...[
+                const SizedBox(width: 6),
+                Flexible(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 200),
+                    child: Text(
+                      segment.firstArg,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      softWrap: false,
+                      style: const TextStyle(
+                        fontFamily: DuckTheme.monoFont,
+                        fontSize: 10.5,
+                        color: DuckColors.fgMuted,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );

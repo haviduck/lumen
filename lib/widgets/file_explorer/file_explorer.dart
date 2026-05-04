@@ -1423,6 +1423,15 @@ class _FileExplorerState extends State<FileExplorer> {
         ),
         const PopupMenuDivider(),
         const PopupMenuItem(
+          value: 'newFile',
+          child: _MenuLabel(label: S.explorerNewFile),
+        ),
+        const PopupMenuItem(
+          value: 'newFolder',
+          child: _MenuLabel(label: S.explorerNewFolder),
+        ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(
           value: 'reveal',
           child: _MenuLabel(label: S.explorerRevealInOs),
         ),
@@ -1476,6 +1485,12 @@ class _FileExplorerState extends State<FileExplorer> {
     switch (result) {
       case 'open':
         await appState.openFile(file);
+        break;
+      case 'newFile':
+        await _handleNewFile(context, appState, file.parent);
+        break;
+      case 'newFolder':
+        await _handleNewFolder(context, appState, file.parent);
         break;
       case 'reveal':
         _revealInOs(file.path);

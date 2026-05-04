@@ -42,13 +42,20 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
-  // 1280x720 is just the fallback size if maximize fails for some
-  // reason (e.g. a future hypothetical no-monitor edge case).
-  // Actual launch size is monitor-fill — Win32Window::Show()
-  // uses SW_SHOWMAXIMIZED, applied on first show before any
-  // Flutter frame is rendered, so the welcome screen doesn't get
-  // a small-then-grown layout flash.
-  Win32Window::Size size(1280, 720);
+  // The window opens at the welcome-panel size (700x560) so the IDE
+  // doesn't launch as a maximised void with a small panel floating
+  // in the middle. The Dart side (`lib/services/window_chrome.dart`,
+  // wired through `window_manager`) maximises the window the moment
+  // the user opens a workspace and shrinks it back if they ever
+  // return to the welcome screen.
+  //
+  // Earlier this used 1280x720 + SW_SHOWMAXIMIZED (welcome panel
+  // centred inside an empty maximised window). That made the
+  // "open the IDE just to pick a project" UX feel like a load
+  // screen with nothing on it. Don't reintroduce SW_SHOWMAXIMIZED
+  // unconditionally — Dart owns the welcome→workspace size
+  // transition now.
+  Win32Window::Size size(700, 560);
   if (!window.Create(L"Lumen", origin, size)) {
     return EXIT_FAILURE;
   }

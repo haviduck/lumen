@@ -28,6 +28,11 @@ migrate_working_dir/
 *.pem
 *.key
 *.p12
+
+# Local Remote Access bearer token, written by tool/remote_pair.dart
+# during dev smoke. Treat as a secret — anyone with this token can
+# drive the desktop chat over the LAN/Tailscale bind.
+tool/.lumen_remote_token
 *.pfx
 credentials.json
 secrets.json
@@ -104,6 +109,13 @@ app.*.map.json
 *.so
 *.dylib
 
+# Vendored binaries we deliberately commit. ripgrep ships in the
+# Flutter asset bundle so SEARCH_TEXT works for colleagues without
+# requiring a manual `winget install BurntSushi.ripgrep.MSVC` /
+# `brew install ripgrep`. See lib/services/ripgrep_provisioner.dart
+# for the runtime-extraction flow.
+!assets/bin/**
+
 # OS junk
 Thumbs.db
 Desktop.ini
@@ -116,3 +128,18 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+
+# AGENTS.md and CLAUDE.md are intentionally tracked — they hold the
+# GitNexus integration block (managed by `npx gitnexus analyze`) plus
+# any project-wide agent rules. Ignoring them would leave fresh
+# clones / new collaborators without GitNexus context until they
+# re-ran the installer. Don't add them here without a concrete
+# reason; they're meant to ship with the repo.
+
+# Defensive: SQLite scratch / journal files if any future feature
+# starts caching to disk. Today nothing writes these; keeping the
+# rule means a future addition won't accidentally commit a half-
+# written DB.
+*.sqlite
+*.sqlite-journal
+*.db

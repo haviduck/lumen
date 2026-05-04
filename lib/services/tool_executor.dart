@@ -149,9 +149,9 @@ class ToolExecutor {
           feedback.writeln(
             '! action required: the tool above did NOT execute. Do '
             'not claim it succeeded. Either fix the call (re-read '
-            'the file with READ_FILE_RANGE so your SEARCH block '
-            'matches exactly) or tell the user why this can\'t be '
-            'done.',
+            'the file with `READ_FILE: file:start-end` so your '
+            'SEARCH block matches exactly) or tell the user why '
+            'this can\'t be done.',
           );
         } else {
           feedback.writeln(result);

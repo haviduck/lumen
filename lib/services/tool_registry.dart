@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'ollama_service.dart' show CancellationToken;
+import 'ripgrep_provisioner.dart';
 
 /// Definition of a single agent tool. The agent uses [syntaxExample] in
 /// its system prompt and we parse the response with [pattern].
@@ -79,6 +80,42 @@ class ToolInvocation {
 class ToolRegistry {
   ToolRegistry._();
 
+  /// READ_FILE caps. The line-and-byte caps protect the model's context
+  /// window when it reads a large file without specifying a range; the
+  /// truncation footer points it at the line range to use for the rest.
+  /// `_kReadMaxFileBytes` is the hard ceiling — even with a range we
+  /// refuse to load files larger than this through READ_FILE; the model
+  /// should reach for SEARCH_TEXT / GLOB / RUN_CMD instead.
+  static const int _kReadMaxLines = 2000;
+  static const int _kReadMaxBytes = 200 * 1024;
+  static const int _kReadMaxFileBytes = 5 * 1024 * 1024;
+
+  /// Width used to right-pad line numbers in READ_FILE output. 6 covers
+  /// up to 999,999 lines and matches the convention most models have
+  /// seen in tool output elsewhere — switching widths confuses smaller
+  /// models that key off the column for `LINE|content` parsing.
+  static const int _kLineNoPad = 6;
+
+  /// Format a slice of file lines as `   42|content` so the model can
+  /// reference exact line numbers in EDIT_FILE SEARCH blocks. The
+  /// numbers are metadata — the model is expected to strip the
+  /// `<num>|` prefix before composing a SEARCH block. EDIT_FILE's
+  /// "SEARCH block must match the file exactly" rule still applies to
+  /// the actual file content, not the numbered display.
+  static String _formatNumbered(List<String> lines, int firstLineNo) {
+    final buf = StringBuffer();
+    for (var i = 0; i < lines.length; i++) {
+      buf
+        ..write((firstLineNo + i).toString().padLeft(_kLineNoPad))
+        ..write('|')
+        ..writeln(lines[i]);
+    }
+    // Trim the trailing newline writeln just added so the caller can
+    // append its own footer cleanly without a blank line.
+    final s = buf.toString();
+    return s.endsWith('\n') ? s.substring(0, s.length - 1) : s;
+  }
+
   static String? _resolvePath(
     ToolInvocation inv,
     String rawPath, {
@@ -107,12 +144,13 @@ class ToolRegistry {
       id: 'create_file',
       name: 'CREATE_FILE',
       description:
-          'Create a NEW file with the given content. Will overwrite '
-          'an existing file at the same path, but you should almost '
-          'never want that — for changes to existing files, use '
-          'EDIT_FILE or MULTI_EDIT instead. Rewriting a 200-line file '
-          'with CREATE_FILE costs you minutes of generation time per '
-          'turn and risks dropping content you did not mean to remove.',
+          'Create a NEW file with the given content. **Refuses to '
+          'overwrite an existing file** — for edits use EDIT_FILE or '
+          'MULTI_EDIT (rewriting a 200-line file with CREATE_FILE '
+          'costs minutes of generation per turn and silently drops '
+          'content). To intentionally replace an existing file, '
+          'append the suffix `:overwrite` to the filename, e.g. '
+          '`<<<CREATE_FILE: foo.dart:overwrite>>>`.',
       syntaxExample:
           '<<<CREATE_FILE: filename.ext>>>\nfile contents go here\n<<<END_FILE>>>',
       // Tolerant separator: `\s*?\n` between the opener and the body
@@ -124,10 +162,20 @@ class ToolRegistry {
         dotAll: true,
       ),
       execute: (inv) async {
-        final fileName = inv.match.group(1)!;
+        var fileName = inv.match.group(1)!;
         final content = inv.match.group(2)!;
         if (inv.workspaceDir == null) {
           return 'CREATE_FILE $fileName: Failed (no workspace open).';
+        }
+        // `:overwrite` opt-in flag. We strip it here so the rest of
+        // the path-resolution code sees a clean filename. The flag
+        // exists deliberately as a friction point — see the description
+        // and the May 2026 knowledgebase entry on CREATE_FILE
+        // misuse. Don't loosen this without re-reading those notes.
+        var overwrite = false;
+        if (fileName.endsWith(':overwrite')) {
+          overwrite = true;
+          fileName = fileName.substring(0, fileName.length - ':overwrite'.length).trim();
         }
         final filePath = _resolvePath(inv, fileName, forWrite: true);
         if (filePath == null) {
@@ -135,9 +183,18 @@ class ToolRegistry {
         }
         try {
           final f = File(filePath);
+          if (await f.exists() && !overwrite) {
+            return 'CREATE_FILE $fileName: Error: file already exists. '
+                'Use EDIT_FILE / MULTI_EDIT for changes (preserves '
+                'surrounding code), or pass `:overwrite` if you '
+                'genuinely intend a full rewrite '
+                '(`<<<CREATE_FILE: $fileName:overwrite>>>`).';
+          }
           await f.parent.create(recursive: true);
           await f.writeAsString(content);
-          return 'CREATE_FILE $fileName: Success';
+          return overwrite
+              ? 'CREATE_FILE $fileName: Success (overwrote existing file)'
+              : 'CREATE_FILE $fileName: Success';
         } catch (e) {
           return 'CREATE_FILE $fileName: Error: $e';
         }
@@ -150,7 +207,11 @@ class ToolRegistry {
           'Edit an existing file by replacing a specific text block with new '
           'content. Safer than CREATE_FILE for targeted edits because it '
           'preserves surrounding code. The SEARCH block must match the file '
-          'exactly (including whitespace/indentation).',
+          'EXACTLY (including whitespace/indentation) AND uniquely — if the '
+          'SEARCH text appears more than once the call FAILS with a '
+          'count-of-matches error. Add more surrounding context to '
+          'disambiguate, or use MULTI_EDIT to target multiple sites '
+          'explicitly.',
       syntaxExample:
           '<<<EDIT_FILE: filename.ext>>>\n<<<SEARCH>>>\nexact text to find\n<<<REPLACE>>>\nreplacement text\n<<<END_EDIT>>>',
       // Tolerant separators between markers (`\s*?\n` accepts CRLF,
@@ -187,26 +248,43 @@ class ToolRegistry {
             return 'EDIT_FILE $fileName: Error: file does not exist.';
           }
           var content = await f.readAsString();
+          // Direct match first; fall back to CRLF-normalised content
+          // since some editors / OSes write `\r\n` line endings the
+          // model didn't include in its SEARCH block.
+          var effectiveSearch = search;
+          var effectiveContent = content;
           if (!content.contains(search)) {
-            // Try with normalized line endings in case of \r\n vs \n mismatch
             final normalizedContent = content.replaceAll('\r\n', '\n');
             final normalizedSearch = search.replaceAll('\r\n', '\n');
             if (normalizedContent.contains(normalizedSearch)) {
-              content = normalizedContent;
-              final result = content.replaceFirst(normalizedSearch, replace);
-              await f.writeAsString(result);
-              return 'EDIT_FILE $fileName: Success (1 replacement made)';
+              effectiveContent = normalizedContent;
+              effectiveSearch = normalizedSearch;
+            } else {
+              return 'EDIT_FILE $fileName: Error: SEARCH block not found in '
+                  'file. Make sure it matches exactly, including whitespace.';
             }
-            return 'EDIT_FILE $fileName: Error: SEARCH block not found in '
-                'file. Make sure it matches exactly, including whitespace.';
           }
+          // **Uniqueness gate.** Multi-match is the silent-wrong-edit
+          // failure mode — smaller models read "Success" and stop
+          // even if we noted the ambiguity in a parenthetical. Refuse
+          // and force the model to add context. MULTI_EDIT remains
+          // the explicit multi-site path.
           final occurrences = RegExp(
-            RegExp.escape(search),
-          ).allMatches(content).length;
-          final result = content.replaceFirst(search, replace);
+            RegExp.escape(effectiveSearch),
+          ).allMatches(effectiveContent).length;
+          if (occurrences > 1) {
+            return 'EDIT_FILE $fileName: Error: SEARCH matched $occurrences '
+                'places (file unchanged — refusing to guess which one). '
+                'Add more surrounding context to make the SEARCH block '
+                'uniquely identify ONE site, or use MULTI_EDIT to target '
+                'multiple sites explicitly.';
+          }
+          final result = effectiveContent.replaceFirst(
+            effectiveSearch,
+            replace,
+          );
           await f.writeAsString(result);
-          return 'EDIT_FILE $fileName: Success (1 replacement made'
-              '${occurrences > 1 ? ', $occurrences total occurrences — only first replaced' : ''})';
+          return 'EDIT_FILE $fileName: Success (1 replacement made)';
         } catch (e) {
           return 'EDIT_FILE $fileName: Error: $e';
         }
@@ -327,7 +405,28 @@ class ToolRegistry {
         try {
           final f = File(filePath);
           await f.parent.create(recursive: true);
-          await f.writeAsString(content, mode: FileMode.append);
+          // If the existing file does not end in a newline, prepend
+          // one to the appended content so we don't fuse the new
+          // text onto the previous last line. Cheap to read the
+          // last byte; saves a real corruption class.
+          var toWrite = content;
+          if (await f.exists()) {
+            final raf = await f.open();
+            try {
+              final len = await raf.length();
+              if (len > 0) {
+                await raf.setPosition(len - 1);
+                final tail = await raf.read(1);
+                final lastByte = tail.isEmpty ? -1 : tail[0];
+                if (lastByte != 0x0a /* \n */ ) {
+                  toWrite = '\n$content';
+                }
+              }
+            } finally {
+              await raf.close();
+            }
+          }
+          await f.writeAsString(toWrite, mode: FileMode.append);
           return 'APPEND_FILE $fileName: Success';
         } catch (e) {
           return 'APPEND_FILE $fileName: Error: $e';
@@ -381,74 +480,129 @@ class ToolRegistry {
       },
     ),
     AgentTool(
-      id: 'read_file_range',
-      name: 'READ_FILE_RANGE',
-      description:
-          'Read a 1-based inclusive line range from a file. Use this '
-          'instead of READ_FILE when you only need a slice of a large file '
-          '— saves your context window. Output is line-numbered. START/END '
-          'are clamped to the file length, so 1-99999 reads the whole '
-          'file safely. NOTE: declared above READ_FILE in the registry so '
-          'the more-specific pattern wins on `<<<READ_FILE_RANGE: ...>>>`.',
-      syntaxExample: '<<<READ_FILE_RANGE: filename.ext:10-50>>>',
-      pattern: RegExp(r'<<<READ_FILE_RANGE:\s*(.+?):(\d+)-(\d+)\s*>>>'),
-      execute: (inv) async {
-        final fileName = inv.match.group(1)!;
-        final start = int.parse(inv.match.group(2)!);
-        final end = int.parse(inv.match.group(3)!);
-        if (inv.workspaceDir == null) {
-          return 'READ_FILE_RANGE $fileName: Failed (no workspace open).';
-        }
-        if (start < 1 || end < start) {
-          return 'READ_FILE_RANGE $fileName: Error: invalid range '
-              '$start-$end.';
-        }
-        try {
-          final filePath = _resolvePath(inv, fileName, forWrite: false);
-          if (filePath == null) {
-            return 'READ_FILE_RANGE $fileName: Failed (no workspace open).';
-          }
-          final lines = await File(filePath).readAsLines();
-          final fromIdx = (start - 1).clamp(0, lines.length);
-          final toIdx = end.clamp(0, lines.length);
-          if (fromIdx >= toIdx) {
-            return 'READ_FILE_RANGE $fileName: Empty (file has '
-                '${lines.length} lines).';
-          }
-          final slice = lines.sublist(fromIdx, toIdx);
-          final numbered = <String>[];
-          for (var i = 0; i < slice.length; i++) {
-            numbered.add(
-              '${(fromIdx + i + 1).toString().padLeft(5)}|${slice[i]}',
-            );
-          }
-          return 'READ_FILE_RANGE $fileName lines $start-$end '
-              '(of ${lines.length}):\n${numbered.join('\n')}';
-        } catch (e) {
-          return 'READ_FILE_RANGE $fileName: Error: $e';
-        }
-      },
-    ),
-    AgentTool(
       id: 'read_file',
       name: 'READ_FILE',
       description:
-          'Read the contents of a file relative to the workspace. '
-          'For files >300 lines prefer READ_FILE_RANGE.',
-      syntaxExample: '<<<READ_FILE: filename.ext>>>',
-      pattern: RegExp(r'<<<READ_FILE:\s*(.*?)\s*>>>'),
+          'Read a file relative to the workspace. Output is line-numbered '
+          '(format: `<lineNo>|<content>`) so you can reference exact lines '
+          'in EDIT_FILE SEARCH blocks — strip the `<num>|` prefix before '
+          'building a SEARCH block; the file itself does NOT contain it. '
+          'Append `:start-end` to read a 1-based inclusive line range '
+          '(saves context on large files; ends are clamped, so 1-99999 '
+          'reads to EOF safely). Without a range the response is capped '
+          'at $_kReadMaxLines lines / ${_kReadMaxBytes ~/ 1024} KiB and '
+          'a footer tells you how to fetch the rest. Files larger than '
+          '${_kReadMaxFileBytes ~/ (1024 * 1024)} MiB are refused — use '
+          'SEARCH_TEXT or RUN_CMD for those. The legacy '
+          '`<<<READ_FILE_RANGE: file:start-end>>>` syntax is still '
+          'accepted but `<<<READ_FILE: file:start-end>>>` is preferred.',
+      syntaxExample:
+          '<<<READ_FILE: filename.ext>>>\n'
+          '    <<<READ_FILE: filename.ext:10-50>>>',
+      // Single regex covers four shapes:
+      //   <<<READ_FILE: file>>>             — full file (capped)
+      //   <<<READ_FILE: file:10-50>>>       — line range
+      //   <<<READ_FILE_RANGE: file:10-50>>> — legacy alias
+      //   <<<READ_FILE_RANGE: file>>>       — accepted (legacy alias,
+      //                                        treated as full file)
+      // The optional `:NN-MM` capture is greedy enough that paths
+      // containing colons but not a digit-dash-digit suffix still
+      // resolve as a full-file read.
+      pattern: RegExp(
+        r'<<<READ_FILE(?:_RANGE)?:\s*(.+?)(?::(\d+)-(\d+))?\s*>>>',
+      ),
       execute: (inv) async {
         final fileName = inv.match.group(1)!;
+        final startStr = inv.match.group(2);
+        final endStr = inv.match.group(3);
+        final hasRange = startStr != null && endStr != null;
+        final int? start = hasRange ? int.tryParse(startStr) : null;
+        final int? end = hasRange ? int.tryParse(endStr) : null;
         if (inv.workspaceDir == null) {
           return 'READ_FILE $fileName: Failed (no workspace open).';
+        }
+        if (hasRange) {
+          if (start == null || end == null || start < 1 || end < start) {
+            return 'READ_FILE $fileName: Error: invalid range '
+                '$startStr-$endStr.';
+          }
         }
         try {
           final filePath = _resolvePath(inv, fileName, forWrite: false);
           if (filePath == null) {
             return 'READ_FILE $fileName: Failed (no workspace open).';
           }
-          final c = await File(filePath).readAsString();
-          return 'READ_FILE $fileName:\n$c';
+          final file = File(filePath);
+          if (!file.existsSync()) {
+            return 'READ_FILE $fileName: Error: file does not exist.';
+          }
+          final fileBytes = await file.length();
+          if (fileBytes > _kReadMaxFileBytes) {
+            final mib = (fileBytes / (1024 * 1024)).toStringAsFixed(1);
+            return 'READ_FILE $fileName: Error: file is $mib MiB '
+                '(limit ${_kReadMaxFileBytes ~/ (1024 * 1024)} MiB). Use '
+                'SEARCH_TEXT to find specific content or RUN_CMD with a '
+                'tool like `head` / `tail` for huge files.';
+          }
+          final List<String> lines;
+          try {
+            lines = await file.readAsLines();
+          } on FormatException {
+            return 'READ_FILE $fileName: Error: file is not valid UTF-8 '
+                '(likely binary). READ_FILE only handles text.';
+          }
+          final total = lines.length;
+          if (total == 0) {
+            return 'READ_FILE $fileName: Empty (0 lines).';
+          }
+
+          if (hasRange) {
+            final fromIdx = (start! - 1).clamp(0, total);
+            final toIdx = end!.clamp(0, total);
+            if (fromIdx >= toIdx) {
+              return 'READ_FILE $fileName: Empty range (file has '
+                  '$total lines).';
+            }
+            final slice = lines.sublist(fromIdx, toIdx);
+            final numbered = _formatNumbered(slice, fromIdx + 1);
+            return 'READ_FILE $fileName lines ${fromIdx + 1}-$toIdx '
+                '(of $total):\n$numbered';
+          }
+
+          // Full-file read with line + byte caps. Walk lines until
+          // either cap is hit so we never blow the context window.
+          var byteBudget = _kReadMaxBytes;
+          var taken = 0;
+          for (var i = 0; i < total && i < _kReadMaxLines; i++) {
+            // +1 for the joining newline. Approximation in chars is fine
+            // — the cap is a guardrail, not an exact byte accounting.
+            final cost = lines[i].length + 1;
+            if (cost > byteBudget) break;
+            byteBudget -= cost;
+            taken++;
+          }
+          if (taken == 0) {
+            // First line alone exceeds the byte cap (very long minified
+            // line). Surface this clearly instead of returning empty.
+            return 'READ_FILE $fileName: Error: first line exceeds the '
+                '${_kReadMaxBytes ~/ 1024} KiB display cap '
+                '(line length: ${lines[0].length}). Use a range like '
+                '`<<<READ_FILE: $fileName:1-1>>>` to force the read, or '
+                'SEARCH_TEXT for targeted lookup.';
+          }
+          final slice = lines.sublist(0, taken);
+          final numbered = _formatNumbered(slice, 1);
+          if (taken < total) {
+            final reason = taken >= _kReadMaxLines
+                ? 'line cap ($_kReadMaxLines)'
+                : 'byte cap (${_kReadMaxBytes ~/ 1024} KiB)';
+            return 'READ_FILE $fileName lines 1-$taken (of $total):\n'
+                '$numbered\n'
+                '... (truncated at $reason; ${total - taken} more '
+                'lines. Continue with '
+                '`<<<READ_FILE: $fileName:${taken + 1}-$total>>>`)';
+          }
+          return 'READ_FILE $fileName ($total lines):\n$numbered';
         } catch (e) {
           return 'READ_FILE $fileName: Error: $e';
         }
@@ -572,23 +726,83 @@ class ToolRegistry {
       id: 'search_text',
       name: 'SEARCH_TEXT',
       description:
-          'Search for a text pattern across all files in the workspace (or a '
-          'subdirectory). Returns matching lines with file paths and line '
-          'numbers. Skips binary files and common ignore dirs. Case-insensitive '
-          'by default.',
-      syntaxExample: '<<<SEARCH_TEXT: search pattern>>>',
+          'Search for a pattern across the workspace. Output is grouped '
+          'by file: `path:line:content` per match. Default is a literal, '
+          'case-insensitive substring scan. Trailing flags refine the '
+          'search:\n'
+          '  :re             — interpret pattern as a regex\n'
+          '  :cs             — case sensitive (default is insensitive)\n'
+          '  :glob=<pattern> — limit to files matching this glob '
+          '(e.g. `:glob=lib/**/*.dart`); repeat for multiple\n'
+          '  :context=N      — include N lines of context around each '
+          'match (max 10)\n'
+          '  :max=N          — cap at N matches (default 100, max 500)\n'
+          'Uses ripgrep (`rg`) when available — orders of magnitude '
+          'faster than the in-process scanner — and falls back to a '
+          'native walker that supports `:re` / `:cs` only (`:glob` and '
+          '`:context` require rg). Skips binary files and common ignore '
+          'dirs (node_modules, .git, build, …).',
+      syntaxExample:
+          '<<<SEARCH_TEXT: search pattern>>>\n'
+          '    <<<SEARCH_TEXT: function\\s+\\w+ :re :glob=lib/**/*.dart :context=2>>>',
       pattern: RegExp(r'<<<SEARCH_TEXT:\s*(.*?)\s*>>>'),
       execute: (inv) async {
-        final query = inv.match.group(1)!;
+        final raw = inv.match.group(1)!;
         if (inv.workspaceDir == null) {
-          return 'SEARCH_TEXT $query: Failed (no workspace open).';
+          return 'SEARCH_TEXT $raw: Failed (no workspace open).';
+        }
+        final flags = <String, List<String>>{};
+        final query = _stripTrailingFlags(raw, flags);
+        if (query.isEmpty) {
+          return 'SEARCH_TEXT: Failed (empty query after parsing flags).';
+        }
+        final useRegex = flags.containsKey('re');
+        final caseSensitive = flags.containsKey('cs');
+        final globs = flags['glob'] ?? const <String>[];
+        final contextLines = (int.tryParse(
+                  flags['context']?.lastOrNull ?? '0',
+                ) ??
+                0)
+            .clamp(0, 10);
+        final maxMatches = (int.tryParse(flags['max']?.lastOrNull ?? '100') ??
+                100)
+            .clamp(1, 500);
+
+        // Try ripgrep first. Most dev machines have it, and the
+        // perf gap is huge on real codebases. Falls back cleanly
+        // when rg isn't on PATH.
+        final rgOut = await _runRipgrep(
+          workspaceDir: inv.workspaceDir!,
+          query: query,
+          useRegex: useRegex,
+          caseSensitive: caseSensitive,
+          globs: globs,
+          contextLines: contextLines,
+          maxMatches: maxMatches,
+        );
+        if (rgOut != null) return rgOut;
+
+        // Fallback: native Dart walker. Supports `:re` / `:cs` only —
+        // `:glob` / `:context` need rg's path-matcher and pre/post
+        // line emission, which would more than double this code path.
+        if (globs.isNotEmpty || contextLines > 0) {
+          return 'SEARCH_TEXT "$query": ripgrep (`rg`) not found and '
+              'fallback scanner does not support `:glob` / `:context`. '
+              'Install ripgrep, or rerun without those flags.';
         }
         try {
           final results = <String>[];
-          final pattern = RegExp(RegExp.escape(query), caseSensitive: false);
+          final RegExp pattern;
+          try {
+            pattern = useRegex
+                ? RegExp(query, caseSensitive: caseSensitive)
+                : RegExp(RegExp.escape(query), caseSensitive: caseSensitive);
+          } on FormatException catch (e) {
+            return 'SEARCH_TEXT "$query": Error: invalid regex — '
+                '${e.message}';
+          }
           var fileCount = 0;
           var matchCount = 0;
-          const maxMatches = 100;
 
           Future<void> walkDir(Directory dir) async {
             if (matchCount >= maxMatches) return;
@@ -620,21 +834,30 @@ class ToolRegistry {
                   continue;
                 }
                 final lines = content.split('\n');
-                var foundInFile = false;
+                final rel = p
+                    .relative(e.path, from: inv.workspaceDir!)
+                    .replaceAll(r'\', '/');
                 for (
                   var i = 0;
                   i < lines.length && matchCount < maxMatches;
                   i++
                 ) {
                   if (pattern.hasMatch(lines[i])) {
-                    if (!foundInFile) {
-                      final rel = p.relative(e.path, from: inv.workspaceDir!);
-                      results.add('\n$rel:');
-                      foundInFile = true;
-                      fileCount++;
+                    if (matchCount == 0 || results.last.startsWith(rel) == false) {
+                      // Track first occurrence to count files.
+                      if (!results.any((r) => r.startsWith('$rel:'))) {
+                        fileCount++;
+                      }
                     }
                     matchCount++;
-                    results.add('  ${i + 1}: ${lines[i].trimRight()}');
+                    // ripgrep-style `path:line:content`. Trim huge
+                    // lines so a minified-asset hit doesn't blow
+                    // the budget on its own.
+                    final body = lines[i].trimRight();
+                    final trimmed = body.length > 240
+                        ? '${body.substring(0, 240)}…'
+                        : body;
+                    results.add('$rel:${i + 1}:$trimmed');
                   }
                 }
               }
@@ -646,12 +869,14 @@ class ToolRegistry {
             return 'SEARCH_TEXT "$query": No matches found.';
           }
           final truncNote = matchCount >= maxMatches
-              ? '\n... (truncated at $maxMatches matches)'
+              ? '\n... (truncated at $maxMatches matches; pass `:max=N` '
+                  'to raise, or narrow with `:glob=...`)'
               : '';
-          return 'SEARCH_TEXT "$query": $matchCount matches in $fileCount files'
+          return 'SEARCH_TEXT "$query": $matchCount matches in '
+              '$fileCount file(s) (native fallback)\n'
               '${results.join('\n')}$truncNote';
         } catch (e) {
-          return 'SEARCH_TEXT $query: Error: $e';
+          return 'SEARCH_TEXT "$query": Error: $e';
         }
       },
     ),
@@ -845,20 +1070,66 @@ class ToolRegistry {
       id: 'git_diff',
       name: 'GIT_DIFF',
       description:
-          'Show `git diff` for the workspace (unstaged changes). Pass an '
-          'optional path to limit the diff to a specific file or '
-          'directory. Output is truncated at 64KB if larger — use a '
-          'narrower path argument if you need more detail.',
-      syntaxExample: '<<<GIT_DIFF>>>  or  <<<GIT_DIFF: lib/widgets/foo.dart>>>',
+          'Show `git diff` for the workspace. Default is unstaged '
+          'changes. Argument is optional and accepts:\n'
+          '  - a file/directory path → diff scoped to that path\n'
+          '  - `:staged` → show staged (`--cached`) changes\n'
+          '  - a git revision (`HEAD~1`, `main..HEAD`, `<sha>`) → diff '
+          'against that ref; combine with a path after `--` if needed\n'
+          'Examples: `<<<GIT_DIFF>>>`, '
+          '`<<<GIT_DIFF: lib/foo.dart>>>`, '
+          '`<<<GIT_DIFF: :staged>>>`, '
+          '`<<<GIT_DIFF: HEAD~3>>>`. Output capped at 64KB.',
+      syntaxExample: '<<<GIT_DIFF>>>  or  <<<GIT_DIFF: HEAD~1>>>',
       pattern: RegExp(r'<<<GIT_DIFF(?::\s*(.+?))?\s*>>>'),
       execute: (inv) async {
         if (inv.workspaceDir == null) {
           return 'GIT_DIFF: Failed (no workspace open).';
         }
-        final pathArg = inv.match.group(1)?.trim() ?? '';
+        final argRaw = inv.match.group(1)?.trim() ?? '';
+        // Parse the argument shape. Three buckets, in priority order:
+        //   1. exactly `:staged` → --cached
+        //   2. starts with a non-`:` token that resolves to a git rev →
+        //      pass through, optionally with a `--` path tail
+        //   3. otherwise → treat as a path
+        // We don't try to detect "rev or path" by syntax — we hand the
+        // whole arg to git as the first positional, and let git
+        // disambiguate via its own `--` convention. Models that want
+        // a path with a complex name pass it after `--`.
+        final args = <String>['diff'];
+        var label = argRaw;
+        if (argRaw.isEmpty) {
+          // unstaged, full workspace
+        } else if (argRaw == ':staged' || argRaw == '--staged') {
+          args.add('--cached');
+          label = 'staged';
+        } else if (argRaw.contains(' -- ')) {
+          // explicit `<rev> -- <path>` form
+          final idx = argRaw.indexOf(' -- ');
+          final rev = argRaw.substring(0, idx).trim();
+          final pathPart = argRaw.substring(idx + 4).trim();
+          if (rev.isNotEmpty) args.add(rev);
+          if (pathPart.isNotEmpty) args.addAll(['--', pathPart]);
+        } else if (argRaw.startsWith(':')) {
+          return 'GIT_DIFF: Unknown flag `$argRaw`. Supported: `:staged`. '
+              'Pass a path or git revision otherwise.';
+        } else {
+          // Heuristic: looks like a rev (no slash, no `.`, or contains
+          // `..` / `~` / `^` / is short hex) → pass as rev, else path.
+          final looksLikeRev = !argRaw.contains('/') &&
+              (RegExp(r'^[0-9a-f]{7,40}$').hasMatch(argRaw) ||
+                  argRaw.contains('..') ||
+                  argRaw.contains('~') ||
+                  argRaw.contains('^') ||
+                  argRaw == 'HEAD' ||
+                  argRaw.startsWith('HEAD'));
+          if (looksLikeRev) {
+            args.add(argRaw);
+          } else {
+            args.addAll(['--', argRaw]);
+          }
+        }
         try {
-          final args = ['diff'];
-          if (pathArg.isNotEmpty) args.addAll(['--', pathArg]);
           final r = await Process.run(
             'git',
             args,
@@ -867,19 +1138,126 @@ class ToolRegistry {
           );
           if (r.exitCode != 0) {
             final err = r.stderr.toString().trim();
-            return 'GIT_DIFF${pathArg.isEmpty ? '' : ' $pathArg'}: '
+            return 'GIT_DIFF${label.isEmpty ? '' : ' $label'}: '
                 'Error: ${err.isEmpty ? "exit ${r.exitCode}" : err}';
           }
           final out = _cap(r.stdout.toString());
           if (out.trim().isEmpty) {
-            return 'GIT_DIFF${pathArg.isEmpty ? '' : ' $pathArg'}: '
+            return 'GIT_DIFF${label.isEmpty ? '' : ' $label'}: '
                 'no changes.';
           }
-          return 'GIT_DIFF${pathArg.isEmpty ? '' : ' $pathArg'}:\n$out';
+          return 'GIT_DIFF${label.isEmpty ? '' : ' $label'}:\n$out';
         } on ProcessException catch (e) {
           return 'GIT_DIFF: git not available: ${e.message}';
         } catch (e) {
           return 'GIT_DIFF: Error: $e';
+        }
+      },
+    ),
+    AgentTool(
+      id: 'git_log',
+      name: 'GIT_LOG',
+      description:
+          'Show recent commit history for the workspace. One line per '
+          'commit: `<short-sha> <date> <author> <subject>`. Argument is '
+          'optional: pass a file/directory path to scope, or '
+          '`:n=<count>` to change the limit (default 20, max 200). '
+          'Combine with `:n=` to drill in deeper, e.g. '
+          '`<<<GIT_LOG: lib/foo.dart :n=50>>>`. Read-only — does not '
+          'fetch from remotes.',
+      syntaxExample:
+          '<<<GIT_LOG>>>  or  <<<GIT_LOG: lib/foo.dart>>>',
+      pattern: RegExp(r'<<<GIT_LOG(?::\s*(.+?))?\s*>>>'),
+      execute: (inv) async {
+        if (inv.workspaceDir == null) {
+          return 'GIT_LOG: Failed (no workspace open).';
+        }
+        final raw = inv.match.group(1)?.trim() ?? '';
+        final flags = <String, List<String>>{};
+        final pathArg = _stripTrailingFlags(raw, flags);
+        final n = (int.tryParse(flags['n']?.lastOrNull ?? '20') ?? 20)
+            .clamp(1, 200);
+        final args = <String>[
+          'log',
+          '-n', '$n',
+          '--pretty=format:%h %ad %an %s',
+          '--date=short',
+        ];
+        if (pathArg.isNotEmpty) args.addAll(['--', pathArg]);
+        try {
+          final r = await Process.run(
+            'git',
+            args,
+            workingDirectory: inv.workspaceDir,
+            runInShell: false,
+          );
+          if (r.exitCode != 0) {
+            final err = r.stderr.toString().trim();
+            return 'GIT_LOG: Error: '
+                '${err.isEmpty ? "exit ${r.exitCode}" : err}';
+          }
+          final out = r.stdout.toString().trim();
+          if (out.isEmpty) {
+            return 'GIT_LOG${pathArg.isEmpty ? '' : ' $pathArg'}: '
+                'no commits.';
+          }
+          return 'GIT_LOG${pathArg.isEmpty ? '' : ' $pathArg'} '
+              '(last $n):\n$out';
+        } on ProcessException catch (e) {
+          return 'GIT_LOG: git not available: ${e.message}';
+        } catch (e) {
+          return 'GIT_LOG: Error: $e';
+        }
+      },
+    ),
+    AgentTool(
+      id: 'git_blame',
+      name: 'GIT_BLAME',
+      description:
+          'Show `git blame` for a file — who last touched each line and '
+          'in which commit. Output format: `<short-sha> (<author> '
+          '<date>) <lineNo>) <content>`. Optional `:start-end` '
+          'suffix limits to a 1-based inclusive line range, useful for '
+          'big files. Examples: `<<<GIT_BLAME: lib/foo.dart>>>`, '
+          '`<<<GIT_BLAME: lib/foo.dart:42-80>>>`. Read-only.',
+      syntaxExample: '<<<GIT_BLAME: lib/foo.dart>>>',
+      pattern: RegExp(
+        r'<<<GIT_BLAME:\s*(.+?)(?::(\d+)-(\d+))?\s*>>>',
+      ),
+      execute: (inv) async {
+        if (inv.workspaceDir == null) {
+          return 'GIT_BLAME: Failed (no workspace open).';
+        }
+        final fileName = inv.match.group(1)!;
+        final startStr = inv.match.group(2);
+        final endStr = inv.match.group(3);
+        final args = <String>['blame', '-c'];
+        if (startStr != null && endStr != null) {
+          args.addAll(['-L', '$startStr,$endStr']);
+        }
+        args.addAll(['--', fileName]);
+        try {
+          final r = await Process.run(
+            'git',
+            args,
+            workingDirectory: inv.workspaceDir,
+            runInShell: false,
+          );
+          if (r.exitCode != 0) {
+            final err = r.stderr.toString().trim();
+            return 'GIT_BLAME $fileName: Error: '
+                '${err.isEmpty ? "exit ${r.exitCode}" : err}';
+          }
+          final out = _cap(r.stdout.toString());
+          if (out.trim().isEmpty) {
+            return 'GIT_BLAME $fileName: no blame output '
+                '(file may be untracked).';
+          }
+          return 'GIT_BLAME $fileName${startStr != null ? ' lines $startStr-$endStr' : ''}:\n$out';
+        } on ProcessException catch (e) {
+          return 'GIT_BLAME $fileName: git not available: ${e.message}';
+        } catch (e) {
+          return 'GIT_BLAME $fileName: Error: $e';
         }
       },
     ),
@@ -1300,6 +1678,209 @@ class ToolRegistry {
     if (bytes < 1024) return '${bytes}B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
+  }
+
+  /// Peel trailing `:flag` / `:flag=value` tokens off the end of a
+  /// SEARCH_TEXT (and similar) raw input so the residue is the actual
+  /// query. We only strip from the END — anything earlier in the input
+  /// stays as part of the query, which lets natural patterns like
+  /// `Map<K, V>` or `foo:bar` appear in the body without being parsed
+  /// as flags.
+  ///
+  /// Multiple instances of the same flag accumulate into a list (e.g.
+  /// repeated `:glob=...` for unioned include patterns).
+  static String _stripTrailingFlags(
+    String input,
+    Map<String, List<String>> flagsOut,
+  ) {
+    // Trailing run of one-or-more flag tokens, each preceded by
+    // whitespace. Anchored at end; we pull the whole run once.
+    final flagRun = RegExp(
+      r'(?:\s+:[a-zA-Z]+(?:=\S+)?)+\s*$',
+    );
+    final m = flagRun.firstMatch(input);
+    if (m == null) return input.trim();
+    final tail = input.substring(m.start);
+    final body = input.substring(0, m.start).trim();
+    final tokenRe = RegExp(r':([a-zA-Z]+)(?:=(\S+))?');
+    for (final t in tokenRe.allMatches(tail)) {
+      final key = t.group(1)!;
+      final value = t.group(2) ?? '';
+      flagsOut.putIfAbsent(key, () => <String>[]).add(value);
+    }
+    return body;
+  }
+
+  /// Run ripgrep against the workspace, returning a fully-formatted
+  /// `SEARCH_TEXT ...` payload on success or `null` when rg isn't
+  /// available (so the caller can fall back). Errors from rg itself
+  /// (regex parse, IO) are surfaced as a normal payload — the caller
+  /// should NOT retry the fallback for those.
+  static Future<String?> _runRipgrep({
+    required String workspaceDir,
+    required String query,
+    required bool useRegex,
+    required bool caseSensitive,
+    required List<String> globs,
+    required int contextLines,
+    required int maxMatches,
+  }) async {
+    final args = <String>[
+      '--no-heading',
+      '-n',
+      '-H',
+      '--color=never',
+      '--max-columns=240',
+      '--max-count', '$maxMatches',
+    ];
+    // Smart-case is the wrong default for an LLM agent — it makes
+    // identical queries behave differently based on the casing the
+    // model happens to type. Pin to explicit insensitive / sensitive.
+    args.add(caseSensitive ? '-s' : '-i');
+    if (!useRegex) args.add('-F');
+    if (contextLines > 0) {
+      args.addAll(['-C', '$contextLines']);
+    }
+    for (final g in globs) {
+      if (g.isEmpty) continue;
+      args.addAll(['-g', g]);
+    }
+    args.addAll(['-e', query]);
+    // The trailing `.` makes ripgrep search the workingDirectory we
+    // pass to Process.run, so workspace-relative paths come out
+    // clean in the output (matching what the model expects).
+    args.add('.');
+
+    // Resolve which rg to spawn. Order:
+    //   1. Bundled binary materialised by RipgrepProvisioner — same
+    //      version on every install, no install friction for colleagues.
+    //   2. Bare `rg` on PATH — for power users who already have a
+    //      newer (or differently-built) ripgrep installed.
+    //   3. Caller falls back to native Dart walker.
+    // First-attempt failure (binary present but blew up) is reported
+    // up; only "rg not found" via ProcessException triggers fallback,
+    // since a real error (regex parse, IO) shouldn't be silently
+    // retried with a different engine.
+    var rgExecutable = await RipgrepProvisioner.ensure() ?? 'rg';
+    ProcessResult res;
+    try {
+      res = await Process.run(
+        rgExecutable,
+        args,
+        workingDirectory: workspaceDir,
+        runInShell: false,
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      );
+    } on ProcessException {
+      // Provisioned path failed (e.g. AV quarantine, permissions) AND
+      // we tried bare `rg` only if the provisioned path was the
+      // sentinel string. Try the PATH fallback once more before
+      // giving up.
+      if (rgExecutable != 'rg') {
+        try {
+          res = await Process.run(
+            'rg',
+            args,
+            workingDirectory: workspaceDir,
+            runInShell: false,
+            stdoutEncoding: utf8,
+            stderrEncoding: utf8,
+          );
+        } on ProcessException {
+          return null;
+        } catch (_) {
+          return null;
+        }
+      } else {
+        return null;
+      }
+    } catch (_) {
+      return null;
+    }
+
+    // rg exit codes: 0 = matches, 1 = no matches, 2+ = error.
+    if (res.exitCode == 1) {
+      final flagSummary = _formatFlagSummary(
+        useRegex: useRegex,
+        caseSensitive: caseSensitive,
+        globs: globs,
+        contextLines: contextLines,
+      );
+      return 'SEARCH_TEXT "$query"$flagSummary: No matches found.';
+    }
+    if (res.exitCode >= 2) {
+      final err = (res.stderr as String? ?? '').trim();
+      if (err.isEmpty) {
+        return 'SEARCH_TEXT "$query": ripgrep failed '
+            '(exit ${res.exitCode}).';
+      }
+      return 'SEARCH_TEXT "$query": ripgrep error — $err';
+    }
+
+    var out = (res.stdout as String? ?? '').replaceAll('\r\n', '\n');
+    // Normalise path separators to forward slashes for consistency
+    // with GLOB / READ_FILE conventions; only touch the leading path
+    // segment up to the first `:`.
+    final lines = out.split('\n');
+    var matchCount = 0;
+    var fileCount = 0;
+    final seenFiles = <String>{};
+    final fixed = <String>[];
+    for (final line in lines) {
+      if (line.isEmpty) {
+        fixed.add(line);
+        continue;
+      }
+      // Context lines from rg use `path-line-content` (note: hyphen
+      // separator); match lines use `path:line:content`. Both flow
+      // through unchanged; we just normalise the path slashes.
+      final colon = line.indexOf(RegExp(r'[:\-]'));
+      if (colon <= 0) {
+        fixed.add(line);
+        continue;
+      }
+      final pathPart = line.substring(0, colon);
+      final rest = line.substring(colon);
+      final normPath = pathPart.replaceAll(r'\', '/');
+      // First char of `rest` is the separator; ':' = match line.
+      if (rest.startsWith(':')) {
+        matchCount++;
+        if (seenFiles.add(normPath)) fileCount++;
+      }
+      fixed.add('$normPath$rest');
+    }
+    final body = fixed.join('\n').trim();
+    if (body.isEmpty || matchCount == 0) {
+      return 'SEARCH_TEXT "$query": No matches found.';
+    }
+    final flagSummary = _formatFlagSummary(
+      useRegex: useRegex,
+      caseSensitive: caseSensitive,
+      globs: globs,
+      contextLines: contextLines,
+    );
+    final truncNote = matchCount >= maxMatches
+        ? '\n... (capped at $maxMatches matches; pass `:max=N` to raise, '
+            'or narrow with `:glob=...`)'
+        : '';
+    return 'SEARCH_TEXT "$query"$flagSummary: '
+        '$matchCount match(es) in $fileCount file(s)\n'
+        '$body$truncNote';
+  }
+
+  static String _formatFlagSummary({
+    required bool useRegex,
+    required bool caseSensitive,
+    required List<String> globs,
+    required int contextLines,
+  }) {
+    final parts = <String>[];
+    if (useRegex) parts.add('regex');
+    if (caseSensitive) parts.add('cs');
+    if (globs.isNotEmpty) parts.add('glob=${globs.join(",")}');
+    if (contextLines > 0) parts.add('±$contextLines');
+    return parts.isEmpty ? '' : ' [${parts.join(", ")}]';
   }
 
   /// Convert a glob pattern into an anchored `RegExp`. Supports the

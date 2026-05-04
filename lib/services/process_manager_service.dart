@@ -11,7 +11,7 @@ class ProcessInfo {
   final String? commandLine;
   final int? memoryBytes;
 
-  const ProcessInfo({
+  ProcessInfo({
     required this.pid,
     required this.name,
     this.ppid,

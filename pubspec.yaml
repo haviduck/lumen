@@ -54,6 +54,21 @@ dependencies:
   crypto: ^3.0.7
   image: ^4.8.0
   pasteboard: ^0.5.0
+  # Embedded HTTP server used by the optional Remote Access feature
+  # (see lib/services/remote/lumen_server.dart). Bound to 127.0.0.1
+  # until pairing/TLS land. shelf + shelf_router for routing,
+  # shelf_web_socket for the /v1/stream live-event channel, and
+  # web_socket_channel for the typed `WebSocketChannel` we hand
+  # off to the bus. All four are official dart-lang packages.
+  shelf: ^1.4.2
+  shelf_router: ^1.1.4
+  shelf_web_socket: ^3.0.0
+  web_socket_channel: ^3.0.0
+  # Native-window control for Flutter desktop. Used so the welcome
+  # screen renders as a small panel-sized window (no surrounding
+  # blank background) and the window grows to maximised when the
+  # user opens a workspace. See lib/services/window_chrome.dart.
+  window_manager: ^0.5.1
 
 dev_dependencies:
   flutter_test:
@@ -85,6 +100,22 @@ flutter:
     # into the shared media WebView2 via `WebviewController.addBrowserExtension`.
     # See `lib/services/extension_provisioner.dart` for the unpack flow.
     - assets/extensions/ublock-lite.zip
+    # Remote Access PWA — vanilla HTML/CSS/JS chat client served by
+    # the LumenServer at `GET /app/*` so any phone on the LAN /
+    # Tailscale can load the chat without an APK. See
+    # `lib/services/remote/lumen_static_assets.dart`.
+    - assets/remote_app/
+    # ripgrep (BurntSushi/ripgrep, MIT/Unlicense). Bundled so
+    # SEARCH_TEXT's regex / glob / context features work without
+    # requiring colleagues to install rg manually. Provisioned at
+    # first use into <appSupport>/bin/rg/<plat>/ by
+    # `lib/services/ripgrep_provisioner.dart`. Licenses live next
+    # to the binary directory and are required for redistribution
+    # — don't drop them.
+    - assets/bin/rg/win-x64/rg.exe
+    - assets/bin/rg/LICENSE-MIT
+    - assets/bin/rg/UNLICENSE
+    - assets/bin/rg/COPYING
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

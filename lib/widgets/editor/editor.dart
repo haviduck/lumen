@@ -19,6 +19,7 @@ import '../../theme/app_theme.dart';
 import '../common/fast_popup_menu.dart';
 import '../common/media_pane_chrome.dart';
 import '../menu_bar.dart';
+import '../process_manager/process_manager_view.dart';
 import '../settings_view.dart';
 import '../common/duck_toast.dart';
 import 'autocomplete_overlay.dart';
@@ -104,8 +105,7 @@ class _EditorState extends State<Editor> {
   /// and move on".
   Future<bool> _closeFile(AppState appState, File file) async {
     if (appState.isFileDirty(file.path)) {
-      final choice =
-          await showUnsavedChangesDialog(context, file: file);
+      final choice = await showUnsavedChangesDialog(context, file: file);
       if (!mounted) return false;
       switch (choice) {
         case UnsavedChangesChoice.cancel:
@@ -251,6 +251,22 @@ class _EditorState extends State<Editor> {
         child: const SettingsView(),
       );
     }
+    // Process manager sentinel — same pattern as settings: a
+    // virtual tab whose content is its own widget tree, not a
+    // code buffer. Routed before the binary/text branches so a
+    // file literally named `__process_manager__` (extremely
+    // unlikely in practice) couldn't accidentally hijack the UI.
+    if (AppState.isProcessManagerTab(path)) {
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapDown: (_) {
+          setState(() => _focusedPane = paneIndex);
+          final file = appState.openFiles.firstWhere((f) => f.path == path);
+          appState.setActiveFile(file);
+        },
+        child: const ProcessManagerView(),
+      );
+    }
 
     // Binary / media files — image, audio, video, archives, fonts,
     // executables, etc. Don't try to render these in the code editor;
@@ -321,9 +337,7 @@ class _EditorState extends State<Editor> {
             dividerHandleBuffer: 8,
             dividerPainter: DividerPainters.background(
               color: DuckColors.glassSeam,
-              highlightedColor: DuckColors.accentCyan.withValues(
-                alpha: 0.4,
-              ),
+              highlightedColor: DuckColors.accentCyan.withValues(alpha: 0.4),
             ),
           ),
           child: MultiSplitView(
@@ -418,8 +432,9 @@ class _EditorState extends State<Editor> {
                     dividerHandleBuffer: 8,
                     dividerPainter: DividerPainters.background(
                       color: DuckColors.glassSeam,
-                      highlightedColor: DuckColors.accentCyan
-                          .withValues(alpha: 0.4),
+                      highlightedColor: DuckColors.accentCyan.withValues(
+                        alpha: 0.4,
+                      ),
                     ),
                   ),
                   child: MultiSplitView(
@@ -700,8 +715,8 @@ class _EditorPaneState extends State<_EditorPane> {
   // controller, so a value owned by the parent went stale across
   // those boundaries. See `indent_guides.dart::_gutterOffset`.
   static const double _codeFieldPadding = 5;
-  static const double _findBarHeight = 42;
-  static const double _replaceBarHeight = 76;
+  static const double _findBarHeight = 70;
+  static const double _replaceBarHeight = 104;
 
   double get _effectiveCodeFieldTopPadding {
     final find = _findController?.value;
@@ -859,7 +874,10 @@ class _EditorPaneState extends State<_EditorPane> {
                             ),
                       },
                       findBuilder: (context, controller, readOnly) =>
-                          _EditorFindBar(controller: controller),
+                          _EditorFindBar(
+                            controller: controller,
+                            editingController: _controller!,
+                          ),
                       wordWrap: widget.appState.wordWrap,
                       style: CodeEditorStyle(
                         fontSize: widget.appState.editorFontSize,
@@ -959,14 +977,18 @@ class _EditorPaneState extends State<_EditorPane> {
 
 class _EditorFindBar extends StatelessWidget implements PreferredSizeWidget {
   final CodeFindController controller;
+  final CodeLineEditingController editingController;
 
-  const _EditorFindBar({required this.controller});
+  const _EditorFindBar({
+    required this.controller,
+    required this.editingController,
+  });
 
   @override
   Size get preferredSize {
     final value = controller.value;
     if (value == null) return Size.zero;
-    return Size.fromHeight(value.replaceMode ? 76 : 42);
+    return Size.fromHeight(value.replaceMode ? 104 : 70);
   }
 
   @override
@@ -991,8 +1013,8 @@ class _EditorFindBar extends StatelessWidget implements PreferredSizeWidget {
           child: Material(
             color: Colors.transparent,
             child: Container(
-              width: 360,
-              padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
+              width: 460,
+              padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
               decoration: BoxDecoration(
                 color: DuckColors.bgRaised,
                 borderRadius: BorderRadius.circular(DuckTheme.radiusS),
@@ -1057,6 +1079,14 @@ class _EditorFindBar extends StatelessWidget implements PreferredSizeWidget {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 5),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: _ReplaceDisclosure(
+                      expanded: value.replaceMode,
+                      onTap: controller.toggleMode,
+                    ),
+                  ),
                   if (value.replaceMode) ...[
                     const SizedBox(height: 6),
                     Row(
@@ -1066,16 +1096,16 @@ class _EditorFindBar extends StatelessWidget implements PreferredSizeWidget {
                             controller: controller.replaceInputController,
                             focusNode: controller.replaceInputFocusNode,
                             hint: S.editorReplacePlaceholder,
-                            onSubmitted: (_) => controller.replaceMatch(),
+                            onSubmitted: (_) => _replaceMatch(),
                           ),
                         ),
                         const SizedBox(width: 8),
                         TextButton(
-                          onPressed: controller.replaceMatch,
+                          onPressed: _replaceMatch,
                           child: const Text(S.editorReplace),
                         ),
                         TextButton(
-                          onPressed: controller.replaceAllMatches,
+                          onPressed: _replaceAllMatches,
                           child: const Text(S.editorReplaceAll),
                         ),
                       ],
@@ -1087,6 +1117,95 @@ class _EditorFindBar extends StatelessWidget implements PreferredSizeWidget {
           ),
         ),
       ),
+    );
+  }
+
+  void _replaceMatch() {
+    final value = controller.value;
+    final result = value?.result;
+    if (value == null || result == null || result.dirty) return;
+
+    final selection = controller.currentMatchSelection;
+    final option = value.option;
+    final regExp = option.regExp;
+    if (selection == null || regExp == null) return;
+
+    var replacement = controller.replaceInputController.text;
+    if (option.regex) {
+      final selectedText = _selectedText(selection);
+      final match = regExp.firstMatch(selectedText);
+      if (match == null ||
+          match.start != 0 ||
+          match.end != selectedText.length) {
+        return;
+      }
+      replacement = _expandReplacement(replacement, match);
+    }
+
+    editingController.replaceSelection(replacement, selection);
+  }
+
+  void _replaceAllMatches() {
+    final value = controller.value;
+    final result = value?.result;
+    if (value == null ||
+        result == null ||
+        result.matches.isEmpty ||
+        result.dirty) {
+      return;
+    }
+
+    final regExp = value.option.regExp;
+    if (regExp == null) return;
+
+    final replacement = controller.replaceInputController.text;
+    final nextText = editingController.text.replaceAllMapped(
+      regExp,
+      (match) => value.option.regex
+          ? _expandReplacement(replacement, match)
+          : replacement,
+    );
+    if (nextText == editingController.text) return;
+    editingController.text = nextText;
+  }
+
+  String _selectedText(CodeLineSelection selection) {
+    final lines = editingController.codeLines;
+    final lineBreak = editingController.options.lineBreak.value;
+    if (selection.isSameLine) {
+      return lines[selection.startIndex].substring(
+        selection.startOffset,
+        selection.endOffset,
+      );
+    }
+
+    final buffer = StringBuffer();
+    for (var i = selection.startIndex; i <= selection.endIndex; i++) {
+      final line = lines[i];
+      if (i == selection.startIndex) {
+        buffer.write(line.substring(selection.startOffset));
+      } else if (i == selection.endIndex) {
+        buffer.write(line.substring(0, selection.endOffset));
+      } else {
+        buffer.write(line.text);
+      }
+      if (i < selection.endIndex) buffer.write(lineBreak);
+    }
+    return buffer.toString();
+  }
+
+  String _expandReplacement(String replacement, Match match) {
+    return replacement.replaceAllMapped(
+      RegExp(r'\\([\\$])|\$(\d+)|\$\{(\d+)\}'),
+      (token) {
+        final escaped = token.group(1);
+        if (escaped != null) return escaped;
+        final indexText = token.group(2) ?? token.group(3);
+        if (indexText == null) return token.group(0)!;
+        final index = int.tryParse(indexText);
+        if (index == null || index > match.groupCount) return '';
+        return match.group(index) ?? '';
+      },
     );
   }
 }
@@ -1134,6 +1253,63 @@ class _FindInput extends StatelessWidget {
           focusedBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(DuckTheme.radiusS),
             borderSide: const BorderSide(color: DuckColors.accentCyan),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReplaceDisclosure extends StatelessWidget {
+  final bool expanded;
+  final VoidCallback onTap;
+
+  const _ReplaceDisclosure({required this.expanded, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: S.editorFindToggleReplace,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+            decoration: BoxDecoration(
+              color: expanded
+                  ? DuckColors.accentCyan.withValues(alpha: 0.12)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+              border: Border.all(
+                color: expanded
+                    ? DuckColors.accentCyan.withValues(alpha: 0.35)
+                    : DuckColors.glassSeam,
+                width: 0.5,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  expanded ? Icons.keyboard_arrow_down : Icons.chevron_right,
+                  size: 15,
+                  color: expanded ? DuckColors.accentCyan : DuckColors.fgMuted,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  S.editorReplace,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w500,
+                    color: expanded
+                        ? DuckColors.accentCyan
+                        : DuckColors.fgMuted,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1318,9 +1494,12 @@ class _EditorTabBar extends StatelessWidget {
                 itemBuilder: (context, index) {
                   final file = appState.openFiles[index];
                   final isSettings = AppState.isSettingsTab(file.path);
+                  final isProcessMgr = AppState.isProcessManagerTab(file.path);
                   final isUntitled = AppState.isUntitledTab(file.path);
                   final fileName = isSettings
                       ? S.settingsTitle
+                      : isProcessMgr
+                      ? S.processManagerTitle
                       : isUntitled
                       ? 'Untitled-${file.path.replaceAll(AppState.untitledPrefix, '')}'
                       : file.path.split(Platform.pathSeparator).last;
@@ -1333,7 +1512,12 @@ class _EditorTabBar extends StatelessWidget {
                       fileName: fileName,
                       isActive: isActive,
                       isDirty: isDirty,
-                      isSettings: isSettings,
+                      // `isSettings` is currently the "virtual tab,
+                      // suppress the file-icon" flag — both the
+                      // Settings and Process Manager sentinels qualify.
+                      // Renaming would touch every call site; the
+                      // boolean intent is identical.
+                      isSettings: isSettings || isProcessMgr,
                       onActivate: () => onActivate(file),
                       onClose: () => onClose(file),
                       onCloseOthers: () => onCloseOthers(file),

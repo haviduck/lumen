@@ -68,6 +68,27 @@ class PreferencesService {
   static const String _kSyncthingDefaultIgnoresWritten =
       'syncthing.defaultIgnoresWritten';
   static const String _kSyncthingWriteStignore = 'syncthing.writeStignore';
+  // Remote Access — opt-in HTTP server that lets paired devices talk to
+  // this Lumen instance over LAN / Tailscale. Off by default on every
+  // install; enabling brings up `LumenServer` (see
+  // `lib/services/remote/lumen_server.dart`). v1 binds to 127.0.0.1 only
+  // and exposes nothing sensitive; pairing/TLS/data API gated by future
+  // pref keys (`remoteAccess.boundHost`, etc.) before the bind opens up.
+  static const String _kRemoteAccessEnabled = 'remoteAccess.enabled';
+  // Sticky port: persisted so a stable URL survives app restarts (much
+  // nicer for manual `curl` testing). The server tries this port
+  // first on boot and falls back to OS-chosen on bind failure (another
+  // Lumen install holding it, port already taken, etc.). Stored as
+  // int; absent / <=0 means "OS picks fresh."
+  static const String _kRemoteAccessLastPort = 'remoteAccess.lastPort';
+  // Sub-toggle for opening the bind to the local network (and any
+  // overlay networks like Tailscale). Default false: a single click
+  // on the master toggle leaves the server loopback-only. Two clicks
+  // opt in to LAN exposure. Bearer auth is required on every non-
+  // public route regardless of the bind, so flipping this on with
+  // zero paired devices leaves an unreachable server (which is the
+  // default-deny posture we want).
+  static const String _kRemoteAccessBindAll = 'remoteAccess.bindAll';
   static const String _kOpenTabIds = 'chat.openTabIds';
   static const String _kChatHidden = 'ui.chatHidden';
   static const String _kAgentAllowOutsideWorkspaceWrites =
@@ -542,4 +563,36 @@ class PreferencesService {
       (await _p).getBool(_kSyncthingWriteStignore) ?? true;
   Future<void> setSyncthingWriteStignore(bool v) async =>
       (await _p).setBool(_kSyncthingWriteStignore, v);
+
+  // --- Remote Access (Lumen mobile companion) ---
+  /// Master switch for the embedded HTTP server. Off by default —
+  /// flipping this on starts a local server bound to 127.0.0.1; later
+  /// passes will open the bind to the LAN once pairing/TLS land.
+  Future<bool> getRemoteAccessEnabled() async =>
+      (await _p).getBool(_kRemoteAccessEnabled) ?? false;
+  Future<void> setRemoteAccessEnabled(bool v) async =>
+      (await _p).setBool(_kRemoteAccessEnabled, v);
+
+  /// Last successfully-bound port for the Remote Access server.
+  /// Returns `null` when no port has been recorded yet (fresh install
+  /// or never enabled), in which case the server lets the OS pick.
+  Future<int?> getRemoteAccessLastPort() async {
+    final v = (await _p).getInt(_kRemoteAccessLastPort);
+    if (v == null || v <= 0 || v > 65535) return null;
+    return v;
+  }
+
+  Future<void> setRemoteAccessLastPort(int port) async {
+    if (port <= 0 || port > 65535) return;
+    await (await _p).setInt(_kRemoteAccessLastPort, port);
+  }
+
+  /// Whether the server should bind to all interfaces (LAN + overlay
+  /// networks like Tailscale) instead of loopback-only. Default false
+  /// — explicit second toggle prevents a single click from opening a
+  /// port to the network.
+  Future<bool> getRemoteAccessBindAll() async =>
+      (await _p).getBool(_kRemoteAccessBindAll) ?? false;
+  Future<void> setRemoteAccessBindAll(bool v) async =>
+      (await _p).setBool(_kRemoteAccessBindAll, v);
 }

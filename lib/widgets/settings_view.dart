@@ -19,6 +19,7 @@ import 'gitnexus/daemon_row.dart';
 import 'gitnexus/wiki_row.dart';
 import 'manual_skill_dialog.dart';
 import 'ai_chat/model_management_panel.dart';
+import 'remote_access/remote_access_panel.dart';
 import 'syncthing/syncthing_panels.dart';
 
 /// Full settings view that renders inside the editor tab area, replacing
@@ -41,6 +42,7 @@ enum _SettingsCategory {
   rules,
   gitnexus,
   syncthing,
+  remoteAccess,
   tools,
   keys,
 }
@@ -114,6 +116,7 @@ class _SettingsViewState extends State<SettingsView> {
       'rules' => _SettingsCategory.rules,
       'gitnexus' => _SettingsCategory.gitnexus,
       'syncthing' => _SettingsCategory.syncthing,
+      'remoteAccess' => _SettingsCategory.remoteAccess,
       'tools' => _SettingsCategory.tools,
       'keys' => _SettingsCategory.keys,
       _ => _SettingsCategory.general,
@@ -328,6 +331,10 @@ class _SettingsViewState extends State<SettingsView> {
                   S.settingsCatSyncthing,
                   _SettingsCategory.syncthing,
                 ),
+                _sidebarItem(
+                  S.settingsCatRemoteAccess,
+                  _SettingsCategory.remoteAccess,
+                ),
                 _sidebarItem(S.settingsCatTools, _SettingsCategory.tools),
                 _sidebarItem(S.settingsCatKeys, _SettingsCategory.keys),
                 const Spacer(),
@@ -442,6 +449,8 @@ class _SettingsViewState extends State<SettingsView> {
         return _buildGitNexus();
       case _SettingsCategory.syncthing:
         return _buildSyncthing();
+      case _SettingsCategory.remoteAccess:
+        return const RemoteAccessPanel();
       case _SettingsCategory.tools:
         return _buildTools();
       case _SettingsCategory.keys:

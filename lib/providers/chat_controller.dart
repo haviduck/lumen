@@ -2115,8 +2115,8 @@ on the next turn — that is real output, not user input.
   emit the tool call. If you only want to describe what you're
   about to do, prefix with one short prose line, then emit the
   tool. Never narrate a completed edit you did not actually issue.
-- Read before editing. Use READ_FILE / READ_FILE_RANGE / SEARCH_TEXT
-  to ground edits in actual code.
+- Read before editing. Use READ_FILE (optionally with `:start-end`)
+  or SEARCH_TEXT to ground edits in actual code.
 - **For existing files, ALWAYS use EDIT_FILE or MULTI_EDIT. NEVER use
   CREATE_FILE on a file that exists** — it forces you to retype the
   entire file, wastes minutes of generation time on big files, and

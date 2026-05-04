@@ -41,10 +41,8 @@ class S {
   static const String welcomeStart = 'Start';
   static const String welcomeRecent = 'Recent';
   static const String welcomeRecentProjects = 'Recent Workspaces';
-  static const String welcomeFocusTitle = 'Local-first workspace';
-  static const String welcomeFocusBody =
-      'Open a project folder and Lumen restores the editor, chat tabs, terminal, rules and tools around that workspace.';
   static const String welcomeShortcuts = 'Quick Shortcuts';
+  static const String welcomeClose = 'Close Lumen';
   static const String welcomeNewProjectTitle = 'New Project';
   static const String welcomeProjectName = 'Project Name';
   static const String welcomeSelectParent = 'Select Parent Directory';
@@ -67,6 +65,7 @@ class S {
   static const String menuHelp = 'Help';
   static const String menuNewWindow = 'New Window';
   static const String menuOpenFolder = 'Open Folder…';
+  static const String menuOpenRecent = 'Open Recent';
   static const String menuNewFile = 'New File';
   static const String menuNewFolder = 'New Folder';
   static const String menuSaveFile = 'Save File';
@@ -616,11 +615,12 @@ class S {
   static const String editorFindNext = 'Next match';
   static const String editorFindCaseSensitive = 'Match Case';
   static const String editorFindRegex = 'Use Regular Expression';
+  static const String editorFindToggleReplace = 'Toggle Replace';
   static const String editorFindClose = 'Close Find';
   static const String editorFindNoResults = 'No results';
   static const String editorReplacePlaceholder = 'Replace';
   static const String editorReplace = 'Replace';
-  static const String editorReplaceAll = 'All';
+  static const String editorReplaceAll = 'Replace All';
   static const String editorLineCol = 'Ln';
   static const String editorColCol = 'Col';
   static const String editorMarkdownPreview = 'Markdown Preview';
@@ -1153,6 +1153,70 @@ class S {
       'Replace the current contents of $path with the version from $when?\n\n'
       'A pre-restore snapshot is captured first, so you can undo this from '
       'the timeline.';
+
+  // Project-wide "revert to this point in time" — the PhpStorm Local
+  // History–style action that lives next to the single-file restore
+  // button.
+  static const String timelineProjectRevertAction = 'Revert project to here';
+  static const String timelineProjectRevertTooltip =
+      'Roll the entire project back to this moment in time. '
+      'Per-file timestamps and chat history are preserved.';
+  static const String timelineProjectRevertConfirmTitle =
+      'Revert project to this point?';
+  static const String timelineProjectRevertNoChanges =
+      'The project already matches this point in time — nothing to do.';
+  static const String timelineProjectRevertChangedFiles =
+      'Files that will change';
+  static const String timelineProjectRevertRecreatedFiles =
+      'Files that will be recreated';
+  static const String timelineProjectRevertCreatedAfter =
+      'Files created after this point';
+  static const String timelineProjectRevertUnrestorable =
+      'Files whose history was pruned (cannot be restored)';
+  static const String timelineProjectRevertKeepNewFiles = 'Keep them';
+  static const String timelineProjectRevertDeleteNewFiles = 'Delete them';
+  static const String timelineProjectRevertNewFilesPrompt =
+      'These files did not exist at the chosen point in time. What should '
+      'happen to them?';
+  static const String timelineProjectRevertSafetyNote =
+      'A pre-revert snapshot of every changed file is captured first, so '
+      'you can undo this from the timeline.';
+
+  static String timelineProjectRevertSummary({
+    required int changed,
+    required int recreated,
+    required int createdAfter,
+    required int unrestorable,
+  }) {
+    final parts = <String>[];
+    if (changed > 0) {
+      parts.add(changed == 1 ? '1 file will change' : '$changed files will change');
+    }
+    if (recreated > 0) {
+      parts.add(
+        recreated == 1
+            ? '1 file will be recreated'
+            : '$recreated files will be recreated',
+      );
+    }
+    if (createdAfter > 0) {
+      parts.add(
+        createdAfter == 1
+            ? '1 file was created after this point'
+            : '$createdAfter files were created after this point',
+      );
+    }
+    if (unrestorable > 0) {
+      parts.add(
+        unrestorable == 1
+            ? '1 file is no longer restorable'
+            : '$unrestorable files are no longer restorable',
+      );
+    }
+    if (parts.isEmpty) return 'No changes.';
+    return '${parts.join(', ')}.';
+  }
+
   static String timelineDiffRevision(String when) => 'REVISION · $when';
   static String timelineBinarySizes(int rev, int cur) =>
       'Revision: ${_humanBytes(rev)}  ·  Current: ${_humanBytes(cur)}';
@@ -1275,4 +1339,127 @@ class S {
 
   // Syncthing — refresh button.
   static const String settingsSyncthingRefreshPending = 'Refresh';
+
+  // ── Process Manager ──
+  // The Terminal-menu entry that opens the manager and the
+  // surface itself. Strings live here per workspace rule
+  // (no hardcoded text in widgets).
+  static const String menuProcessManager = 'Process Manager…';
+  static const String processManagerTitle = 'Process Manager';
+
+  // Filter chips. Labels are intentionally short so the chip
+  // bar wraps cleanly at narrow widths.
+  static const String processFilterAll = 'All';
+  static const String processFilterNode = 'Node';
+  static const String processFilterPython = 'Python';
+  static const String processFilterJava = 'Java';
+  static const String processFilterWorkspace = 'This workspace';
+  static const String processFilterLumen = 'Lumen-spawned';
+
+  // Search + table headers.
+  static const String processSearchHint =
+      'Search by name, path, or command line\u2026';
+  static const String processColPid = 'PID';
+  static const String processColName = 'NAME';
+  static const String processColMemory = 'MEMORY';
+  static const String processColCommand = 'COMMAND';
+
+  // Per-row + bulk actions.
+  static const String processKill = 'Kill';
+  static const String processRefresh = 'Refresh';
+  static const String processAutoRefreshOn = 'Auto-refresh: ON';
+  static const String processAutoRefreshOff = 'Auto-refresh: OFF';
+  static String processKillAllMatching(int n) => 'Kill all $n matching';
+  static const String processKillFailed = 'Failed to kill';
+  static String processKillBulkDone(int n) =>
+      'Killed $n process${n == 1 ? '' : 'es'}.';
+  static String processKillBulkPartial(int ok, int failed) =>
+      'Killed $ok, failed $failed. Some processes may need elevated rights.';
+  static const String processKillBulkConfirmTitle = 'Kill matching processes?';
+  static String processKillBulkConfirmBody(int n) =>
+      'You are about to terminate $n process${n == 1 ? '' : 'es'}. '
+      'Unsaved work in those processes will be lost.';
+  static const String processKillBulkConfirmAction = 'Kill all';
+
+  // Empty / error states.
+  static const String processEmpty = 'No processes returned by the OS.';
+  static const String processNoMatches =
+      'No processes match the current filter.';
+  static const String processError = 'Could not list processes';
+  static const String processLumenSpawnedTooltip =
+      'Spawned by Lumen (or a descendant of one)';
+
+  // Footer stats line. Ordered so the most actionable number
+  // ("matched") sits next to the search box visually.
+  static String processFooterStats(int total, int matched, int spawned) =>
+      '$total processes  ·  $matched matched  ·  $spawned Lumen-spawned';
+
+  // ── Settings view — Remote Access ────────────────────────────
+  // The Remote Access feature lets paired phones / tablets talk to
+  // this Lumen instance over LAN or Tailscale. v1 is foundation
+  // only — the strings below describe a loopback-bound /v1/health
+  // server. Pairing / TLS / data API strings will land alongside
+  // their respective passes; keep this block focused on what the
+  // current build actually surfaces so the panel doesn't lie.
+  static const String settingsCatRemoteAccess = 'Remote Access';
+  static const String settingsRemoteAccessTitle = 'Remote Access';
+  static const String settingsRemoteAccessSubtitle =
+      'Let paired devices on your local network or Tailscale connect '
+      'to this Lumen instance. Foundation build — pairing, TLS, and '
+      'the data API land in upcoming versions.';
+  static const String settingsRemoteAccessEnabled = 'Enable remote access';
+  static const String settingsRemoteAccessStarting = 'Starting…';
+  static const String settingsRemoteAccessDisabled = 'Disabled';
+  static const String settingsRemoteAccessNotRunning = 'Not running';
+  static const String settingsRemoteAccessRunningOn = 'Running on';
+  static const String settingsRemoteAccessInstanceName = 'Instance name';
+  static const String settingsRemoteAccessInstanceId = 'Instance ID';
+  static const String settingsRemoteAccessHealthHint =
+      'Quick check: with this enabled, a curl to '
+      'http://<host>:<port>/v1/health should return JSON.';
+
+  // Bind / network exposure
+  static const String settingsRemoteAccessBindAll = 'Bind to LAN / Tailscale';
+  static const String settingsRemoteAccessBindAllDesc =
+      'Listen on every network interface so paired phones, tablets, '
+      'and Tailscale peers can reach this Lumen instance. Off by '
+      'default: a single click on the master toggle keeps the server '
+      'loopback-only.';
+  static const String settingsRemoteAccessReachableUrls = 'Reachable on';
+  static const String settingsRemoteAccessNoInterfaces =
+      'No non-loopback interfaces detected.';
+
+  // Plain-HTTP warning (replaces the prior "foundation notice"
+  // string). Load-bearing — the threat model intentionally skips
+  // TLS, see knowledgebase § Remote Access.
+  static const String settingsRemoteAccessPlainHttpBanner =
+      'Plain HTTP, bearer-auth only. Fine over Tailscale (already '
+      'encrypted) and over LANs you trust. Don\'t expose on hostile '
+      'networks (coffee-shop wifi, public APs) until TLS lands.';
+
+  // Pairing
+  static const String settingsRemoteAccessPairing = 'Pair a device';
+  static const String settingsRemoteAccessPairingDesc =
+      'Generate a one-time 6-digit code that a phone or tablet enters '
+      'to pair with this Lumen instance.';
+  static const String settingsRemoteAccessShowCode = 'Show pairing code';
+  static const String settingsRemoteAccessHideCode = 'Hide pairing code';
+  static const String settingsRemoteAccessPairingCodeTitle = 'Pairing code';
+  static const String settingsRemoteAccessPairingCodeBody =
+      'Enter this code on the device you want to pair. It expires in 60s '
+      'and can only be used once.';
+  static const String settingsRemoteAccessPairingExpired =
+      'Code expired. Generate a new one.';
+  static const String settingsRemoteAccessPairingExpiresIn = 'Expires in';
+  static const String settingsRemoteAccessPairingComplete =
+      'Paired successfully.';
+
+  // Paired devices
+  static const String settingsRemoteAccessPairedDevices = 'Paired devices';
+  static const String settingsRemoteAccessNoPairedDevices =
+      'No paired devices yet.';
+  static const String settingsRemoteAccessRevoke = 'Revoke';
+  static const String settingsRemoteAccessRevokeAll = 'Revoke all';
+  static const String settingsRemoteAccessLastSeen = 'Last seen';
+  static const String settingsRemoteAccessNever = 'never';
 }

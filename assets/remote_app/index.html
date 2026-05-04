@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <!-- viewport-fit=cover so the page extends into the iOS notch / Android
+       gesture area; the CSS uses env(safe-area-inset-*) to keep content
+       out of those regions. user-scalable=no prevents the iOS
+       double-tap-to-zoom that messes up tap latency on chat bubbles. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#14171D" />
+  <meta name="color-scheme" content="dark" />
+  <!-- iOS PWA polish. Apple ignores manifest.theme-color, hence the
+       custom meta. status-bar-style=black-translucent makes the status
+       bar overlay our dark background cleanly when "Add to Home Screen"
+       is used. -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Lumen" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Lumen</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/png" href="icon.png" />
+  <link rel="apple-touch-icon" href="icon.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- App root. The JS replaces the inner content per route. The bare
+       `loading` placeholder is what the user sees during the brief
+       window between paint and JS hydration; styled to match the dark
+       theme so there's no white flash. -->
+  <div id="app" class="screen-pair">
+    <div class="loading">
+      <div class="spinner"></div>
+    </div>
+  </div>
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -17,6 +17,7 @@ import '../services/lumen_process_tracker.dart';
 import '../services/ollama_service.dart';
 import '../services/preferences_service.dart';
 import '../services/recent_edits_tracker.dart';
+import '../services/remote/lumen_server.dart';
 import '../services/rules_service.dart';
 import '../services/syncthing_service.dart';
 import '../services/timeline_models.dart';
@@ -88,6 +89,30 @@ class AppState extends ChangeNotifier {
   final SyncthingService syncthing = SyncthingService();
   final GitNexusService gitnexus = GitNexusService();
   final WorkspaceSkillsService workspaceSkills = WorkspaceSkillsService();
+  // Optional embedded HTTP server used by the Remote Access feature
+  // (paired phones / tablets connect over LAN / Tailscale). Off by
+  // default; toggled on via Settings → Remote Access. Constructed
+  // here so widgets can listen via `Consumer<AppState>` and reach
+  // `state.remote`. The server itself is a `ChangeNotifier` so the
+  // settings panel uses `AnimatedBuilder` against it for live
+  // status updates without piping every change through AppState.
+  //
+  // Read closures rather than direct AppState wiring keep the
+  // server's dependency surface narrow — see `lumen_routes.dart`
+  // § LumenRemoteDeps. They're evaluated per request so a workspace
+  // switch surfaces immediately without listener plumbing.
+  late final LumenServer remote = LumenServer(
+    prefs: prefs,
+    persistence: _persistence,
+    currentDirectory: () => _currentDirectory,
+    recentProjects: () => List.unmodifiable(_recentProjects),
+    // Lazy on purpose: `chat` is `late final` and constructed in
+    // the AppState constructor body, so the `LumenServer` field
+    // initializer can't reach it directly. The closure is only
+    // dereferenced when a mutating REST route fires, which is
+    // strictly after `_bootstrap` has run `chat.init()`.
+    chatController: () => chat,
+  );
   // Per-workspace foolproof file revision history. Mounted by
   // `setDirectory` and detached by `closeWorkspace`; capture hooks
   // (manual save, FS watcher, agent tool ops) all funnel into this
@@ -343,6 +368,18 @@ class AppState extends ChangeNotifier {
     await chat.init();
     await autoBackup.init();
     await chat.reloadExternalTools(_currentDirectory);
+    // Remote Access is opt-in and disabled by default. `init` reads
+    // the persisted toggle and only spawns the HttpServer if it was
+    // previously enabled — so a fresh install never opens a port.
+    // Kept last in bootstrap because the network bind is the slowest
+    // step and we don't want it to delay UI-affecting work above.
+    await remote.init();
+    // Attach the live-event bus to the chat controller AFTER its own
+    // init has settled. The bus listens to `notifyListeners()` and
+    // diffs state into semantic events for `/v1/stream` clients.
+    // Detached in `dispose` via `remote.dispose()` (which calls
+    // `eventBus.disposeBus()` internally).
+    remote.eventBus.attach(chat);
   }
 
   @override
@@ -353,6 +390,7 @@ class AppState extends ChangeNotifier {
     timeline.dispose();
     gitnexus.removeListener(_onGitnexusChanged);
     gitnexus.dispose();
+    remote.dispose();
     super.dispose();
   }
 
@@ -812,6 +850,22 @@ class AppState extends ChangeNotifier {
     );
     await _resyncTouchedPaths(result.touchedRelPaths);
     return result.message;
+  }
+
+  /// Project-wide "revert to this point in time" entry point. Wraps
+  /// [TimelineService.restoreToPointInTime] with the editor + explorer
+  /// resync that matches the per-message restore path. Returns the
+  /// service's result so the UI can show counts + the toast text.
+  Future<TimelineBulkRestoreResult> revertProjectToPointInTime(
+    DateTime when, {
+    bool deleteFilesCreatedAfter = false,
+  }) async {
+    final result = await timeline.restoreToPointInTime(
+      when,
+      deleteFilesCreatedAfter: deleteFilesCreatedAfter,
+    );
+    await _resyncTouchedPaths(result.touchedRelPaths);
+    return result;
   }
 
   /// Cursor / Antigravity-style "revert to before this message" applied

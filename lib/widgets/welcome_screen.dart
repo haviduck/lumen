@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
+import '../services/window_chrome.dart';
 import '../services/workspace_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
@@ -130,46 +131,49 @@ class WelcomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
 
+    // The native window is sized to the welcome panel (see
+    // `services/window_chrome.dart`), so the welcome screen IS the
+    // window — no maximised void around a tiny centred card. The
+    // ambient gradient still paints behind the panel for visual
+    // depth at this scale (cheap; one radial gradient).
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Stack(
         children: [
-          // Welcome uses a slightly stronger ambient (1.0) since it's the
-          // only thing on screen and has no chrome competing with it.
           const Positioned.fill(child: AmbientBackground(intensity: 1.0)),
-          Center(
-            child: SizedBox(
-              width: 720,
-              child: _WelcomeCardSurface(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        Image.asset(
-                          'assets/images/lumen_logo.png',
-                          width: 50,
-                          height: 50,
-                          filterQuality: FilterQuality.high,
-                        ),
-                        const SizedBox(width: 10),
-                        const Column(
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: _WelcomeCardSurface(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Image.asset(
+                        'assets/images/lumen_logo.png',
+                        width: 44,
+                        height: 44,
+                        filterQuality: FilterQuality.high,
+                      ),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Column(
                           mainAxisSize: MainAxisSize.min,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
                               S.appName,
                               style: TextStyle(
-                                fontSize: 44,
-                                height: 0.9,
+                                fontSize: 36,
+                                height: 0.95,
                                 fontWeight: FontWeight.w200,
                                 letterSpacing: 4,
                                 color: DuckColors.pearlWhite,
                               ),
                             ),
-                            SizedBox(height: 8),
+                            SizedBox(height: 6),
                             Text(
                               S.tagline,
                               style: TextStyle(
@@ -181,43 +185,29 @@ class WelcomeScreen extends StatelessWidget {
                             ),
                           ],
                         ),
-                      ],
-                    ),
-                    const SizedBox(height: 32),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                S.welcomeStart,
-                                style: DuckTheme.titleS,
-                              ),
-                              const SizedBox(height: 14),
-                              _Action(
-                                icon: Icons.folder_open,
-                                label: S.openFolder,
-                                onTap: () => _openFolder(context),
-                              ),
-                              const SizedBox(height: 6),
-                              _Action(
-                                icon: Icons.create_new_folder,
-                                label: S.newProject,
-                                onTap: () => _createNewProject(context),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 32),
-                        const Expanded(child: _WelcomeFocusPanel()),
-                      ],
-                    ),
-                    const SizedBox(height: 28),
-                    _RecentWorkspacesPanel(appState: appState),
-                  ],
-                ),
+                      ),
+                      const _WelcomeCloseButton(),
+                    ],
+                  ),
+                  const SizedBox(height: 22),
+                  const Text(S.welcomeStart, style: DuckTheme.titleS),
+                  const SizedBox(height: 10),
+                  _Action(
+                    icon: Icons.folder_open,
+                    label: S.openFolder,
+                    onTap: () => _openFolder(context),
+                  ),
+                  const SizedBox(height: 4),
+                  _Action(
+                    icon: Icons.create_new_folder,
+                    label: S.newProject,
+                    onTap: () => _createNewProject(context),
+                  ),
+                  const SizedBox(height: 16),
+                  Flexible(
+                    child: _RecentWorkspacesPanel(appState: appState),
+                  ),
+                ],
               ),
             ),
           ),
@@ -227,6 +217,65 @@ class WelcomeScreen extends StatelessWidget {
   }
 }
 
+/// Close (X) affordance on the welcome panel. The OS-level title bar
+/// still has its own minimize/close, but at the small panel size the
+/// in-card button is more discoverable and gives the welcome screen a
+/// dialog-like feel. Routes through `WindowChrome.close()` so we
+/// degrade gracefully on hosts where `window_manager` isn't available.
+class _WelcomeCloseButton extends StatefulWidget {
+  const _WelcomeCloseButton();
+
+  @override
+  State<_WelcomeCloseButton> createState() => _WelcomeCloseButtonState();
+}
+
+class _WelcomeCloseButtonState extends State<_WelcomeCloseButton> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: S.welcomeClose,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hover = true),
+        onExit: (_) => setState(() => _hover = false),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => WindowChrome.close(),
+          child: AnimatedContainer(
+            duration: DuckMotion.fast,
+            width: 26,
+            height: 26,
+            decoration: BoxDecoration(
+              color: _hover
+                  ? DuckColors.stateError.withValues(alpha: 0.18)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+              border: Border.all(
+                color: _hover
+                    ? DuckColors.stateError.withValues(alpha: 0.45)
+                    : DuckColors.glassSeam,
+                width: 0.5,
+              ),
+            ),
+            alignment: Alignment.center,
+            child: Icon(
+              Icons.close,
+              size: 14,
+              color: _hover ? DuckColors.stateError : DuckColors.fgMuted,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Single card surface that hosts the welcome content. The native
+/// window is sized to roughly this card's footprint
+/// (`WindowChrome.welcomeSize`), so this widget is the entire visible
+/// surface of Lumen during welcome.
 class _WelcomeCardSurface extends StatelessWidget {
   final Widget child;
 
@@ -237,7 +286,7 @@ class _WelcomeCardSurface extends StatelessWidget {
     return Material(
       color: Colors.transparent,
       child: Container(
-        padding: const EdgeInsets.all(40),
+        padding: const EdgeInsets.fromLTRB(28, 22, 22, 22),
         decoration: BoxDecoration(
           color: DuckColors.bgGlassHi,
           borderRadius: BorderRadius.circular(DuckTheme.radiusL),
@@ -253,47 +302,12 @@ class _WelcomeCardSurface extends StatelessWidget {
 // (The old per-screen `_BackgroundDecor` was extracted to
 // `widgets/common/ambient_background.dart` and is now shared between the
 // welcome screen and the IDE shell.)
-
-class _WelcomeFocusPanel extends StatelessWidget {
-  const _WelcomeFocusPanel();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-      decoration: BoxDecoration(
-        color: DuckColors.bgRaised.withValues(alpha: 0.38),
-        border: Border.all(color: DuckColors.glassSeam, width: 0.5),
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-      ),
-      child: const Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                Icons.folder_special_outlined,
-                size: 16,
-                color: DuckColors.accentCyan,
-              ),
-              SizedBox(width: 8),
-              Text(S.welcomeFocusTitle, style: DuckTheme.titleS),
-            ],
-          ),
-          SizedBox(height: 10),
-          Text(
-            S.welcomeFocusBody,
-            style: TextStyle(
-              color: DuckColors.fgMuted,
-              fontSize: 12,
-              height: 1.45,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
+//
+// `_WelcomeFocusPanel` ("Local-first workspace" copy block) was removed
+// when the welcome screen was reshaped into a small panel-sized window.
+// Static info-only chrome doesn't earn pixels at that footprint; if the
+// onboarding nudge needs to come back, do it as a one-time tooltip on
+// the Open Folder action, NOT as a permanent panel.
 
 class _Action extends StatefulWidget {
   final IconData icon;

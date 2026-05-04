@@ -1,0 +1,20 @@
+{
+  "name": "Lumen Remote",
+  "short_name": "Lumen",
+  "description": "Talk to your Lumen desktop chat from anywhere on your LAN or Tailscale.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "portrait",
+  "background_color": "#14171D",
+  "theme_color": "#14171D",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "192x192 512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

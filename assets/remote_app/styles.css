@@ -1,0 +1,844 @@
+/* ────────────────────────────────────────────────────────────────
+   Lumen Remote — mobile-first stylesheet.
+
+   Design goals:
+   - Match the desktop's "Cursor Dark Midnight" palette one-for-one
+     (tokens copied verbatim from lib/theme/app_colors.dart so a
+     phone screenshot is recognisable as Lumen).
+   - Feel native on both iOS Safari and Android Chrome:
+     - 16px input font (else iOS auto-zooms on focus).
+     - -webkit-tap-highlight-color: transparent (no blue flash on tap).
+     - overscroll-behavior: contain on the body (no rubber-band
+       reaching the URL bar).
+     - safe-area-inset-* on the chrome regions (notch / gesture bars).
+     - 44px+ tap targets per Apple HIG.
+     - System-stack font; we don't ship a custom face.
+   - Strict mobile-first; the desktop view renders fine but isn't
+     the design target. The PWA install path centers around phones.
+
+   File is hand-rolled CSS (no preprocessor) so the bundle stays
+   small and the file maps 1:1 to a single browser request. Roughly
+   400 lines; if it grows past 700 split into per-screen files.
+   ──────────────────────────────────────────────────────────────── */
+
+:root {
+  /* ── Palette (copied from DuckColors) ── */
+  --bg-deepest: #14171D;
+  --bg-deeper:  #191C22;
+  --bg-base:    #1D2128;
+  --bg-raised:  #1E2127;
+  --bg-raised-hi: #272C36;
+  --bg-chip:    #1E2129;
+
+  --border:        #272C36;
+  --border-strong: #434C5E;
+  --glass-seam:    rgba(255, 255, 255, 0.05);
+  --glass-edge:    rgba(255, 255, 255, 0.08);
+
+  --fg-primary: #D8DEE9;
+  --fg-pearl:   #ECEFF4;
+  --fg-muted:   #7B88A1;
+  --fg-subtle:  #4B5163;
+
+  --accent-cyan:   #88C0D0;
+  --accent-cyan-hi: #9FD0DD;
+  --accent-purple: #B48EAD;
+  --accent-mint:   #8FBCBB;
+
+  --state-ok:    #A3BE8C;
+  --state-warn:  #EBCB8B;
+  --state-error: #BF616A;
+
+  /* ── Geometry ── */
+  --radius-s: 8px;
+  --radius-m: 12px;
+  --radius-l: 18px;
+
+  --tap-min: 44px;
+
+  /* Header height is hard-coded so the chat-screen scroll math
+     (scroll to bottom on new message) doesn't have to measure. */
+  --header-h: 52px;
+  --composer-h: 56px;
+
+  /* Safe area passthrough for use inside other calc()s. */
+  --safe-top:    env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left:   env(safe-area-inset-left, 0px);
+  --safe-right:  env(safe-area-inset-right, 0px);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg-deepest);
+  color: var(--fg-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Stop the page-level rubber-band on iOS — the chat scroller is
+     the only thing that should bounce. */
+  overscroll-behavior-y: contain;
+}
+
+body {
+  /* Lock the viewport so the keyboard doesn't shrink the document
+     and break our composer. JS sets `--vh` to window.innerHeight*0.01
+     on resize; we use it instead of `100vh` to avoid the iOS Safari
+     URL-bar vh bug. */
+  height: calc(var(--vh, 1vh) * 100);
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Loading splash ────────────────────────────────────────── */
+.loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--glass-edge);
+  border-top-color: var(--accent-cyan);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Top header ────────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  padding-top: max(var(--safe-top), 8px);
+  height: calc(var(--header-h) + var(--safe-top));
+  background: var(--bg-deepest);
+  border-bottom: 1px solid var(--glass-seam);
+  flex: 0 0 auto;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.header__back {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-s);
+  color: var(--fg-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.header__back:active {
+  background: var(--bg-raised-hi);
+}
+.header__title {
+  flex: 1;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg-pearl);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.header__action {
+  background: transparent;
+  border: 0;
+  color: var(--accent-cyan);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-radius: var(--radius-s);
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.header__action:active {
+  background: var(--bg-raised-hi);
+}
+.header__connection {
+  /* Tiny dot in the header indicating the WS state. Keeps the
+     subtle "phone is live with desktop" affordance visible without
+     spending real estate. */
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--state-error);
+  transition: background 0.3s;
+}
+.header__connection.is-connected { background: var(--state-ok); }
+.header__connection.is-connecting { background: var(--state-warn); }
+
+/* ── Generic content area + scrolling ──────────────────────── */
+.content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 16px;
+  padding-bottom: calc(16px + var(--safe-bottom));
+}
+
+.empty-state {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+/* ── Pairing screen ────────────────────────────────────────── */
+.pair {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  padding: 24px;
+  padding-top: calc(24px + var(--safe-top));
+  padding-bottom: calc(24px + var(--safe-bottom));
+  gap: 18px;
+  max-width: 420px;
+  margin: 0 auto;
+  width: 100%;
+}
+.pair__logo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.pair__logo-mark {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-mint) 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--bg-deepest);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  box-shadow: 0 4px 18px rgba(136, 192, 208, 0.28);
+}
+.pair__title {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--fg-pearl);
+  text-align: center;
+  margin: 0;
+}
+.pair__hint {
+  font-size: 13px;
+  color: var(--fg-muted);
+  text-align: center;
+  line-height: 1.5;
+  margin: 0 0 8px;
+}
+.pair__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pair__label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+.input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  padding: 14px 14px;
+  background: var(--bg-chip);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--fg-primary);
+  /* 16px+ avoids iOS focus-zoom; smaller fonts re-introduce it. */
+  font-size: 16px;
+  font-family: inherit;
+  transition: border-color 0.15s, background 0.15s;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--accent-cyan);
+  background: var(--bg-raised-hi);
+}
+.input--code {
+  letter-spacing: 8px;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 22px;
+  font-weight: 600;
+}
+.button {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  padding: 14px 16px;
+  background: var(--accent-cyan);
+  color: var(--bg-deepest);
+  border: 0;
+  border-radius: var(--radius-s);
+  font-size: 15px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: transform 0.05s, opacity 0.15s, background 0.15s;
+  min-height: var(--tap-min);
+}
+.button:active {
+  transform: scale(0.985);
+  background: var(--accent-cyan-hi);
+}
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.button--ghost {
+  background: var(--bg-raised);
+  color: var(--fg-primary);
+  border: 1px solid var(--border);
+}
+.button--ghost:active {
+  background: var(--bg-raised-hi);
+}
+.error-banner {
+  padding: 10px 12px;
+  background: rgba(191, 97, 106, 0.10);
+  border: 1px solid rgba(191, 97, 106, 0.4);
+  border-radius: var(--radius-s);
+  color: var(--fg-pearl);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* ── List screens (projects, chats) ────────────────────────── */
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.list__item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  background: var(--bg-raised);
+  border: 1px solid var(--glass-seam);
+  border-radius: var(--radius-m);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.05s;
+  min-height: var(--tap-min);
+  text-align: left;
+  width: 100%;
+  font-family: inherit;
+  color: var(--fg-primary);
+  -webkit-appearance: none;
+  appearance: none;
+}
+.list__item:active {
+  background: var(--bg-raised-hi);
+  transform: scale(0.995);
+}
+.list__icon {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-s);
+  background: var(--bg-chip);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-cyan);
+  flex: 0 0 auto;
+}
+.list__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.list__title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg-pearl);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.list__subtitle {
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.list__meta {
+  font-size: 10.5px;
+  color: var(--fg-subtle);
+  flex: 0 0 auto;
+  letter-spacing: 0.3px;
+}
+.list__badge {
+  background: rgba(136, 192, 208, 0.14);
+  color: var(--accent-cyan);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+}
+
+/* ── Chat screen ───────────────────────────────────────────── */
+.chat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.chat__messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px 12px;
+  padding-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.bubble {
+  max-width: 82%;
+  padding: 10px 13px;
+  border-radius: 18px;
+  font-size: 14px;
+  line-height: 1.5;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  /* Gentle entrance; matches the soft springy feel iOS / Material
+     messaging UIs use. Pure CSS, no JS animation cost. */
+  animation: bubble-in 180ms ease-out;
+}
+@keyframes bubble-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.bubble--user {
+  align-self: flex-end;
+  background: var(--accent-cyan);
+  color: var(--bg-deepest);
+  border-bottom-right-radius: 6px;
+}
+.bubble--assistant {
+  align-self: flex-start;
+  background: var(--bg-raised);
+  border: 1px solid var(--glass-seam);
+  color: var(--fg-pearl);
+  border-bottom-left-radius: 6px;
+}
+.bubble--system,
+.bubble--tool {
+  align-self: center;
+  max-width: 90%;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  font-style: italic;
+  padding: 6px 10px;
+  border-radius: 10px;
+}
+.bubble__role {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  margin-bottom: 4px;
+}
+.bubble--user .bubble__role { color: var(--bg-deepest); }
+.bubble--assistant .bubble__role { color: var(--fg-subtle); }
+.bubble__content code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  background: rgba(0, 0, 0, 0.28);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.bubble--user .bubble__content code {
+  background: rgba(0, 0, 0, 0.18);
+}
+.bubble__content pre {
+  margin: 6px 0;
+  padding: 10px;
+  background: var(--bg-deepest);
+  border-radius: var(--radius-s);
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.bubble__content pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+.bubble__content strong { font-weight: 700; }
+.bubble__content em { font-style: italic; }
+.bubble__cursor {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  background: var(--accent-cyan);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s steps(2, end) infinite;
+}
+.bubble--user .bubble__cursor { background: var(--bg-deepest); }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Tool-call pills inside an assistant bubble. The agent emits
+   markers like `<!-- LUMEN_TOOL:read_file|index.html|ok -->` between
+   prose blocks; markdownToHtml replaces each with one of these.
+   Designed to be visually quieter than prose so the agent's actual
+   words remain dominant. */
+.tool-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+  padding: 3px 9px;
+  background: var(--bg-deepest);
+  border: 1px solid var(--glass-seam);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  /* `max-width: 100%` plus the inner ellipsis on `__arg` keeps a
+     long file path from overflowing the bubble on narrow screens. */
+  max-width: 100%;
+  overflow: hidden;
+}
+.tool-pill__icon {
+  font-size: 11px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+.tool-pill--ok .tool-pill__icon  { color: var(--state-ok); }
+.tool-pill--err {
+  border-color: rgba(191, 97, 106, 0.4);
+  background: rgba(191, 97, 106, 0.08);
+}
+.tool-pill--err .tool-pill__icon { color: var(--state-error); }
+.tool-pill__arg {
+  color: var(--fg-primary);
+  font-weight: 500;
+  /* Truncate long args (file paths) with an ellipsis so a deeply-
+     nested path doesn't blow up the bubble layout. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.chat__composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  padding-bottom: calc(10px + var(--safe-bottom));
+  background: var(--bg-deepest);
+  border-top: 1px solid var(--glass-seam);
+}
+.chat__composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* Model pill — small chip above the textarea showing the chat's
+   current model. Tap → bottom-sheet picker. Sized to the label so
+   it doesn't dominate the composer; the chevron is a deliberate
+   visual cue that this is interactive. */
+.model-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 4px 10px;
+  background: var(--bg-chip);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--fg-muted);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  max-width: 100%;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.model-pill:active {
+  background: var(--bg-raised-hi);
+  border-color: var(--border-strong);
+  color: var(--fg-primary);
+}
+.model-pill__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+.model-pill__chevron {
+  font-size: 10px;
+  opacity: 0.7;
+  flex: 0 0 auto;
+}
+.chat__input {
+  flex: 1;
+  padding: 10px 14px;
+  background: var(--bg-chip);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  color: var(--fg-primary);
+  font-size: 16px;
+  font-family: inherit;
+  resize: none;
+  max-height: 140px;
+  min-height: 40px;
+  line-height: 1.45;
+  transition: border-color 0.15s, background 0.15s;
+}
+.chat__input:focus {
+  outline: none;
+  border-color: var(--accent-cyan);
+}
+.chat__send,
+.chat__cancel {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 0;
+  background: var(--accent-cyan);
+  color: var(--bg-deepest);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.05s, opacity 0.15s, background 0.15s;
+  flex: 0 0 auto;
+}
+.chat__send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.chat__send:active:not(:disabled) {
+  transform: scale(0.92);
+  background: var(--accent-cyan-hi);
+}
+.chat__cancel {
+  background: var(--state-error);
+  color: var(--fg-pearl);
+}
+.chat__cancel:active {
+  transform: scale(0.92);
+}
+
+.thinking {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 13px;
+  background: var(--bg-raised);
+  border: 1px solid var(--glass-seam);
+  border-radius: 18px;
+  border-bottom-left-radius: 6px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+.thinking__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  animation: thinking 1.2s ease-in-out infinite;
+}
+.thinking__dot:nth-child(2) { animation-delay: 0.15s; }
+.thinking__dot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes thinking {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-2px); }
+}
+
+/* ── Bottom sheet (model picker) ───────────────────────────── */
+
+/* iOS / Material-style bottom sheet. Slides up over a dimmed
+   backdrop, snaps to content height (capped at 70vh so the user
+   can still see the chat above). Tapping the dim layer closes
+   the sheet — same affordance both platforms use. The handle is
+   pure visual cue; the whole sheet isn't draggable in v1. */
+.sheet-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  z-index: 90;
+}
+.sheet-overlay.is-shown { opacity: 1; }
+
+.sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 70vh;
+  background: var(--bg-deeper);
+  border-top-left-radius: 18px;
+  border-top-right-radius: 18px;
+  border-top: 1px solid var(--glass-edge);
+  padding-top: 8px;
+  padding-bottom: calc(12px + var(--safe-bottom));
+  z-index: 91;
+  display: flex;
+  flex-direction: column;
+  transform: translateY(100%);
+  transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  box-shadow: 0 -10px 32px rgba(0, 0, 0, 0.4);
+}
+.sheet.is-shown { transform: translateY(0); }
+.sheet__handle {
+  width: 40px;
+  height: 4px;
+  background: var(--border-strong);
+  border-radius: 2px;
+  margin: 6px auto 12px;
+  flex: 0 0 auto;
+}
+.sheet__title {
+  padding: 0 18px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-pearl);
+  letter-spacing: 0.2px;
+  flex: 0 0 auto;
+}
+.sheet__list {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 12px 8px;
+  flex: 1;
+  min-height: 0;
+}
+.sheet__item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  color: var(--fg-primary);
+  font-family: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+  -webkit-appearance: none;
+  appearance: none;
+  min-height: var(--tap-min);
+}
+.sheet__item:active {
+  background: var(--bg-raised-hi);
+}
+.sheet__item.is-active {
+  background: rgba(136, 192, 208, 0.08);
+  border-color: rgba(136, 192, 208, 0.35);
+}
+.sheet__item-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sheet__item-name {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--fg-pearl);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sheet__item-provider {
+  font-size: 10.5px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+.sheet__item-check {
+  flex: 0 0 auto;
+  color: var(--accent-cyan);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+/* ── Toast ─────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(20px + var(--safe-bottom));
+  transform: translateX(-50%);
+  padding: 10px 16px;
+  background: var(--bg-raised-hi);
+  color: var(--fg-pearl);
+  border: 1px solid var(--glass-edge);
+  border-radius: 22px;
+  font-size: 12.5px;
+  font-weight: 500;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 100;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s, transform 0.18s;
+}
+.toast.is-shown {
+  opacity: 1;
+  transform: translateX(-50%) translateY(-4px);
+}
