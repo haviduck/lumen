@@ -164,6 +164,7 @@ class SilentApproval {
 /// workspace context at drain time, which is surprising.
 class QueuedPrompt {
   final String id;
+  final String sessionId;
   final String text;
   final List<String> imagesBase64;
   final List<ChatReference> references;
@@ -180,6 +181,7 @@ class QueuedPrompt {
 
   QueuedPrompt({
     required this.id,
+    required this.sessionId,
     required this.text,
     required this.imagesBase64,
     required this.references,
@@ -413,25 +415,27 @@ class ChatController extends ChangeNotifier {
   }
 
   // ---- generation state ----
-  bool _isGenerating = false;
-  CancellationToken? _cancelToken;
-  PendingApproval? _pendingApproval;
+  final Set<String> _generatingSessionIds = <String>{};
+  final Map<String, CancellationToken> _cancelTokens =
+      <String, CancellationToken>{};
+  final Map<String, PendingApproval> _pendingApprovals =
+      <String, PendingApproval>{};
   bool _autoApprove = false;
 
   // ---- generation timing (stall detection) ----
-  // `_generationStartedAt` is set when a turn begins streaming and
-  // cleared in `finally{}`. `_lastChunkAt` ticks every time a
-  // streaming chunk arrives (or when an iteration boundary completes).
-  // The chat panel reads these to render an escalating "model has
-  // been silent" badge — see `generationElapsed` / `silenceDuration`.
+  // These maps are keyed by session id so multiple chat tabs can stream
+  // independently. Each `_lastChunkAt` entry ticks every time a streaming
+  // chunk arrives (or when an iteration boundary completes). The chat panel
+  // reads the active session's values to render elapsed / silence badges.
   //
   // Why two timestamps not one: total elapsed is a poor stall signal
   // (a hard prompt on a thinking model legitimately takes minutes),
   // but inter-chunk silence IS — a model that's still streaming
   // tokens is not stuck, just slow. The UI badges on silence, not
   // total elapsed.
-  DateTime? _generationStartedAt;
-  DateTime? _lastChunkAt;
+  final Map<String, DateTime> _generationStartedAtBySession =
+      <String, DateTime>{};
+  final Map<String, DateTime> _lastChunkAtBySession = <String, DateTime>{};
 
   // ---- empty-response detection (Ollama "model just stops" guard) ----
   // Set in `_runGenerationLoop` finally{} when the just-finished turn
@@ -502,15 +506,25 @@ class ChatController extends ChangeNotifier {
       .map((t) => t.id)
       .toSet();
 
-  bool get isGenerating => _isGenerating;
-  PendingApproval? get pendingApproval => _pendingApproval;
+  bool get isGenerating {
+    final id = _current?.id;
+    return id != null && _generatingSessionIds.contains(id);
+  }
+
+  bool isSessionGenerating(String id) => _generatingSessionIds.contains(id);
+
+  PendingApproval? get pendingApproval {
+    final id = _current?.id;
+    return id == null ? null : _pendingApprovals[id];
+  }
   bool get autoApprove => _autoApprove;
 
   /// Time the current generation has been running, or `null` when
   /// not generating. UI uses this for elapsed-time labels next to
   /// the streaming indicator.
   Duration? get generationElapsed {
-    final start = _generationStartedAt;
+    final id = _current?.id;
+    final start = id == null ? null : _generationStartedAtBySession[id];
     if (start == null) return null;
     return DateTime.now().difference(start);
   }
@@ -521,8 +535,10 @@ class ChatController extends ChangeNotifier {
   /// threshold — a stall signal that's robust even when the model
   /// is just slow.
   Duration? get silenceDuration {
-    final last = _lastChunkAt;
-    if (last == null || !_isGenerating) return null;
+    final id = _current?.id;
+    if (id == null || !_generatingSessionIds.contains(id)) return null;
+    final last = _lastChunkAtBySession[id];
+    if (last == null) return null;
     return DateTime.now().difference(last);
   }
 
@@ -556,7 +572,7 @@ class ChatController extends ChangeNotifier {
   /// it gets cleared on entry, so a second empty response in a
   /// row prompts the user again rather than auto-retrying forever.
   Future<void> continueLastTurn() async {
-    if (!_lastTurnLooksEmpty || _isGenerating || _current == null) return;
+    if (!_lastTurnLooksEmpty || isGenerating || _current == null) return;
     final ws = _emptyTurnWorkspacePath;
     final active = _emptyTurnActiveFilePath;
     final open = _emptyTurnOpenFilePaths;
@@ -585,7 +601,7 @@ class ChatController extends ChangeNotifier {
   /// generating. The chat-side error card uses this to gate its
   /// Retry chip.
   bool get canRetryLastTurn =>
-      !_isGenerating && _lastUserMessageForRetry != null;
+      !isGenerating && _lastUserMessageForRetry != null;
 
   /// Read-only view of the tool ids the user has permanently
   /// approved via the "Allow always" button. Settings renders this
@@ -1358,6 +1374,16 @@ class ChatController extends ChangeNotifier {
     }
   }
 
+  Future<void> _persistSession(ChatSession session) async {
+    session.updatedAt = DateTime.now();
+    await persistence.saveSession(session);
+    final idx = _sessions.indexWhere((s) => s.id == session.id);
+    if (idx >= 0) {
+      _sessions[idx] = session;
+      _sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    }
+  }
+
   // ---- attachments ----
   void addPendingImage(String base64) {
     _pendingImages.add(base64);
@@ -1488,10 +1514,10 @@ class ChatController extends ChangeNotifier {
 
     // Cancel any in-flight generation. Wait briefly for the loop to
     // settle so the streaming persist doesn't race our truncation.
-    if (_isGenerating) {
+    if (isGenerating) {
       cancelGeneration();
       var waited = 0;
-      while (_isGenerating && waited < 40) {
+      while (isGenerating && waited < 40) {
         await Future<void>.delayed(const Duration(milliseconds: 50));
         waited++;
       }
@@ -1579,7 +1605,8 @@ class ChatController extends ChangeNotifier {
   ///    "Allow always" on a previous prompt of this tool.
   /// 3. Otherwise: surface an `ApprovalStrip` (chrome dock above
   ///    the chat input) and await the user.
-  Future<bool> _approveCommand(
+  Future<bool> _approveCommandForSession(
+    String sessionId,
     String toolId,
     String label,
     String detail,
@@ -1603,15 +1630,18 @@ class ChatController extends ChangeNotifier {
       return true;
     }
     final c = Completer<bool>();
-    _pendingApproval = PendingApproval(
+    final pending = PendingApproval(
       toolId: toolId,
       label: label,
       detail: detail,
       completer: c,
     );
+    _pendingApprovals[sessionId] = pending;
     notifyListeners();
     final result = await c.future;
-    _pendingApproval = null;
+    if (identical(_pendingApprovals[sessionId], pending)) {
+      _pendingApprovals.remove(sessionId);
+    }
     notifyListeners();
     return result;
   }
@@ -1640,7 +1670,8 @@ class ChatController extends ChangeNotifier {
   }
 
   void respondToApproval(bool approved) {
-    final p = _pendingApproval;
+    final id = _current?.id;
+    final p = id == null ? null : _pendingApprovals[id];
     if (p == null) return;
     if (!p.completer.isCompleted) p.completer.complete(approved);
   }
@@ -1669,9 +1700,16 @@ class ChatController extends ChangeNotifier {
 
   // ---- generation ----
   void cancelGeneration() {
-    _cancelToken?.cancel();
-    if (_pendingApproval != null && !_pendingApproval!.completer.isCompleted) {
-      _pendingApproval!.completer.complete(false);
+    final id = _current?.id;
+    if (id == null) return;
+    _cancelGenerationForSession(id);
+  }
+
+  void _cancelGenerationForSession(String id) {
+    _cancelTokens[id]?.cancel();
+    final pending = _pendingApprovals[id];
+    if (pending != null && !pending.completer.isCompleted) {
+      pending.completer.complete(false);
     }
   }
 
@@ -1704,8 +1742,8 @@ class ChatController extends ChangeNotifier {
     // if the user still wants them.
     _promptQueue.removeRange(0, 0); // no-op, kept for clarity
     _promptQueue.insert(0, entry);
-    if (_isGenerating) {
-      cancelGeneration();
+    if (_generatingSessionIds.contains(entry.sessionId)) {
+      _cancelGenerationForSession(entry.sessionId);
     } else {
       // Idle path: drain ourselves (the in-flight branch flows
       // through the existing finally{} drain).
@@ -1734,7 +1772,7 @@ class ChatController extends ChangeNotifier {
     String? activeFilePath,
     List<String>? openFilePaths,
   }) async {
-    if (_isGenerating || _current == null) return;
+    if (isGenerating || _current == null) return;
     final session = _current!;
     if (session.messages.isEmpty) return;
     // A retry abandons whatever the prior empty-response hint was
@@ -1787,8 +1825,11 @@ class ChatController extends ChangeNotifier {
     // workspace context as a `QueuedPrompt`; the chat panel renders
     // an above-input strip with delete / send-now controls; the
     // controller drains the head when the current turn finishes.
-    if (_isGenerating) {
+    final currentSessionId = _current?.id;
+    if (currentSessionId != null &&
+        _generatingSessionIds.contains(currentSessionId)) {
       _enqueuePrompt(
+        sessionId: currentSessionId,
         text: trimmed,
         images: List<String>.from(_pendingImages),
         references: List<ChatReference>.from(_pendingReferences),
@@ -1863,6 +1904,7 @@ class ChatController extends ChangeNotifier {
   /// flight. Returns the assigned id so the UI can target the entry
   /// for delete / send-now actions.
   String _enqueuePrompt({
+    required String sessionId,
     required String text,
     required List<String> images,
     required List<ChatReference> references,
@@ -1875,6 +1917,7 @@ class ChatController extends ChangeNotifier {
     _promptQueue.add(
       QueuedPrompt(
         id: id,
+        sessionId: sessionId,
         text: text,
         imagesBase64: List.unmodifiable(images),
         references: List.unmodifiable(references),
@@ -1892,28 +1935,51 @@ class ChatController extends ChangeNotifier {
   /// Called from `_runGenerationLoop`'s `finally{}` and from
   /// `sendQueuedPromptNow` when the user reorders into idle.
   ///
-  /// Re-uses the public `sendMessage` so the queued entry walks the
-  /// same path as a freshly-typed prompt — no special-cased branch
-  /// for queued vs. live, fewer surprises.
+  /// Replays into the session captured when the prompt was queued, so
+  /// switching tabs while a background run finishes never moves a queued
+  /// follow-up into the wrong chat.
   Future<void> _drainPromptQueue() async {
-    if (_isGenerating) return;
     if (_promptQueue.isEmpty) return;
-    final next = _promptQueue.removeAt(0);
+    final next = _promptQueue.first;
+    if (_generatingSessionIds.contains(next.sessionId)) return;
+    final sessionIdx = _sessions.indexWhere((s) => s.id == next.sessionId);
+    if (sessionIdx < 0) {
+      _promptQueue.removeAt(0);
+      notifyListeners();
+      unawaited(Future.microtask(_drainPromptQueue));
+      return;
+    }
+    final session = _sessions[sessionIdx];
+    _promptQueue.removeAt(0);
     notifyListeners();
-    // Re-prime pending images from the snapshot — `sendMessage`
-    // expects to read `_pendingImages` for attachment.
-    _pendingImages
-      ..clear()
-      ..addAll(next.imagesBase64);
-    _pendingReferences
-      ..clear()
-      ..addAll(next.references);
-    await sendMessage(
-      next.text,
+
+    final userMsg = PersistedMessage(
+      role: 'user',
+      content: next.text,
+      imagesBase64: List<String>.from(next.imagesBase64),
+      references: List<ChatReference>.from(next.references),
+      displayContent: next.displayText,
+    );
+    session.messages.add(userMsg);
+    if (session.messages.length == 1) {
+      final titleSeed = next.displayText?.trim().isNotEmpty == true
+          ? next.displayText!.trim()
+          : next.text.trim();
+      session.title = persistence.deriveTitleFromMessage(titleSeed);
+      unawaited(_summarizeTitleInBackground(session, titleSeed));
+    }
+    await _persistSession(session);
+    _lastUserMessageForRetry = userMsg;
+    _lastTurnLooksEmpty = false;
+    _emptyTurnWorkspacePath = null;
+    _emptyTurnActiveFilePath = null;
+    _emptyTurnOpenFilePaths = null;
+
+    await _runGenerationLoop(
+      targetSession: session,
       workspacePath: next.workspacePath,
       activeFilePath: next.activeFilePath,
       openFilePaths: next.openFilePaths,
-      displayText: next.displayText,
     );
   }
 
@@ -1934,24 +2000,28 @@ class ChatController extends ChangeNotifier {
     return buffer.toString().trimRight();
   }
 
-  /// Run the streaming generation loop against the current
-  /// `_current` session. Caller is responsible for ensuring the
+  /// Run the streaming generation loop against [targetSession] or the
+  /// active `_current` session. Caller is responsible for ensuring the
   /// most-recent message in the session is the user prompt to
   /// respond to (either freshly added by `sendMessage`, or the
   /// pre-existing last-user-message in the case of `retryLastTurn`).
   Future<void> _runGenerationLoop({
+    ChatSession? targetSession,
     String? workspacePath,
     String? activeFilePath,
     List<String>? openFilePaths,
   }) async {
-    if (_current == null) return;
-    final session = _current!;
-    if (_isGenerating) return;
+    final session = targetSession ?? _current;
+    if (session == null) return;
+    final sessionId = session.id;
+    if (_generatingSessionIds.contains(sessionId)) return;
+    final modelForTurn = session.model ?? _selectedModel;
 
-    _isGenerating = true;
-    _cancelToken = CancellationToken();
-    _generationStartedAt = DateTime.now();
-    _lastChunkAt = DateTime.now();
+    final cancelToken = CancellationToken();
+    _generatingSessionIds.add(sessionId);
+    _cancelTokens[sessionId] = cancelToken;
+    _generationStartedAtBySession[sessionId] = DateTime.now();
+    _lastChunkAtBySession[sessionId] = DateTime.now();
     notifyListeners();
 
     // Recover the latest user message + its trimmed text — used for
@@ -2068,7 +2138,7 @@ class ChatController extends ChangeNotifier {
       // Claude Haiku, Gemini 2.0). When native IS supported, we trust
       // the API knob and skip the suffix.
       final effort = session.reasoningEffort;
-      final (selectedProvider, selectedRawModel) = _splitModel(_selectedModel);
+      final (selectedProvider, selectedRawModel) = _splitModel(modelForTurn);
       final effortIsNative = ReasoningEffortHelper.modelSupportsNative(
         provider: selectedProvider,
         rawModel: selectedRawModel,
@@ -2214,7 +2284,8 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           .getAgentAllowOutsideWorkspaceWrites();
       final executor = ToolExecutor(
         workspaceDir: workspacePath,
-        approver: _approveCommand,
+        approver: (toolId, label, detail) =>
+            _approveCommandForSession(sessionId, toolId, label, detail),
         enabledTools: _enabledTools,
         recorder: tlRecorder,
         allowWritesOutsideWorkspace: allowOutsideWrites,
@@ -2223,7 +2294,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         // when the user clicks Stop. Without this, Stop only
         // interrupts the LLM stream — a `npm start` already in
         // flight will keep blocking the executor's await forever.
-        cancelToken: _cancelToken,
+        cancelToken: cancelToken,
       );
 
       // Derive a stable `turnId` for this user request. Used to tag
@@ -2409,30 +2480,21 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // (2) the maxIters cap is the ultimate backstop anyway.
       bool autoContinuedThisTurn = false;
 
-      while (keepLooping && i < maxIters && !_cancelToken!.isCancelled) {
+      while (keepLooping && i < maxIters && !cancelToken.isCancelled) {
         i++;
         firstToolEnd = null;
         hallucinationCutAt = null;
         hallucinationDetected = false;
         final iterBuf = StringBuffer();
         // **Runaway-loop guards** (set during streaming, checked
-        // post-stream). Three independent trips:
+        // post-stream). Two trips:
         //
-        //   1. **Closeless babble** (most common with single-tool-cut)
-        //      The model emits opening tool markers without ever
-        //      producing a closeable block. `cutOnFirstTool` would
-        //      have bailed on the first complete tool, so accumulating
-        //      many `<<<` with `firstToolEnd` still null = the model
-        //      is stuck repeating partial syntax. 8 markers without
-        //      a closeable block is plenty (a multi-line tool needs
-        //      ≤ 6 markers in normal use).
-        //
-        //   2. **Total marker explosion** — > 80 `<<<` even if some
+        //   1. **Total marker explosion** — > 80 `<<<` even if some
         //      are forming valid blocks. This catches MULTI_EDITs
         //      with absurd hunk counts (legit max ~16 hunks ≈ 50
         //      markers; >80 means the model is duplicating).
         //
-        //   3. **Repeated RUN_CMD spam** — > 12 `<<<RUN_CMD:` markers.
+        //   2. **Repeated RUN_CMD spam** — > 12 `<<<RUN_CMD:` markers.
         //      Mostly defensive now (cutOnFirstTool means we exit on
         //      the first complete RUN_CMD), but cheap to keep as
         //      belt-and-suspenders for partial-block cases.
@@ -2494,11 +2556,11 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         // the live message's content each chunk.
         await for (final chunk in _generateChatStream(
           wireMessages,
-          model: _selectedModel,
-          token: _cancelToken,
+          model: modelForTurn,
+          token: cancelToken,
           effort: effort,
         )) {
-          if (_cancelToken!.isCancelled) break;
+          if (cancelToken.isCancelled) break;
           final bufLenBeforeChunk = iterBuf.length;
           iterBuf.write(chunk);
           // Stall detector: refresh the last-chunk timestamp so the
@@ -2507,7 +2569,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           // here is unnecessary — `DateTime.now()` is cheap, and the
           // UI ticker already runs at 1Hz so finer granularity
           // wouldn't be visible anyway.
-          _lastChunkAt = DateTime.now();
+          _lastChunkAtBySession[sessionId] = DateTime.now();
 
           // Cheap incremental counters — count occurrences in the
           // chunk, not in the whole buffer (which would be
@@ -2578,18 +2640,8 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             }
           }
 
-          // Trips. Order matters: closeless-babble fires first
-          // because it's the diagnostic signal we care about most;
-          // the total-explosion / RUN_CMD trips are fallbacks.
-          if (markerCount >= 8 && firstToolEnd == null) {
-            runawayDetected = true;
-            runawayReason =
-                'the model emitted $markerCount opening "<<<" markers '
-                'without ever forming a complete tool block. This is '
-                'the classic "stuck repeating an EDIT_FILE skeleton" '
-                'failure mode for cloud models.';
-            break;
-          }
+          // Total-explosion / RUN_CMD trip: catches genuinely
+          // broken output (absurd hunk counts, command spam).
           if (markerCount > 80 || runCmdCount > 12) {
             runawayDetected = true;
             runawayReason =
@@ -2606,7 +2658,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
               : '$aggregated\n\n${iterBuf.toString()}';
           updateLive(draft);
         }
-        if (_cancelToken!.isCancelled) {
+        if (cancelToken.isCancelled) {
           aggregated += '${aggregated.isEmpty ? '' : '\n\n'}_(stopped)_';
           updateLive(aggregated, forceNotify: true);
           break;
@@ -2702,7 +2754,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           //   - skipped when iteration cap is exhausted
           if (autoVerifyEnabled &&
               !autoVerifyAlreadyRan &&
-              !_cancelToken!.isCancelled &&
+              !cancelToken.isCancelled &&
               i < maxIters &&
               firedAcrossTurn.any((f) => _editToolIds.contains(f.id)) &&
               !firedAcrossTurn.any((f) => f.id == 'verify') &&
@@ -2841,7 +2893,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // Skipped when a tool fired this turn (rare but possible for
       // a partial success; in that case we want the prose visible
       // for context, the retry chip would lose tool-side state).
-      if (!_cancelToken!.isCancelled && firedAcrossTurn.isEmpty) {
+      if (!cancelToken.isCancelled && firedAcrossTurn.isEmpty) {
         final err = ProviderError.tryParse(aggregated);
         if (err != null) {
           aggregated = ProviderError.marker(err);
@@ -2867,7 +2919,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // the rare "model emitted exactly one whitespace character"
       // failure mode. False negatives are recoverable (user retypes
       // their request); false positives are noisy.
-      if (!_cancelToken!.isCancelled &&
+      if (!cancelToken.isCancelled &&
           firedAcrossTurn.isEmpty &&
           !aggregated.contains('<!-- LUMEN_ERR') &&
           aggregated.trim().isEmpty) {
@@ -2880,7 +2932,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       }
 
       session.updatedAt = DateTime.now();
-      await _persistCurrent();
+      await _persistSession(session);
 
       // Append a one-line entry to the chat's tasks.md so the next
       // turn can see what we just did. Best-effort: if the chat
@@ -2889,7 +2941,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // a "nothing happened" line in the log is just noise.
       // Cancellation aborts the append too: a stopped turn isn't
       // "completed" by any reasonable definition.
-      if (!_cancelToken!.isCancelled && firedAcrossTurn.isNotEmpty) {
+      if (!cancelToken.isCancelled && firedAcrossTurn.isNotEmpty) {
         final entry = _formatTaskEntry(
           userText: trimmed,
           firedTools: firedAcrossTurn,
@@ -2911,12 +2963,13 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       session.messages.add(
         PersistedMessage(role: 'assistant', content: ProviderError.marker(err)),
       );
-      await _persistCurrent();
+      await _persistSession(session);
     } finally {
-      _isGenerating = false;
-      _cancelToken = null;
-      _generationStartedAt = null;
-      _lastChunkAt = null;
+      _generatingSessionIds.remove(sessionId);
+      _cancelTokens.remove(sessionId);
+      _pendingApprovals.remove(sessionId);
+      _generationStartedAtBySession.remove(sessionId);
+      _lastChunkAtBySession.remove(sessionId);
       // Always clear the timeline's chat context so anything that
       // writes to disk *after* the agent run completes (a FS event
       // arriving late, the user manually saving a file, etc.) is

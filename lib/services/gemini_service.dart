@@ -7,6 +7,42 @@ import 'package:http/http.dart' as http;
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
 
+/// Detect image MIME type from base64 data by inspecting magic bytes.
+String _detectMediaType(String base64Data) {
+  if (base64Data.length < 8) return 'image/jpeg';
+  try {
+    final bytes = base64Decode(base64Data.substring(0, 16));
+    if (bytes.length >= 8 &&
+        bytes[0] == 0x89 &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x4E &&
+        bytes[3] == 0x47) {
+      return 'image/png';
+    }
+    if (bytes.length >= 3 &&
+        bytes[0] == 0xFF &&
+        bytes[1] == 0xD8 &&
+        bytes[2] == 0xFF) {
+      return 'image/jpeg';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46) {
+      return 'image/webp';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x47 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x38) {
+      return 'image/gif';
+    }
+  } catch (_) {}
+  return 'image/jpeg';
+}
+
 /// Talks to the Google Gemini REST API.
 /// Supports the same `CancellationToken` pattern as `OllamaService`.
 class GeminiService {
@@ -71,7 +107,7 @@ class GeminiService {
       for (final img in images) {
         parts.add({
           'inline_data': {
-            'mime_type': 'image/png',
+            'mime_type': _detectMediaType(img as String),
             'data': img as String,
           },
         });
@@ -320,7 +356,7 @@ class GeminiService {
         for (final img in images) {
           parts.add({
             'inline_data': {
-              'mime_type': 'image/png',
+              'mime_type': _detectMediaType(img as String),
               'data': img as String,
             },
           });

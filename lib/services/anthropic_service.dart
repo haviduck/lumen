@@ -7,6 +7,43 @@ import 'package:http/http.dart' as http;
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
 
+/// Detect image MIME type from base64 data by inspecting magic bytes.
+/// Falls back to image/jpeg since that's what our resize pipeline produces.
+String _detectMediaType(String base64Data) {
+  if (base64Data.length < 8) return 'image/jpeg';
+  try {
+    final bytes = base64Decode(base64Data.substring(0, 16));
+    if (bytes.length >= 8 &&
+        bytes[0] == 0x89 &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x4E &&
+        bytes[3] == 0x47) {
+      return 'image/png';
+    }
+    if (bytes.length >= 3 &&
+        bytes[0] == 0xFF &&
+        bytes[1] == 0xD8 &&
+        bytes[2] == 0xFF) {
+      return 'image/jpeg';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46) {
+      return 'image/webp';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x47 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x38) {
+      return 'image/gif';
+    }
+  } catch (_) {}
+  return 'image/jpeg';
+}
+
 /// Talks to Anthropic's Claude Messages API.
 ///
 /// The rest of Lumen speaks an Ollama-style message shape:
@@ -59,7 +96,7 @@ class AnthropicService {
           'type': 'image',
           'source': {
             'type': 'base64',
-            'media_type': 'image/png',
+            'media_type': _detectMediaType(img as String),
             'data': img as String,
           },
         });

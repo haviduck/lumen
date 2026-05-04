@@ -61,6 +61,14 @@ class _SettingsViewState extends State<SettingsView> {
   String? _githubTestMessage;
   bool? _githubTestOk;
   late TextEditingController _openaiKeyCtrl;
+
+  // API key visibility toggles
+  bool _showGeminiKey = false;
+  bool _showClaudeKey = false;
+  bool _showGithubKey = false;
+  bool _showOpenaiKey = false;
+  bool _showStApiKey = false;
+
   late String _editorTheme;
   late double _fontSize;
   late int _tabSize;
@@ -534,13 +542,10 @@ class _SettingsViewState extends State<SettingsView> {
         _settingRow(
           label: S.settingsApiKey,
           description: S.settingsGeminiApiKeyDesc,
-          child: SizedBox(
-            width: 320,
-            child: TextField(
-              controller: _geminiKeyCtrl,
-              obscureText: true,
-              style: const TextStyle(fontSize: 13),
-            ),
+          child: _apiKeyField(
+            controller: _geminiKeyCtrl,
+            visible: _showGeminiKey,
+            onToggle: (v) => _showGeminiKey = v,
           ),
         ),
         _divider(),
@@ -548,13 +553,10 @@ class _SettingsViewState extends State<SettingsView> {
         _settingRow(
           label: S.settingsApiKey,
           description: S.settingsClaudeApiKeyDesc,
-          child: SizedBox(
-            width: 320,
-            child: TextField(
-              controller: _claudeKeyCtrl,
-              obscureText: true,
-              style: const TextStyle(fontSize: 13),
-            ),
+          child: _apiKeyField(
+            controller: _claudeKeyCtrl,
+            visible: _showClaudeKey,
+            onToggle: (v) => _showClaudeKey = v,
           ),
         ),
         _divider(),
@@ -569,8 +571,22 @@ class _SettingsViewState extends State<SettingsView> {
               children: [
                 TextField(
                   controller: _githubKeyCtrl,
-                  obscureText: true,
+                  obscureText: !_showGithubKey,
                   style: const TextStyle(fontSize: 13),
+                  decoration: InputDecoration(
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        _showGithubKey
+                            ? Icons.visibility_off
+                            : Icons.visibility,
+                        size: 18,
+                        color: DuckColors.fgMuted,
+                      ),
+                      onPressed: () =>
+                          setState(() => _showGithubKey = !_showGithubKey),
+                      tooltip: _showGithubKey ? 'Hide' : 'Show',
+                    ),
+                  ),
                 ),
                 const SizedBox(height: 8),
                 Row(
@@ -693,13 +709,10 @@ class _SettingsViewState extends State<SettingsView> {
         _settingRow(
           label: S.settingsApiKey,
           description: S.settingsOpenAIApiKeyDesc,
-          child: SizedBox(
-            width: 320,
-            child: TextField(
-              controller: _openaiKeyCtrl,
-              obscureText: true,
-              style: const TextStyle(fontSize: 13),
-            ),
+          child: _apiKeyField(
+            controller: _openaiKeyCtrl,
+            visible: _showOpenaiKey,
+            onToggle: (v) => _showOpenaiKey = v,
           ),
         ),
         _divider(),
@@ -1571,9 +1584,23 @@ class _SettingsViewState extends State<SettingsView> {
               width: 320,
               child: TextField(
                 controller: _stApiKeyCtrl,
-                obscureText: true,
+                obscureText: !_showStApiKey,
                 style: const TextStyle(fontSize: 13),
-                decoration: const InputDecoration(hintText: 'optional'),
+                decoration: InputDecoration(
+                  hintText: 'optional',
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      _showStApiKey
+                          ? Icons.visibility_off
+                          : Icons.visibility,
+                      size: 18,
+                      color: DuckColors.fgMuted,
+                    ),
+                    onPressed: () =>
+                        setState(() => _showStApiKey = !_showStApiKey),
+                    tooltip: _showStApiKey ? 'Hide' : 'Show',
+                  ),
+                ),
               ),
             ),
           ),
@@ -2212,6 +2239,32 @@ class _SettingsViewState extends State<SettingsView> {
           letterSpacing: 1.0,
           fontWeight: FontWeight.w600,
           color: DuckColors.fgSubtle,
+        ),
+      ),
+    );
+  }
+
+  Widget _apiKeyField({
+    required TextEditingController controller,
+    required bool visible,
+    required ValueChanged<bool> onToggle,
+  }) {
+    return SizedBox(
+      width: 320,
+      child: TextField(
+        controller: controller,
+        obscureText: !visible,
+        style: const TextStyle(fontSize: 13),
+        decoration: InputDecoration(
+          suffixIcon: IconButton(
+            icon: Icon(
+              visible ? Icons.visibility_off : Icons.visibility,
+              size: 18,
+              color: DuckColors.fgMuted,
+            ),
+            onPressed: () => setState(() => onToggle(!visible)),
+            tooltip: visible ? 'Hide' : 'Show',
+          ),
         ),
       ),
     );

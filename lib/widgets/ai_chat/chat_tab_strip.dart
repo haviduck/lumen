@@ -195,6 +195,7 @@ class _ChatTabStripState extends State<ChatTabStrip> {
                             key: isActive ? _activeKey : null,
                             title: _tabTitle(s),
                             isActive: isActive,
+                            isGenerating: chat.isSessionGenerating(s.id),
                             hasOtherTabs: tabs.length > 1,
                             hasTabsAfter: i < tabs.length - 1,
                             onActivate: () => chat.openSession(s.id),
@@ -243,6 +244,7 @@ class _ChatTabStripState extends State<ChatTabStrip> {
 class _ChatTab extends StatefulWidget {
   final String title;
   final bool isActive;
+  final bool isGenerating;
   final bool hasOtherTabs;
   final bool hasTabsAfter;
   final VoidCallback onActivate;
@@ -255,6 +257,7 @@ class _ChatTab extends StatefulWidget {
     super.key,
     required this.title,
     required this.isActive,
+    required this.isGenerating,
     required this.hasOtherTabs,
     required this.hasTabsAfter,
     required this.onActivate,
@@ -383,13 +386,24 @@ class _ChatTabState extends State<_ChatTab> {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(
-                      Icons.chat_bubble_outline,
-                      size: 11,
-                      color: widget.isActive
-                          ? DuckColors.accentCyan
-                          : DuckColors.fgSubtle,
-                    ),
+                    widget.isGenerating
+                        ? SizedBox(
+                            width: 11,
+                            height: 11,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 1.5,
+                              color: widget.isActive
+                                  ? DuckColors.accentCyan
+                                  : DuckColors.fgSubtle,
+                            ),
+                          )
+                        : Icon(
+                            Icons.chat_bubble_outline,
+                            size: 11,
+                            color: widget.isActive
+                                ? DuckColors.accentCyan
+                                : DuckColors.fgSubtle,
+                          ),
                     const SizedBox(width: 6),
                     Flexible(
                       child: Text(
