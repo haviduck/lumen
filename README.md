@@ -3,6 +3,7 @@
 Lumen is a desktop IDE built with Flutter. It combines a code editor, file explorer, terminal, project tools, and an agentic chat interface in one workspace.
 
 The project is currently focused on Windows desktop development, with Flutter platform scaffolding present for other desktop/mobile targets.
+### [Grab it from releases](https://github.com/haviduck/lumen/releases)
 
 ## Features
 
@@ -14,8 +15,9 @@ The project is currently focused on Windows desktop development, with Flutter pl
 - File timeline/history for user saves, agent edits, filesystem events, and restore flows.
 - Optional integrations for GitNexus, Syncthing, workspace backups, and media playback.
 
-## Grab it from Releases 
-[https://github.com/haviduck/lumen/releases](Releases over yonder)
+
+
+
 
 ## Build Requirements
 
