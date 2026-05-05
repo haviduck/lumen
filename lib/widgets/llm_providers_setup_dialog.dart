@@ -45,6 +45,7 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
   // (Skip / barrier dismiss) doesn't accidentally persist edits.
   final Set<String> _enabled = <String>{};
   late final TextEditingController _ollamaEndpointCtrl;
+  late final TextEditingController _ollamaApiKeyCtrl;
   late final TextEditingController _geminiCtrl;
   late final TextEditingController _claudeCtrl;
   late final TextEditingController _githubCtrl;
@@ -59,6 +60,7 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
     final state = context.read<AppState>();
     _enabled.addAll(state.enabledProviders);
     _ollamaEndpointCtrl = TextEditingController(text: state.ollamaEndpoint);
+    _ollamaApiKeyCtrl = TextEditingController(text: state.ollamaApiKey);
     _geminiCtrl = TextEditingController(text: state.geminiApiKey);
     _claudeCtrl = TextEditingController(text: state.anthropicApiKey);
     _githubCtrl = TextEditingController(text: state.githubModelsApiKey);
@@ -70,6 +72,7 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
   @override
   void dispose() {
     _ollamaEndpointCtrl.dispose();
+    _ollamaApiKeyCtrl.dispose();
     _geminiCtrl.dispose();
     _claudeCtrl.dispose();
     _githubCtrl.dispose();
@@ -95,6 +98,7 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
     await state.updateProviderSettings(
       enabledProviders: _enabled.toSet(),
       ollamaEndpoint: _ollamaEndpointCtrl.text.trim(),
+      ollamaApiKey: _ollamaApiKeyCtrl.text.trim(),
       geminiApiKey: _geminiCtrl.text.trim(),
       anthropicApiKey: _claudeCtrl.text.trim(),
       githubModelsApiKey: _githubCtrl.text.trim(),
@@ -153,10 +157,22 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
                         hint: S.llmProvidersOllamaHint,
                         enabled: _enabled.contains('Ollama'),
                         onToggle: (v) => _toggle('Ollama', v),
-                        body: _LabeledField(
-                          label: S.settingsEndpointUrl,
-                          controller: _ollamaEndpointCtrl,
-                          obscure: false,
+                        body: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _LabeledField(
+                              label: S.llmProvidersOllamaEndpointLabel,
+                              controller: _ollamaEndpointCtrl,
+                              obscure: false,
+                            ),
+                            const SizedBox(height: 8),
+                            _LabeledField(
+                              label: S.llmProvidersOllamaCloudKeyLabel,
+                              controller: _ollamaApiKeyCtrl,
+                              obscure: true,
+                              hintText: S.llmProvidersOllamaCloudKeyHint,
+                            ),
+                          ],
                         ),
                       ),
                       _ProviderCard(

@@ -2,6 +2,7 @@
 
 #include <wrl.h>
 
+#include <cstdio>
 #include <format>
 #include <iostream>
 
@@ -585,24 +586,35 @@ void Webview::SetPointerButtonState(WebviewPointerButton button, bool is_down) {
 }
 
 void Webview::SendScroll(double delta, bool horizontal) {
-  // delta * 6 gives me a multiple of WHEEL_DELTA (120)
-  constexpr auto kScrollMultiplier = 6;
+  // Wheel events are dispatched via CDP (Input.dispatchMouseEvent) instead
+  // of composition_controller_->SendMouseInput(_WHEEL,...). In WebView2
+  // composition mode the SendMouseInput wheel path returns S_OK but the
+  // renderer silently drops the event for the great majority of pages
+  // (wikipedia, Teams, anything iframe-heavy). CDP routes the wheel
+  // through Chromium's own dispatch which handles iframe / hit-test
+  // targeting correctly. Buttons / move / pointer events still go through
+  // SendMouseInput because those paths work fine in composition mode.
+  //
+  // CDP coordinates are CSS (logical) pixels; last_cursor_pos_ is stored
+  // in raw pixels (multiplied by scale_factor_ in SetCursorPos), so divide
+  // back out. CDP also flips the wheel-delta sign convention: deltaY > 0
+  // means "scroll down", whereas the WHEEL_DELTA convention `delta` follows
+  // is positive = wheel rotated forward / scroll up — hence the negation.
+  const double cdp_x =
+      last_cursor_pos_.x / static_cast<double>(scale_factor_);
+  const double cdp_y =
+      last_cursor_pos_.y / static_cast<double>(scale_factor_);
+  const double cdp_dx = horizontal ? -delta : 0.0;
+  const double cdp_dy = horizontal ? 0.0 : -delta;
 
-  auto offset = static_cast<short>(delta * kScrollMultiplier);
-
-  POINT point;
-  point.x = 0;
-  point.y = 0;
-
-  if (horizontal) {
-    composition_controller_->SendMouseInput(
-        COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL, virtual_keys_.state(),
-        offset, point);
-  } else {
-    composition_controller_->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
-                                            virtual_keys_.state(), offset,
-                                            point);
-  }
+  char json_buf[256];
+  std::snprintf(json_buf, sizeof(json_buf),
+                R"({"type":"mouseWheel","x":%.2f,"y":%.2f,"deltaX":%.2f,)"
+                R"("deltaY":%.2f})",
+                cdp_x, cdp_y, cdp_dx, cdp_dy);
+  webview_->CallDevToolsProtocolMethod(
+      L"Input.dispatchMouseEvent", util::Utf16FromUtf8(json_buf).c_str(),
+      nullptr);
 }
 
 void Webview::SetScrollDelta(double delta_x, double delta_y) {

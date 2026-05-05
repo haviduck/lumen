@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import '../services/agent_terminal_bridge.dart';
 import '../services/anthropic_service.dart';
 import '../services/auto_backup_scheduler.dart';
 import '../services/backup_service.dart';
@@ -85,6 +86,17 @@ class AppState extends ChangeNotifier {
   // logic. Owned here because the lifetime is workspace-independent
   // — terminals can outlive a workspace switch.
   final LumenProcessTracker lumenProcesses = LumenProcessTracker();
+  // Bridge between agent-spawned `RUN_CMD` invocations and the
+  // visible terminal pane. The chat controller hands the bridge a
+  // launcher closure (see `tool_executor.dart`); long-running
+  // commands get promoted to real terminal tabs the user can see
+  // and kill via tab close. Lives here (not in `chat`) because the
+  // terminal pane needs to subscribe to it independent of chat
+  // lifetime, and it shares the `lumenProcesses` tracker for PID
+  // visibility.
+  late final AgentTerminalBridge agentTerminals = AgentTerminalBridge(
+    processes: lumenProcesses,
+  );
   final BackupService backups = BackupService();
   final SyncthingService syncthing = SyncthingService();
   final GitNexusService gitnexus = GitNexusService();
@@ -196,11 +208,27 @@ class AppState extends ChangeNotifier {
   // LLM provider settings — multiple providers can be enabled at once.
   Set<String> _enabledProviders = {'Ollama'};
   String _ollamaEndpoint = 'http://localhost:11434';
+  // Optional Ollama Cloud key. When non-empty, the chat controller
+  // also fetches `https://ollama.com/api/tags` for cloud-only models
+  // and routes any `*-cloud`/`*:cloud` chat to the cloud endpoint
+  // with Bearer auth — so users without a local daemon can still use
+  // hosted Ollama models, and users with both keep the cloud path
+  // even if they haven't `ollama signin`'d locally.
+  String _ollamaApiKey = '';
   String _geminiApiKey = '';
   String _anthropicApiKey = '';
   String _githubModelsApiKey = '';
   String _githubModelsOrganization = '';
   String _openaiApiKey = '';
+  bool _toolCompressionEnabled = false;
+  String _toolCompressionModel = '';
+  int _toolCompressionThreshold = 2000;
+  // Chat-history summarization. Reuses `_toolCompressionModel` for
+  // the small-model choice (one user-facing "small model" setting,
+  // two consumers — see preferences_service.dart for rationale).
+  bool _historySummaryEnabled = false;
+  int _historySummaryMaxChars = 1200;
+  int _historySummaryRefreshDelta = 10;
 
   // Editor settings
   // Default to `lumen-midnight` — bespoke theme tuned to the IDE chrome
@@ -276,11 +304,18 @@ class AppState extends ChangeNotifier {
 
   Set<String> get enabledProviders => _enabledProviders;
   String get ollamaEndpoint => _ollamaEndpoint;
+  String get ollamaApiKey => _ollamaApiKey;
   String get geminiApiKey => _geminiApiKey;
   String get anthropicApiKey => _anthropicApiKey;
   String get githubModelsApiKey => _githubModelsApiKey;
   String get githubModelsOrganization => _githubModelsOrganization;
   String get openaiApiKey => _openaiApiKey;
+  bool get toolCompressionEnabled => _toolCompressionEnabled;
+  String get toolCompressionModel => _toolCompressionModel;
+  int get toolCompressionThreshold => _toolCompressionThreshold;
+  bool get historySummaryEnabled => _historySummaryEnabled;
+  int get historySummaryMaxChars => _historySummaryMaxChars;
+  int get historySummaryRefreshDelta => _historySummaryRefreshDelta;
   bool isProviderEnabled(String p) => _enabledProviders.contains(p);
 
   String get editorTheme => _editorTheme;
@@ -324,6 +359,7 @@ class AppState extends ChangeNotifier {
       timeline: timeline,
       recentEdits: recentEdits,
       skills: workspaceSkills,
+      agentTerminals: agentTerminals,
     );
     autoBackup = AutoBackupScheduler(
       backups: backups,
@@ -397,12 +433,20 @@ class AppState extends ChangeNotifier {
   Future<void> _loadSettings() async {
     _enabledProviders = (await prefs.getEnabledProviders()).toSet();
     _ollamaEndpoint = await prefs.getEndpoint();
+    _ollamaApiKey = await prefs.getOllamaApiKey();
     _geminiApiKey = await prefs.getGeminiApiKey();
     _anthropicApiKey = await prefs.getAnthropicApiKey();
     _githubModelsApiKey = await prefs.getGithubModelsApiKey();
     _githubModelsOrganization = await prefs.getGithubModelsOrganization();
     _openaiApiKey = await prefs.getOpenaiApiKey();
+    _toolCompressionEnabled = await prefs.getToolCompressionEnabled();
+    _toolCompressionModel = await prefs.getToolCompressionModel();
+    _toolCompressionThreshold = await prefs.getToolCompressionThreshold();
+    _historySummaryEnabled = await prefs.getHistorySummaryEnabled();
+    _historySummaryMaxChars = await prefs.getHistorySummaryMaxChars();
+    _historySummaryRefreshDelta = await prefs.getHistorySummaryRefreshDelta();
     _ollamaService.baseUrl = _ollamaEndpoint;
+    _ollamaService.apiKey = _ollamaApiKey;
     _geminiService.apiKey = _geminiApiKey;
     _anthropicService.apiKey = _anthropicApiKey;
     _githubModelsService.apiKey = _githubModelsApiKey;
@@ -500,6 +544,7 @@ class AppState extends ChangeNotifier {
   Future<void> updateProviderSettings({
     required Set<String> enabledProviders,
     required String ollamaEndpoint,
+    required String ollamaApiKey,
     required String geminiApiKey,
     required String anthropicApiKey,
     required String githubModelsApiKey,
@@ -508,24 +553,55 @@ class AppState extends ChangeNotifier {
   }) async {
     _enabledProviders = enabledProviders;
     _ollamaEndpoint = ollamaEndpoint;
+    _ollamaApiKey = ollamaApiKey.trim();
     _geminiApiKey = geminiApiKey;
     _anthropicApiKey = anthropicApiKey;
     _githubModelsApiKey = githubModelsApiKey;
     _githubModelsOrganization = githubModelsOrganization.trim();
     _openaiApiKey = openaiApiKey;
     _ollamaService.baseUrl = _ollamaEndpoint;
+    _ollamaService.apiKey = _ollamaApiKey;
     _geminiService.apiKey = _geminiApiKey;
     _anthropicService.apiKey = _anthropicApiKey;
     _githubModelsService.apiKey = _githubModelsApiKey;
     _githubModelsService.organization = _githubModelsOrganization;
     await prefs.setEnabledProviders(enabledProviders.toList());
     await prefs.setEndpoint(ollamaEndpoint);
+    await prefs.setOllamaApiKey(_ollamaApiKey);
     await prefs.setGeminiApiKey(geminiApiKey);
     await prefs.setAnthropicApiKey(anthropicApiKey);
     await prefs.setGithubModelsApiKey(githubModelsApiKey);
     await prefs.setGithubModelsOrganization(_githubModelsOrganization);
     await prefs.setOpenaiApiKey(openaiApiKey);
     await chat.reloadModels(enabledProviders: _enabledProviders);
+    notifyListeners();
+  }
+
+  Future<void> updateToolCompressionSettings({
+    required bool enabled,
+    required String model,
+    required int threshold,
+  }) async {
+    _toolCompressionEnabled = enabled;
+    _toolCompressionModel = model.trim();
+    _toolCompressionThreshold = threshold;
+    await prefs.setToolCompressionEnabled(enabled);
+    await prefs.setToolCompressionModel(_toolCompressionModel);
+    await prefs.setToolCompressionThreshold(threshold);
+    notifyListeners();
+  }
+
+  Future<void> updateHistorySummarySettings({
+    required bool enabled,
+    required int maxChars,
+    required int refreshDelta,
+  }) async {
+    _historySummaryEnabled = enabled;
+    _historySummaryMaxChars = maxChars <= 0 ? 1200 : maxChars;
+    _historySummaryRefreshDelta = refreshDelta <= 0 ? 10 : refreshDelta;
+    await prefs.setHistorySummaryEnabled(enabled);
+    await prefs.setHistorySummaryMaxChars(_historySummaryMaxChars);
+    await prefs.setHistorySummaryRefreshDelta(_historySummaryRefreshDelta);
     notifyListeners();
   }
 

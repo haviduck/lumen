@@ -379,6 +379,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                         githubModelsOrganization: a.githubModelsOrganization,
                         enabledProviders: _enabledProviders,
                         ollamaEndpoint: _ollamaEndpointCtrl.text,
+                        ollamaApiKey: a.ollamaApiKey,
                         geminiApiKey: _geminiKeyCtrl.text,
                         anthropicApiKey: _claudeKeyCtrl.text,
                         openaiApiKey: _openaiKeyCtrl.text,

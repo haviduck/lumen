@@ -561,6 +561,29 @@ body {
   background: rgba(191, 97, 106, 0.08);
 }
 .tool-pill--err .tool-pill__icon { color: var(--state-error); }
+/* Pending = the model emitted a tool call but execution hasn't
+   completed yet (or, on the PWA, the body block is still streaming
+   in). Cyan accent + soft pulse so it reads as "in flight" without
+   competing with the prose for attention. */
+.tool-pill--pending {
+  border-color: rgba(136, 192, 208, 0.4);
+  background: rgba(136, 192, 208, 0.08);
+  animation: tool-pill-breathe 1.6s ease-in-out infinite;
+}
+.tool-pill--pending .tool-pill__icon { color: var(--accent-cyan); }
+@keyframes tool-pill-breathe {
+  0%, 100% { background: rgba(136, 192, 208, 0.06); }
+  50%      { background: rgba(136, 192, 208, 0.16); }
+}
+/* Malformed = parser saw a tool-shaped block but the inner shape
+   was invalid (e.g. EDIT_FILE without SEARCH/REPLACE). The desktop
+   shows a yellow warn card; on the phone we use the same accent
+   but in chip form. */
+.tool-pill--warn {
+  border-color: rgba(235, 203, 139, 0.45);
+  background: rgba(235, 203, 139, 0.08);
+}
+.tool-pill--warn .tool-pill__icon { color: var(--state-warn); }
 .tool-pill__arg {
   color: var(--fg-primary);
   font-weight: 500;
@@ -568,6 +591,110 @@ body {
      nested path doesn't blow up the bubble layout. */
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* Thinking block — collapsible <details> rendered for every
+   `<!-- LUMEN_THINKING -->` span in the assistant's response.
+   `--active` flag (mirrored from the marker's `active` attr by
+   `renderThinkingBlock`) means the model is still streaming
+   reasoning tokens, so we render the summary with a pulsing dot.
+   Body uses monospace + muted color so it reads as "trace", not
+   prose. We deliberately DON'T preserve open/closed state across
+   re-renders during streaming — every delta replaces the bubble's
+   innerHTML, so per-section interactivity would only show up
+   after the stream completes. Acceptable trade-off because
+   collapsed-by-default-when-done is the right resting state. */
+.lumen-thinking {
+  display: block;
+  margin: 6px 0;
+  padding: 0;
+  background: var(--bg-deepest);
+  border: 1px solid var(--glass-seam);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.lumen-thinking__summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  letter-spacing: 0.2px;
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+}
+/* Default disclosure triangle clutters the row; hide it cross-browser. */
+.lumen-thinking__summary::-webkit-details-marker { display: none; }
+.lumen-thinking__summary::marker { display: none; content: ''; }
+.lumen-thinking[open] .lumen-thinking__summary {
+  border-bottom: 1px solid var(--glass-seam);
+}
+.lumen-thinking__pulse {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-subtle);
+  flex: 0 0 auto;
+}
+.lumen-thinking--active .lumen-thinking__pulse {
+  background: var(--accent-cyan);
+  animation: lumen-thinking-pulse 1.2s ease-in-out infinite;
+}
+@keyframes lumen-thinking-pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50%      { opacity: 1.0; transform: scale(1.15); }
+}
+.lumen-thinking__label { flex: 1 1 auto; }
+.lumen-thinking__body {
+  padding: 8px 10px 10px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Error chip — compact inline rendering of `<!-- LUMEN_ERR -->`
+   markers. The desktop has a full retry-capable card; on a phone
+   the chip is enough since retry happens by sending a new message
+   or going back to the desktop. */
+.error-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+  padding: 3px 9px;
+  background: rgba(191, 97, 106, 0.10);
+  border: 1px solid rgba(191, 97, 106, 0.4);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--fg-primary);
+  max-width: 100%;
+  overflow: hidden;
+}
+.error-chip__icon {
+  font-weight: 700;
+  color: var(--state-error);
+  flex: 0 0 auto;
+}
+.error-chip__kind {
+  color: var(--state-error);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  flex: 0 0 auto;
+}
+.error-chip__detail {
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   min-width: 0;
 }
 

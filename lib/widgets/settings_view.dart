@@ -53,6 +53,7 @@ class _SettingsViewState extends State<SettingsView> {
   // Cached mutable copies — written back on save.
   late Set<String> _enabledProviders;
   late TextEditingController _ollamaEndpointCtrl;
+  late TextEditingController _ollamaApiKeyCtrl;
   late TextEditingController _geminiKeyCtrl;
   late TextEditingController _claudeKeyCtrl;
   late TextEditingController _githubKeyCtrl;
@@ -63,6 +64,7 @@ class _SettingsViewState extends State<SettingsView> {
   late TextEditingController _openaiKeyCtrl;
 
   // API key visibility toggles
+  bool _showOllamaKey = false;
   bool _showGeminiKey = false;
   bool _showClaudeKey = false;
   bool _showGithubKey = false;
@@ -78,6 +80,12 @@ class _SettingsViewState extends State<SettingsView> {
   late bool _reduceTransparency;
   late bool _allowAgentOutsideWorkspaceWrites;
   late bool _autoVerifyAfterEdits;
+  late bool _toolCompressionEnabled;
+  late String _toolCompressionModel;
+  late TextEditingController _toolCompressionThresholdCtrl;
+  late bool _historySummaryEnabled;
+  late TextEditingController _historySummaryMaxCharsCtrl;
+  late TextEditingController _historySummaryRefreshDeltaCtrl;
   late bool _gitnexusAutoWiki;
   late TextEditingController _gitnexusWikiModelCtrl;
   late TextEditingController _globalRulesCtrl;
@@ -151,6 +159,7 @@ class _SettingsViewState extends State<SettingsView> {
     final a = context.read<AppState>();
     _enabledProviders = Set<String>.from(a.enabledProviders);
     _ollamaEndpointCtrl = TextEditingController(text: a.ollamaEndpoint);
+    _ollamaApiKeyCtrl = TextEditingController(text: a.ollamaApiKey);
     _geminiKeyCtrl = TextEditingController(text: a.geminiApiKey);
     _claudeKeyCtrl = TextEditingController(text: a.anthropicApiKey);
     _githubKeyCtrl = TextEditingController(text: a.githubModelsApiKey);
@@ -165,6 +174,18 @@ class _SettingsViewState extends State<SettingsView> {
     _reduceTransparency = a.reduceTransparency;
     _allowAgentOutsideWorkspaceWrites = a.allowAgentOutsideWorkspaceWrites;
     _autoVerifyAfterEdits = a.autoVerifyAfterEdits;
+    _toolCompressionEnabled = a.toolCompressionEnabled;
+    _toolCompressionModel = a.toolCompressionModel;
+    _toolCompressionThresholdCtrl = TextEditingController(
+      text: a.toolCompressionThreshold.toString(),
+    );
+    _historySummaryEnabled = a.historySummaryEnabled;
+    _historySummaryMaxCharsCtrl = TextEditingController(
+      text: a.historySummaryMaxChars.toString(),
+    );
+    _historySummaryRefreshDeltaCtrl = TextEditingController(
+      text: a.historySummaryRefreshDelta.toString(),
+    );
     _gitnexusAutoWiki = a.gitnexusAutoWiki;
     _gitnexusWikiModelCtrl = TextEditingController(text: a.gitnexusWikiModel);
     _globalRulesCtrl = TextEditingController();
@@ -189,11 +210,15 @@ class _SettingsViewState extends State<SettingsView> {
   @override
   void dispose() {
     _ollamaEndpointCtrl.dispose();
+    _ollamaApiKeyCtrl.dispose();
     _geminiKeyCtrl.dispose();
     _claudeKeyCtrl.dispose();
     _githubKeyCtrl.dispose();
     _githubOrgCtrl.dispose();
     _openaiKeyCtrl.dispose();
+    _toolCompressionThresholdCtrl.dispose();
+    _historySummaryMaxCharsCtrl.dispose();
+    _historySummaryRefreshDeltaCtrl.dispose();
     _gitnexusWikiModelCtrl.dispose();
     _globalRulesCtrl.dispose();
     _workspaceRulesCtrl.dispose();
@@ -208,6 +233,7 @@ class _SettingsViewState extends State<SettingsView> {
     await a.updateProviderSettings(
       enabledProviders: _enabledProviders,
       ollamaEndpoint: _ollamaEndpointCtrl.text,
+      ollamaApiKey: _ollamaApiKeyCtrl.text,
       geminiApiKey: _geminiKeyCtrl.text,
       anthropicApiKey: _claudeKeyCtrl.text,
       githubModelsApiKey: _githubKeyCtrl.text,
@@ -227,6 +253,34 @@ class _SettingsViewState extends State<SettingsView> {
       _allowAgentOutsideWorkspaceWrites,
     );
     await a.setAutoVerifyAfterEdits(_autoVerifyAfterEdits);
+    final parsedCompressionThreshold = int.tryParse(
+      _toolCompressionThresholdCtrl.text.trim(),
+    );
+    await a.updateToolCompressionSettings(
+      enabled: _toolCompressionEnabled,
+      model: _toolCompressionModel,
+      threshold:
+          parsedCompressionThreshold == null || parsedCompressionThreshold <= 0
+          ? 2000
+          : parsedCompressionThreshold,
+    );
+    final parsedHistoryMaxChars = int.tryParse(
+      _historySummaryMaxCharsCtrl.text.trim(),
+    );
+    final parsedHistoryRefreshDelta = int.tryParse(
+      _historySummaryRefreshDeltaCtrl.text.trim(),
+    );
+    await a.updateHistorySummarySettings(
+      enabled: _historySummaryEnabled,
+      maxChars:
+          parsedHistoryMaxChars == null || parsedHistoryMaxChars <= 0
+          ? 1200
+          : parsedHistoryMaxChars,
+      refreshDelta:
+          parsedHistoryRefreshDelta == null || parsedHistoryRefreshDelta <= 0
+          ? 10
+          : parsedHistoryRefreshDelta,
+    );
     await a.updateGitNexusWikiSettings(
       autoWiki: _gitnexusAutoWiki,
       wikiModel: _gitnexusWikiModelCtrl.text,
@@ -535,6 +589,15 @@ class _SettingsViewState extends State<SettingsView> {
               controller: _ollamaEndpointCtrl,
               style: const TextStyle(fontSize: 13),
             ),
+          ),
+        ),
+        _settingRow(
+          label: S.settingsOllamaCloudKeyLabel,
+          description: S.settingsOllamaCloudKeyDesc,
+          child: _apiKeyField(
+            controller: _ollamaApiKeyCtrl,
+            visible: _showOllamaKey,
+            onToggle: (v) => _showOllamaKey = v,
           ),
         ),
         _divider(),
@@ -1006,6 +1069,112 @@ class _SettingsViewState extends State<SettingsView> {
               ),
             );
           },
+        ),
+        _settingToggle(
+          label: S.settingsToolCompressionToggle,
+          description: S.settingsToolCompressionDesc,
+          value: _toolCompressionEnabled,
+          onChanged: (v) => setState(() => _toolCompressionEnabled = v),
+        ),
+        Consumer<AppState>(
+          builder: (context, state, _) {
+            final models = state.chat.availableModels.toSet().toList()..sort();
+            final modelOptions = <String>['', ...models];
+            if (_toolCompressionModel.isNotEmpty &&
+                !modelOptions.contains(_toolCompressionModel)) {
+              modelOptions.add(_toolCompressionModel);
+            }
+            final selectedModel = modelOptions.contains(_toolCompressionModel)
+                ? _toolCompressionModel
+                : '';
+            return _settingRow(
+              label: S.settingsToolCompressionModel,
+              description: S.settingsToolCompressionModelDesc,
+              child: SizedBox(
+                width: 320,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    DropdownButtonFormField<String>(
+                      initialValue: selectedModel,
+                      decoration: const InputDecoration(
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                      ),
+                      items: [
+                        for (final model in modelOptions)
+                          DropdownMenuItem(
+                            value: model,
+                            child: Text(
+                              model.isEmpty
+                                  ? S.settingsToolCompressionNoModel
+                                  : model,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                      ],
+                      onChanged: (v) =>
+                          setState(() => _toolCompressionModel = v ?? ''),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _toolCompressionThresholdCtrl,
+                      keyboardType: TextInputType.number,
+                      style: const TextStyle(fontSize: 13),
+                      decoration: const InputDecoration(
+                        labelText: S.settingsToolCompressionThreshold,
+                        helperText: S.settingsToolCompressionThresholdDesc,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+        _settingToggle(
+          label: S.settingsHistorySummaryToggle,
+          description: S.settingsHistorySummaryDesc,
+          value: _historySummaryEnabled,
+          onChanged: (v) => setState(() => _historySummaryEnabled = v),
+        ),
+        _settingRow(
+          label: S.settingsHistorySummaryMaxChars,
+          description: S.settingsHistorySummaryMaxCharsDesc,
+          child: SizedBox(
+            width: 320,
+            child: TextField(
+              controller: _historySummaryMaxCharsCtrl,
+              keyboardType: TextInputType.number,
+              style: const TextStyle(fontSize: 13),
+              decoration: const InputDecoration(
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
+              ),
+            ),
+          ),
+        ),
+        _settingRow(
+          label: S.settingsHistorySummaryRefreshDelta,
+          description: S.settingsHistorySummaryRefreshDeltaDesc,
+          child: SizedBox(
+            width: 320,
+            child: TextField(
+              controller: _historySummaryRefreshDeltaCtrl,
+              keyboardType: TextInputType.number,
+              style: const TextStyle(fontSize: 13),
+              decoration: const InputDecoration(
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
+              ),
+            ),
+          ),
         ),
         _settingRow(
           label: S.settingsDefaultModel,
@@ -1590,9 +1759,7 @@ class _SettingsViewState extends State<SettingsView> {
                   hintText: 'optional',
                   suffixIcon: IconButton(
                     icon: Icon(
-                      _showStApiKey
-                          ? Icons.visibility_off
-                          : Icons.visibility,
+                      _showStApiKey ? Icons.visibility_off : Icons.visibility,
                       size: 18,
                       color: DuckColors.fgMuted,
                     ),

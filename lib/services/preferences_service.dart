@@ -9,6 +9,13 @@ class PreferencesService {
   static const String _kProvider = 'llmProvider';
   static const String _kEndpoint = 'ollamaEndpoint';
   static const String _kApiKey = 'apiKey'; // legacy shared key
+  // Ollama Cloud API key (https://ollama.com/settings/keys). When set,
+  // chat requests for cloud-tagged models go directly to
+  // https://ollama.com with `Authorization: Bearer <key>` instead of
+  // proxying through the local daemon. Empty = legacy behaviour
+  // (cloud models work IFF the user ran `ollama signin` and pulled
+  // them locally).
+  static const String _kOllamaApiKey = 'ollama.apiKey';
   static const String _kGeminiApiKey = 'gemini.apiKey';
   static const String _kAnthropicApiKey = 'anthropic.apiKey';
   static const String _kGithubModelsApiKey = 'githubModels.apiKey';
@@ -31,6 +38,31 @@ class PreferencesService {
   static const String _kSelectedModel = 'chat.selectedModel';
   static const String _kEnabledChatModels = 'chat.enabledModels';
   static const String _kKnownChatModels = 'chat.knownModels';
+  static const String _kToolCompressionEnabled = 'chat.toolCompression.enabled';
+  static const String _kToolCompressionModel = 'chat.toolCompression.model';
+  static const String _kToolCompressionThreshold =
+      'chat.toolCompression.threshold';
+  // History-summary keys. The summarizer reuses
+  // `_kToolCompressionModel` so users only configure one "small model"
+  // for both tool-output compression and chat-history summarization.
+  // The two features are independently toggleable so a user can opt
+  // into one without the other.
+  //
+  // `refreshDelta` is the cache-staleness threshold in messages: once
+  // the dropped-history count exceeds the cached value by this much,
+  // we re-summarize. Larger = cheaper (fewer LLM calls), smaller =
+  // fresher summaries. Default 10 means a long agentic session
+  // re-summarizes every ~10 elided messages, not every turn.
+  //
+  // `maxChars` caps the summary body. If the small model returns
+  // something longer (verbose model, ignored the prompt), we fall
+  // back to the existing one-line elision placeholder rather than
+  // ship a 4 KB "summary" that's worse than the placeholder it
+  // replaced.
+  static const String _kHistorySummaryEnabled = 'chat.historySummary.enabled';
+  static const String _kHistorySummaryMaxChars = 'chat.historySummary.maxChars';
+  static const String _kHistorySummaryRefreshDelta =
+      'chat.historySummary.refreshDelta';
   static const String _kTerminalShell = 'terminal.shell';
   static const String _kAutoBackupEnabled = 'autoBackup.enabled';
   static const String _kAutoBackupIntervalMinutes =
@@ -150,6 +182,11 @@ class PreferencesService {
   Future<String> getApiKey() async => (await _p).getString(_kApiKey) ?? '';
   Future<void> setApiKey(String v) async => (await _p).setString(_kApiKey, v);
 
+  Future<String> getOllamaApiKey() async =>
+      (await _p).getString(_kOllamaApiKey) ?? '';
+  Future<void> setOllamaApiKey(String v) async =>
+      (await _p).setString(_kOllamaApiKey, v.trim());
+
   Future<String> getGeminiApiKey() async =>
       (await _p).getString(_kGeminiApiKey) ?? '';
   Future<void> setGeminiApiKey(String v) async =>
@@ -201,6 +238,36 @@ class PreferencesService {
       (await _p).getStringList(_kKnownChatModels);
   Future<void> setKnownChatModels(List<String> ids) async =>
       (await _p).setStringList(_kKnownChatModels, ids);
+
+  Future<bool> getToolCompressionEnabled() async =>
+      (await _p).getBool(_kToolCompressionEnabled) ?? false;
+  Future<void> setToolCompressionEnabled(bool v) async =>
+      (await _p).setBool(_kToolCompressionEnabled, v);
+
+  Future<String> getToolCompressionModel() async =>
+      (await _p).getString(_kToolCompressionModel) ?? '';
+  Future<void> setToolCompressionModel(String v) async =>
+      (await _p).setString(_kToolCompressionModel, v.trim());
+
+  Future<int> getToolCompressionThreshold() async =>
+      (await _p).getInt(_kToolCompressionThreshold) ?? 2000;
+  Future<void> setToolCompressionThreshold(int v) async =>
+      (await _p).setInt(_kToolCompressionThreshold, v);
+
+  Future<bool> getHistorySummaryEnabled() async =>
+      (await _p).getBool(_kHistorySummaryEnabled) ?? false;
+  Future<void> setHistorySummaryEnabled(bool v) async =>
+      (await _p).setBool(_kHistorySummaryEnabled, v);
+
+  Future<int> getHistorySummaryMaxChars() async =>
+      (await _p).getInt(_kHistorySummaryMaxChars) ?? 1200;
+  Future<void> setHistorySummaryMaxChars(int v) async =>
+      (await _p).setInt(_kHistorySummaryMaxChars, v);
+
+  Future<int> getHistorySummaryRefreshDelta() async =>
+      (await _p).getInt(_kHistorySummaryRefreshDelta) ?? 10;
+  Future<void> setHistorySummaryRefreshDelta(int v) async =>
+      (await _p).setInt(_kHistorySummaryRefreshDelta, v);
 
   /// Skill ids the user has explicitly toggled on. `null` means
   /// "no preference yet — fall back to each skill's defaultEnabled".

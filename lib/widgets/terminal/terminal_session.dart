@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_pty/flutter_pty.dart';
@@ -67,8 +68,39 @@ class TerminalSession {
   final StringBuffer _earlyOutput = StringBuffer();
   Timer? _earlyWatchdog;
 
+  /// Set when this session is an agent-spawned one-shot command (RUN_CMD)
+  /// rather than an interactive shell. The pane uses this to render a
+  /// distinct icon/label, and the start path runs the command directly
+  /// via the chosen shell's `commandArgs(...)` instead of dropping the
+  /// user into an interactive prompt.
+  final String? _agentCommand;
+
+  /// Optional callback fired with each output chunk *after* ANSI
+  /// escape codes have been stripped — i.e. the model-friendly view.
+  /// xterm still sees the raw bytes so the human terminal renders
+  /// colors and cursor moves correctly.
+  final void Function(String stripped)? _onAgentOutput;
+
+  /// Resolves with the child process's exit code when the agent
+  /// command finishes. Null in shell mode.
+  Completer<int?>? _agentExitCompleter;
+
   bool get usingFallback => _usingFallback;
   ShellSpec? get activeShell => _activeShell;
+
+  /// True when this session was spawned to run a single agent command
+  /// (vs an interactive shell). The terminal pane uses this to badge
+  /// the tab and route close-tab events through the agent bridge.
+  bool get isAgent => _agentCommand != null;
+
+  /// The original command line the agent asked us to run. Useful for
+  /// tab labels and tooltips. Null in shell mode.
+  String? get agentCommand => _agentCommand;
+
+  /// Future that completes with the exit code of the agent process.
+  /// Null in shell mode. Resolves with `null` if the session was
+  /// disposed before the process ever started.
+  Future<int?>? get agentExitCode => _agentExitCompleter?.future;
 
   TerminalSession({
     required this.id,
@@ -77,15 +109,53 @@ class TerminalSession {
     this.onShellSwitched,
     this.onPidStarted,
     this.onPidEnded,
-  }) {
+  })  : _agentCommand = null,
+        _onAgentOutput = null {
     terminal = Terminal();
     controller = TerminalController();
     focusNode = FocusNode(debugLabel: title);
     scrollController = ScrollController();
   }
 
+  /// Build a session that runs a single command through the user's
+  /// preferred shell instead of starting an interactive shell. This
+  /// is the entry point used by the agent terminal bridge for
+  /// `RUN_CMD` invocations: same xterm widget, same PID-tracking
+  /// hooks, same kill semantics — just spawned via
+  /// `shell.commandArgs(command)` so it exits when the command does
+  /// (or stays alive for daemon-style commands until killed).
+  ///
+  /// [onAgentOutput] receives ANSI-stripped chunks for the model.
+  /// [agentExitCompleter] resolves with the exit code; the bridge
+  /// uses it to wire `RUN_CMD`'s race against `whenCancelled` /
+  /// `softTimeout` / `readyDetected`.
+  TerminalSession.agent({
+    required this.id,
+    required this.title,
+    required this.workingDirectory,
+    required String command,
+    this.onPidStarted,
+    this.onPidEnded,
+    void Function(String stripped)? onAgentOutput,
+  })  : _agentCommand = command,
+        _onAgentOutput = onAgentOutput,
+        onShellSwitched = null {
+    terminal = Terminal();
+    controller = TerminalController();
+    focusNode = FocusNode(debugLabel: title);
+    scrollController = ScrollController();
+    _agentExitCompleter = Completer<int?>();
+  }
+
   /// Start the session. If [preferredShellId] is given we try that one first;
   /// otherwise we use [ShellDiscovery.bestAvailable].
+  ///
+  /// In agent mode (constructed via [TerminalSession.agent]) we use only
+  /// the preferred shell with [ShellSpec.commandArgs] — running the same
+  /// command across multiple fallback shells would either re-execute it
+  /// (bad: side effects twice) or leak state. If PTY init fails for that
+  /// one shell we still drop to the [Process.start] fallback so the
+  /// command runs *somewhere*.
   Future<void> start({String? preferredShellId}) async {
     final available = await ShellDiscovery.available();
     final ordered = <ShellSpec>[];
@@ -119,6 +189,20 @@ class TerminalSession {
       );
     }
 
+    // Agent mode: single-shot through the user's preferred shell only.
+    // Don't iterate fallbacks — the command might have side effects and
+    // running it twice on a fallback retry is worse than failing loudly.
+    if (isAgent) {
+      _activeShell = ordered.first;
+      final ok = await _attemptPty(ordered.first, isLastCandidate: true);
+      if (!ok && !(_agentExitCompleter?.isCompleted ?? true)) {
+        // PTY/Process fallback both failed and never resolved the
+        // exit completer. Resolve with null so callers don't deadlock.
+        _agentExitCompleter?.complete(null);
+      }
+      return;
+    }
+
     for (var i = 0; i < ordered.length; i++) {
       if (_disposed) return;
       final shell = ordered[i];
@@ -144,10 +228,18 @@ class TerminalSession {
     _earlyOutput.clear();
     _earlyWatchdog?.cancel();
 
+    // Agent mode: run a single command through the chosen shell using
+    // its `commandArgs(...)` (e.g. `/c <cmd>`, `-Command <cmd>`,
+    // `-c <cmd>`). Shell mode keeps the existing interactive
+    // [startupArgs] path.
+    final args = isAgent
+        ? shell.commandArgs(_agentCommand!)
+        : shell.startupArgs;
+
     try {
       _pty = Pty.start(
         shell.executable,
-        arguments: shell.startupArgs,
+        arguments: args,
         workingDirectory: workingDirectory,
         // CRITICAL: pass the full parent environment. `flutter_pty`
         // 0.4.2 does NOT auto-inherit `Platform.environment` when
@@ -190,10 +282,24 @@ class TerminalSession {
       data,
     ) {
       terminal.write(data);
+      // Agent mode: tee an ANSI-stripped copy to the model-facing
+      // callback so RUN_CMD's ready-pattern / error-string scanners
+      // see plain text instead of `\x1b[31m` color escapes.
+      if (isAgent && _onAgentOutput != null) {
+        try {
+          _onAgentOutput(_stripAnsi(data));
+        } catch (e) {
+          debugPrint('agent-output tee error: $e');
+        }
+      }
       if (!decidedSuccess) {
         _earlyOutput.write(data);
-        if (ShellDiscovery.looksLikeFatalShellError(_earlyOutput.toString())) {
-          // Bail to the next candidate.
+        // Fatal-error sniffing only applies to interactive shell
+        // sessions where we can fall back to a different candidate.
+        // In agent mode there's only one shell and the command's
+        // own stderr is its own business — let it through.
+        if (!isAgent &&
+            ShellDiscovery.looksLikeFatalShellError(_earlyOutput.toString())) {
           terminal.write(
             '\r\n\x1b[33m[Detected fatal ${shell.label} startup error — '
             'switching shell…]\x1b[0m\r\n',
@@ -206,6 +312,22 @@ class TerminalSession {
         }
       }
     }, onError: (e, _) => terminal.write('\r\n[pty stream error: $e]\r\n'));
+
+    // Agent mode: forward exit code to the completer so callers can
+    // race it against cancel / soft-timeout futures.
+    if (isAgent) {
+      _pty!.exitCode.then((code) {
+        if (_agentExitCompleter != null &&
+            !_agentExitCompleter!.isCompleted) {
+          _agentExitCompleter!.complete(code);
+        }
+      }).catchError((_) {
+        if (_agentExitCompleter != null &&
+            !_agentExitCompleter!.isCompleted) {
+          _agentExitCompleter!.complete(null);
+        }
+      });
+    }
 
     terminal.onOutput = (data) {
       if (_disposed) return;
@@ -241,9 +363,14 @@ class TerminalSession {
       'no full TTY support]\x1b[0m\r\n\r\n',
     );
     try {
+      // Same args resolution as the PTY path: agent commands take
+      // `commandArgs(cmd)`, interactive shells take `startupArgs`.
+      final args = isAgent
+          ? shell.commandArgs(_agentCommand!)
+          : shell.startupArgs;
       _proc = await Process.start(
         shell.executable,
-        shell.startupArgs,
+        args,
         workingDirectory: workingDirectory,
         runInShell: false,
         // `Process.start` defaults to `includeParentEnvironment: true`
@@ -255,14 +382,48 @@ class TerminalSession {
       );
       _announcePid(_proc?.pid);
 
+      // Agent mode: tee ANSI-stripped output to the agent callback.
+      // Process.start gives us stdout/stderr separately so we feed
+      // both into the same callback (the agent doesn't distinguish
+      // streams — it just wants the text, same as the PTY path).
       _proc!.stdout
           .transform(utf8.decoder)
           .transform(const LineSplitter())
-          .listen((line) => terminal.write('$line\r\n'));
+          .listen((line) {
+            terminal.write('$line\r\n');
+            if (isAgent && _onAgentOutput != null) {
+              try {
+                _onAgentOutput('${_stripAnsi(line)}\n');
+              } catch (e) {
+                debugPrint('agent-output tee error: $e');
+              }
+            }
+          });
       _proc!.stderr
           .transform(utf8.decoder)
           .transform(const LineSplitter())
-          .listen((line) => terminal.write('\x1b[31m$line\x1b[0m\r\n'));
+          .listen((line) {
+            terminal.write('\x1b[31m$line\x1b[0m\r\n');
+            if (isAgent && _onAgentOutput != null) {
+              try {
+                _onAgentOutput('${_stripAnsi(line)}\n');
+              } catch (e) {
+                debugPrint('agent-output tee error: $e');
+              }
+            }
+          });
+
+      // Forward fallback-process exit to the agent completer.
+      if (isAgent) {
+        unawaited(
+          _proc!.exitCode.then((code) {
+            if (_agentExitCompleter != null &&
+                !_agentExitCompleter!.isCompleted) {
+              _agentExitCompleter!.complete(code);
+            }
+          }),
+        );
+      }
 
       final inputBuffer = StringBuffer();
       terminal.onOutput = (data) {
@@ -293,19 +454,69 @@ class TerminalSession {
       terminal.write(
         '\x1b[31m[Failed to start fallback shell ${shell.label}: $e]\x1b[0m\r\n',
       );
+      // Don't strand the completer — caller is awaiting it.
+      if (isAgent &&
+          _agentExitCompleter != null &&
+          !_agentExitCompleter!.isCompleted) {
+        _agentExitCompleter!.complete(null);
+      }
     }
   }
 
-  void dispose() {
-    if (_disposed) return;
-    _disposed = true;
-    _earlyWatchdog?.cancel();
+  /// Best-effort graceful kill for agent sessions: write Ctrl+C into
+  /// the PTY first so ConPTY broadcasts SIGINT to the foreground
+  /// process group (which is what kills `node`/`python`/etc. spawned
+  /// by `npm`/`pwsh`/`bash` — `Process.killPid` only terminates the
+  /// shell wrapper and leaves grandchildren orphaned, the exact bug
+  /// behind the "I have to taskkill node every time" complaint).
+  /// Then waits up to [graceWindow] before falling through to a hard
+  /// kill via `_pty.kill()` / `_proc.kill()`.
+  Future<void> killAgent({
+    Duration graceWindow = const Duration(milliseconds: 500),
+  }) async {
+    if (!isAgent) return;
+    if (_agentExitCompleter?.isCompleted ?? true) {
+      // Already exited (or never started). Nothing to do.
+      _hardKill();
+      return;
+    }
+    // Ctrl+C to the PTY = SIGINT to the foreground process group.
+    try {
+      _pty?.write(Uint8List.fromList([0x03]));
+    } catch (_) {}
+    // Race the grace window vs. a clean exit.
+    try {
+      await _agentExitCompleter!.future.timeout(graceWindow);
+      _hardKill(); // No-op if everything has already torn down.
+      return;
+    } on TimeoutException {
+      // Fall through to hard-kill.
+    } catch (_) {
+      // Future itself errored — hard kill anyway.
+    }
+    _hardKill();
+  }
+
+  /// Final-resort kill. Called by [killAgent] after the grace window
+  /// and unconditionally by [dispose]. Idempotent — safe to call when
+  /// the process has already exited.
+  void _hardKill() {
     try {
       _pty?.kill();
     } catch (_) {}
     try {
       _proc?.kill();
     } catch (_) {}
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _earlyWatchdog?.cancel();
+    _hardKill();
+    if (_agentExitCompleter != null && !_agentExitCompleter!.isCompleted) {
+      _agentExitCompleter!.complete(null);
+    }
     if (_trackedPid != null) {
       try {
         onPidEnded?.call(_trackedPid!);
@@ -314,6 +525,35 @@ class TerminalSession {
     }
     focusNode.dispose();
     scrollController.dispose();
+  }
+
+  /// Strip ANSI escape sequences from PTY output so the agent's
+  /// view (regex-based ready/error scanners, tool_result text) sees
+  /// plain text instead of `\x1b[31m`/`\x1b]0;…\x07` noise. xterm
+  /// itself still gets the raw bytes for color rendering.
+  ///
+  /// Matches:
+  ///  - CSI sequences `ESC [ <params> <intermediate> <final>` (most
+  ///    color/cursor codes);
+  ///  - OSC sequences `ESC ] <text> (BEL | ESC \)` (window titles,
+  ///    hyperlinks);
+  ///  - One-byte ESC sequences (`ESC =`, `ESC >`, `ESC c`, etc.).
+  ///
+  /// Note: chunk-local — a sequence split across stream chunks may
+  /// leak a stray escape byte. In practice PTY drivers flush whole
+  /// sequences; callers that need bullet-proof stripping can buffer
+  /// and call this on accumulated text.
+  static final RegExp _ansiCsi = RegExp(r'\x1B\[[0-?]*[ -/]*[@-~]');
+  static final RegExp _ansiOsc = RegExp(
+    r'\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)',
+  );
+  static final RegExp _ansiSimple = RegExp(r'\x1B[=>cDEHMNOZ78]');
+
+  static String _stripAnsi(String s) {
+    return s
+        .replaceAll(_ansiOsc, '')
+        .replaceAll(_ansiCsi, '')
+        .replaceAll(_ansiSimple, '');
   }
 
   /// Hand a freshly-known child PID to the optional tracker

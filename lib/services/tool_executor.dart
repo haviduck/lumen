@@ -70,6 +70,27 @@ class ToolExecutor {
   /// uses it to abort a hung subprocess when the user clicks Stop.
   CancellationToken? cancelToken;
 
+  /// Optional launcher that routes `RUN_CMD` through the agent
+  /// terminal-pane bridge. When supplied, long-running commands
+  /// (dev servers, watchers) appear as real terminal tabs the user
+  /// can see and kill. When omitted, `RUN_CMD` runs through the
+  /// legacy `Process.start` path. Production wiring in
+  /// `ChatController._runGenerationLoop` always supplies one.
+  AgentTerminalLauncher? agentTerminalLauncher;
+
+  /// Optional bridge to Ollama Cloud's web search endpoint, plumbed
+  /// down to every `ToolInvocation` for the `WEB_SEARCH` tool. When
+  /// null, `WEB_SEARCH` returns a configuration-error feedback
+  /// string (caller should set the Ollama Cloud API key in
+  /// Settings → AI / Chat).
+  WebSearchFn? webSearch;
+
+  /// Optional bridge to Ollama Cloud's web fetch endpoint. Same
+  /// null semantics as [webSearch] — without a wired closure the
+  /// `WEB_FETCH` tool fails closed rather than reaching out
+  /// directly to arbitrary URLs from the host process.
+  WebFetchFn? webFetch;
+
   ToolExecutor({
     required this.workspaceDir,
     required this.approver,
@@ -78,6 +99,9 @@ class ToolExecutor {
     this.recorder,
     this.allowWritesOutsideWorkspace = false,
     this.cancelToken,
+    this.agentTerminalLauncher,
+    this.webSearch,
+    this.webFetch,
   }) : enabledTools =
            enabledTools ??
            ToolRegistry.all
@@ -127,6 +151,9 @@ class ToolExecutor {
           allowWritesOutsideWorkspace: allowWritesOutsideWorkspace,
           onOutput: onToolOutput,
           cancelToken: cancelToken,
+          agentTerminalLauncher: agentTerminalLauncher,
+          webSearch: webSearch,
+          webFetch: webFetch,
         );
         // Pre-snapshot the file the tool will touch (if any). Cheap —
         // when the file already has a baseline / head this is a no-op;

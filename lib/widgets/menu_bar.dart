@@ -746,7 +746,10 @@ Future<bool> _isLumenFirstRun(AppState state) async {
   final hasAnyKey = state.geminiApiKey.isNotEmpty ||
       state.anthropicApiKey.isNotEmpty ||
       state.githubModelsApiKey.isNotEmpty ||
-      state.openaiApiKey.isNotEmpty;
+      state.openaiApiKey.isNotEmpty ||
+      // Mirror the welcome-screen heuristic: an Ollama Cloud key
+      // counts as "configured" so cloud-only users skip onboarding.
+      state.ollamaApiKey.isNotEmpty;
   if (hasAnyKey) return false;
   final ollamaUp = await state.ollamaService.isReachable();
   return !ollamaUp;

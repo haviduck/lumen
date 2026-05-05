@@ -361,35 +361,39 @@ class _MessageBubbleState extends State<MessageBubble> {
             const SizedBox(height: 2),
             const _StreamingCursor(),
           ],
+          // Diagnostic timing footer. Only renders when:
+          //   - the turn has actually finished (no streaming cursor
+          //     showing — partial timings during streaming would
+          //     mislead);
+          //   - the persisted message carries timing fields (legacy
+          //     messages from before the instrumentation landed
+          //     have all-null timing and stay clean).
+          if (!widget.isStreaming &&
+              widget.message.totalDurationMs != null) ...[
+            const SizedBox(height: 4),
+            _TurnTimingFooter(message: widget.message),
+          ],
         ],
       ),
     );
   }
 
   Widget _segmentWidget(ChatSegment seg, int index) {
+    if (seg is ThinkingSegment) {
+      return KeyedSubtree(
+        key: ValueKey('think-$index'),
+        child: _ThinkingBlock(
+          content: seg.content,
+          isActive: seg.isActive,
+        ),
+      );
+    }
     if (seg is ProseSegment) {
       return KeyedSubtree(
         key: ValueKey('prose-$index'),
         child: _buildProse(seg.text),
       );
     }
-    // Selection model: we do NOT wrap tool/group/error segments in
-    // `SelectionContainer.disabled` anymore. We used to, so that
-    // cross-bubble drag-select via the outer `SelectionArea`
-    // skipped tool cards. But mid-stream rebuilds (every chunk
-    // changes segment indices when prose grows / a tool resolves)
-    // would unmount a `SelectionContainer.disabled` subtree
-    // *between* the SelectionArea delegate's `_flushAdditions` and
-    // its `_compareScreenOrder` microtask, blowing up with
-    // `Cannot get renderObject of inactive element` (visible
-    // first on Opus 4.7 — its first chunk is fast enough that two
-    // segment-list rebuilds land in the same frame). The fix is
-    // structural: don't introduce SelectionContainers whose shape
-    // we can't keep stable across streaming. Side effect: dragging
-    // a selection across a bubble now also picks up the small
-    // text inside tool cards (status / tool name / file path).
-    // Acceptable — copy-paste of a few extra labels is a much
-    // smaller papercut than the chat panel crashing.
     if (seg is ToolSegment) {
       return KeyedSubtree(
         key: ValueKey('tool-$index-${seg.toolId}-${seg.firstArg}'),
@@ -397,12 +401,6 @@ class _MessageBubbleState extends State<MessageBubble> {
       );
     }
     if (seg is ToolGroupSegment) {
-      // Group key includes count so adding another member to the
-      // tail doesn't invalidate the expand/collapse state
-      // pointlessly — but DOES invalidate it when a new group
-      // appears at the same index (which is the right behaviour:
-      // the user's current expand/collapse choice belongs to the
-      // *previous* group, not the new one that took its slot).
       final first = seg.tools.first;
       return KeyedSubtree(
         key: ValueKey(
@@ -455,6 +453,107 @@ class _MessageBubbleState extends State<MessageBubble> {
         ),
       ),
     );
+  }
+}
+
+/// Dim, non-interactive timing footer for finished assistant
+/// turns. Renders something like:
+///
+///     3:02 · TTFB 8.4s · 4 iters · last 2:58
+///
+/// Surfaces the data needed to diagnose Ollama Cloud's hard 182s
+/// timeout (issue ollama/ollama#15973) without adding UI noise to
+/// short, fast turns — most one-iteration Q&A turns will read
+/// just `2.3s · TTFB 1.1s` and that's it.
+///
+/// Pure presentation; the source of truth lives on the
+/// [PersistedMessage] timing fields populated by
+/// `ChatController._runGenerationLoop`.
+class _TurnTimingFooter extends StatelessWidget {
+  final PersistedMessage message;
+
+  const _TurnTimingFooter({required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = <String>[];
+    final total = message.totalDurationMs;
+    if (total != null) parts.add(_formatDuration(total));
+
+    final ttfb = message.firstByteLatencyMs;
+    if (ttfb != null) parts.add(S.turnTimingTtfb(_formatDuration(ttfb)));
+
+    final iters = message.iterationCount;
+    if (iters != null && iters > 1) {
+      parts.add(S.turnTimingIters(iters));
+    }
+
+    final lastIter = message.lastIterationDurationMs;
+    // Only show last-iteration duration when there were multiple
+    // iterations AND the last one is meaningfully shorter than the
+    // total (otherwise it's redundant — a 1-iter turn has total ==
+    // lastIter by definition, and printing both is just noise).
+    if (lastIter != null &&
+        iters != null &&
+        iters > 1 &&
+        total != null &&
+        (total - lastIter) > 250) {
+      parts.add(S.turnTimingLast(_formatDuration(lastIter)));
+    }
+
+    if (parts.isEmpty) return const SizedBox.shrink();
+
+    final text = parts.join(' · ');
+
+    // Highlight the 182s-wall failure mode visually so it's easy
+    // to spot in a long chat: any turn whose total OR last-iter
+    // landed in the 175-185s window gets a faint warning tint.
+    // 175ms on either side covers clock jitter, gateway delay,
+    // and the actual cliff (which the bug report measured at
+    // 182,043ms ±50ms).
+    final hitTheWall =
+        (total != null && total >= 175000 && total <= 185000) ||
+        (lastIter != null && lastIter >= 175000 && lastIter <= 185000);
+
+    return Tooltip(
+      message: hitTheWall
+          ? S.turnTimingWallTooltip
+          : S.turnTimingTooltip,
+      waitDuration: const Duration(milliseconds: 350),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 11,
+          color: hitTheWall
+              ? DuckColors.stateWarn
+              : DuckColors.fgMuted,
+          fontFamily: DuckTheme.monoFont,
+          height: 1.3,
+        ),
+      ),
+    );
+  }
+
+  /// Render a duration in human-friendly form. Sub-second uses
+  /// one decimal ("0.8s"), under a minute uses no decimal ("12s"),
+  /// minute-plus uses `Nm SSs` ("3m 02s"). The minute-plus format
+  /// is *deliberately* not `M:SS` — that colon-separated shape
+  /// reads exactly like a wallclock time-of-day (15:56 → "3:56
+  /// PM?") and confused users into thinking the footer was
+  /// showing when the turn happened, not how long it took.
+  static String _formatDuration(int ms) {
+    if (ms < 1000) return '${ms}ms';
+    if (ms < 10000) {
+      final seconds = ms / 1000;
+      return '${seconds.toStringAsFixed(1)}s';
+    }
+    if (ms < 60000) {
+      return '${(ms / 1000).round()}s';
+    }
+    final totalSec = (ms / 1000).round();
+    final minutes = totalSec ~/ 60;
+    final seconds = totalSec % 60;
+    return '${minutes}m ${seconds.toString().padLeft(2, '0')}s';
   }
 }
 
@@ -809,6 +908,143 @@ class _SlashCommandLabel extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Collapsible block showing model reasoning (thinking tokens).
+/// While [isActive], renders an animated "Thinking…" indicator.
+/// Once complete, collapses to a one-line summary that expands on tap
+/// to reveal the full reasoning trace.
+class _ThinkingBlock extends StatefulWidget {
+  final String content;
+  final bool isActive;
+
+  const _ThinkingBlock({required this.content, required this.isActive});
+
+  @override
+  State<_ThinkingBlock> createState() => _ThinkingBlockState();
+}
+
+class _ThinkingBlockState extends State<_ThinkingBlock>
+    with SingleTickerProviderStateMixin {
+  bool _expanded = false;
+  late final AnimationController _pulseController;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasContent = widget.content.trim().isNotEmpty;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          GestureDetector(
+            onTap: hasContent ? () => setState(() => _expanded = !_expanded) : null,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: DuckColors.bgDeeper.withValues(alpha: 0.6),
+                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                border: Border.all(
+                  color: DuckColors.fgSubtle.withValues(alpha: 0.4),
+                  width: 0.5,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (widget.isActive)
+                    AnimatedBuilder(
+                      animation: _pulseController,
+                      builder: (_, child) => Opacity(
+                        opacity: 0.4 + 0.6 * _pulseController.value,
+                        child: child,
+                      ),
+                      child: Icon(
+                        Icons.psychology,
+                        size: 14,
+                        color: DuckColors.accentPurple,
+                      ),
+                    )
+                  else
+                    Icon(
+                      Icons.psychology,
+                      size: 14,
+                      color: DuckColors.fgMuted,
+                    ),
+                  const SizedBox(width: 6),
+                  Text(
+                    widget.isActive
+                        ? S.thinkingActive
+                        : S.thinkingDone,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: widget.isActive
+                          ? DuckColors.accentPurple
+                          : DuckColors.fgMuted,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                  if (hasContent && !widget.isActive) ...[
+                    const SizedBox(width: 4),
+                    Icon(
+                      _expanded
+                          ? Icons.expand_less
+                          : Icons.expand_more,
+                      size: 14,
+                      color: DuckColors.fgMuted,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (_expanded && hasContent)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, left: 4),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                constraints: const BoxConstraints(maxHeight: 200),
+                decoration: BoxDecoration(
+                  color: DuckColors.bgDeepest.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                  border: Border.all(
+                    color: DuckColors.fgSubtle.withValues(alpha: 0.3),
+                    width: 0.5,
+                  ),
+                ),
+                child: SingleChildScrollView(
+                  child: Text(
+                    widget.content,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: DuckColors.fgMuted,
+                      fontFamily: DuckTheme.monoFont,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );

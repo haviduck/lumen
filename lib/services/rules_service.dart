@@ -55,15 +55,76 @@ practical, and specific to this project.
 - The user may not know which standard IDE conveniences or project hygiene steps
   are missing. When a small addition would make the result more complete, add it
   and mention it.
+
+## Servers and long-running processes
+- Do not start webservers, dev servers, watchers, or other long-running
+  processes unless the user explicitly asks for it. Many of these are
+  auth-gated, bind to ports the user may already be using, or interfere with
+  the user's own running stack. Suggest the command and let the user run it.
+- One-shot commands that exit on their own (build, test, lint, format,
+  install) are fine to invoke directly when the task calls for them.
+''';
+
+  static const String _knowledgebaseRuleBlock =
+      '''<!-- LUMEN_KNOWLEDGEBASE_RULE -->
+## Knowledgebase (cross-chat memory)
+
+A shared knowledgebase lives at `.lumen/knowledgebase.md`. It is the only
+persistent memory between separate chat sessions in this workspace.
+
+**At the start of every chat:**
+- Read `.lumen/knowledgebase.md` if it exists. Use it as context for the
+  current session — it describes architecture, conventions, recent changes,
+  and things that previous sessions learned the hard way.
+
+**After completing non-trivial work:**
+- Update `.lumen/knowledgebase.md` with anything a future chat session would
+  benefit from knowing: new patterns introduced, architectural decisions made,
+  pitfalls discovered, conventions established, or important file locations.
+- Keep it concise and scannable (bullets, short sections). Remove stale entries
+  when they no longer apply.
+- Do not duplicate information already in rules.md — the knowledgebase is for
+  evolving project knowledge, not static policy.
+
+If the file does not exist yet, create it on your first meaningful contribution
+to the workspace.
 ''';
 
   /// Workspace stub for brand-new workspaces — same body as
-  /// [_workspaceDefaultStub] plus the chat-handoff receive rule so
-  /// the system works out of the box. Existing workspaces get the
-  /// rule auto-appended on first `/handoff` via
-  /// [HandoffService.ensureRuleInstalled].
+  /// [_workspaceDefaultStub] plus the chat-handoff receive rule and
+  /// the knowledgebase rule so the system works out of the box.
+  /// Existing workspaces get the handoff rule auto-appended on first
+  /// `/handoff` via [HandoffService.ensureRuleInstalled].
   static String get workspaceDefaultStub =>
-      '$_workspaceDefaultStub\n${HandoffService.ruleBlock}\n';
+      '$_workspaceDefaultStub\n${HandoffService.ruleBlock}\n\n$_knowledgebaseRuleBlock\n';
+
+  /// Marker comment for the knowledgebase rule block. Used to detect
+  /// whether the block is already present — idempotent append.
+  static const String knowledgebaseRuleMarker = '<!-- LUMEN_KNOWLEDGEBASE_RULE -->';
+
+  /// Append the knowledgebase rule block to an existing workspace
+  /// rules file if not already present. Returns true when newly
+  /// installed (so callers can log or toast).
+  static Future<bool> ensureKnowledgebaseRuleInstalled(
+      String workspacePath) async {
+    try {
+      await LumenWorkspaceConfig.ensureDir(workspacePath);
+      final file = LumenWorkspaceConfig.rulesFile(workspacePath);
+      final existing = await file.exists() ? await file.readAsString() : '';
+      if (existing.contains(knowledgebaseRuleMarker)) return false;
+      final separator = existing.isEmpty || existing.endsWith('\n\n')
+          ? ''
+          : (existing.endsWith('\n') ? '\n' : '\n\n');
+      await file.writeAsString(
+        '$existing$separator$_knowledgebaseRuleBlock\n',
+        mode: FileMode.write,
+      );
+      return true;
+    } catch (e) {
+      debugPrint('RulesService.ensureKnowledgebaseRuleInstalled: $e');
+      return false;
+    }
+  }
 
   Future<File> globalRulesFile() async {
     final base = await getApplicationSupportDirectory();
@@ -102,6 +163,9 @@ practical, and specific to this project.
   Future<String> readWorkspace(String workspacePath) async {
     try {
       final f = await ensureWorkspaceRulesFile(workspacePath);
+      // Auto-install knowledgebase rule for existing workspaces that
+      // predate the feature. Idempotent — no-ops if already present.
+      await ensureKnowledgebaseRuleInstalled(workspacePath);
       return await f.readAsString();
     } catch (e) {
       debugPrint('Failed to read workspace rules: $e');

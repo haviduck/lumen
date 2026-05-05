@@ -671,6 +671,7 @@ class _WebviewState extends State<Webview> {
         child: SizeChangedLayoutNotifier(
             child: _controller.value.isInitialized
                 ? Listener(
+                    behavior: HitTestBehavior.opaque,
                     onPointerHover: (ev) {
                       // ev.kind is for whatever reason not set to touch
                       // even on touch input
@@ -733,6 +734,17 @@ class _WebviewState extends State<Webview> {
                     },
                     onPointerSignal: (signal) {
                       if (signal is PointerScrollEvent) {
+                        // Guarantee the wheel event is delivered at the
+                        // current cursor position. `onPointerHover` only
+                        // fires while the mouse is *moving*; a wheel spin
+                        // over a stationary cursor would otherwise scroll
+                        // at whatever stale point hover last set, which
+                        // can land outside the scrollable element (or
+                        // even at (0,0) on first interaction). Method
+                        // channel calls are FIFO so the cursor update
+                        // is processed before the scroll delta on the
+                        // native side.
+                        _controller._setCursorPos(signal.localPosition);
                         _controller._setScrollDelta(
                             -signal.scrollDelta.dx, -signal.scrollDelta.dy);
                       }

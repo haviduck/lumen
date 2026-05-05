@@ -48,7 +48,31 @@ class CancellationToken {
 class OllamaService {
   String baseUrl;
 
-  OllamaService({this.baseUrl = 'http://localhost:11434'});
+  /// Optional Ollama Cloud API key. When set, Lumen can talk to
+  /// `https://ollama.com` directly with `Authorization: Bearer <key>`
+  /// for cloud-tagged models, bypassing the local daemon entirely.
+  /// When empty, only the local [baseUrl] is used (the historic
+  /// behaviour — cloud models still work IFF the user previously ran
+  /// `ollama signin` against their local daemon, which proxies them
+  /// transparently).
+  ///
+  /// Per Ollama Cloud docs (https://docs.ollama.com/cloud) the key
+  /// is created at https://ollama.com/settings/keys and authenticates
+  /// the same `/api/tags` and `/api/chat` shapes — only the host and
+  /// auth header differ.
+  String apiKey;
+
+  OllamaService({this.baseUrl = 'http://localhost:11434', this.apiKey = ''});
+
+  /// Cloud host. Same API shape as the local daemon — `/api/tags`
+  /// for listing models, `/api/chat` for chat — but requires
+  /// `Authorization: Bearer <apiKey>` and obviously goes over the
+  /// public internet.
+  static const String cloudBaseUrl = 'https://ollama.com';
+
+  /// Whether a non-empty cloud API key is configured. Routes chat
+  /// requests for cloud-tagged models to [cloudBaseUrl] when true.
+  bool get hasCloudApiKey => apiKey.trim().isNotEmpty;
 
   /// Default `keep_alive` we send on every chat request.
   ///
@@ -77,6 +101,63 @@ class OllamaService {
     return rawModel.endsWith('-cloud') || rawModel.endsWith(':cloud');
   }
 
+  /// Strip Ollama's `-cloud` / `:cloud` marker from a raw model
+  /// name. The local daemon expects the suffix (so it knows to proxy
+  /// the request to Ollama's cloud), but the cloud endpoint at
+  /// [cloudBaseUrl] expects the bare name (e.g. `gpt-oss:120b`, not
+  /// `gpt-oss:120b-cloud`). Used when re-routing a request for a
+  /// cloud-tagged model directly through the API-key path.
+  static String stripCloudSuffix(String rawModel) {
+    if (rawModel.endsWith('-cloud')) {
+      return rawModel.substring(0, rawModel.length - '-cloud'.length);
+    }
+    if (rawModel.endsWith(':cloud')) {
+      return rawModel.substring(0, rawModel.length - ':cloud'.length);
+    }
+    return rawModel;
+  }
+
+  /// Pick the right (host, headers, model) tuple for a chat request.
+  ///
+  /// Routing rules:
+  ///   * [forceCloud] true (caller selected a model from the
+  ///     `ollama-cloud:` namespace) → `cloudBaseUrl` with
+  ///     `Authorization: Bearer <apiKey>`, model name unchanged
+  ///     (cloud-namespace names are already bare).
+  ///   * `apiKey` set + model carries the legacy `-cloud`/`:cloud`
+  ///     suffix (came from the local `ollama:` namespace because
+  ///     the user pulled it via SSO) → `cloudBaseUrl` with auth,
+  ///     suffix stripped (cloud endpoint expects the bare name).
+  ///   * otherwise → local [baseUrl], no auth, model unchanged.
+  ///
+  /// Centralised so `generateChat`, `generateChatStream`, and
+  /// `summarizeTitle` all dispatch identically — adding a new
+  /// route mode (e.g. a custom remote daemon) only touches this
+  /// function.
+  ({String host, Map<String, String> headers, String model})
+      _resolveChatRoute(String rawModel, {bool forceCloud = false}) {
+    final headers = <String, String>{'Content-Type': 'application/json'};
+    if (forceCloud) {
+      if (hasCloudApiKey) {
+        headers['Authorization'] = 'Bearer ${apiKey.trim()}';
+      }
+      return (
+        host: cloudBaseUrl,
+        headers: headers,
+        model: stripCloudSuffix(rawModel),
+      );
+    }
+    if (hasCloudApiKey && isCloudModel(rawModel)) {
+      headers['Authorization'] = 'Bearer ${apiKey.trim()}';
+      return (
+        host: cloudBaseUrl,
+        headers: headers,
+        model: stripCloudSuffix(rawModel),
+      );
+    }
+    return (host: baseUrl, headers: headers, model: rawModel);
+  }
+
   /// Non-streaming chat. Honours [token] cancellation by closing the client.
   /// Messages may carry `images` (base64) for multimodal models.
   ///
@@ -92,13 +173,18 @@ class OllamaService {
     CancellationToken? token,
     String? keepAlive = defaultKeepAlive,
     Map<String, dynamic>? options,
+    // Set when the caller already knows the request must hit Ollama
+    // Cloud (e.g. routed from the `ollama-cloud:` provider namespace).
+    // Bypasses the `-cloud` suffix heuristic.
+    bool forceCloud = false,
   }) async {
     if (token?.isCancelled == true) return '_(cancelled)_';
     final client = http.Client();
     token?.attach(client);
     try {
+      final route = _resolveChatRoute(model, forceCloud: forceCloud);
       final payload = <String, dynamic>{
-        'model': model,
+        'model': route.model,
         'messages': messages,
         'stream': false,
       };
@@ -107,8 +193,8 @@ class OllamaService {
       final body = jsonEncode(payload);
 
       final res = await client.post(
-        Uri.parse('$baseUrl/api/chat'),
-        headers: {'Content-Type': 'application/json'},
+        Uri.parse('${route.host}/api/chat'),
+        headers: route.headers,
         body: body,
       );
 
@@ -144,18 +230,20 @@ class OllamaService {
     CancellationToken? token,
     String? keepAlive = defaultKeepAlive,
     Map<String, dynamic>? options,
+    bool forceCloud = false,
   }) async* {
     if (token?.isCancelled == true) return;
     final client = http.Client();
     token?.attach(client);
     try {
+      final route = _resolveChatRoute(model, forceCloud: forceCloud);
       final request = http.Request(
         'POST',
-        Uri.parse('$baseUrl/api/chat'),
+        Uri.parse('${route.host}/api/chat'),
       );
-      request.headers['Content-Type'] = 'application/json';
+      request.headers.addAll(route.headers);
       final payload = <String, dynamic>{
-        'model': model,
+        'model': route.model,
         'messages': messages,
         'stream': true,
       };
@@ -202,11 +290,26 @@ class OllamaService {
     }
   }
 
+  /// Marker yielded BEFORE thinking content so the controller / UI
+  /// can distinguish reasoning tokens from answer tokens.
+  static const String thinkStartMarker = '<!-- LUMEN_THINK_START -->';
+
+  /// Marker yielded AFTER the thinking phase ends (first content
+  /// chunk arrives, or stream completes while still in thinking).
+  static const String thinkEndMarker = '<!-- LUMEN_THINK_END -->';
+
   /// Streaming chat. Same payload shape as [generateChat] but with
   /// `stream: true` — Ollama responds with NDJSON (one JSON object
   /// per line). Each yielded `String` is an incremental content
   /// chunk for the chat UI to append to the in-progress assistant
   /// message. Errors / cancellation yield once and end the stream.
+  ///
+  /// **Thinking models** (Qwen 3, DeepSeek R1, GPT-OSS, etc.) emit
+  /// a separate `message.thinking` field during their reasoning
+  /// phase. We yield those tokens wrapped in `thinkStartMarker` /
+  /// `thinkEndMarker` so the controller tracks activity and the UI
+  /// can render a collapsible "Thinking…" section. Without this,
+  /// the user sees dead air for the entire reasoning phase.
   ///
   /// Cancellation: closing `client` mid-response surfaces as a
   /// `ClientException` we swallow. The token's `isCancelled` is
@@ -225,22 +328,24 @@ class OllamaService {
     Duration idleTimeout = const Duration(minutes: 3),
     String? keepAlive = defaultKeepAlive,
     Map<String, dynamic>? options,
+    bool forceCloud = false,
   }) async* {
     if (token?.isCancelled == true) return;
     final client = http.Client();
     token?.attach(client);
     bool timedOut = false;
     try {
+      final route = _resolveChatRoute(model, forceCloud: forceCloud);
       final payload = <String, dynamic>{
-        'model': model,
+        'model': route.model,
         'messages': messages,
         'stream': true,
       };
       if (keepAlive != null) payload['keep_alive'] = keepAlive;
       if (options != null && options.isNotEmpty) payload['options'] = options;
       final body = jsonEncode(payload);
-      final req = http.Request('POST', Uri.parse('$baseUrl/api/chat'))
-        ..headers['Content-Type'] = 'application/json'
+      final req = http.Request('POST', Uri.parse('${route.host}/api/chat'))
+        ..headers.addAll(route.headers)
         ..body = body;
       final res = await client.send(req);
       if (res.statusCode != 200) {
@@ -251,12 +356,14 @@ class OllamaService {
       // NDJSON: lines like {"message":{"content":"..."},"done":false}
       // and a final {"done":true}.
       //
+      // Thinking models add {"message":{"thinking":"..."}} chunks
+      // before the content phase begins. We track the phase transition
+      // to emit start/end markers exactly once.
+      //
       // **Idle timeout** — `Stream.timeout(onTimeout: ...)` lets us
       // *close* the sink rather than throw, so the await-for below
       // exits cleanly and the chat controller still runs the
       // executor on whatever partial content we accumulated.
-      // Trying to do this with try/catch around `await for` instead
-      // would mean tossing the partial content into the catch block.
       final lineStream = res.stream
           .transform(utf8.decoder)
           .transform(const LineSplitter())
@@ -264,25 +371,147 @@ class OllamaService {
         timedOut = true;
         sink.close();
       });
+      // Two parallel "thinking" sources we have to handle:
+      //
+      //   1. `msg.thinking` — Ollama's proper separate field for
+      //      reasoning models (Qwen, DeepSeek R1, GPT-OSS). The
+      //      original happy path.
+      //
+      //   2. Inline `<think>...</think>` tags WITHIN `msg.content`
+      //      — observed on glm-5.1:cloud where the model leaks
+      //      its reasoning format into the visible stream. Without
+      //      handling these, the user sees orphan `</think>` tags
+      //      mid-reply.
+      //
+      // The controller's marker-based state machine is idempotent
+      // (a thinkEndMarker while not in think mode is a no-op), so
+      // we can over-emit at the seams without breaking it. That
+      // simplifies things: each inline `<think>` block emits its
+      // own start/end pair regardless of whether field-thinking
+      // is also active.
+      bool inThinking = false;
+      bool inlineInThink = false;
+      String inlineCarry = '';
+      // Hold back this many trailing bytes between yields so a
+      // `<think>` or `</think>` tag split across chunk boundaries
+      // doesn't leak. `</think>` is 8 bytes — that's the max we
+      // ever need.
+      const inlineMinHold = 8;
       await for (final line in lineStream) {
         if (token?.isCancelled == true) return;
         if (line.isEmpty) continue;
         try {
           final obj = jsonDecode(line) as Map<String, dynamic>;
-          final content = obj['message']?['content'] as String?;
-          if (content != null && content.isNotEmpty) yield content;
+          final msg = obj['message'] as Map<String, dynamic>?;
+          final thinking = msg?['thinking'] as String?;
+          final content = msg?['content'] as String?;
+
+          // Phase: thinking tokens arriving.
+          if (thinking != null && thinking.isNotEmpty) {
+            if (!inThinking) {
+              inThinking = true;
+              yield thinkStartMarker;
+            }
+            yield thinking;
+          }
+
+          // Phase transition: first content chunk closes thinking.
+          if (content != null && content.isNotEmpty) {
+            if (inThinking) {
+              inThinking = false;
+              yield thinkEndMarker;
+            }
+            // Run content through the inline-`<think>` state
+            // machine. Anything that's NOT inside a `<think>...
+            // </think>` block is yielded as content; anything
+            // inside is yielded as content but bracketed by
+            // think-markers so the controller routes it to the
+            // thinking buffer. Orphan `</think>` (close without
+            // matching open) is silently dropped.
+            inlineCarry += content;
+            bool keepProcessing = true;
+            while (keepProcessing) {
+              if (!inlineInThink) {
+                final openIdx = inlineCarry.indexOf('<think>');
+                final orphanIdx = inlineCarry.indexOf('</think>');
+                final firstIsOpen = openIdx >= 0 &&
+                    (orphanIdx < 0 || openIdx < orphanIdx);
+                final firstIsOrphan = orphanIdx >= 0 &&
+                    (openIdx < 0 || orphanIdx < openIdx);
+                if (firstIsOpen) {
+                  if (openIdx > 0) {
+                    yield inlineCarry.substring(0, openIdx);
+                  }
+                  yield thinkStartMarker;
+                  inlineInThink = true;
+                  inlineCarry =
+                      inlineCarry.substring(openIdx + '<think>'.length);
+                } else if (firstIsOrphan) {
+                  if (orphanIdx > 0) {
+                    yield inlineCarry.substring(0, orphanIdx);
+                  }
+                  inlineCarry = inlineCarry
+                      .substring(orphanIdx + '</think>'.length);
+                } else {
+                  if (inlineCarry.length > inlineMinHold) {
+                    yield inlineCarry.substring(
+                      0,
+                      inlineCarry.length - inlineMinHold,
+                    );
+                    inlineCarry = inlineCarry.substring(
+                      inlineCarry.length - inlineMinHold,
+                    );
+                  }
+                  keepProcessing = false;
+                }
+              } else {
+                final closeIdx = inlineCarry.indexOf('</think>');
+                if (closeIdx >= 0) {
+                  if (closeIdx > 0) {
+                    yield inlineCarry.substring(0, closeIdx);
+                  }
+                  yield thinkEndMarker;
+                  inlineInThink = false;
+                  inlineCarry = inlineCarry
+                      .substring(closeIdx + '</think>'.length);
+                } else {
+                  if (inlineCarry.length > inlineMinHold) {
+                    yield inlineCarry.substring(
+                      0,
+                      inlineCarry.length - inlineMinHold,
+                    );
+                    inlineCarry = inlineCarry.substring(
+                      inlineCarry.length - inlineMinHold,
+                    );
+                  }
+                  keepProcessing = false;
+                }
+              }
+            }
+          }
+
           if (obj['done'] == true) {
+            // Flush any inline carry — a final chunk might have
+            // ended mid-tag-detection-window, but the stream is
+            // closing so we have to surface what's left.
+            if (inlineCarry.isNotEmpty) {
+              yield inlineCarry;
+              inlineCarry = '';
+            }
+            if (inlineInThink) {
+              inlineInThink = false;
+              yield thinkEndMarker;
+            }
+            // Close thinking if stream ended mid-reasoning (model
+            // exhausted output budget during think phase).
+            if (inThinking) {
+              inThinking = false;
+              yield thinkEndMarker;
+            }
             // Final frame carries timing metrics + done_reason.
             // Surface a hidden marker when the model hit its output
             // token cap (`length`) so the controller can auto-
-            // continue: the model has more to say and we know it.
-            // Markdown ignores the comment, downstream chat parser
-            // doesn't match LUMEN_TRUNCATED (it's a separate matcher
-            // from LUMEN_TOOL / LUMEN_ERR), but the controller's
-            // post-stream scan picks it up.
-            //
-            // We log timing in debug so devs can tell prefill
-            // latency apart from generation latency.
+            // continue.
             final reason = obj['done_reason'] as String?;
             if (reason == 'length') {
               yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
@@ -295,10 +524,22 @@ class OllamaService {
           // partial frames during disconnects.
         }
       }
-      // Append a one-liner so the user knows we cut early. Markdown
-      // italic so it visually separates from the model's content.
-      // Only fires when the stream ended via timeout, not on natural
-      // completion or cancellation.
+      // Flush inline state on stream-end-without-done (timeout,
+      // disconnect). Same shape as the done branch above so we
+      // never leave the controller's think-phase flag in a
+      // permanently-stuck state.
+      if (inlineCarry.isNotEmpty) {
+        yield inlineCarry;
+        inlineCarry = '';
+      }
+      if (inlineInThink) {
+        inlineInThink = false;
+        yield thinkEndMarker;
+      }
+      // Close thinking if we exited via timeout while still reasoning.
+      if (inThinking) {
+        yield thinkEndMarker;
+      }
       if (timedOut && token?.isCancelled != true) {
         yield '\n\n_(generation paused — no response from Ollama for '
             '${idleTimeout.inMinutes} min. The model may have stalled '
@@ -314,6 +555,18 @@ class OllamaService {
     }
   }
 
+  /// Fetch the list of models the daemon currently exposes via
+  /// `/api/tags`. Returns an empty list on **any** failure
+  /// (unreachable, non-200, malformed JSON) — the picker has its
+  /// own "No models available" empty state, and silently substituting
+  /// a hardcoded list of model names the user almost certainly
+  /// hasn't pulled is worse than showing nothing: the user picks
+  /// `ollama:llama3`, sends a message, and gets a generation error
+  /// because the model doesn't exist on this machine.
+  ///
+  /// Callers that need to *know* whether Ollama is reachable should
+  /// gate on [isReachable] in addition to / instead of treating an
+  /// empty list as "down".
   Future<List<String>> getModels() async {
     try {
       final res = await http.get(Uri.parse('$baseUrl/api/tags'));
@@ -324,17 +577,166 @@ class OllamaService {
     } catch (e) {
       debugPrint('Error fetching models: $e');
     }
-    return ['llama3', 'mistral', 'phi3'];
+    return const <String>[];
+  }
+
+  /// Fetch the list of cloud-hosted models reachable via the Ollama
+  /// Cloud API key path (`https://ollama.com/api/tags`). Returns the
+  /// names exactly as the API surfaces them (bare — `gpt-oss:120b`,
+  /// `deepseek-v3.1:671b`, etc.). The `-cloud` suffix that the
+  /// LOCAL daemon uses to mark a proxied cloud pull is intentionally
+  /// stripped if the API ever sent one, because in our model surface
+  /// the namespace prefix (`ollama-cloud:`) already carries that
+  /// information — callers route on the prefix, not on a name suffix.
+  ///
+  /// We always attach the `Authorization: Bearer <key>` header when
+  /// a key is set; the public catalogue is reachable without auth
+  /// but per-account model entitlements aren't, and there's no
+  /// downside to authenticating an idempotent GET.
+  ///
+  /// Returns an empty list when no key is configured or any failure
+  /// occurs (network, non-200, malformed JSON). Mirrors [getModels]
+  /// — the picker has its own "no models" empty state, and we'd
+  /// rather show nothing than ghost entries the user can't actually
+  /// run.
+  Future<List<String>> getCloudModels() async {
+    if (!hasCloudApiKey) return const <String>[];
+    try {
+      final res = await http.get(
+        Uri.parse('$cloudBaseUrl/api/tags'),
+        headers: {'Authorization': 'Bearer ${apiKey.trim()}'},
+      ).timeout(const Duration(seconds: 8));
+      if (res.statusCode != 200) {
+        debugPrint(
+          'Ollama Cloud /api/tags returned ${res.statusCode}: ${res.body}',
+        );
+        return const <String>[];
+      }
+      final data = jsonDecode(res.body);
+      final models = (data['models'] as List?) ?? const [];
+      return models
+          .map((m) => (m as Map)['name'] as String)
+          .map(stripCloudSuffix)
+          .toList(growable: false);
+    } catch (e) {
+      debugPrint('Error fetching Ollama Cloud models: $e');
+      return const <String>[];
+    }
+  }
+
+  /// Lightweight "is the cloud key valid?" probe. GETs
+  /// `https://ollama.com/api/tags` with the configured key and
+  /// returns true on a 200. Used by Settings UI to validate a
+  /// pasted key before save.
+  Future<bool> isCloudReachable() async {
+    if (!hasCloudApiKey) return false;
+    try {
+      final res = await http.get(
+        Uri.parse('$cloudBaseUrl/api/tags'),
+        headers: {'Authorization': 'Bearer ${apiKey.trim()}'},
+      ).timeout(const Duration(seconds: 6));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Run an Ollama Cloud web search. Hits
+  /// `POST https://ollama.com/api/web_search` with the configured
+  /// API key (https://docs.ollama.com/capabilities/web-search) and
+  /// returns the parsed JSON body — `{ results: [{title, url, content}, …] }`.
+  ///
+  /// [maxResults] is clamped to 1..10 (the API's documented bounds).
+  /// Throws [StateError] when no API key is set, [HttpException] for
+  /// non-2xx responses, and lets [TimeoutException] propagate after
+  /// 30 s — the caller (a tool body) translates these into a
+  /// human-readable feedback string for the agent.
+  Future<Map<String, dynamic>> webSearch(
+    String query, {
+    int maxResults = 5,
+  }) async {
+    if (!hasCloudApiKey) {
+      throw StateError(
+        'Ollama Cloud API key is not configured. Set it in '
+        'Settings → AI / Chat → Ollama Cloud API key.',
+      );
+    }
+    final clamped = maxResults.clamp(1, 10);
+    final res = await http
+        .post(
+          Uri.parse('$cloudBaseUrl/api/web_search'),
+          headers: {
+            'Authorization': 'Bearer ${apiKey.trim()}',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'query': query, 'max_results': clamped}),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw HttpException(
+        'Ollama Cloud /api/web_search returned ${res.statusCode}: ${res.body}',
+      );
+    }
+    final decoded = jsonDecode(res.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException(
+        'Ollama Cloud /api/web_search returned a non-object body',
+      );
+    }
+    return decoded;
+  }
+
+  /// Fetch a single URL via Ollama Cloud's web-fetch endpoint
+  /// (`POST https://ollama.com/api/web_fetch`). Returns the parsed
+  /// JSON body — `{ title, content, links: [...] }`.
+  ///
+  /// We deliberately go through Ollama rather than a direct HTTP
+  /// request because (a) the cloud endpoint already strips ads /
+  /// boilerplate and renders SPA content, and (b) it hides the
+  /// user's IP from the target site. Throws on misconfiguration /
+  /// network / non-2xx responses; see [webSearch] for the error
+  /// taxonomy.
+  Future<Map<String, dynamic>> webFetch(String url) async {
+    if (!hasCloudApiKey) {
+      throw StateError(
+        'Ollama Cloud API key is not configured. Set it in '
+        'Settings → AI / Chat → Ollama Cloud API key.',
+      );
+    }
+    final res = await http
+        .post(
+          Uri.parse('$cloudBaseUrl/api/web_fetch'),
+          headers: {
+            'Authorization': 'Bearer ${apiKey.trim()}',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'url': url}),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw HttpException(
+        'Ollama Cloud /api/web_fetch returned ${res.statusCode}: ${res.body}',
+      );
+    }
+    final decoded = jsonDecode(res.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException(
+        'Ollama Cloud /api/web_fetch returned a non-object body',
+      );
+    }
+    return decoded;
   }
 
   /// Lightweight reachability check. Does Ollama's HTTP API respond
   /// at the configured `baseUrl` with a 200 right now? Returns false
   /// for any error (network, timeout, non-200).
   ///
-  /// Distinct from `getModels()` which intentionally falls back to a
-  /// hardcoded list when unreachable — that fallback is a UX nicety
-  /// for the model picker, but features that need a working LLM
-  /// (e.g. the skill generator) MUST gate on `isReachable()` instead.
+  /// Complementary to [getModels], which returns an empty list on
+  /// the same failure modes — features that need to distinguish
+  /// "Ollama is down" from "Ollama is up but has no models pulled
+  /// yet" should gate on `isReachable()` directly. Both share the
+  /// same `/api/tags` endpoint, so a positive `isReachable` plus an
+  /// empty `getModels` is the canonical "running but empty" signal.
   ///
   /// Times out at 4 seconds — Ollama is local; if it can't answer
   /// in 4s it's effectively down.
@@ -382,13 +784,18 @@ class OllamaService {
   /// summarization would race with the first chat turn for the model
   /// load / cloud slot, occasionally adding seconds to the user's
   /// first response.
-  Future<String> summarizeTitle(String firstMessage, {String model = 'llama3'}) async {
+  Future<String> summarizeTitle(
+    String firstMessage, {
+    String model = 'llama3',
+    bool forceCloud = false,
+  }) async {
     try {
+      final route = _resolveChatRoute(model, forceCloud: forceCloud);
       final res = await http.post(
-        Uri.parse('$baseUrl/api/chat'),
-        headers: {'Content-Type': 'application/json'},
+        Uri.parse('${route.host}/api/chat'),
+        headers: route.headers,
         body: jsonEncode({
-          'model': model,
+          'model': route.model,
           'stream': false,
           'keep_alive': defaultKeepAlive,
           'options': {'temperature': 0.2, 'num_predict': 24},

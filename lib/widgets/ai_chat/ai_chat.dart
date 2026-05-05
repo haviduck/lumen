@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:desktop_drop/desktop_drop.dart' as desktop_drop;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:pasteboard/pasteboard.dart';
@@ -215,10 +216,21 @@ class _AiChatState extends State<AiChat> {
   void _onScroll() {
     if (!_scroll.hasClients) return;
     final pos = _scroll.position;
-    // ScrollPosition.pixels GROWS toward maxScrollExtent (bottom).
-    // Distance from bottom = max - current. >80 = reading history.
     final distFromBottom = pos.maxScrollExtent - pos.pixels;
-    final away = distFromBottom > 80;
+
+    // Detect user scrolling UP during streaming. Any upward movement
+    // is treated as intent to read history — we disengage auto-scroll
+    // immediately (no 80px dead zone) so the scrollbar doesn't fight
+    // the user's input with postFrameCallback jumpTo's.
+    if (!_userScrolledAway &&
+        pos.userScrollDirection == ScrollDirection.forward) {
+      // forward = content moving down = user scrolling UP
+      setState(() => _userScrolledAway = true);
+      return;
+    }
+
+    // Re-engage auto-scroll when the user returns close to the bottom.
+    final away = distFromBottom > 40;
     if (away != _userScrolledAway) {
       setState(() => _userScrolledAway = away);
     }
@@ -1541,7 +1553,16 @@ class _ModelSelectionPanelState extends State<_ModelSelectionPanel> {
 
   static List<String> _providers(List<String> models) {
     final set = <String>{for (final m in models) _providerOf(m)};
-    final order = ['ollama', 'gemini', 'claude', 'github', 'openai'];
+    // Keep `ollama-cloud` adjacent to `ollama` — same conceptual
+    // provider, two namespaces.
+    final order = [
+      'ollama',
+      'ollama-cloud',
+      'gemini',
+      'claude',
+      'github',
+      'openai',
+    ];
     return set.toList()..sort((a, b) {
       final ai = order.indexOf(a);
       final bi = order.indexOf(b);
@@ -1799,6 +1820,7 @@ String _rawModelName(String model) {
 String _prettyProvider(String provider) {
   return switch (provider) {
     'ollama' => S.providerOllama,
+    'ollama-cloud' => S.providerOllamaCloud,
     'gemini' => S.providerGemini,
     'claude' => S.providerClaude,
     'github' => S.providerGithub,
@@ -2411,6 +2433,23 @@ class _ModelPicker extends StatelessWidget {
                         ),
                     const PopupMenuDivider(),
                     const PopupMenuItem<String>(
+                      value: '__refresh__',
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.refresh,
+                            size: 14,
+                            color: DuckColors.accentCyan,
+                          ),
+                          SizedBox(width: 8),
+                          Text(
+                            S.chatModelRefresh,
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const PopupMenuItem<String>(
                       value: '__all__',
                       child: Row(
                         children: [
@@ -2438,6 +2477,23 @@ class _ModelPicker extends StatelessWidget {
                     builder: (_) => _ModelSelectionPanel(chat: chat),
                   );
                   if (chosen != null) chat.setModel(chosen);
+                } else if (picked == '__refresh__') {
+                  // Power-user escape hatch: pull models again
+                  // without going through Settings → Save. Useful
+                  // after `ollama pull` / `ollama signin` outside
+                  // the app. Toast confirms the new picker size so
+                  // the user knows the refresh actually did
+                  // something.
+                  await chat.reloadModels();
+                  if (!context.mounted) return;
+                  final count = chat.pickerModels.length;
+                  showDuckToast(
+                    context,
+                    S.chatModelRefreshedToast.replaceFirst(
+                      '%d',
+                      count.toString(),
+                    ),
+                  );
                 } else if (picked != null) {
                   chat.setModel(picked);
                 }

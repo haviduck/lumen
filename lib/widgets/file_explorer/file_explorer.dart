@@ -141,6 +141,8 @@ class _FileExplorerState extends State<FileExplorer> {
   // so dropping inside `src/components/` lands there, not in `src/`.
   String? _externalDropFolder;
   final Map<String, GlobalKey> _folderHitKeys = <String, GlobalKey>{};
+  final Map<String, GlobalKey> _fileRowKeys = <String, GlobalKey>{};
+  final Set<String> _revealedDirectoryPaths = <String>{};
   // Owned scroll controller so the menu bar's "jump to explorer"
   // action can call `animateTo(0)` without the explorer needing to
   // expose its inner widget tree. Same controller drives the existing
@@ -160,6 +162,7 @@ class _FileExplorerState extends State<FileExplorer> {
       if (!mounted) return;
       context.read<AppState>().ideActions.registerFileExplorerActions(
         onFocus: _onFocusRequested,
+        onRevealPath: _revealPathInTree,
       );
     });
   }
@@ -184,6 +187,51 @@ class _FileExplorerState extends State<FileExplorer> {
     }
     setState(() => _selectedPath = path);
     _focusNode.requestFocus();
+  }
+
+  void _revealPathInTree(String rawPath) {
+    final workspace = context.read<AppState>().currentDirectory;
+    if (workspace == null || rawPath.trim().isEmpty) return;
+    final abs = p.normalize(
+      p.isAbsolute(rawPath) ? rawPath : p.join(workspace, rawPath),
+    );
+    final root = p.normalize(workspace);
+    if (!p.equals(abs, root) && !p.isWithin(root, abs)) return;
+
+    final targetIsDirectory = FileSystemEntity.isDirectorySync(abs);
+    final parent = targetIsDirectory ? abs : p.dirname(abs);
+    final dirs = <String>{};
+    var cursor = parent;
+    while (!p.equals(cursor, root) && p.isWithin(root, cursor)) {
+      dirs.add(p.normalize(cursor));
+      final next = p.dirname(cursor);
+      if (p.equals(next, cursor)) break;
+      cursor = next;
+    }
+
+    setState(() {
+      _treeCollapsed = false;
+      _selectedPath = abs;
+      _revealedDirectoryPaths.addAll(dirs);
+    });
+    _focusNode.requestFocus();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final key = targetIsDirectory ? _folderHitKeys[abs] : _fileRowKeys[abs];
+      final ctx = key?.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          alignment: 0.35,
+        );
+      }
+      if (_revealedDirectoryPaths.isNotEmpty) {
+        setState(_revealedDirectoryPaths.clear);
+      }
+    });
   }
 
   Future<void> _copySelected() async {
@@ -840,6 +888,16 @@ class _FileExplorerState extends State<FileExplorer> {
     }
   }
 
+  void _registerFileRow(String path, GlobalKey key) {
+    _fileRowKeys[path] = key;
+  }
+
+  void _unregisterFileRow(String path, GlobalKey key) {
+    if (_fileRowKeys[path] == key) {
+      _fileRowKeys.remove(path);
+    }
+  }
+
   /// Walk every registered folder row, find the deepest one whose
   /// rendered rectangle contains [globalPos]. Returns null when the
   /// cursor isn't over any folder (e.g. it's over a file row, the
@@ -1153,6 +1211,7 @@ class _FileExplorerState extends State<FileExplorer> {
                                   onContextMenu: _showItemContextMenu,
                                   onContextMenuFolder: _showFolderContextMenu,
                                   onExplorerOperation: _recordExplorerOperation,
+                                  forcedExpandedPaths: _revealedDirectoryPaths,
                                   // Highlight only while a drag is
                                   // actively in flight — the raw
                                   // `_externalDropFolder` value
@@ -1166,6 +1225,8 @@ class _FileExplorerState extends State<FileExplorer> {
                                       : null,
                                   onRegisterFolderHit: _registerFolderHit,
                                   onUnregisterFolderHit: _unregisterFolderHit,
+                                  onRegisterFileRow: _registerFileRow,
+                                  onUnregisterFileRow: _unregisterFileRow,
                                 ),
                               ),
                             ),
@@ -2195,6 +2256,7 @@ class _FileTree extends StatefulWidget {
   final String? selectedPath;
   final void Function(String path) onSelect;
   final GitIgnoreMatcher gitignore;
+  final Set<String> forcedExpandedPaths;
   final void Function(BuildContext context, File file, Offset position)
   onContextMenu;
   final void Function(BuildContext context, Directory dir, Offset position)
@@ -2212,6 +2274,8 @@ class _FileTree extends StatefulWidget {
   /// `DropTarget` can resolve the cursor position to a folder path.
   final void Function(String path, GlobalKey key)? onRegisterFolderHit;
   final void Function(String path, GlobalKey key)? onUnregisterFolderHit;
+  final void Function(String path, GlobalKey key)? onRegisterFileRow;
+  final void Function(String path, GlobalKey key)? onUnregisterFileRow;
 
   const _FileTree({
     required this.directory,
@@ -2222,11 +2286,14 @@ class _FileTree extends StatefulWidget {
     required this.selectedPath,
     required this.onSelect,
     required this.gitignore,
+    required this.forcedExpandedPaths,
     this.isRoot = false,
     this.level = 0,
     this.externalDropFolder,
     this.onRegisterFolderHit,
     this.onUnregisterFolderHit,
+    this.onRegisterFileRow,
+    this.onUnregisterFileRow,
   });
 
   @override
@@ -2255,7 +2322,12 @@ class _FileTreeState extends State<_FileTree> {
   @override
   void initState() {
     super.initState();
-    if (widget.isRoot) _expanded = true;
+    if (widget.isRoot ||
+        widget.forcedExpandedPaths.contains(
+          p.normalize(widget.directory.path),
+        )) {
+      _expanded = true;
+    }
     _loadChildren();
     _registerHit();
   }
@@ -2288,6 +2360,15 @@ class _FileTreeState extends State<_FileTree> {
     if (oldWidget.directory.path != widget.directory.path ||
         oldWidget.refreshTick != widget.refreshTick) {
       _loadChildren();
+    }
+    if (!_expanded &&
+        widget.forcedExpandedPaths.contains(
+          p.normalize(widget.directory.path),
+        )) {
+      setState(() {
+        _expanded = true;
+        _loadChildren();
+      });
     }
     if (oldWidget.directory.path != widget.directory.path) {
       _unregisterHit();
@@ -2393,12 +2474,15 @@ class _FileTreeState extends State<_FileTree> {
                           selectedPath: widget.selectedPath,
                           onSelect: widget.onSelect,
                           gitignore: widget.gitignore,
+                          forcedExpandedPaths: widget.forcedExpandedPaths,
                           onContextMenu: widget.onContextMenu,
                           onContextMenuFolder: widget.onContextMenuFolder,
                           onExplorerOperation: widget.onExplorerOperation,
                           externalDropFolder: widget.externalDropFolder,
                           onRegisterFolderHit: widget.onRegisterFolderHit,
                           onUnregisterFolderHit: widget.onUnregisterFolderHit,
+                          onRegisterFileRow: widget.onRegisterFileRow,
+                          onUnregisterFileRow: widget.onUnregisterFileRow,
                         )
                       : _FileItemRow(
                           file: c as File,
@@ -2410,6 +2494,8 @@ class _FileTreeState extends State<_FileTree> {
                             isDirectory: false,
                           ),
                           onContextMenu: widget.onContextMenu,
+                          onRegisterFileRow: widget.onRegisterFileRow,
+                          onUnregisterFileRow: widget.onUnregisterFileRow,
                         ),
                 )
                 .toList(),
@@ -2527,12 +2613,15 @@ class _FileTreeState extends State<_FileTree> {
                           selectedPath: widget.selectedPath,
                           onSelect: widget.onSelect,
                           gitignore: widget.gitignore,
+                          forcedExpandedPaths: widget.forcedExpandedPaths,
                           onContextMenu: widget.onContextMenu,
                           onContextMenuFolder: widget.onContextMenuFolder,
                           onExplorerOperation: widget.onExplorerOperation,
                           externalDropFolder: widget.externalDropFolder,
                           onRegisterFolderHit: widget.onRegisterFolderHit,
                           onUnregisterFolderHit: widget.onUnregisterFolderHit,
+                          onRegisterFileRow: widget.onRegisterFileRow,
+                          onUnregisterFileRow: widget.onUnregisterFileRow,
                         )
                       : _FileItemRow(
                           file: c as File,
@@ -2544,6 +2633,8 @@ class _FileTreeState extends State<_FileTree> {
                             isDirectory: false,
                           ),
                           onContextMenu: widget.onContextMenu,
+                          onRegisterFileRow: widget.onRegisterFileRow,
+                          onUnregisterFileRow: widget.onUnregisterFileRow,
                         ),
                 )
                 .toList(),
@@ -2634,6 +2725,8 @@ class _FileItemRow extends StatefulWidget {
   final void Function(String path) onSelect;
   final void Function(BuildContext context, File file, Offset position)
   onContextMenu;
+  final void Function(String path, GlobalKey key)? onRegisterFileRow;
+  final void Function(String path, GlobalKey key)? onUnregisterFileRow;
 
   const _FileItemRow({
     required this.file,
@@ -2642,6 +2735,8 @@ class _FileItemRow extends StatefulWidget {
     required this.ignored,
     required this.onSelect,
     required this.onContextMenu,
+    this.onRegisterFileRow,
+    this.onUnregisterFileRow,
   });
 
   @override
@@ -2650,6 +2745,42 @@ class _FileItemRow extends StatefulWidget {
 
 class _FileItemRowState extends State<_FileItemRow> {
   bool _hover = false;
+  final GlobalKey _rowKey = GlobalKey();
+  String? _registeredPath;
+
+  @override
+  void initState() {
+    super.initState();
+    _registerRow();
+  }
+
+  void _registerRow() {
+    final path = widget.file.path;
+    widget.onRegisterFileRow?.call(path, _rowKey);
+    _registeredPath = path;
+  }
+
+  void _unregisterRow() {
+    final path = _registeredPath;
+    if (path == null) return;
+    widget.onUnregisterFileRow?.call(path, _rowKey);
+    _registeredPath = null;
+  }
+
+  @override
+  void didUpdateWidget(covariant _FileItemRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.file.path != widget.file.path) {
+      _unregisterRow();
+      _registerRow();
+    }
+  }
+
+  @override
+  void dispose() {
+    _unregisterRow();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2704,67 +2835,73 @@ class _FileItemRowState extends State<_FileItemRow> {
   }
 
   Widget _buildRow(String fileName, bool isActive, AppState appState) {
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _hover = true),
-      onExit: (_) => setState(() => _hover = false),
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onSecondaryTapDown: (details) {
-          widget.onSelect(widget.file.path);
-          widget.onContextMenu(context, widget.file, details.globalPosition);
-        },
-        child: InkWell(
-          mouseCursor: SystemMouseCursors.click,
-          onTap: () {
+    return KeyedSubtree(
+      key: _rowKey,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hover = true),
+        onExit: (_) => setState(() => _hover = false),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onSecondaryTapDown: (details) {
             widget.onSelect(widget.file.path);
-            appState.openFile(widget.file);
+            widget.onContextMenu(context, widget.file, details.globalPosition);
           },
-          child: Container(
-            // Active file gets a 2px accentCyan stripe down its leading
-            // edge — clear "this is the open file" signal on top of the
-            // existing subtle bg lift. Greys are unchanged.
-            decoration: BoxDecoration(
-              color: isActive
-                  ? DuckColors.bgChip
-                  : (widget.selected
-                        ? DuckColors.bgRaisedHi.withValues(alpha: 0.7)
-                        : (_hover
-                              ? DuckColors.bgRaisedHi
-                              : Colors.transparent)),
-              border: isActive
-                  ? const Border(
-                      left: BorderSide(color: DuckColors.accentCyan, width: 2),
-                    )
-                  : null,
-            ),
-            padding: EdgeInsets.only(
-              left: (isActive ? 22.0 : 24.0) + (widget.level * 12.0),
-              right: 8.0,
-              top: 3,
-              bottom: 3,
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  FileIconColors.iconForFileName(fileName),
-                  size: 13,
-                  color: FileIconColors.forFileName(fileName),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    fileName,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: widget.ignored
-                          ? DuckColors.fgMuted
-                          : DuckColors.fgPrimary,
-                    ),
-                    overflow: TextOverflow.ellipsis,
+          child: InkWell(
+            mouseCursor: SystemMouseCursors.click,
+            onTap: () {
+              widget.onSelect(widget.file.path);
+              appState.openFile(widget.file);
+            },
+            child: Container(
+              // Active file gets a 2px accentCyan stripe down its leading
+              // edge — clear "this is the open file" signal on top of the
+              // existing subtle bg lift. Greys are unchanged.
+              decoration: BoxDecoration(
+                color: isActive
+                    ? DuckColors.bgChip
+                    : (widget.selected
+                          ? DuckColors.bgRaisedHi.withValues(alpha: 0.7)
+                          : (_hover
+                                ? DuckColors.bgRaisedHi
+                                : Colors.transparent)),
+                border: isActive
+                    ? const Border(
+                        left: BorderSide(
+                          color: DuckColors.accentCyan,
+                          width: 2,
+                        ),
+                      )
+                    : null,
+              ),
+              padding: EdgeInsets.only(
+                left: (isActive ? 22.0 : 24.0) + (widget.level * 12.0),
+                right: 8.0,
+                top: 3,
+                bottom: 3,
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    FileIconColors.iconForFileName(fileName),
+                    size: 13,
+                    color: FileIconColors.forFileName(fileName),
                   ),
-                ),
-              ],
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      fileName,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        color: widget.ignored
+                            ? DuckColors.fgMuted
+                            : DuckColors.fgPrimary,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),

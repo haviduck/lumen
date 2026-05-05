@@ -42,6 +42,16 @@ class ProseSegment extends ChatSegment {
   const ProseSegment(this.text);
 }
 
+/// Model reasoning trace, rendered as a collapsible "Thinking…"
+/// section. [isActive] true means the model is still thinking
+/// (stream in progress) — shows an animated indicator. When false,
+/// the section collapses to a single-line summary the user can expand.
+class ThinkingSegment extends ChatSegment {
+  final String content;
+  final bool isActive;
+  const ThinkingSegment({required this.content, this.isActive = false});
+}
+
 class ToolSegment extends ChatSegment {
   final String toolId;
   final String firstArg;
@@ -101,19 +111,39 @@ class ProviderErrorSegment extends ChatSegment {
 /// single expandable "Read 10 files" card instead of a stack of 10.
 List<ChatSegment> parseChatSegments(String content) {
   final raw = <ChatSegment>[];
+
+  // ── Phase 1: Extract thinking blocks first ──
+  // They sit before/between tool markers. We replace them with a
+  // placeholder so the tool regex doesn't trip over them, then
+  // re-inject as ThinkingSegments at the right positions.
+  final thinkRe = RegExp(
+    r'<!-- LUMEN_THINKING(\s+active)? -->\n([\s\S]*?)\n<!-- /LUMEN_THINKING -->',
+  );
+  final thinkMatches = thinkRe.allMatches(content).toList();
+  // Replace thinking blocks with unique tokens we can split on later.
+  var processed = content;
+  for (var t = thinkMatches.length - 1; t >= 0; t--) {
+    final m = thinkMatches[t];
+    processed = processed.replaceRange(
+      m.start, m.end, '\u0000THINK:$t\u0000',
+    );
+  }
+
   // Combined matcher — alternation between LUMEN_TOOL and LUMEN_ERR.
   // Group 1-3 = tool fields; group 4-5 = error fields. Either
   // half is null for any given match.
   final re = RegExp(
     r'<!--\s*LUMEN_TOOL:([a-z_]+)\|([^|]*)\|(ok|err|pending|malformed)\s*-->'
     r'|'
-    r'<!--\s*LUMEN_ERR:([a-z_]+)\|([^|]*)\s*-->',
+    r'<!--\s*LUMEN_ERR:([a-z_]+)\|([^|]*)\s*-->'
+    r'|'
+    r'\x00THINK:(\d+)\x00',
     multiLine: true,
   );
   int cursor = 0;
-  for (final m in re.allMatches(content)) {
+  for (final m in re.allMatches(processed)) {
     if (m.start > cursor) {
-      final prose = content.substring(cursor, m.start);
+      final prose = processed.substring(cursor, m.start);
       if (prose.trim().isNotEmpty) {
         raw.add(ProseSegment(prose));
       }
@@ -129,11 +159,19 @@ List<ChatSegment> parseChatSegments(String content) {
     } else if (m.group(4) != null) {
       final err = ProviderError.fromMarkerMatch(m);
       if (err != null) raw.add(ProviderErrorSegment(err));
+    } else if (m.group(6) != null) {
+      final idx = int.parse(m.group(6)!);
+      if (idx < thinkMatches.length) {
+        final tm = thinkMatches[idx];
+        final isActive = tm.group(1) != null;
+        final thinkContent = tm.group(2) ?? '';
+        raw.add(ThinkingSegment(content: thinkContent, isActive: isActive));
+      }
     }
     cursor = m.end;
   }
-  if (cursor < content.length) {
-    final tail = content.substring(cursor);
+  if (cursor < processed.length) {
+    final tail = processed.substring(cursor);
     if (tail.trim().isNotEmpty) {
       raw.add(ProseSegment(tail));
     }
@@ -226,6 +264,11 @@ String stripMarkersForCopy(String content) {
     final err = ProviderError.fromMarkerMatch(m);
     return err != null ? ProviderError.friendlyTextFor(err) : '';
   });
+  // Strip thinking blocks — copy gets the answer, not the trace.
+  s = s.replaceAll(
+    RegExp(r'<!-- LUMEN_THINKING[^>]* -->\n[\s\S]*?\n<!-- /LUMEN_THINKING -->\n*'),
+    '',
+  );
   return s;
 }
 
@@ -767,7 +810,8 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
     // rendered as a "barely-visible dark grey square" — the user
     // had to copy the bubble to find out it was a 400.
     final kind = widget.error.kind;
-    _showDetails = kind == ProviderErrorKind.badRequest ||
+    _showDetails =
+        kind == ProviderErrorKind.badRequest ||
         kind == ProviderErrorKind.unknown ||
         kind == ProviderErrorKind.serverError;
   }
@@ -814,7 +858,8 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
     // user's perspective ("this won't work, do something") so it
     // shares the red accent rather than the amber one used for
     // transient cases.
-    final accent = err.kind == ProviderErrorKind.unauthorized ||
+    final accent =
+        err.kind == ProviderErrorKind.unauthorized ||
             err.kind == ProviderErrorKind.notFound ||
             err.kind == ProviderErrorKind.badRequest
         ? DuckColors.stateError
@@ -901,15 +946,13 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
                     label: S.providerErrorOpenSettings,
                     accent: DuckColors.fgMuted,
                     onTap: () => context.read<AppState>().openSettingsTab(
-                          category: 'general',
-                        ),
+                      category: 'general',
+                    ),
                   ),
                 ],
                 const SizedBox(width: 6),
                 _ErrorChip(
-                  icon: _showDetails
-                      ? Icons.expand_less
-                      : Icons.expand_more,
+                  icon: _showDetails ? Icons.expand_less : Icons.expand_more,
                   label: _showDetails
                       ? S.providerErrorHideDetails
                       : S.providerErrorShowDetails,
@@ -927,10 +970,7 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
                 decoration: BoxDecoration(
                   color: DuckColors.bgDeepest,
                   borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                  border: Border.all(
-                    color: DuckColors.glassSeam,
-                    width: 0.5,
-                  ),
+                  border: Border.all(color: DuckColors.glassSeam, width: 0.5),
                 ),
                 child: SingleChildScrollView(
                   child: SelectableText(
@@ -999,17 +1039,14 @@ class _ErrorChipState extends State<_ErrorChip> {
   Widget build(BuildContext context) {
     final disabled = widget.onTap == null;
     return MouseRegion(
-      cursor: disabled
-          ? SystemMouseCursors.basic
-          : SystemMouseCursors.click,
+      cursor: disabled ? SystemMouseCursors.basic : SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
       child: GestureDetector(
         onTap: widget.onTap,
         child: AnimatedContainer(
           duration: DuckMotion.fast,
-          padding:
-              const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
           decoration: BoxDecoration(
             color: _hover && !disabled
                 ? widget.accent.withValues(alpha: 0.12)
@@ -1042,9 +1079,7 @@ class _ErrorChipState extends State<_ErrorChip> {
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
-                  color: disabled
-                      ? DuckColors.fgSubtle
-                      : widget.accent,
+                  color: disabled ? DuckColors.fgSubtle : widget.accent,
                   letterSpacing: 0.2,
                 ),
               ),
@@ -1095,6 +1130,7 @@ class _FileToolCardState extends State<_FileToolCard> {
     final f = File(abs);
     if (!await f.exists()) return;
     await state.openFile(f);
+    state.ideActions.revealFileExplorerPath(f.path);
   }
 
   @override
@@ -1489,9 +1525,7 @@ class _PendingDotState extends State<_PendingDot>
       child: AnimatedBuilder(
         animation: _ctrl,
         builder: (_, _) {
-          return CustomPaint(
-            painter: _PendingDotPainter(t: _ctrl.value),
-          );
+          return CustomPaint(painter: _PendingDotPainter(t: _ctrl.value));
         },
       ),
     );

@@ -37,6 +37,39 @@ class ShellSpec {
       startupArgs: startupArgs ?? this.startupArgs,
     );
   }
+
+  /// Build the full argument vector for executing a single one-shot
+  /// command in this shell — e.g. agent-spawned `RUN_CMD` invocations
+  /// that should still surface as a real terminal tab when long-running.
+  ///
+  /// We append the shell's "execute then exit" flag plus the command
+  /// to [startupArgs] so any cmd.exe-wrapping (see [_wrapWithCmd]) or
+  /// `-NoLogo`/`-NoProfile` flags stay in front. The cmd.exe wrapper
+  /// is transparent: `cmd.exe /c "<real-shell>" -NoLogo -Command <cmd>`
+  /// gets reparsed by cmd as `<real-shell> -NoLogo -Command <cmd>`,
+  /// which is exactly the invocation we'd run if there were no spaces
+  /// in the path.
+  List<String> commandArgs(String command) {
+    switch (id) {
+      case 'pwsh':
+      case 'powershell':
+        return [...startupArgs, '-Command', command];
+      case 'cmd':
+        // Plain cmd: `/c <cmd>` is the canonical one-shot form.
+        // startupArgs is empty for the unwrapped case.
+        return [...startupArgs, '/c', command];
+      case 'zsh':
+      case 'bash':
+      case 'sh':
+        return [...startupArgs, '-c', command];
+      default:
+        // POSIX-ish convention; if a future shell needs different
+        // flags this default keeps it from silently misfiring —
+        // it'll surface as a startup error in the agent terminal
+        // and the user can pick a different shell.
+        return [...startupArgs, '-c', command];
+    }
+  }
 }
 
 /// Probes the host for available shells. Order = priority.

@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import '../l10n/strings.dart';
+import '../services/agent_terminal_bridge.dart';
 import '../services/anthropic_service.dart';
 import '../services/github_models_service.dart';
 import '../services/chat_persistence_service.dart';
@@ -22,7 +23,9 @@ import '../services/timeline_service.dart';
 import '../services/tool_executor.dart';
 import '../services/tool_registry.dart';
 import '../services/workspace_skills_service.dart';
+import 'chat/hallucination_detector.dart';
 import 'chat/history_compressor.dart';
+import 'chat/history_summarizer.dart';
 
 /// Matches a single COMPLETE Lumen tool-call block in a streaming
 /// buffer. Used by the agent loop to enforce single-tool-per-iteration
@@ -111,6 +114,56 @@ int? _firstCompleteToolCallEnd(String buffer, [int start = 0]) {
 final RegExp _kTruncatedLengthRe = RegExp(
   r'<!--\s*LUMEN_TRUNCATED:length\s*-->\s*',
 );
+
+/// Opener and closer markers for multi-line file tools. Used by the
+/// auto-continue gate to detect the failure mode where a model (most
+/// often glm-5.1:cloud and other smaller Ollama-hosted models) emits
+/// an opening `<<<CREATE_FILE: path>>>` marker and prose narration but
+/// never the file body or matching `<<<END_FILE>>>` close. Without a
+/// complete block the executor fires nothing and the iteration ends
+/// with text but no work — this trips a specific nudge instead of
+/// silently producing a useless turn.
+final RegExp _kOpenFileToolRe = RegExp(
+  r'<<<(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):',
+);
+final RegExp _kCloseFileToolRe = RegExp(r'<<<END_(?:FILE|EDIT|APPEND)>>>');
+
+/// Regex matching thinking blocks in live/persisted message content.
+/// Used by the UI to detect and render collapsible thinking sections.
+/// The segment parser also uses it to separate thinking from prose.
+final RegExp kThinkingBlockRe = RegExp(
+  r'<!-- LUMEN_THINKING -->\n([\s\S]*?)\n<!-- /LUMEN_THINKING -->',
+);
+
+/// Assemble the live-message draft including an optional thinking
+/// section. The thinking block is wrapped in HTML comments that the
+/// segment parser / message bubble knows how to render as a
+/// collapsible "Thinking…" indicator.
+///
+/// [isThinking] true means the model is still in its reasoning phase
+/// — the UI should show an animated indicator. When false and
+/// [thinkContent] is non-empty, the UI collapses the section.
+String _draftWithThinking(
+  String aggregated,
+  String content,
+  String thinkContent,
+  bool isThinking,
+) {
+  final parts = <String>[];
+  if (aggregated.isNotEmpty) parts.add(aggregated);
+  if (thinkContent.isNotEmpty) {
+    // Wrap thinking in markers the UI can parse. The `active` attr
+    // tells the renderer whether to show the spinner or collapse.
+    final attr = isThinking ? ' active' : '';
+    parts.add('<!-- LUMEN_THINKING$attr -->\n$thinkContent\n<!-- /LUMEN_THINKING -->');
+  } else if (isThinking) {
+    // Thinking just started, no content yet — emit empty block with
+    // active flag so the UI shows "Thinking…" immediately.
+    parts.add('<!-- LUMEN_THINKING active -->\n<!-- /LUMEN_THINKING -->');
+  }
+  if (content.isNotEmpty) parts.add(content);
+  return parts.join('\n\n');
+}
 
 /// In-flight approval request shown to the user.
 ///
@@ -327,6 +380,16 @@ class ChatController extends ChangeNotifier {
   /// can omit it; production wiring in `AppState` always supplies one.
   final RecentEditsTracker? _recentEdits;
 
+  /// Bridge that lets `RUN_CMD` spawn agent commands as real PTY-backed
+  /// terminal sessions instead of orphan `Process.start` invocations.
+  /// Long-running commands get promoted to visible tabs in the
+  /// terminal pane. Optional so tests / non-IDE callers can run
+  /// without a terminal pane mounted; production wiring in
+  /// `AppState` always supplies one. See
+  /// `services/agent_terminal_bridge.dart` for the full lifetime
+  /// model.
+  final AgentTerminalBridge? agentTerminals;
+
   ChatController({
     required this.ollama,
     required this.gemini,
@@ -338,6 +401,7 @@ class ChatController extends ChangeNotifier {
     this.timeline,
     RecentEditsTracker? recentEdits,
     this.skills,
+    this.agentTerminals,
     ExternalToolLoader? toolLoader,
   }) : _recentEdits = recentEdits,
        _toolLoader = toolLoader ?? ExternalToolLoader();
@@ -517,6 +581,7 @@ class ChatController extends ChangeNotifier {
     final id = _current?.id;
     return id == null ? null : _pendingApprovals[id];
   }
+
   bool get autoApprove => _autoApprove;
 
   /// Time the current generation has been running, or `null` when
@@ -795,9 +860,37 @@ class ChatController extends ChangeNotifier {
     final all = <String>[];
 
     if (enabled.contains('Ollama')) {
+      // Two parallel Ollama surfaces, each with its own provider
+      // namespace so the model-management panel renders them as
+      // distinct tabs and the user can flip whole groups on/off:
+      //
+      //   1. Local daemon (`baseUrl`) → `ollama:<name>`. Includes
+      //      anything the user `ollama pull`'d, even `*-cloud`
+      //      entries added via `ollama signin` SSO (those proxy
+      //      through the local daemon to Ollama's cloud).
+      //   2. Cloud API key (`https://ollama.com/api/tags`) →
+      //      `ollama-cloud:<name>`. Direct Bearer-auth path, no
+      //      local daemon required.
+      //
+      // **Dedupe rule.** When BOTH paths are configured we drop
+      // any `*-cloud`/`*:cloud` entries from the local list — the
+      // dedicated cloud namespace already exposes them, and
+      // listing the same model in both tabs (under different
+      // routes that produce identical output) is just confusing.
+      // Pure local models (no cloud suffix) stay regardless. Users
+      // who haven't configured a cloud key keep the legacy SSO-
+      // proxy path untouched.
       try {
-        final models = await ollama.getModels();
-        all.addAll(models.map((m) => 'ollama:$m'));
+        final localModels = await ollama.getModels();
+        final cloudModels = await ollama.getCloudModels();
+        final hasCloud = ollama.hasCloudApiKey && cloudModels.isNotEmpty;
+        for (final m in localModels) {
+          if (hasCloud && OllamaService.isCloudModel(m)) continue;
+          all.add('ollama:$m');
+        }
+        for (final m in cloudModels) {
+          all.add('ollama-cloud:$m');
+        }
       } catch (_) {}
     }
     if (enabled.contains('Gemini')) {
@@ -819,13 +912,32 @@ class ChatController extends ChangeNotifier {
       } catch (_) {}
     }
     // OpenAI placeholder — add when implemented.
+
+    // Single source-of-truth sort. Sorting the full prefixed name
+    // (`provider:rawModel`) keeps each provider's models contiguous
+    // because every entry from a given provider shares its prefix —
+    // the per-provider `_providers(...)` order in `ai_chat.dart` /
+    // `model_management_panel.dart` then arranges the *groups*, and
+    // this sort handles the *within-group* order so models read in
+    // alphabetical name order under each tab without any consumer
+    // needing to re-sort. Case-insensitive so `Llama` and `llama`
+    // collate naturally.
+    all.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
     return all;
   }
 
   /// True if at least one enabled provider is reachable.
   Future<bool> isReachable() async {
     final enabled = (await prefs.getEnabledProviders()).toSet();
-    if (enabled.contains('Ollama') && await ollama.isReachable()) return true;
+    if (enabled.contains('Ollama')) {
+      // Either path counts as Ollama-reachable: local daemon up OR
+      // cloud key configured. Without the cloud branch a user with
+      // only an API key (no local Ollama installed) would be
+      // misreported as "no providers ready" by callers like the
+      // first-run heuristic.
+      if (ollama.hasCloudApiKey) return true;
+      if (await ollama.isReachable()) return true;
+    }
     if (enabled.contains('Gemini') && await gemini.isReachable()) return true;
     if (enabled.contains('Claude') && await anthropic.isReachable()) {
       return true;
@@ -851,6 +963,9 @@ class ChatController extends ChangeNotifier {
       'gemini' => 'Gemini',
       'claude' => 'Claude',
       'github' => 'GitHub Models',
+      // Both `ollama` and `ollama-cloud` map to the same enabled-
+      // provider toggle in Settings — the namespace split is for
+      // display / routing only.
       _ => 'Ollama',
     };
     if (!enabled.contains(providerName)) {
@@ -864,9 +979,126 @@ class ChatController extends ChangeNotifier {
         return anthropic.generateChat(messages, model: rawModel, token: token);
       case 'github':
         return github.generateChat(messages, model: rawModel, token: token);
+      case 'ollama-cloud':
+        return ollama.generateChat(
+          messages,
+          model: rawModel,
+          token: token,
+          forceCloud: true,
+        );
       case 'ollama':
       default:
         return ollama.generateChat(messages, model: rawModel, token: token);
+    }
+  }
+
+  /// Returns a structured summary of [droppedSpan] using the configured
+  /// utility model, or `null` if summarization is disabled, the
+  /// model isn't set, the routed big model is Anthropic (cache-prefix
+  /// concern — see `chat_controller.dart` § history pruning), the
+  /// cached summary is still fresh, or the small model failed.
+  ///
+  /// On success, persists the new summary onto [session] so a chat
+  /// reopened later doesn't re-pay the round-trip.
+  ///
+  /// Cache logic:
+  ///   - hit: `cachedDropped` within `refreshDelta` of `droppedCount`
+  ///     → reuse `session.cachedHistorySummary` verbatim.
+  ///   - miss / first run: invoke the small model on the full dropped
+  ///     span, validate, store on the session.
+  ///
+  /// Never throws. The caller treats `null` as "use the deterministic
+  /// elision placeholder".
+  Future<String?> _maybeSummarizeHistory({
+    required ChatSession session,
+    required List<PersistedMessage> droppedSpan,
+    required int droppedCount,
+    required String routedProvider,
+    CancellationToken? token,
+  }) async {
+    if (routedProvider == 'claude') return null;
+
+    final enabled = await prefs.getHistorySummaryEnabled();
+    if (!enabled) return null;
+
+    final model = (await prefs.getToolCompressionModel()).trim();
+    if (model.isEmpty) return null;
+
+    final maxChars = await prefs.getHistorySummaryMaxChars();
+    final refreshDelta = await prefs.getHistorySummaryRefreshDelta();
+
+    final cached = session.cachedHistorySummary;
+    final cachedDropped = session.cachedHistorySummaryDroppedCount;
+    if (cached != null &&
+        cachedDropped != null &&
+        droppedCount - cachedDropped < refreshDelta) {
+      return cached;
+    }
+
+    if (droppedSpan.isEmpty) return null;
+
+    final summary = await HistorySummarizer.summarize(
+      droppedMessages: droppedSpan,
+      generate: (messages, {required String model}) =>
+          generateUtilityText(messages, model: model, token: token),
+      model: model,
+      maxChars: maxChars,
+    );
+
+    if (summary == null) return null;
+
+    // Persist the new cache so a chat reopened later (or after an
+    // app restart) doesn't re-pay this round-trip. Best-effort —
+    // a save failure shouldn't block returning the summary we
+    // already produced for this turn.
+    session.cachedHistorySummary = summary;
+    session.cachedHistorySummaryDroppedCount = droppedCount;
+    try {
+      await persistence.saveSession(session);
+    } catch (e) {
+      debugPrint('history-summary persist failed: $e');
+    }
+
+    return summary;
+  }
+
+  Future<String> _compressToolFeedback(
+    String rawFeedback, {
+    CancellationToken? token,
+  }) async {
+    final enabled = await prefs.getToolCompressionEnabled();
+    final model = (await prefs.getToolCompressionModel()).trim();
+    final threshold = await prefs.getToolCompressionThreshold();
+    final effectiveThreshold = threshold <= 0 ? 2000 : threshold;
+    if (!enabled || model.isEmpty || rawFeedback.length <= effectiveThreshold) {
+      return rawFeedback;
+    }
+
+    try {
+      final compressed = await generateUtilityText(
+        [
+          {
+            'role': 'system',
+            'content':
+                'Compress this tool output for an AI coding assistant. '
+                'Preserve all file paths, line numbers, code snippets, '
+                'error messages, and key facts. Remove redundancy and '
+                'verbose formatting. Be concise but lose no actionable detail.',
+          },
+          {'role': 'user', 'content': rawFeedback},
+        ],
+        model: model,
+        token: token,
+      ).timeout(const Duration(seconds: 45));
+      final trimmed = compressed.trim();
+      if (trimmed.isEmpty ||
+          trimmed.startsWith('Error:') ||
+          trimmed.length >= rawFeedback.length) {
+        return rawFeedback;
+      }
+      return '[compressed by $model]\n$trimmed';
+    } catch (_) {
+      return rawFeedback;
     }
   }
 
@@ -900,6 +1132,9 @@ class ChatController extends ChangeNotifier {
       'gemini' => 'Gemini',
       'claude' => 'Claude',
       'github' => 'GitHub Models',
+      // `ollama` and `ollama-cloud` are both gated by the single
+      // 'Ollama' provider toggle — the namespace split is purely
+      // for picker grouping and route selection.
       _ => 'Ollama',
     };
     if (!enabled.contains(providerName)) {
@@ -933,6 +1168,16 @@ class ChatController extends ChangeNotifier {
           effort: effort,
         );
         return;
+      case 'ollama-cloud':
+        // Cloud-namespace models always go through ollama.com with
+        // Bearer auth, regardless of any name-suffix heuristic.
+        yield* ollama.generateChatStream(
+          messages,
+          model: rawModel,
+          token: token,
+          forceCloud: true,
+        );
+        return;
       case 'ollama':
       default:
         // Ollama has no native reasoning param; the prompt-suffix
@@ -960,6 +1205,12 @@ class ChatController extends ChangeNotifier {
         return anthropic.summarizeTitle(firstMessage, model: rawModel);
       case 'github':
         return github.summarizeTitle(firstMessage, model: rawModel);
+      case 'ollama-cloud':
+        return ollama.summarizeTitle(
+          firstMessage,
+          model: rawModel,
+          forceCloud: true,
+        );
       case 'ollama':
       default:
         return ollama.summarizeTitle(firstMessage, model: rawModel);
@@ -2047,6 +2298,30 @@ class ChatController extends ChangeNotifier {
     // entries we want to highlight).
     String? capturedTurnId;
 
+    // ── Per-turn timing instrumentation (hoisted) ─────────────
+    // Same hoist rationale as `throttleTimer` / `capturedTurnId`
+    // above: declared out here so the catch{} / finally{} blocks
+    // can record timing on the error path too. The 182s wall
+    // failure mode usually goes through the error path, so this
+    // hoist is the difference between "we have data on the
+    // failure" and "we don't".
+    final turnStartedAt = DateTime.now();
+    int? firstByteLatencyMs;
+    int iterationCount = 0;
+    int? lastIterationDurationMs;
+    DateTime iterationStartedAt = turnStartedAt;
+    // ── Hallucination / near-miss state ───────────────────────
+    // Accumulated across the WHOLE turn. A model that claims
+    // "Created foo.dart" (no tool ran) once might be a recap; the
+    // same model claiming three different non-existent file ops
+    // in one iteration is hallucinating and burning the user's
+    // tokens on fiction. Once `hallucinatedPaths.length` crosses
+    // [HallucinationDetector.defaultHallucinationThreshold] inside
+    // a single iteration, the loop halts with a warning. Reset
+    // per iteration via `iterationHallucinationCount`.
+    final hallucinatedPathsAccumulated = <String>[];
+    bool halluHaltTriggered = false;
+
     try {
       // Tight workspace context. We deliberately do NOT dump a 50-entry
       // root listing anymore — most of those slots are noise (`build/`,
@@ -2168,6 +2443,18 @@ ran; files were already written. Only respond to the LATEST user
 message. If it's a greeting, acknowledgement, or unclear, ask what
 they want next — do NOT re-execute prior requests "to be helpful".$pauseLine
 
+## Interpreting short user replies
+When the user replies with one word or a very short phrase
+("continue", "go", "next", "more", "keep going", "and?",
+"yes", "ok", "do it"), they are asking you to make PROGRESS
+on the ORIGINAL task. Do NOT interpret these as "repeat my
+previous tool with different arguments" or "continue the
+read I started". Reread the latest substantive user message
+— the one that established the actual task — and pick the
+next concrete action toward completing it. If the original
+task is genuinely finished, ask the user what they want next
+instead of inventing more work.
+
 ## Workspace
 $workspaceContext
 
@@ -2209,6 +2496,32 @@ on the next turn — that is real output, not user input.
   — do NOT spawn a duplicate.
 - ${allowOutsideWorkspaceWrites ? 'Built-in mutation tools may write outside the workspace when explicitly targeted with absolute/parent paths. Prefer in-workspace edits unless the user asks otherwise.' : 'Built-in mutation tools cannot write outside the active workspace. Reads outside are fine. If a write outside is needed, ask the user to enable Settings → Rules → Allow agent writes outside workspace.'}
 
+**Common syntax mistakes — DO NOT MAKE THESE:**
+- WRONG: `<LIST_DIR: .>` (single angle brackets — XML style)
+- WRONG: `<list_dir>...</list_dir>` (XML closing tag)
+- WRONG: ``` ```LIST_DIR``` ``` (markdown code fence)
+- WRONG: `[LIST_DIR: .]` (square brackets)
+- RIGHT: `<<<LIST_DIR: .>>>` (EXACTLY three `<` and three `>` on each side)
+
+Tool calls written in any of the wrong forms WILL NOT EXECUTE. The IDE's
+parser is strict — it only matches three-bracket syntax. If you find
+yourself writing single-bracket tags out of habit, stop and fix the
+syntax before continuing.
+
+**Anti-hallucination rule (critical):**
+- A file you describe as "Created", "Wrote", "Added", "Edited",
+  "Updated", "Modified", or "Saved" MUST have been touched by an
+  actual `<<<CREATE_FILE: ...>>>` / `<<<EDIT_FILE: ...>>>` /
+  `<<<MULTI_EDIT: ...>>>` / `<<<APPEND_FILE: ...>>>` tool call in
+  THIS turn or a previous turn. Never claim file ops you did not
+  invoke as tools.
+- If you are about to write "Created `src/foo.tsx`" but you have
+  not actually emitted a CREATE_FILE block for it, STOP. Either
+  emit the tool call now, or describe it as planned ("I will
+  create `src/foo.tsx`") instead of claimed ("Created
+  `src/foo.tsx`"). The IDE checks claims against actually-fired
+  tools; persistent hallucinated claims will halt the turn.
+
 $toolDocs
 
 ## How to work
@@ -2228,14 +2541,24 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // **Conversation history pruning.** When a long session crosses
       // [_kHistoryKeepRecent] messages, we keep the first user
       // message (the original ask is load-bearing context) plus the
-      // last N, and replace the omitted middle with a single
-      // synthetic user note. This keeps token cost bounded on
-      // hour-long agentic sessions without losing the prompt that
-      // started everything OR the recent window the model needs to
-      // continue. We don't try to summarise the dropped middle —
-      // that would require an LLM round-trip we'd be charging the
-      // user for, and the recent window is already the model's
-      // working memory.
+      // last N, and replace the omitted middle with EITHER a
+      // structured LLM-generated summary (opt-in via Settings → AI /
+      // Chat → "Summarize chat history with utility model") OR a
+      // single synthetic user note. The summary path uses the same
+      // small model configured for tool-result compression — see
+      // `lib/providers/chat/history_summarizer.dart`.
+      //
+      // Layered fallback: cached summary → fresh summary on cache
+      // miss → deterministic one-line placeholder on any failure
+      // (model unset, timeout, malformed output, summary too long).
+      // Worst case is "feature did nothing", never "broke chat".
+      //
+      // Anthropic carve-out: Claude has automatic prompt caching
+      // keyed on prefix stability. Re-summarizing rewrites the
+      // middle of history and blows the cache prefix every turn,
+      // costing more than the elision approach saves. So we skip
+      // summarization on Claude entirely — the deterministic
+      // placeholder keeps the prefix stable.
       final historyMessages = session.messages;
       Iterable<PersistedMessage> historyToSend;
       if (historyMessages.length <= _kHistoryKeepRecent) {
@@ -2245,17 +2568,32 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         final tail = historyMessages.sublist(
           historyMessages.length - _kHistoryKeepRecent,
         );
-        // Synthetic placeholder for the omitted span. Marked clearly
-        // so the model knows context was elided rather than the user
-        // having actually said this.
         final droppedCount = historyMessages.length - 1 - tail.length;
+        final droppedSpan = historyMessages.sublist(
+          1,
+          historyMessages.length - _kHistoryKeepRecent,
+        );
+
+        final summaryText = await _maybeSummarizeHistory(
+          session: session,
+          droppedSpan: droppedSpan,
+          droppedCount: droppedCount,
+          routedProvider: selectedProvider,
+          token: cancelToken,
+        );
+
+        final placeholderContent = summaryText != null
+            ? '(... earlier context elided: $droppedCount messages '
+                  'were summarized below. Treat the summary as a '
+                  'recap of work already done; do NOT redo any '
+                  'actions it describes.)\n\n$summaryText'
+            : '(... earlier context elided: $droppedCount messages '
+                  'between the original user message and the recent '
+                  'window were dropped to keep token usage bounded. '
+                  'If you need them, ask the user.)';
         final placeholder = PersistedMessage(
           role: 'user',
-          content:
-              '(... earlier context elided: $droppedCount messages '
-              'between the original user message and the recent '
-              'window were dropped to keep token usage bounded. '
-              'If you need them, ask the user.)',
+          content: placeholderContent,
         );
         historyToSend = [first, placeholder, ...tail];
       }
@@ -2295,6 +2633,43 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         // interrupts the LLM stream — a `npm start` already in
         // flight will keep blocking the executor's await forever.
         cancelToken: cancelToken,
+        // Route agent-spawned commands through the terminal-pane
+        // bridge when wired (production always wires one). The
+        // executor passes this through to every `ToolInvocation` —
+        // `RUN_CMD` uses it to spawn a hidden PTY session that
+        // gets promoted to a visible tab on detach (long-running
+        // commands like `npm run dev`). When the bridge is null
+        // (tests / non-IDE callers) `RUN_CMD` falls back to its
+        // legacy `Process.start` path.
+        agentTerminalLauncher: agentTerminals == null
+            ? null
+            : ({
+                required String command,
+                required String workingDirectory,
+                void Function(String stripped)? onOutput,
+              }) async {
+                final shellId = await prefs.getTerminalShellId();
+                return agentTerminals!.start(
+                  command: command,
+                  workingDirectory: workingDirectory,
+                  preferredShellId: shellId,
+                  onOutput: onOutput,
+                );
+              },
+        // Wire `WEB_SEARCH` / `WEB_FETCH` to Ollama Cloud's web
+        // tooling endpoints (https://docs.ollama.com/capabilities/web-search).
+        // When the user has no cloud API key set, the closure
+        // still routes through `OllamaService` — its `webSearch` /
+        // `webFetch` methods throw a `StateError` with a "set the
+        // key in Settings" message that the tool body surfaces to
+        // the agent verbatim. We deliberately wire the closures
+        // unconditionally rather than `null`-ing them out without
+        // a key: that way the failure surface is the same in both
+        // places (the tool feedback string) instead of one path
+        // returning "tool not available" and another saying "key
+        // missing".
+        webSearch: ollama.webSearch,
+        webFetch: ollama.webFetch,
       );
 
       // Derive a stable `turnId` for this user request. Used to tag
@@ -2466,19 +2841,17 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       int? hallucinationCutAt;
       bool hallucinationDetected = false;
 
-      // **Auto-continue** — fires AT MOST ONCE per user turn when the
-      // model either (a) produced empty content with no tool calls
-      // ("just stops responding" failure mode the user described
-      // for cloud Ollama) or (b) was cut at the provider's output
-      // token cap (`<!-- LUMEN_TRUNCATED:length -->` marker). We
-      // synthesize a brief continue prompt and re-enter the loop so
-      // the model gets one real recovery attempt before we surface
-      // the user-facing Continue strip. Bounded to one attempt
-      // because: (1) the second empty/truncated turn is a real
-      // signal something is wrong (model context, prompt confusion,
-      // capacity), and silent infinite continues would hide that;
-      // (2) the maxIters cap is the ultimate backstop anyway.
-      bool autoContinuedThisTurn = false;
+      // **Auto-continue** — fires up to [_maxAutoContinues] times per
+      // user turn when the model either (a) produced empty content
+      // with no tool calls ("just stops responding" failure mode
+      // common with cloud Ollama models) or (b) was cut at the
+      // provider's output token cap. We synthesize a brief continue
+      // prompt and re-enter the loop so the model gets a real
+      // recovery attempt. Bounded to prevent infinite silent loops
+      // — after exhausting retries, the empty-response strip
+      // surfaces so the user can intervene.
+      const int maxAutoContinues = 3;
+      int autoContinueCount = 0;
 
       while (keepLooping && i < maxIters && !cancelToken.isCancelled) {
         i++;
@@ -2552,8 +2925,19 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         final wireMessages = selectedProvider == 'claude'
             ? apiMessages
             : HistoryCompressor.compressForWire(apiMessages);
+        // **Thinking-phase tracking.** Thinking models (Qwen 3,
+        // DeepSeek R1, etc.) yield reasoning tokens wrapped in
+        // LUMEN_THINK_START / LUMEN_THINK_END markers. Those tokens
+        // are NOT executable (no tool calls, no user-facing prose),
+        // so they go into a separate buffer. The live UI renders
+        // them as a collapsible "Thinking…" indicator so the user
+        // sees activity instead of dead air.
+        final thinkBuf = StringBuffer();
+        bool inThinkPhase = false;
+
         // Stream this iteration's response into iterBuf, updating
         // the live message's content each chunk.
+        iterationStartedAt = DateTime.now();
         await for (final chunk in _generateChatStream(
           wireMessages,
           model: modelForTurn,
@@ -2561,15 +2945,43 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           effort: effort,
         )) {
           if (cancelToken.isCancelled) break;
+
+          // Stall detector: refresh the last-chunk timestamp on
+          // EVERY chunk (including thinking) so the stall-warning
+          // strip knows the model is still alive.
+          _lastChunkAtBySession[sessionId] = DateTime.now();
+          // First-byte stamp: any chunk counts as "model is doing
+          // something". One-shot per turn.
+          firstByteLatencyMs ??= DateTime.now()
+              .difference(turnStartedAt)
+              .inMilliseconds;
+
+          // ── Thinking-marker state machine ──
+          if (chunk == OllamaService.thinkStartMarker) {
+            inThinkPhase = true;
+            updateLive(_draftWithThinking(
+              aggregated, iterBuf.toString(), thinkBuf.toString(), true,
+            ));
+            continue;
+          }
+          if (chunk == OllamaService.thinkEndMarker) {
+            inThinkPhase = false;
+            updateLive(_draftWithThinking(
+              aggregated, iterBuf.toString(), thinkBuf.toString(), false,
+            ));
+            continue;
+          }
+          if (inThinkPhase) {
+            thinkBuf.write(chunk);
+            updateLive(_draftWithThinking(
+              aggregated, iterBuf.toString(), thinkBuf.toString(), true,
+            ));
+            continue;
+          }
+
+          // ── Normal content chunk (non-thinking) ──
           final bufLenBeforeChunk = iterBuf.length;
           iterBuf.write(chunk);
-          // Stall detector: refresh the last-chunk timestamp so the
-          // chat panel can read `silenceDuration` and surface a
-          // "model has been silent for X seconds" badge. Throttling
-          // here is unnecessary — `DateTime.now()` is cheap, and the
-          // UI ticker already runs at 1Hz so finer granularity
-          // wouldn't be visible anyway.
-          _lastChunkAtBySession[sessionId] = DateTime.now();
 
           // Cheap incremental counters — count occurrences in the
           // chunk, not in the whole buffer (which would be
@@ -2601,31 +3013,10 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
               ? _firstCompleteToolCallEnd(buffered, firstOpenerOffset)
               : null;
           if (firstToolEnd != null) {
-            // First complete tool call landed. Close the stream so
-            // the executor runs ONE tool, feeds the real result back,
-            // and the next iteration starts with grounded context.
-            // The async generator's finally{} closes the http client;
-            // below we truncate the partial buffer to exactly the prose
-            // up to and including the first complete tool block.
             break;
           }
 
-          // **Hallucinated `<tool_result>` detection.** Scan the new
-          // chunk (not the full buffer — that would be quadratic
-          // across the stream) for the literal string. We track the
-          // tail of the previous buffer to catch matches that span
-          // a chunk boundary; `<tool_result>` is 13 chars so the
-          // 12-char overlap below is sufficient. Once flagged, we
-          // record the absolute offset in `iterBuf` and break — the
-          // post-stream branch routes through the auto-continue gate
-          // with a hallucination-specific nudge.
-          //
-          // No false-positive guard against backtick-wrapped or
-          // markdown-quoted occurrences: an agent doing real work
-          // has no reason to literally narrate tool_result framing,
-          // and the worst case (rare prose match) costs one wasted
-          // iteration with a clear correction nudge — strictly
-          // better than continuing to stream fabricated output.
+          // **Hallucinated `<tool_result>` detection.**
           if (hallucinationCutAt == null) {
             const needle = '<tool_result>';
             final overlap = needle.length - 1;
@@ -2640,8 +3031,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             }
           }
 
-          // Total-explosion / RUN_CMD trip: catches genuinely
-          // broken output (absurd hunk counts, command spam).
+          // Total-explosion / RUN_CMD trip.
           if (markerCount > 80 || runCmdCount > 12) {
             runawayDetected = true;
             runawayReason =
@@ -2651,12 +3041,11 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           }
 
           // The live message shows previous-iterations aggregated +
-          // current iteration's running buffer, separated by a
-          // blank line. Matches the post-loop formatting below.
-          final draft = aggregated.isEmpty
-              ? iterBuf.toString()
-              : '$aggregated\n\n${iterBuf.toString()}';
-          updateLive(draft);
+          // current iteration's running buffer + thinking section,
+          // separated by blank lines.
+          updateLive(_draftWithThinking(
+            aggregated, iterBuf.toString(), thinkBuf.toString(), false,
+          ));
         }
         if (cancelToken.isCancelled) {
           aggregated += '${aggregated.isEmpty ? '' : '\n\n'}_(stopped)_';
@@ -2706,7 +3095,88 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         // tool-call syntax rewritten to friendly placeholders.
         final pass = await executor.run(executableRaw);
         firedAcrossTurn.addAll(pass.firedTools);
+        // End-of-iteration timing stamp. Includes both streaming
+        // wall-clock AND executor wall-clock (tool runs). That's
+        // the right boundary because the user perceives both as
+        // the same "the agent is working" phase, and a slow tool
+        // (e.g. a `verify` that runs `dart analyze`) is a real
+        // contributor to per-iteration latency.
+        iterationCount += 1;
+        lastIterationDurationMs = DateTime.now()
+            .difference(iterationStartedAt)
+            .inMilliseconds;
+
+        // ── Misbehaviour detection (per-iteration) ──────────────
+        // Two complementary checks. Both are pure parsers (see
+        // `lib/providers/chat/hallucination_detector.dart`) and
+        // must run on EVERY iteration so they catch failure modes
+        // even when the auto-continue gate doesn't trigger.
+        //
+        // 1. Hallucinated file-op claims: model wrote past-tense
+        //    "Created `foo`" / "Edited `bar`" but no
+        //    create/edit/multi_edit/append tool actually fired
+        //    for that path during the turn. Accumulated across
+        //    iterations; halts the turn when a single iteration
+        //    contributes >= threshold new claims.
+        // 2. Near-miss tool syntax: zero fired tools AND the text
+        //    contains `<TOOL_NAME: arg>` (single brackets) for a
+        //    known tool. Means the model wrote a tool with the
+        //    wrong outer syntax and needs a correction nudge.
+        //    Wired into the auto-continue gate as a 5th trigger.
+        final firedFilePaths = firedAcrossTurn
+            .where((f) => HallucinationDetector.isFileMutationTool(f.id))
+            .map((f) => f.firstArg)
+            .toList(growable: false);
+        final newHallucinations =
+            HallucinationDetector.detectHallucinatedClaims(
+              assistantText: pass.processedResponse,
+              firedFilePaths: firedFilePaths,
+            );
+        hallucinatedPathsAccumulated.addAll(newHallucinations);
+
+        ({String name, NearMissShape shape})? nearMissTool;
+        bool intentWithoutAction = false;
+        if (!pass.hasToolCalls) {
+          final knownNames = <String>{
+            for (final t in ToolRegistry.all)
+              if (_enabledTools.contains(t.id)) t.id.toUpperCase(),
+          };
+          nearMissTool = HallucinationDetector.detectNearMissTool(
+            assistantText: executableRaw,
+            knownToolNames: knownNames,
+          );
+          // Only check intent-without-action when no near-miss
+          // was found — a near-miss means the model TRIED to
+          // call a tool, and the dedicated branch in the
+          // auto-continue gate gives a more specific nudge.
+          if (nearMissTool == null && executableRaw.trim().isNotEmpty) {
+            intentWithoutAction =
+                HallucinationDetector.detectIntentWithoutAction(executableRaw);
+          }
+        }
+
+        // Halt the loop when a single iteration produced enough
+        // hallucinated claims to look like a runaway role-play
+        // session. Defer the visible warning + persistence to the
+        // post-loop block so it lands ONCE in `aggregated` instead
+        // of competing with auto-continue / auto-verify text.
+        if (newHallucinations.length >=
+            HallucinationDetector.defaultHallucinationThreshold) {
+          halluHaltTriggered = true;
+          keepLooping = false;
+        }
+
         if (aggregated.isNotEmpty) aggregated += '\n\n';
+        // Persist the thinking section in the displayed message so
+        // the user can expand it post-stream. Only on the first
+        // iteration that actually produced thinking content (later
+        // iterations in the same turn rarely think again, and
+        // duplicating the collapsed block would be noisy).
+        final thinkStr = thinkBuf.toString();
+        if (thinkStr.isNotEmpty) {
+          aggregated +=
+              '<!-- LUMEN_THINKING -->\n$thinkStr\n<!-- /LUMEN_THINKING -->\n\n';
+        }
         aggregated += pass.processedResponse.trim();
         // Snap the live message to the cleaned-up version. Force
         // notify so the executor's "raw → friendly" rewrite is
@@ -2726,10 +3196,14 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           // it or expanded scope; the explicit XML-ish framing is a
           // strong enough signal to fix that without us moving to
           // native tool-calling APIs.
+          final toolFeedback = await _compressToolFeedback(
+            pass.toolFeedback,
+            token: cancelToken,
+          );
           final feedback = <String, dynamic>{
             'role': 'user',
             'content':
-                '<tool_result>\n${pass.toolFeedback.trimRight()}\n'
+                '<tool_result>\n${toolFeedback.trimRight()}\n'
                 '</tool_result>',
           };
           apiMessages.add(feedback);
@@ -2776,7 +3250,8 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             // else (analyzer issues, timeout, launch failure)
             // round-trips so the model can fix.
             final fb = verifyPass.toolFeedback;
-            final clean = fb.contains('no analyzer errors') ||
+            final clean =
+                fb.contains('no analyzer errors') ||
                 fb.contains('no analyzer detected');
             if (clean) {
               keepLooping = false;
@@ -2793,14 +3268,18 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
               // Stay in the loop for one more iteration so the model
               // can react to the analyzer output.
             }
-          } else if (!autoContinuedThisTurn &&
+          } else if (autoContinueCount < maxAutoContinues &&
               i < maxIters &&
               (wasTruncated ||
                   hallucinationDetected ||
-                  executableRaw.trim().isEmpty)) {
+                  nearMissTool != null ||
+                  intentWithoutAction ||
+                  executableRaw.trim().isEmpty ||
+                  (_kOpenFileToolRe.hasMatch(executableRaw) &&
+                      !_kCloseFileToolRe.hasMatch(executableRaw)))) {
             // ── Auto-continue gate ────────────────────────────────
-            // Three triggers, all bounded to one recovery attempt
-            // per turn (`autoContinuedThisTurn`):
+            // Four triggers, bounded to [_maxAutoContinues] recovery
+            // attempts per turn:
             //
             //   1. **Truncation** — the upstream API cut the stream
             //      at the model's output token cap. Continue from
@@ -2816,9 +3295,26 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             //      pattern). Nudge it to either commit to a tool
             //      call or explain what it needs.
             //
+            //   4. **Incomplete file-tool block** — the model
+            //      opened `<<<CREATE_FILE: ...>>>` (or EDIT_FILE /
+            //      MULTI_EDIT / APPEND_FILE) but never emitted the
+            //      matching `<<<END_FILE>>>` (or END_EDIT /
+            //      END_APPEND). Common with smaller Ollama-hosted
+            //      models (glm-5.1:cloud and similar) that narrate
+            //      "Now creating X" with the opener but skip the
+            //      body and close, leaving the executor with
+            //      nothing to fire. This case used to be caught by
+            //      the closeless-babble guard before it was
+            //      removed for false-positiving on legitimate
+            //      Claude multi-tool output — Claude always closes
+            //      its blocks, so this targeted check is safe.
+            //
             // Each gets a reason-specific nudge so the model has
             // concrete guidance instead of a generic "try again".
-            autoContinuedThisTurn = true;
+            final hasIncompleteFileTool =
+                _kOpenFileToolRe.hasMatch(executableRaw) &&
+                !_kCloseFileToolRe.hasMatch(executableRaw);
+            autoContinueCount++;
             final String reason;
             final String nudge;
             if (hallucinationDetected) {
@@ -2834,6 +3330,76 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
                   'tag), one tool per response, then STOP and wait '
                   'for the real `<tool_result>` to come back. Do '
                   'not narrate or simulate tool output yourself.';
+            } else if (nearMissTool != null) {
+              final hit = nearMissTool;
+              final toolName = hit.name;
+              reason = 'tool syntax near-miss ($toolName, '
+                  '${hit.shape.name})';
+              switch (hit.shape) {
+                case NearMissShape.xmlStyle:
+                  nudge =
+                      'You wrote `<$toolName: ...>` (single '
+                      'angle brackets — XML style). NO tool '
+                      'ran. Lumen\'s parser requires EXACTLY '
+                      'three angle brackets on each side: '
+                      '`<<<$toolName: args>>>`. Re-emit the '
+                      'same invocation with three brackets each '
+                      'side, one tool per response, then STOP '
+                      'and wait for the real `<tool_result>`.';
+                case NearMissShape.doubleBracket:
+                  nudge =
+                      'You wrote `<<$toolName: ...>>` (TWO '
+                      'angle brackets each side). NO tool ran. '
+                      'Lumen\'s parser requires EXACTLY THREE '
+                      'angle brackets on each side: '
+                      '`<<<$toolName: args>>>`. Add one more '
+                      '`<` and one more `>` and re-emit, one '
+                      'tool per response, then STOP and wait '
+                      'for the real `<tool_result>`.';
+                case NearMissShape.malformedClose:
+                  nudge =
+                      'You opened the tool correctly with '
+                      '`<<<$toolName:` (three `<`) but the '
+                      'CLOSING brackets were short — only one '
+                      'or two `>` instead of three. NO tool '
+                      'ran. The close MUST be exactly `>>>` '
+                      '(three angle brackets). Re-emit the '
+                      'invocation with the proper close: '
+                      '`<<<$toolName: args>>>`, then STOP and '
+                      'wait for the real `<tool_result>`.';
+              }
+            } else if (intentWithoutAction) {
+              reason = 'intent without action';
+              nudge =
+                  'You committed to an action ("Let me read…", '
+                  '"I\'ll check…", or similar) but never actually '
+                  'invoked the tool. Saying you will do something '
+                  'is not the same as doing it — the IDE only '
+                  'sees a tool call when you emit '
+                  '`<<<TOOL_NAME: args>>>` in your response, with '
+                  'three angle brackets each side. Either emit '
+                  'the tool call you committed to NOW, one tool '
+                  'per response, then stop and wait for the '
+                  '`<tool_result>` — or, if you genuinely don\'t '
+                  'know what to call, ask the user a concrete '
+                  'question. Do not narrate intent with no '
+                  'follow-through.';
+            } else if (hasIncompleteFileTool) {
+              reason = 'incomplete tool block';
+              nudge =
+                  'You opened a multi-line tool block '
+                  '(CREATE_FILE / EDIT_FILE / MULTI_EDIT / '
+                  'APPEND_FILE) but never emitted the matching '
+                  'close marker (`<<<END_FILE>>>`, '
+                  '`<<<END_EDIT>>>`, or `<<<END_APPEND>>>`). No '
+                  'file was created or edited. Each multi-line '
+                  'tool needs THREE parts on separate lines: '
+                  'opening marker, the body content, then the '
+                  'matching close marker. Re-emit ONE complete '
+                  'tool block — opening, body, AND close — in '
+                  'this response, then stop and wait for the '
+                  'tool_result. Do not narrate "now creating X" '
+                  'without the close marker; that produces nothing.';
             } else if (wasTruncated) {
               reason = 'truncation';
               nudge =
@@ -2843,13 +3409,19 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
                   'MULTI_EDIT over CREATE_FILE so you do not '
                   'have to retype content you already produced.';
             } else {
-              reason = 'empty';
-              nudge =
-                  'Your previous response had no content. Either '
-                  'complete the task with the appropriate tool '
-                  'call (one per response, then wait for '
-                  '<tool_result>), or briefly say what you need '
-                  'from me to proceed. Do not stay silent.';
+              reason = thinkStr.isNotEmpty ? 'thinking but no output' : 'empty';
+              nudge = thinkStr.isNotEmpty
+                  ? 'You reasoned internally but produced no visible '
+                    'output. Your thinking was received — now commit to '
+                    'an action: emit the appropriate tool call '
+                    '(one per response, then wait for <tool_result>), '
+                    'or provide a brief answer. Do not stay silent after '
+                    'thinking.'
+                  : 'Your previous response had no content. Either '
+                    'complete the task with the appropriate tool '
+                    'call (one per response, then wait for '
+                    '<tool_result>), or briefly say what you need '
+                    'from me to proceed. Do not stay silent.';
             }
             // Only persist a non-empty assistant turn — Anthropic
             // 400s on empty assistant content and Gemini's
@@ -2858,15 +3430,14 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             // turns (the merge logic in those services handles
             // consecutive same-role).
             if (executableRaw.trim().isNotEmpty) {
-              apiMessages.add(
-                {'role': 'assistant', 'content': executableRaw},
-              );
+              apiMessages.add({'role': 'assistant', 'content': executableRaw});
             }
             apiMessages.add({'role': 'user', 'content': nudge});
             if (aggregated.isNotEmpty) aggregated += '\n\n';
+            final remaining = maxAutoContinues - autoContinueCount;
             aggregated +=
-                '_(auto-continued — $reason. The model will get '
-                'one more attempt.)_';
+                '_(auto-continued — $reason. '
+                '${remaining > 0 ? 'Attempt $autoContinueCount/$maxAutoContinues.' : 'Final attempt.'})_';
             updateLive(aggregated, forceNotify: true);
             // keepLooping stays true; next iteration runs.
           } else {
@@ -2882,6 +3453,30 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // stale "still streaming" indicator visible).
       throttleTimer?.cancel();
       throttleTimer = null;
+
+      // ── Hallucination halt warning ────────────────────────────
+      // If [halluHaltTriggered] flipped during the loop, append a
+      // user-facing warning so the chat panel surfaces a clear
+      // explanation. Distinct shape from provider-errors and
+      // empty-response strips because the failure is the model's
+      // *behaviour*, not the connection. Showing the actual
+      // claimed-but-missing paths matters: it lets the user
+      // verify ("yep, those files don't exist") instead of
+      // trusting an opaque warning.
+      if (halluHaltTriggered) {
+        final paths = hallucinatedPathsAccumulated.toSet().toList()..sort();
+        final preview = paths.length <= 4
+            ? paths.join(', ')
+            : '${paths.take(4).join(', ')} (+${paths.length - 4} more)';
+        if (aggregated.isNotEmpty) aggregated += '\n\n';
+        aggregated += S.chatHallucinationHaltWarning(paths.length, preview);
+        updateLive(aggregated, forceNotify: true);
+        debugPrint(
+          '[hallucination-halt] sessionId=$sessionId '
+          'count=${paths.length} '
+          'paths=${paths.take(8).join(", ")}',
+        );
+      }
 
       // ── provider-error rewriting ─────────────────────────────────
       // If the turn ended with a recognisable provider failure
@@ -2931,6 +3526,37 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             : List<String>.unmodifiable(openFilePaths);
       }
 
+      // Stamp final timing onto the live assistant message so the
+      // bubble can render the dim footer and `_persistSession`
+      // writes the timing fields to disk. This is the ONLY mutation
+      // path that includes the timing fields; `updateLive` keeps
+      // them null during streaming so an interrupted/crashed turn
+      // doesn't surface partial numbers as if they were final.
+      final liveCurrent = session.messages[liveIdx];
+      session.messages[liveIdx] = PersistedMessage(
+        id: liveCurrent.id,
+        role: liveCurrent.role,
+        content: liveCurrent.content,
+        timestamp: liveCurrent.timestamp,
+        imagesBase64: liveCurrent.imagesBase64,
+        references: liveCurrent.references,
+        displayContent: liveCurrent.displayContent,
+        totalDurationMs: DateTime.now()
+            .difference(turnStartedAt)
+            .inMilliseconds,
+        firstByteLatencyMs: firstByteLatencyMs,
+        iterationCount: iterationCount > 0 ? iterationCount : null,
+        lastIterationDurationMs: lastIterationDurationMs,
+      );
+      debugPrint(
+        '[turn-timing] sessionId=$sessionId '
+        'total=${DateTime.now().difference(turnStartedAt).inMilliseconds}ms '
+        'ttfb=${firstByteLatencyMs ?? -1}ms '
+        'iters=$iterationCount '
+        'lastIter=${lastIterationDurationMs ?? -1}ms '
+        'cancelled=${cancelToken.isCancelled}',
+      );
+
       session.updatedAt = DateTime.now();
       await _persistSession(session);
 
@@ -2960,8 +3586,28 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             kind: ProviderErrorKind.unknown,
             rawDetail: 'Error during generation: $e',
           );
+      // Even on the error path we record timing, because that's
+      // where it's MOST diagnostic ("did the turn die at exactly
+      // 182s? then it's the cloud wall, not a local bug").
       session.messages.add(
-        PersistedMessage(role: 'assistant', content: ProviderError.marker(err)),
+        PersistedMessage(
+          role: 'assistant',
+          content: ProviderError.marker(err),
+          totalDurationMs: DateTime.now()
+              .difference(turnStartedAt)
+              .inMilliseconds,
+          firstByteLatencyMs: firstByteLatencyMs,
+          iterationCount: iterationCount > 0 ? iterationCount : null,
+          lastIterationDurationMs: lastIterationDurationMs,
+        ),
+      );
+      debugPrint(
+        '[turn-timing:error] sessionId=$sessionId '
+        'total=${DateTime.now().difference(turnStartedAt).inMilliseconds}ms '
+        'ttfb=${firstByteLatencyMs ?? -1}ms '
+        'iters=$iterationCount '
+        'lastIter=${lastIterationDurationMs ?? -1}ms '
+        'err=$e',
       );
       await _persistSession(session);
     } finally {

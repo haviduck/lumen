@@ -93,7 +93,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     HardwareKeyboard.instance.addHandler(_onHardwareKeyEvent);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      context.read<AppState>().ideActions.registerTerminalActions(
+      final state = context.read<AppState>();
+      state.ideActions.registerTerminalActions(
         onNewTerminal: () {
           final wd = context.read<AppState>().currentDirectory;
           if (wd != null) _addSession(wd);
@@ -102,7 +103,41 @@ class _TerminalPaneState extends State<TerminalPane> {
           if (_sessions.isNotEmpty) _killSession(_focusedSessionIndex);
         },
       );
+      // Subscribe to the agent terminal bridge — when a `RUN_CMD`
+      // promotes its hidden session (e.g. dev server soft-timeouts,
+      // ready-detect hits), we merge it into the visible tab strip
+      // and focus it so the user can interact with it immediately.
+      state.agentTerminals.addListener(_onAgentTerminalsChanged);
     });
+  }
+
+  /// Sync `_sessions` against the bridge's `visibleSessions` list.
+  /// Cheap because both lists are small (almost always < 10 entries).
+  /// Append-only on the agent side: anything in the bridge but not in
+  /// `_sessions` gets added; if multiple promotions happened in one
+  /// frame we focus the last one (the most recent agent action).
+  void _onAgentTerminalsChanged() {
+    if (!mounted) return;
+    final state = context.read<AppState>();
+    final bridgeVisible = state.agentTerminals.visibleSessions;
+    final known = _sessions.toSet();
+    int? newlyAddedIndex;
+    setState(() {
+      for (final s in bridgeVisible) {
+        if (!known.contains(s)) {
+          _sessions.add(s);
+          newlyAddedIndex = _sessions.length - 1;
+        }
+      }
+      if (newlyAddedIndex != null) {
+        if (_splitView && _focusedPane == 1) {
+          _secondaryIndex = newlyAddedIndex;
+        } else {
+          _activeIndex = newlyAddedIndex!;
+        }
+      }
+    });
+    if (newlyAddedIndex != null) _focusActiveSession();
   }
 
   Future<void> _loadShells() async {
@@ -127,7 +162,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     HardwareKeyboard.instance.removeHandler(_onHardwareKeyEvent);
     _stopTermSelectionAutoScroll();
     try {
-      context.read<AppState>().ideActions.unregisterTerminalActions();
+      final state = context.read<AppState>();
+      state.ideActions.unregisterTerminalActions();
+      state.agentTerminals.removeListener(_onAgentTerminalsChanged);
     } catch (_) {
       // context might be unmounted during shutdown; safe to ignore.
     }
@@ -248,7 +285,22 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _killSession(int index) {
     if (index < 0 || index >= _sessions.length) return;
-    _sessions[index].dispose();
+    final session = _sessions[index];
+    // Agent sessions go through `killAgent()` first so child processes
+    // (npm → node, python → uvicorn, …) get a Ctrl+C and shut down
+    // cleanly instead of being orphaned by a raw TerminateProcess.
+    // We then dispose to release the terminal/scroll/focus controllers
+    // and let the bridge drop its bookkeeping.
+    if (session.isAgent) {
+      // Fire-and-forget — `killAgent` waits up to 500ms for graceful
+      // exit then hard-kills; blocking the UI thread on it is
+      // unnecessary because the visual close happens in setState below.
+      unawaited(session.killAgent());
+      try {
+        context.read<AppState>().agentTerminals.handleSessionRemoved(session);
+      } catch (_) {}
+    }
+    session.dispose();
     setState(() {
       _sessions.removeAt(index);
       if (_sessions.isEmpty) {
@@ -843,6 +895,16 @@ class _TerminalPaneState extends State<TerminalPane> {
         if (wd != null && _initializedFor != wd && _shellsLoaded) {
           _initializedFor = wd;
           for (final s in _sessions) {
+            // Agent sessions need bridge bookkeeping cleared in
+            // addition to the regular dispose — otherwise the
+            // bridge's `visibleSessions` list keeps stale entries
+            // and the next `_onAgentTerminalsChanged` re-adds them
+            // to the dead `_sessions` list.
+            if (s.isAgent) {
+              try {
+                appState.agentTerminals.handleSessionRemoved(s);
+              } catch (_) {}
+            }
             s.dispose();
           }
           _sessions.clear();
@@ -1231,6 +1293,12 @@ class _TerminalTabBar extends StatelessWidget {
                       title: s.title + (s.usingFallback ? ' *' : ''),
                       isFocused: isFocused,
                       isMounted: isMounted,
+                      isAgent: s.isAgent,
+                      // Show the full agent command on hover —
+                      // the tab title truncates at ~28 chars so
+                      // long invocations (`pnpm run dev --host
+                      // 0.0.0.0 --port 5174`) are still readable.
+                      tooltip: s.isAgent ? s.agentCommand : null,
                       onActivate: () => onSelect(i),
                       onClose: () => onClose(i),
                     ),
@@ -1238,14 +1306,6 @@ class _TerminalTabBar extends StatelessWidget {
                 },
               ),
             ),
-            if (shells.isNotEmpty)
-              _ShellPicker(
-                shells: shells,
-                current: preferredShellId,
-                onChanged: onChangeShell,
-                onReset: onResetShell,
-              ),
-
             IconButton(
               icon: Icon(
                 splitView ? Icons.fullscreen_exit : Icons.view_column_outlined,
@@ -1256,12 +1316,12 @@ class _TerminalTabBar extends StatelessWidget {
               constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
               onPressed: onToggleSplit,
             ),
-            IconButton(
-              icon: const Icon(Icons.add, size: 14),
-              tooltip: S.terminalNew,
-              padding: const EdgeInsets.all(6),
-              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-              onPressed: onNew,
+            _NewTerminalDropdown(
+              shells: shells,
+              current: preferredShellId,
+              onNew: onNew,
+              onChangeShell: onChangeShell,
+              onReset: onResetShell,
             ),
             const SizedBox(width: 8),
           ],
@@ -1271,58 +1331,74 @@ class _TerminalTabBar extends StatelessWidget {
   }
 }
 
-class _ShellPicker extends StatelessWidget {
-  /// Sentinel value used by the popup menu to mean "clear the persisted
-  /// shell preference and restart with the best available shell". Picked
-  /// to never collide with a real [ShellSpec.id].
+/// Combined "new terminal" chevron dropdown that replaces the old
+/// separate `+` button and `_ShellPicker`. Tapping opens a menu with
+/// one entry per available shell (launches that shell immediately) plus
+/// a "Reset to default" option. Saves horizontal space in the tab bar.
+class _NewTerminalDropdown extends StatelessWidget {
   static const String _kResetSentinel = '__reset_default__';
 
   final List<ShellSpec> shells;
   final String? current;
-  final ValueChanged<String> onChanged;
+  final VoidCallback onNew;
+  final ValueChanged<String> onChangeShell;
   final VoidCallback onReset;
 
-  const _ShellPicker({
+  const _NewTerminalDropdown({
     required this.shells,
     required this.current,
-    required this.onChanged,
+    required this.onNew,
+    required this.onChangeShell,
     required this.onReset,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Tooltip(
-      message: S.terminalShell,
-      child: PopupMenuButton<String>(
-        tooltip: '',
-        position: PopupMenuPosition.under,
-        onSelected: (value) {
-          if (value == _kResetSentinel) {
-            onReset();
-          } else {
-            onChanged(value);
-          }
-        },
-        itemBuilder: (ctx) => [
-          ...shells.map(
-            (s) => PopupMenuItem<String>(
-              value: s.id,
-              height: 30,
-              child: Row(
-                children: [
-                  Icon(
-                    s.id == current ? Icons.check : Icons.terminal,
-                    size: 12,
-                    color: s.id == current
-                        ? DuckColors.accentMint
-                        : DuckColors.fgSubtle,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(s.label, style: const TextStyle(fontSize: 12)),
-                ],
-              ),
+    return PopupMenuButton<String>(
+      tooltip: S.terminalNew,
+      position: PopupMenuPosition.under,
+      onSelected: (value) {
+        if (value == _kResetSentinel) {
+          onReset();
+        } else if (value == '__new_default__') {
+          onNew();
+        } else {
+          onChangeShell(value);
+        }
+      },
+      itemBuilder: (ctx) => [
+        const PopupMenuItem<String>(
+          value: '__new_default__',
+          height: 30,
+          child: Row(
+            children: [
+              Icon(Icons.add, size: 12, color: DuckColors.fgMuted),
+              SizedBox(width: 8),
+              Text(S.terminalNew, style: TextStyle(fontSize: 12)),
+            ],
+          ),
+        ),
+        if (shells.isNotEmpty) const PopupMenuDivider(),
+        ...shells.map(
+          (s) => PopupMenuItem<String>(
+            value: s.id,
+            height: 30,
+            child: Row(
+              children: [
+                Icon(
+                  s.id == current ? Icons.check : Icons.terminal,
+                  size: 12,
+                  color: s.id == current
+                      ? DuckColors.accentMint
+                      : DuckColors.fgSubtle,
+                ),
+                const SizedBox(width: 8),
+                Text(s.label, style: const TextStyle(fontSize: 12)),
+              ],
             ),
           ),
+        ),
+        if (shells.isNotEmpty) ...[
           const PopupMenuDivider(),
           PopupMenuItem<String>(
             value: _kResetSentinel,
@@ -1339,45 +1415,14 @@ class _ShellPicker extends StatelessWidget {
             ),
           ),
         ],
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          margin: const EdgeInsets.symmetric(horizontal: 4),
-          decoration: BoxDecoration(
-            color: DuckColors.bgRaised,
-            borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-            border: Border.all(color: DuckColors.glassSeam, width: 0.5),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.terminal, size: 11, color: DuckColors.fgMuted),
-              const SizedBox(width: 4),
-              Text(
-                _labelForId(current) ?? S.terminalShell,
-                style: const TextStyle(
-                  fontSize: 10.5,
-                  color: DuckColors.fgMuted,
-                ),
-              ),
-              const SizedBox(width: 2),
-              const Icon(
-                Icons.arrow_drop_down,
-                size: 12,
-                color: DuckColors.fgSubtle,
-              ),
-            ],
-          ),
-        ),
+      ],
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+      child: const Padding(
+        padding: EdgeInsets.all(6),
+        child: Icon(Icons.expand_more, size: 14),
       ),
     );
-  }
-
-  String? _labelForId(String? id) {
-    if (id == null) return null;
-    for (final s in shells) {
-      if (s.id == id) return s.label;
-    }
-    return null;
   }
 }
 
@@ -1389,6 +1434,8 @@ class _TerminalTab extends StatefulWidget {
   final String title;
   final bool isFocused;
   final bool isMounted;
+  final bool isAgent;
+  final String? tooltip;
   final VoidCallback onActivate;
   final VoidCallback onClose;
   const _TerminalTab({
@@ -1397,6 +1444,8 @@ class _TerminalTab extends StatefulWidget {
     required this.isMounted,
     required this.onActivate,
     required this.onClose,
+    this.isAgent = false,
+    this.tooltip,
   });
 
   @override
@@ -1423,7 +1472,31 @@ class _TerminalTabState extends State<_TerminalTab> {
     } else {
       tabColor = Colors.transparent;
     }
-    return MouseRegion(
+    // Agent-spawned tabs use a distinct icon (`smart_toy`) and an
+    // amber-leaning accent so the user immediately knows "this came
+    // from the LLM, not me". When focused, the agent accent collapses
+    // to the same cyan as user tabs — focus state still wins so the
+    // active-tab indicator stays consistent.
+    final Color iconColor;
+    final IconData iconData;
+    if (widget.isAgent) {
+      iconData = Icons.smart_toy_outlined;
+      // Warm-gold (`accentDuck`) signals "agent surface" the same way
+      // the chat pane uses it — and it's distinct enough from the
+      // cyan / mint user-shell tints that a glance at the tab strip
+      // tells you which terminals are LLM-spawned.
+      iconColor = widget.isFocused
+          ? DuckColors.accentCyan
+          : DuckColors.accentDuck;
+    } else {
+      iconData = Icons.terminal;
+      iconColor = widget.isFocused
+          ? DuckColors.accentCyan
+          : widget.isMounted
+              ? DuckColors.accentMint
+              : DuckColors.fgSubtle;
+    }
+    final Widget tab = MouseRegion(
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
@@ -1443,15 +1516,7 @@ class _TerminalTabState extends State<_TerminalTab> {
             decoration: BoxDecoration(color: tabColor),
             child: Row(
               children: [
-                Icon(
-                  Icons.terminal,
-                  size: 12,
-                  color: widget.isFocused
-                      ? DuckColors.accentCyan
-                      : widget.isMounted
-                      ? DuckColors.accentMint
-                      : DuckColors.fgSubtle,
-                ),
+                Icon(iconData, size: 12, color: iconColor),
                 const SizedBox(width: 6),
                 Text(
                   widget.title,
@@ -1477,5 +1542,9 @@ class _TerminalTabState extends State<_TerminalTab> {
         ),
       ),
     );
+    if (widget.tooltip != null && widget.tooltip!.isNotEmpty) {
+      return Tooltip(message: widget.tooltip!, child: tab);
+    }
+    return tab;
   }
 }

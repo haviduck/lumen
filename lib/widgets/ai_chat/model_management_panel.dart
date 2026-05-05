@@ -401,7 +401,16 @@ class _ModelRow extends StatelessWidget {
 
 List<String> _providers(List<String> models) {
   final set = <String>{for (final m in models) _providerOf(m)};
-  final order = ['ollama', 'gemini', 'claude', 'github', 'openai'];
+  // `ollama-cloud` sits next to `ollama` so the two Ollama
+  // namespaces appear adjacent in the Model Management sidebar.
+  final order = [
+    'ollama',
+    'ollama-cloud',
+    'gemini',
+    'claude',
+    'github',
+    'openai',
+  ];
   return set.toList()..sort((a, b) {
     final ai = order.indexOf(a);
     final bi = order.indexOf(b);
@@ -425,6 +434,7 @@ String _rawModelName(String model) {
 String _prettyProvider(String provider) {
   return switch (provider) {
     'ollama' => S.providerOllama,
+    'ollama-cloud' => S.providerOllamaCloud,
     'gemini' => S.providerGemini,
     'claude' => S.providerClaude,
     'github' => S.providerGithub,

@@ -5,7 +5,6 @@ import 'package:provider/provider.dart';
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
 import '../services/window_chrome.dart';
-import '../services/workspace_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import 'common/ambient_background.dart';
@@ -95,35 +94,39 @@ class WelcomeScreen extends StatelessWidget {
     final hasAnyKey = state.geminiApiKey.isNotEmpty ||
         state.anthropicApiKey.isNotEmpty ||
         state.githubModelsApiKey.isNotEmpty ||
-        state.openaiApiKey.isNotEmpty;
+        state.openaiApiKey.isNotEmpty ||
+        // An Ollama Cloud key is just as much "the user has configured
+        // a provider" as any other key — treat it the same so cloud-
+        // only Ollama users don't get re-prompted with onboarding
+        // every project open.
+        state.ollamaApiKey.isNotEmpty;
     if (hasAnyKey) return false;
     final ollamaUp = await state.ollamaService.isReachable();
     return !ollamaUp;
   }
 
+  /// "New Project" entry point. We deliberately do NOT prompt for a
+  /// name + parent combo anymore — the previous two-step flow (name
+  /// dialog → parent picker) was confusing because Lumen has no
+  /// independent "project name" concept; project identity is the
+  /// folder path, and the displayed name is just the folder's
+  /// basename. Letting the OS file picker do all of it (incl. its
+  /// built-in "New folder" affordance) is one fewer dialog and
+  /// matches how every other native IDE-ish app on this platform
+  /// behaves.
+  ///
+  /// Always runs the wizard regardless of whether the folder is
+  /// already in recents — clicking "New Project" implies the user
+  /// wants the onboarding flow, even if they happened to pick a
+  /// folder Lumen has seen before.
   Future<void> _createNewProject(BuildContext context) async {
-    final result = await showDialog<({String name, String parent})>(
-      context: context,
-      builder: (_) => const _NewProjectDialog(),
-    );
-    if (result == null || !context.mounted) return;
-
+    final dir = await FilePicker.getDirectoryPath();
+    if (dir == null || !context.mounted) return;
     final navigator = Navigator.of(context);
-    final svc = WorkspaceService();
-    final newPath = await svc.createNewProject(result.parent, result.name);
-    if (newPath != null && context.mounted) {
-      final state = context.read<AppState>();
-      await state.setDirectory(newPath);
-      // Newly-created projects always trigger the wizard. We don't
-      // gate this on `setDirectory`'s `isNewProject` return because
-      // a freshly-created folder is by definition new — and using
-      // the same wizard helper as `_openFolder` keeps the two paths
-      // in sync if the steps ever change.
-      if (navigator.mounted) {
-        await _runNewProjectWizard(navigator.context, state, newPath);
-      }
-    } else if (context.mounted) {
-      showDuckToast(context, S.welcomeFailedToCreate);
+    final state = context.read<AppState>();
+    await state.setDirectory(dir);
+    if (navigator.mounted) {
+      await _runNewProjectWizard(navigator.context, state, dir);
     }
   }
 
@@ -482,91 +485,6 @@ class _RecentRowState extends State<_RecentRow> {
           ),
         ),
       ),
-    );
-  }
-}
-
-/// Stateful dialog for creating a new project.
-/// User enters a name, hits Create, folder picker opens for location.
-class _NewProjectDialog extends StatefulWidget {
-  const _NewProjectDialog();
-
-  @override
-  State<_NewProjectDialog> createState() => _NewProjectDialogState();
-}
-
-class _NewProjectDialogState extends State<_NewProjectDialog> {
-  final _controller = TextEditingController();
-  String? _error;
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  Future<void> _create() async {
-    final name = _controller.text.trim();
-    if (name.isEmpty) {
-      setState(() => _error = 'Enter a project name.');
-      return;
-    }
-    // Open folder picker for where to create the project.
-    final parent = await FilePicker.getDirectoryPath();
-    if (parent == null) return;
-    if (!mounted) return;
-    Navigator.pop(context, (name: name, parent: parent));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      backgroundColor: DuckColors.bgRaised,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        side: const BorderSide(color: DuckColors.border, width: 0.5),
-      ),
-      title: const Text(
-        S.welcomeNewProjectTitle,
-        style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-      ),
-      content: SizedBox(
-        width: 340,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            TextField(
-              controller: _controller,
-              autofocus: true,
-              style: const TextStyle(fontSize: 13),
-              decoration: InputDecoration(
-                hintText: 'my-project',
-                labelText: S.welcomeProjectName,
-                isDense: true,
-                border: const OutlineInputBorder(),
-                errorText: _error,
-              ),
-              onChanged: (_) {
-                if (_error != null) setState(() => _error = null);
-              },
-              onSubmitted: (_) => _create(),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              "You'll pick the folder location next.",
-              style: TextStyle(fontSize: 11, color: DuckColors.fgSubtle),
-            ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text(S.cancel),
-        ),
-        TextButton(onPressed: _create, child: const Text(S.welcomeCreate)),
-      ],
     );
   }
 }

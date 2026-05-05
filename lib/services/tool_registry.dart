@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
+import 'agent_terminal_bridge.dart';
 import 'ollama_service.dart' show CancellationToken;
 import 'ripgrep_provisioner.dart';
 
@@ -42,6 +43,28 @@ class AgentTool {
   });
 }
 
+/// Closure used by `RUN_CMD` to spawn an agent command through the
+/// terminal-pane bridge (`AgentTerminalBridge.start`). Production wiring
+/// in `ChatController._runGenerationLoop` baked in via `tool_executor.dart`;
+/// tests / non-IDE callers can omit it and `RUN_CMD` falls back to its
+/// legacy `Process.start` path. The closure shape lives here so
+/// `tool_registry.dart` doesn't have to import widget code transitively.
+typedef AgentTerminalLauncher = Future<AgentRunHandle> Function({
+  required String command,
+  required String workingDirectory,
+  void Function(String stripped)? onOutput,
+});
+
+/// Closures used by `WEB_SEARCH` / `WEB_FETCH` to reach Ollama Cloud's
+/// web tooling (`POST /api/web_search`, `POST /api/web_fetch`). Wired
+/// from `ChatController._runGenerationLoop` so the registry doesn't
+/// have to depend on `OllamaService` directly — tests / non-IDE
+/// callers can leave these null and the tools will report a
+/// configuration error instead of erroring out at the import.
+typedef WebSearchFn =
+    Future<Map<String, dynamic>> Function(String query, {int maxResults});
+typedef WebFetchFn = Future<Map<String, dynamic>> Function(String url);
+
 class ToolInvocation {
   final RegExpMatch match;
   final String? workspaceDir;
@@ -62,6 +85,28 @@ class ToolInvocation {
   /// the whole IDE.
   final CancellationToken? cancelToken;
 
+  /// Optional launcher that routes `RUN_CMD` through the agent
+  /// terminal bridge so long-running commands surface as real
+  /// terminal-pane tabs the user can see and kill. When null,
+  /// `RUN_CMD` falls back to its legacy `Process.start` path
+  /// (which orphans detached processes — see `RUN_CMD`'s body
+  /// for the long history of why).
+  final AgentTerminalLauncher? agentTerminalLauncher;
+
+  /// Optional bridge to Ollama Cloud's web search endpoint
+  /// (https://docs.ollama.com/capabilities/web-search). Used by the
+  /// `WEB_SEARCH` tool. When null, the tool returns a configuration
+  /// error pointing the user at Settings → AI / Chat → Ollama
+  /// Cloud API key.
+  final WebSearchFn? webSearch;
+
+  /// Optional bridge to Ollama Cloud's web fetch endpoint
+  /// (https://docs.ollama.com/capabilities/web-search#web-fetch-api).
+  /// Used by the `WEB_FETCH` tool. Same null semantics as
+  /// [webSearch] — without a wired closure the tool reports a
+  /// configuration error rather than crashing.
+  final WebFetchFn? webFetch;
+
   ToolInvocation({
     required this.match,
     required this.workspaceDir,
@@ -69,6 +114,9 @@ class ToolInvocation {
     this.allowWritesOutsideWorkspace = false,
     this.onOutput,
     this.cancelToken,
+    this.agentTerminalLauncher,
+    this.webSearch,
+    this.webFetch,
   });
 }
 
@@ -393,6 +441,29 @@ class ToolRegistry {
             effectiveSearch,
             replace,
           );
+          // No-op detection. If the SEARCH matched but the REPLACE
+          // produced byte-identical content, the model thinks it
+          // edited the file but nothing actually changed. Without
+          // this branch the model gets back "Success (1 replacement
+          // made)" and confidently moves on, only to be confused
+          // when a re-read shows the change isn't there. Common
+          // failure shape on big files: model copies a line from
+          // its READ_FILE output for the SEARCH block, copies the
+          // SAME line for the REPLACE block (intending to rewrite
+          // it), then fills in the wrong target — or the model
+          // mis-typed and SEARCH equals REPLACE verbatim. Skipping
+          // the write also avoids the silent CRLF→LF normalisation
+          // that would otherwise happen on a no-op via the
+          // fallback path above.
+          if (result == effectiveContent) {
+            return 'EDIT_FILE $fileName: No-op — SEARCH matched but '
+                'REPLACE produced byte-identical content (your SEARCH '
+                'and REPLACE blocks are effectively the same, OR the '
+                'matched region is already in the target state). '
+                'File NOT written. Re-read the file, pick a SEARCH '
+                'region that actually differs from your REPLACE, '
+                'and try again.';
+          }
           await f.writeAsString(result);
           return 'EDIT_FILE $fileName: Success (1 replacement made)';
         } catch (e) {
@@ -462,7 +533,8 @@ class ToolRegistry {
           }
           // Atomic: apply all edits to an in-memory copy first;
           // only write back if every SEARCH found its match.
-          var content = await f.readAsString();
+          final originalContent = await f.readAsString();
+          var content = originalContent;
           for (var i = 0; i < edits.length; i++) {
             final e = edits[i];
             if (content.contains(e.search)) {
@@ -481,6 +553,22 @@ class ToolRegistry {
             }
             return 'MULTI_EDIT $fileName: Error: edit ${i + 1} SEARCH not '
                 'found (file unchanged — no edits applied).';
+          }
+          // Aggregate no-op detection. Same rationale as EDIT_FILE
+          // above: every chunk's SEARCH matched but the cumulative
+          // REPLACE content is byte-identical to the file's prior
+          // state. Skip the write so a re-read shows the truth
+          // (file unchanged) and tell the model what happened
+          // instead of letting it move on confidently with
+          // "${edits.length} edits applied".
+          if (content == originalContent) {
+            return 'MULTI_EDIT $fileName: No-op — all ${edits.length} '
+                'SEARCH blocks matched, but the resulting file '
+                'content is BYTE-IDENTICAL to before. Your '
+                'SEARCH/REPLACE pairs cancelled out or were '
+                'already in their target state. File NOT written. '
+                'Re-read the file and pick edits that actually '
+                'change content.';
           }
           await f.writeAsString(content);
           return 'MULTI_EDIT $fileName: Success (${edits.length} edits applied)';
@@ -1512,7 +1600,8 @@ class ToolRegistry {
           'watchers): CHECK_URL the expected port FIRST so you do '
           'not spawn a duplicate. The call soft-times-out at ~25s; '
           'a "detached, still running" result is success, not '
-          'failure — the process keeps running in the background.',
+          'failure — the process keeps running as a tab in the '
+          'terminal pane that the user can see and close.',
       syntaxExample: '<<<RUN_CMD: command to run>>>',
       pattern: RegExp(r'<<<RUN_CMD:\s*(.*?)\s*>>>'),
       requiresApproval: true,
@@ -1526,164 +1615,30 @@ class ToolRegistry {
           return 'RUN_CMD $cmd: Denied by user.';
         }
 
-        // ── Long-running command handling ────────────────────────
+        // **Two execution paths**, depending on whether the IDE has
+        // wired up the agent terminal bridge:
         //
-        // RUN_CMD has historically `await`ed `Future.wait([stdoutDone,
-        // stderrDone])` followed by `process.exitCode`. That blocks
-        // forever for daemon-style commands (`npm start`, `vite`,
-        // `python -m http.server`, …) because their stdout never
-        // closes. The chat's executor loop sat hung on a single
-        // tool call; the Stop button could not interrupt because
-        // the await had no cancellation point inside it.
+        //   1. **Bridge path (production wiring)** — preferred.
+        //      Routes the command through `AgentTerminalBridge` so
+        //      it runs inside a real PTY-backed `TerminalSession`.
+        //      On detach (soft-timeout / ready-detect), we promote
+        //      the session into the visible terminal pane: the user
+        //      sees a fresh tab labeled `agent: <cmd>`, can interact
+        //      with it (`r` to hot-reload Vite, `q` to quit, etc.),
+        //      and can kill it cleanly via tab close — pty.kill
+        //      forwards Ctrl+C to the foreground process group, so
+        //      `npm run dev` actually shuts down `node` instead of
+        //      orphaning it.
         //
-        // Three escape hatches now race the natural completion:
-        //
-        //   (a) **User cancellation** via [ToolInvocation.cancelToken]
-        //       — Stop button immediately wins, subprocess is killed,
-        //       partial stdout is returned with a `cancelled` marker.
-        //
-        //   (b) **Soft timeout** at [_runCmdSoftTimeout] (default 25s)
-        //       — process is detached (kept running), partial stdout
-        //       is returned with a `detached` marker so the agent
-        //       can proceed without waiting on the daemon.
-        //
-        //   (c) **Ready-pattern detection** — known "server up" lines
-        //       (`Server is running`, `Listening on`, `Local:`,
-        //       `ready in`, …) trigger an early detach after 500ms
-        //       of post-ready quiescence, so a fast-starting Vite or
-        //       Express server doesn't block the loop for the full
-        //       soft-timeout window.
-        //
-        // When detach happens we **leave the subprocess running**
-        // (no kill) so the user's app stays up. The stdout listener
-        // is intentionally not cancelled — its only side effect is
-        // appending to a buffer we no longer hold a reference to,
-        // which becomes garbage. There is a known orphan-process
-        // risk if Lumen exits without the OS reaping these; we
-        // treat it as acceptable for now (the user can kill via
-        // Task Manager) and may add an explicit job-object /
-        // process-group reaper later.
-        try {
-          final process = await Process.start(
-            Platform.isWindows ? 'cmd.exe' : 'bash',
-            Platform.isWindows ? ['/c', cmd] : ['-c', cmd],
-            workingDirectory: inv.workspaceDir,
-          );
-
-          final stdoutBuf = StringBuffer();
-          final stderrBuf = StringBuffer();
-          final readyDetected = Completer<void>();
-          DateTime lastReadyHit = DateTime.fromMillisecondsSinceEpoch(0);
-
-          void scanForReady(String chunk) {
-            if (readyDetected.isCompleted) return;
-            if (_serverReadyPattern.hasMatch(chunk)) {
-              lastReadyHit = DateTime.now();
-              // Wait 500ms of post-ready quiescence before
-              // declaring "ready" — the agent gets the helpful
-              // "Local: http://..." line + any immediate
-              // follow-up logs in the same flush.
-              Timer(const Duration(milliseconds: 500), () {
-                if (readyDetected.isCompleted) return;
-                final sinceHit =
-                    DateTime.now().difference(lastReadyHit);
-                if (sinceHit >= const Duration(milliseconds: 500)) {
-                  readyDetected.complete();
-                }
-              });
-            }
-          }
-
-          final stdoutSub = process.stdout
-              .transform(const SystemEncoding().decoder)
-              .listen((chunk) {
-                stdoutBuf.write(chunk);
-                inv.onOutput?.call(chunk);
-                scanForReady(chunk);
-              });
-          final stderrSub = process.stderr
-              .transform(const SystemEncoding().decoder)
-              .listen((chunk) {
-                stderrBuf.write(chunk);
-                inv.onOutput?.call(chunk);
-                // Some dev tools (Vite, webpack) emit "ready"
-                // banners on stderr. Scan there too.
-                scanForReady(chunk);
-              });
-
-          final processDone = process.exitCode;
-          final softTimeout = Future<void>.delayed(_runCmdSoftTimeout);
-          final cancelled = inv.cancelToken?.whenCancelled ??
-              // No token attached: a future that never resolves
-              // so it doesn't win the race.
-              Completer<void>().future;
-
-          var didCancel = false;
-          var didTimeout = false;
-          var didReady = false;
-          int? exitCode;
-
-          await Future.any<void>([
-            processDone.then((c) {
-              exitCode = c;
-            }),
-            cancelled.then((_) {
-              didCancel = true;
-            }),
-            softTimeout.then((_) {
-              didTimeout = true;
-            }),
-            readyDetected.future.then((_) {
-              didReady = true;
-            }),
-          ]);
-
-          if (didCancel) {
-            try {
-              process.kill(ProcessSignal.sigterm);
-              // Give the process 200ms to exit cleanly, then
-              // sigkill if it didn't.
-              await Future<void>.delayed(const Duration(milliseconds: 200));
-              process.kill(ProcessSignal.sigkill);
-            } catch (_) {}
-            await stdoutSub.cancel();
-            await stderrSub.cancel();
-            final out = _cap(stdoutBuf.toString());
-            final err = _cap(stderrBuf.toString());
-            return 'RUN_CMD $cmd: cancelled by user.\n'
-                'STDOUT-so-far:\n$out\nSTDERR-so-far:\n$err';
-          }
-
-          if (didReady || didTimeout) {
-            // Detach: process keeps running. We DO NOT cancel
-            // the stream subscriptions — the listeners' only
-            // observable effect is appending to buffers we
-            // discard, and cancelling them risks orphaning
-            // unflushed bytes. The subscriptions die naturally
-            // when the process eventually exits.
-            final out = _cap(stdoutBuf.toString());
-            final err = _cap(stderrBuf.toString());
-            final reason = didReady
-                ? 'detected ready signal in output'
-                : 'soft-timed-out after ${_runCmdSoftTimeout.inSeconds}s';
-            return 'RUN_CMD $cmd: detached, still running '
-                '($reason). The process keeps running in the '
-                'background. STDOUT-so-far:\n$out\n'
-                'STDERR-so-far:\n$err';
-          }
-
-          // Normal completion.
-          await stdoutSub.cancel();
-          await stderrSub.cancel();
-          final stdout = _cap(stdoutBuf.toString());
-          final stderr = _cap(stderrBuf.toString());
-          final tail = exitCode == 0
-              ? ''
-              : ' (exit code: $exitCode)';
-          return 'RUN_CMD $cmd:$tail\nSTDOUT:\n$stdout\nSTDERR:\n$stderr';
-        } catch (e) {
-          return 'RUN_CMD $cmd: Error: $e';
+        //   2. **Legacy path (tests / non-IDE callers)** — when no
+        //      launcher is attached. Runs via `Process.start` and
+        //      detaches the orphan as before. Same semantics it
+        //      always had; kept so headless test harnesses keep
+        //      working without mounting a terminal pane.
+        if (inv.agentTerminalLauncher != null) {
+          return _runCmdViaBridge(cmd, inv);
         }
+        return _runCmdLegacy(cmd, inv);
       },
     ),
     AgentTool(
@@ -1703,7 +1658,195 @@ class ToolRegistry {
       pattern: RegExp(r'<<<VERIFY\s*>>>'),
       execute: _executeVerify,
     ),
+    AgentTool(
+      id: 'web_search',
+      name: 'WEB_SEARCH',
+      description:
+          'Search the public web via Ollama Cloud and return ranked '
+          'results (title, URL, content snippet). Requires an Ollama '
+          'Cloud API key (Settings → AI / Chat → Ollama Cloud API '
+          'key). Use this when the user\'s question depends on '
+          'fresh / external knowledge the model can\'t be expected '
+          'to know — current events, library APIs released after '
+          'training, error messages from third-party tools, etc. '
+          'Pair with WEB_FETCH to drill into a specific result. '
+          'Trailing flag refines the call:\n'
+          '  :max=N  — max results (default 5, clamped to 1..10)',
+      syntaxExample:
+          '<<<WEB_SEARCH: search query>>>\n'
+          '    <<<WEB_SEARCH: ollama new engine release notes :max=10>>>',
+      pattern: RegExp(r'<<<WEB_SEARCH:\s*(.*?)\s*>>>'),
+      execute: _executeWebSearch,
+    ),
+    AgentTool(
+      id: 'web_fetch',
+      name: 'WEB_FETCH',
+      description:
+          'Fetch a single web page via Ollama Cloud and return its '
+          'title, main content, and outbound links. Requires an '
+          'Ollama Cloud API key (Settings → AI / Chat → Ollama '
+          'Cloud API key). Routes through ollama.com\'s extractor '
+          'so the response is cleaned of ads / boilerplate and '
+          'SPA content is rendered before extraction. Use after '
+          'WEB_SEARCH to read the actual article, or to look up a '
+          'URL the user pasted. Content is truncated to '
+          '~16k characters; if you need more, fetch a more '
+          'specific URL (e.g. the article\'s permalink rather than '
+          'a section index).',
+      syntaxExample:
+          '<<<WEB_FETCH: https://example.com/article>>>',
+      pattern: RegExp(r'<<<WEB_FETCH:\s*(.*?)\s*>>>'),
+      execute: _executeWebFetch,
+    ),
   ];
+
+  /// Hard caps on `WEB_FETCH` content / link list size. Web pages
+  /// can easily blow past 100k characters of body text — even with
+  /// cloud models running at ~32k tokens the agent doesn't benefit
+  /// from feeding the model a wall of nav-menu boilerplate. Caller
+  /// is told to fetch a more specific URL when they hit the cap.
+  static const int _kWebFetchMaxContentChars = 16 * 1024;
+  static const int _kWebFetchMaxLinks = 30;
+
+  /// Per-result content snippet cap for `WEB_SEARCH`. The Ollama
+  /// API already returns short snippets but we trim further so a
+  /// `:max=10` call with verbose content stays under ~6k chars
+  /// total. Models can call `WEB_FETCH` on a result URL when they
+  /// need the full body.
+  static const int _kWebSearchSnippetChars = 600;
+
+  static Future<String> _executeWebSearch(ToolInvocation inv) async {
+    final raw = inv.match.group(1)!.trim();
+    if (raw.isEmpty) {
+      return 'WEB_SEARCH: Error: query is empty.';
+    }
+
+    var query = raw;
+    var maxResults = 5;
+    final maxFlag = RegExp(r'\s:max=(\d+)\s*$').firstMatch(query);
+    if (maxFlag != null) {
+      final parsed = int.tryParse(maxFlag.group(1)!);
+      if (parsed != null) maxResults = parsed.clamp(1, 10);
+      query = query.substring(0, maxFlag.start).trim();
+    }
+    if (query.isEmpty) {
+      return 'WEB_SEARCH: Error: query is empty (only flags supplied).';
+    }
+
+    if (inv.webSearch == null) {
+      return 'WEB_SEARCH "$query": Error: Ollama Cloud API key is not '
+          'configured. Set it in Settings → AI / Chat → Ollama Cloud '
+          'API key.';
+    }
+
+    Map<String, dynamic> body;
+    try {
+      body = await inv.webSearch!(query, maxResults: maxResults);
+    } on StateError catch (e) {
+      return 'WEB_SEARCH "$query": Error: ${e.message}';
+    } on TimeoutException {
+      return 'WEB_SEARCH "$query": Error: request timed out after 30s.';
+    } catch (e) {
+      return 'WEB_SEARCH "$query": Error: $e';
+    }
+
+    final results = (body['results'] as List?) ?? const [];
+    if (results.isEmpty) {
+      return 'WEB_SEARCH "$query": No results.';
+    }
+
+    final out = StringBuffer();
+    out.writeln('WEB_SEARCH "$query": ${results.length} result(s)');
+    for (var i = 0; i < results.length; i++) {
+      final r = results[i] as Map?;
+      if (r == null) continue;
+      final title = (r['title'] ?? '').toString().trim();
+      final url = (r['url'] ?? '').toString().trim();
+      var content = (r['content'] ?? '').toString().trim();
+      if (content.length > _kWebSearchSnippetChars) {
+        content =
+            '${content.substring(0, _kWebSearchSnippetChars)}…';
+      }
+      out.writeln();
+      out.writeln('[${i + 1}] ${title.isEmpty ? '(no title)' : title}');
+      if (url.isNotEmpty) out.writeln('    URL: $url');
+      if (content.isNotEmpty) out.writeln('    $content');
+    }
+    return out.toString().trimRight();
+  }
+
+  static Future<String> _executeWebFetch(ToolInvocation inv) async {
+    final raw = inv.match.group(1)!.trim();
+    if (raw.isEmpty) {
+      return 'WEB_FETCH: Error: URL is empty.';
+    }
+    // Tolerate URLs without a scheme (the Ollama API accepts
+    // `ollama.com` per their docs, but normalising up-front keeps
+    // the feedback string stable and gives us a parse error with
+    // a clear message when the agent passes obvious garbage).
+    final url = raw.contains('://') ? raw : 'https://$raw';
+    final parsed = Uri.tryParse(url);
+    if (parsed == null || parsed.host.isEmpty) {
+      return 'WEB_FETCH "$raw": Error: not a valid URL.';
+    }
+
+    if (inv.webFetch == null) {
+      return 'WEB_FETCH "$url": Error: Ollama Cloud API key is not '
+          'configured. Set it in Settings → AI / Chat → Ollama Cloud '
+          'API key.';
+    }
+
+    Map<String, dynamic> body;
+    try {
+      body = await inv.webFetch!(url);
+    } on StateError catch (e) {
+      return 'WEB_FETCH "$url": Error: ${e.message}';
+    } on TimeoutException {
+      return 'WEB_FETCH "$url": Error: request timed out after 30s.';
+    } catch (e) {
+      return 'WEB_FETCH "$url": Error: $e';
+    }
+
+    final title = (body['title'] ?? '').toString().trim();
+    var content = (body['content'] ?? '').toString();
+    final truncated = content.length > _kWebFetchMaxContentChars;
+    if (truncated) {
+      content = content.substring(0, _kWebFetchMaxContentChars);
+    }
+    final linksRaw = (body['links'] as List?) ?? const [];
+    final links = linksRaw
+        .map((e) => e?.toString() ?? '')
+        .where((s) => s.isNotEmpty)
+        .toList(growable: false);
+    final shownLinks = links.length > _kWebFetchMaxLinks
+        ? links.sublist(0, _kWebFetchMaxLinks)
+        : links;
+
+    final out = StringBuffer();
+    out.writeln('WEB_FETCH "$url":');
+    out.writeln('Title: ${title.isEmpty ? '(no title)' : title}');
+    out.writeln();
+    out.writeln('--- Content ---');
+    out.writeln(content.trimRight());
+    if (truncated) {
+      out.writeln(
+        '... (content truncated at $_kWebFetchMaxContentChars chars; '
+        'fetch a more specific URL for the rest)',
+      );
+    }
+    if (shownLinks.isNotEmpty) {
+      out.writeln();
+      out.writeln('--- Links (${shownLinks.length}'
+          '${links.length > shownLinks.length ? ' of ${links.length}' : ''}) ---');
+      for (final l in shownLinks) {
+        out.writeln(l);
+      }
+      if (links.length > shownLinks.length) {
+        out.writeln('... (${links.length - shownLinks.length} more)');
+      }
+    }
+    return out.toString().trimRight();
+  }
 
   /// Directories/files never descended into by TREE, SEARCH_TEXT, FIND_FILE.
   static const _treeIgnore = <String>{
@@ -2131,6 +2274,235 @@ class ToolRegistry {
       return '$name $firstArg:\nSTDOUT:\n$stdout\nSTDERR:\n$stderr';
     } catch (e) {
       return '$name $firstArg: Error: $e';
+    }
+  }
+
+  /// **Bridge path** for `RUN_CMD`. Routes the command through the
+  /// agent terminal bridge: it runs inside a real PTY-backed
+  /// `TerminalSession`, output is teed to the agent's view (with ANSI
+  /// stripped for the model's regex scanners), and on detach the
+  /// session is promoted to a visible tab in the terminal pane.
+  ///
+  /// Same race semantics as the legacy path:
+  ///   - `processDone` wins → return full STDOUT/exit_code (short
+  ///     command, no tab ever appeared);
+  ///   - `cancelled` wins → kill via PTY (Ctrl+C → SIGINT → SIGKILL),
+  ///     return cancelled marker;
+  ///   - `softTimeout` or `readyDetected` wins → promote to visible
+  ///     tab, return detached marker (process keeps running, user can
+  ///     see and close it).
+  static Future<String> _runCmdViaBridge(
+    String cmd,
+    ToolInvocation inv,
+  ) async {
+    final launcher = inv.agentTerminalLauncher!;
+    final outputBuf = StringBuffer();
+    final readyDetected = Completer<void>();
+    DateTime lastReadyHit = DateTime.fromMillisecondsSinceEpoch(0);
+
+    void scanForReady(String chunk) {
+      if (readyDetected.isCompleted) return;
+      if (_serverReadyPattern.hasMatch(chunk)) {
+        lastReadyHit = DateTime.now();
+        Timer(const Duration(milliseconds: 500), () {
+          if (readyDetected.isCompleted) return;
+          final sinceHit = DateTime.now().difference(lastReadyHit);
+          if (sinceHit >= const Duration(milliseconds: 500)) {
+            readyDetected.complete();
+          }
+        });
+      }
+    }
+
+    AgentRunHandle? handle;
+    try {
+      handle = await launcher(
+        command: cmd,
+        workingDirectory: inv.workspaceDir!,
+        onOutput: (stripped) {
+          outputBuf.write(stripped);
+          inv.onOutput?.call(stripped);
+          scanForReady(stripped);
+        },
+      );
+
+      final processDone = handle.exitCode;
+      final softTimeout = Future<void>.delayed(_runCmdSoftTimeout);
+      final cancelled = inv.cancelToken?.whenCancelled ??
+          Completer<void>().future;
+
+      var didCancel = false;
+      var didTimeout = false;
+      var didReady = false;
+      int? exitCode;
+
+      await Future.any<void>([
+        processDone.then((c) {
+          exitCode = c;
+        }),
+        cancelled.then((_) {
+          didCancel = true;
+        }),
+        softTimeout.then((_) {
+          didTimeout = true;
+        }),
+        readyDetected.future.then((_) {
+          didReady = true;
+        }),
+      ]);
+
+      if (didCancel) {
+        try {
+          await handle.kill();
+        } catch (_) {}
+        handle.dispose();
+        final out = _cap(outputBuf.toString());
+        return 'RUN_CMD $cmd: cancelled by user.\n'
+            'OUTPUT-so-far:\n$out';
+      }
+
+      if (didReady || didTimeout) {
+        // Detach: promote the session to a visible terminal tab so
+        // the user can watch it stream, interact with it, and close
+        // it (which kills the PTY → SIGINT to the process group →
+        // `node`/`vite`/etc. shut down cleanly). Bookkeeping
+        // ownership transfers from the bridge to the pane at this
+        // moment.
+        handle.promoteToVisible();
+        final out = _cap(outputBuf.toString());
+        final reason = didReady
+            ? 'detected ready signal in output'
+            : 'soft-timed-out after ${_runCmdSoftTimeout.inSeconds}s';
+        return 'RUN_CMD $cmd: detached, still running '
+            '($reason). The process is now a terminal tab labeled '
+            '"agent: $cmd" — the user can see it stream and close '
+            'the tab to kill it. STDOUT-so-far:\n$out';
+      }
+
+      // Normal completion — short command, no tab appeared. Hidden
+      // session is auto-disposed by the bridge when its exit
+      // completer resolves.
+      final out = _cap(outputBuf.toString());
+      final tail = exitCode == 0 ? '' : ' (exit code: $exitCode)';
+      return 'RUN_CMD $cmd:$tail\nSTDOUT:\n$out';
+    } catch (e) {
+      try {
+        handle?.dispose();
+      } catch (_) {}
+      return 'RUN_CMD $cmd: Error: $e';
+    }
+  }
+
+  /// **Legacy path** for `RUN_CMD` when no agent terminal bridge is
+  /// attached (test harnesses, non-IDE callers). Same behavior as
+  /// before the bridge landed — `Process.start` with stdout/stderr
+  /// capture, detach-orphan on soft-timeout. **Has the orphan-process
+  /// problem this whole feature was added to fix**, so production
+  /// flows should never hit this path.
+  static Future<String> _runCmdLegacy(
+    String cmd,
+    ToolInvocation inv,
+  ) async {
+    try {
+      final process = await Process.start(
+        Platform.isWindows ? 'cmd.exe' : 'bash',
+        Platform.isWindows ? ['/c', cmd] : ['-c', cmd],
+        workingDirectory: inv.workspaceDir,
+      );
+
+      final stdoutBuf = StringBuffer();
+      final stderrBuf = StringBuffer();
+      final readyDetected = Completer<void>();
+      DateTime lastReadyHit = DateTime.fromMillisecondsSinceEpoch(0);
+
+      void scanForReady(String chunk) {
+        if (readyDetected.isCompleted) return;
+        if (_serverReadyPattern.hasMatch(chunk)) {
+          lastReadyHit = DateTime.now();
+          Timer(const Duration(milliseconds: 500), () {
+            if (readyDetected.isCompleted) return;
+            final sinceHit = DateTime.now().difference(lastReadyHit);
+            if (sinceHit >= const Duration(milliseconds: 500)) {
+              readyDetected.complete();
+            }
+          });
+        }
+      }
+
+      final stdoutSub = process.stdout
+          .transform(const SystemEncoding().decoder)
+          .listen((chunk) {
+            stdoutBuf.write(chunk);
+            inv.onOutput?.call(chunk);
+            scanForReady(chunk);
+          });
+      final stderrSub = process.stderr
+          .transform(const SystemEncoding().decoder)
+          .listen((chunk) {
+            stderrBuf.write(chunk);
+            inv.onOutput?.call(chunk);
+            scanForReady(chunk);
+          });
+
+      final processDone = process.exitCode;
+      final softTimeout = Future<void>.delayed(_runCmdSoftTimeout);
+      final cancelled = inv.cancelToken?.whenCancelled ??
+          Completer<void>().future;
+
+      var didCancel = false;
+      var didTimeout = false;
+      var didReady = false;
+      int? exitCode;
+
+      await Future.any<void>([
+        processDone.then((c) {
+          exitCode = c;
+        }),
+        cancelled.then((_) {
+          didCancel = true;
+        }),
+        softTimeout.then((_) {
+          didTimeout = true;
+        }),
+        readyDetected.future.then((_) {
+          didReady = true;
+        }),
+      ]);
+
+      if (didCancel) {
+        try {
+          process.kill(ProcessSignal.sigterm);
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          process.kill(ProcessSignal.sigkill);
+        } catch (_) {}
+        await stdoutSub.cancel();
+        await stderrSub.cancel();
+        final out = _cap(stdoutBuf.toString());
+        final err = _cap(stderrBuf.toString());
+        return 'RUN_CMD $cmd: cancelled by user.\n'
+            'STDOUT-so-far:\n$out\nSTDERR-so-far:\n$err';
+      }
+
+      if (didReady || didTimeout) {
+        final out = _cap(stdoutBuf.toString());
+        final err = _cap(stderrBuf.toString());
+        final reason = didReady
+            ? 'detected ready signal in output'
+            : 'soft-timed-out after ${_runCmdSoftTimeout.inSeconds}s';
+        return 'RUN_CMD $cmd: detached, still running '
+            '($reason). The process keeps running in the '
+            'background. STDOUT-so-far:\n$out\n'
+            'STDERR-so-far:\n$err';
+      }
+
+      await stdoutSub.cancel();
+      await stderrSub.cancel();
+      final stdout = _cap(stdoutBuf.toString());
+      final stderr = _cap(stderrBuf.toString());
+      final tail = exitCode == 0 ? '' : ' (exit code: $exitCode)';
+      return 'RUN_CMD $cmd:$tail\nSTDOUT:\n$stdout\nSTDERR:\n$stderr';
+    } catch (e) {
+      return 'RUN_CMD $cmd: Error: $e';
     }
   }
 

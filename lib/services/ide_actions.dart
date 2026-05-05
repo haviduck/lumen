@@ -140,17 +140,25 @@ class IdeActions extends ChangeNotifier {
   // its border without owning a reference to the widget — same
   // pattern used for the editor / terminal / overlay actions above.
   VoidCallback? _focusFileExplorer;
+  ValueChanged<String>? _revealFileExplorerPath;
   bool get hasFileExplorer => _focusFileExplorer != null;
 
-  void registerFileExplorerActions({required VoidCallback onFocus}) {
+  void registerFileExplorerActions({
+    required VoidCallback onFocus,
+    ValueChanged<String>? onRevealPath,
+  }) {
     _focusFileExplorer = onFocus;
+    _revealFileExplorerPath = onRevealPath;
     notifyListeners();
   }
 
   void unregisterFileExplorerActions() {
     _focusFileExplorer = null;
+    _revealFileExplorerPath = null;
     notifyListeners();
   }
 
   void focusFileExplorer() => _focusFileExplorer?.call();
+  void revealFileExplorerPath(String path) =>
+      _revealFileExplorerPath?.call(path);
 }

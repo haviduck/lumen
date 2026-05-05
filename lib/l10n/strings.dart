@@ -43,12 +43,6 @@ class S {
   static const String welcomeRecentProjects = 'Recent Workspaces';
   static const String welcomeShortcuts = 'Quick Shortcuts';
   static const String welcomeClose = 'Close Lumen';
-  static const String welcomeNewProjectTitle = 'New Project';
-  static const String welcomeProjectName = 'Project Name';
-  static const String welcomeSelectParent = 'Select Parent Directory';
-  static const String welcomeCreate = 'Create';
-  static const String welcomeFailedToCreate =
-      'Failed to create project or it already exists.';
   static const String openFolder = 'Open Folder...';
   static const String open = 'Open';
   static const String newProject = 'New Project...';
@@ -199,6 +193,45 @@ class S {
       'No tokens for ${seconds}s — the model may be stuck. Use Stop and try the prompt again if it doesn\'t recover.';
   static const String chatStallStop = 'Stop';
 
+  // Per-turn timing footer rendered at the bottom of finished
+  // assistant bubbles. Diagnostic plumbing for the Ollama Cloud
+  // 182s hard timeout (issue ollama/ollama#15973) and general
+  // "why was this turn slow" debugging.
+  static String turnTimingTtfb(String duration) => 'TTFB $duration';
+  static String turnTimingIters(int count) => '$count iters';
+  static String turnTimingLast(String duration) => 'last $duration';
+  static const String turnTimingTooltip =
+      'Wall-clock time for this turn · time-to-first-byte · iteration '
+      'count · last-iteration duration. Diagnostic only.';
+  static const String turnTimingWallTooltip =
+      'This turn finished within the 175–185s window where Ollama '
+      'Cloud has a known hard server-side timeout (issue 15973). '
+      'If turns die here repeatedly, the cloud cut you off — split '
+      'the work into smaller turns.';
+
+  // Hallucination-halt warning surfaced at the bottom of the
+  // assistant message when the loop was halted because the model
+  // claimed file ops it never actually invoked as tools.
+  // Parameterised so a user with 3 hallucinated paths and a user
+  // with 30 see the same shape but different numbers, with a
+  // hard cap on the paths preview to keep the warning readable.
+  static String chatHallucinationHaltWarning(int count, String pathsPreview) =>
+      '\n---\n\n'
+      '⚠ **Hallucination detected — stopped this turn.**\n\n'
+      'The model claimed to have created or edited $count file(s) '
+      '(`$pathsPreview`) but no actual file-mutation tool ran for '
+      'them this turn. This is a known failure mode of weaker / '
+      'smaller models under reasoning load — the model role-plays '
+      'the work instead of invoking the tools.\n\n'
+      'What you can do:\n'
+      '- Verify the listed paths in your file explorer; if they '
+      'don\'t exist on disk, the model fabricated them.\n'
+      '- Ask the model again with a focused prompt ("create the '
+      'specific file at `path`") so it commits to a tool call.\n'
+      '- If this keeps happening, switch to a stronger model — '
+      'Qwen Coder, GLM, or Gemini variants tend to obey custom '
+      'tool syntax better than thinking-only Ollama models.';
+
   // Empty-response strip — surfaces after a turn ends with no visible
   // content, no tool calls, no error. Common Ollama failure mode where
   // the stream closes cleanly but the model produced nothing useful.
@@ -208,6 +241,10 @@ class S {
       'The stream closed without any visible output. This sometimes happens with Ollama models when context shifts or the model stalls. Continue to nudge it, or dismiss to send your own follow-up.';
   static const String chatEmptyResponseContinue = 'Continue';
   static const String chatEmptyResponseDismiss = 'Dismiss';
+
+  // Thinking indicator (collapsible reasoning trace).
+  static const String thinkingActive = 'Thinking\u2026';
+  static const String thinkingDone = 'Thought process';
 
   // Queued prompts (composed while the agent is still generating).
   static const String chatQueuedHeader = 'Queued';
@@ -367,7 +404,13 @@ class S {
   static const String llmProvidersSave = 'Save & continue';
   static const String llmProvidersSavedToast = 'Provider settings saved.';
   static const String llmProvidersOllamaHint =
-      'Local — no API key. Endpoint defaults to http://localhost:11434.';
+      'Local daemon AND/OR Ollama Cloud key. Both can run side-by-side '
+      '— local models come from your machine, cloud models stream from '
+      'ollama.com.';
+  static const String llmProvidersOllamaEndpointLabel = 'Local endpoint';
+  static const String llmProvidersOllamaCloudKeyLabel = 'Cloud API key';
+  static const String llmProvidersOllamaCloudKeyHint =
+      'Paste an Ollama Cloud key (optional)…';
   static const String llmProvidersGeminiHint =
       'Get a free API key at aistudio.google.com.';
   static const String llmProvidersClaudeHint =
@@ -658,6 +701,11 @@ class S {
       'Shell preference cleared — using best available shell.';
   static const String terminalSplitView = 'Split Terminal';
   static const String terminalUnsplitView = 'Unsplit Terminal';
+  // Agent-spawned terminals (RUN_CMD via the agent terminal bridge).
+  // The prefix is concatenated with a truncated command in
+  // `AgentTerminalBridge._deriveTitle` so a `npm run dev` invocation
+  // surfaces in the tab strip as `agent: npm run dev`.
+  static const String terminalAgentPrefix = 'agent: ';
 
   // Chat
   static const String chatHeader = 'AI ASSISTANT';
@@ -747,6 +795,17 @@ class S {
   static const String chatModelPanelTitle = 'Select Model';
   static const String chatModelManageTitle = 'Manage Models';
   static const String chatModelViewAll = 'View all models';
+
+  /// Popup-menu entry that re-polls every enabled provider for its
+  /// current model list. Useful when the user pulled a new Ollama
+  /// model (or ran `ollama signin`) outside the app and doesn't
+  /// want to leave the chat panel just to refresh the picker.
+  static const String chatModelRefresh = 'Refresh models';
+
+  /// Toast confirmation shown after a successful refresh, with the
+  /// post-refresh model count substituted for `%d`.
+  static const String chatModelRefreshedToast =
+      'Models refreshed (%d available)';
   static const String chatModelProvidersTitle = 'Providers';
   static const String chatModelProviderModelsTitle = 'Provider Models';
   static const String chatModelEnableAll = 'Enable all';
@@ -920,6 +979,11 @@ class S {
   static const String settingsTitle = 'Settings';
   static const String settingsLlmProvider = 'LLM Provider';
   static const String providerOllama = 'Ollama';
+  // Display label for the `ollama-cloud:` provider namespace —
+  // models surfaced via the Ollama Cloud API key path. Separate
+  // tab from `Ollama` (local daemon) in Model Management so the
+  // user can flip whole groups on/off independently.
+  static const String providerOllamaCloud = 'Ollama Cloud';
   static const String providerGemini = 'Gemini';
   static const String providerClaude = 'Claude';
   static const String providerGithub = 'GitHub Models';
@@ -959,7 +1023,14 @@ class S {
       'Enable the backends you want to use. Models from all enabled providers appear in the chat model picker.';
   static const String settingsOllamaSection = 'Ollama';
   static const String settingsOllamaEndpointDesc =
-      'Base URL for the Ollama API server.';
+      'Base URL for the local Ollama daemon. Leave default unless '
+      'you run ollama on a different host or port.';
+  static const String settingsOllamaCloudKeyLabel = 'Cloud API key';
+  static const String settingsOllamaCloudKeyDesc =
+      'Optional. With a key from ollama.com/settings/keys, Lumen also '
+      'fetches cloud models directly from ollama.com — no local '
+      'daemon required. Both paths run side-by-side; cloud-tagged '
+      'models prefer the API-key route when set.';
   static const String settingsGeminiSection = 'Google Gemini';
   static const String settingsGeminiApiKeyDesc =
       'Get one at aistudio.google.com.';
@@ -1026,6 +1097,37 @@ class S {
       'Number of scrollback lines to keep in terminal buffer.';
 
   // Settings view — AI / Chat
+  static const String settingsToolCompressionToggle =
+      'Compress tool results with utility model';
+  static const String settingsToolCompressionDesc =
+      'Before large tool outputs go back to the main model, summarize '
+      'them with a cheaper model to reduce cloud context cost.';
+  static const String settingsToolCompressionModel = 'Utility model';
+  static const String settingsToolCompressionModelDesc =
+      'Model used for tool-output compression. Pick a fast cloud model '
+      'you have pulled, such as an Ollama cloud Qwen or Gemma model.';
+  static const String settingsToolCompressionNoModel = 'None';
+  static const String settingsToolCompressionThreshold =
+      'Minimum characters to compress';
+  static const String settingsToolCompressionThresholdDesc =
+      'Default: 2000. Smaller tool results are sent raw.';
+  static const String settingsHistorySummaryToggle =
+      'Summarize chat history with utility model';
+  static const String settingsHistorySummaryDesc =
+      'On long sessions, replace the dropped middle of chat history '
+      'with a structured summary written by the utility model above. '
+      'Reduces context pressure on the main model. Skipped on Claude '
+      '(automatic prompt caching keeps its cost low without this).';
+  static const String settingsHistorySummaryMaxChars =
+      'Max summary length (chars)';
+  static const String settingsHistorySummaryMaxCharsDesc =
+      'Default: 1200. Summaries longer than this are rejected and the '
+      'plain elision placeholder is used instead.';
+  static const String settingsHistorySummaryRefreshDelta =
+      'Refresh after N new dropped messages';
+  static const String settingsHistorySummaryRefreshDeltaDesc =
+      'Default: 10. Lower = fresher summaries, more LLM calls. Higher = '
+      'cheaper, but the summary lags behind ongoing work.';
   static const String settingsDefaultModel = 'Default model';
   static const String settingsDefaultModelDesc =
       'Name of the model to use for chat completions.';
@@ -1207,7 +1309,9 @@ class S {
   }) {
     final parts = <String>[];
     if (changed > 0) {
-      parts.add(changed == 1 ? '1 file will change' : '$changed files will change');
+      parts.add(
+        changed == 1 ? '1 file will change' : '$changed files will change',
+      );
     }
     if (recreated > 0) {
       parts.add(

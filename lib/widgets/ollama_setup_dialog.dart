@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/gestures.dart';
@@ -77,6 +78,16 @@ class _OllamaSetupDialogState extends State<_OllamaSetupDialog> {
         _phase = _Phase.missing;
       }
     });
+    // Daemon just confirmed reachable — refresh the chat picker so
+    // any models the user pulled (or cloud models exposed by
+    // `ollama signin`) appear immediately. Without this the picker
+    // stays stale until the user opens Settings and hits Save,
+    // which is the bug behind "I went through the wizard and my
+    // cloud model still isn't in the list". Fire-and-forget; the
+    // picker rebuilds when ChangeNotifier fires.
+    if (reachable) {
+      unawaited(state.chat.reloadModels());
+    }
   }
 
   void _close() => Navigator.of(context).pop();

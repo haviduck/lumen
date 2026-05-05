@@ -325,40 +325,99 @@ function toast(msg) {
 }
 
 /* Tiny markdown -> HTML. Handles fenced code, inline code, bold,
-   italic, headers, plus Lumen's tool-call markers. Deliberately
-   conservative — anything ambiguous renders as plain text. */
+   italic, headers, plus Lumen's tool-call / thinking / provider-error
+   markers. Deliberately conservative — anything ambiguous renders as
+   plain text.
+
+   Marker families this understands (all desktop-side parsers in
+   `lib/widgets/ai_chat/tool_segments.dart`, kept in sync here):
+
+     1. `<!-- LUMEN_TOOL:id|percent-encoded-arg|status -->`
+        Status: ok | err | pending | malformed. Rendered as a pill.
+     2. `<!-- LUMEN_THINKING [active] -->\n…content…\n<!-- /LUMEN_THINKING -->`
+        Reasoning trace; `active` means still streaming. Rendered as
+        a collapsible <details>; open while active, collapsed once
+        complete.
+     3. `<!-- LUMEN_ERR:kind|percent-encoded-detail -->`
+        Provider error. Rendered as an inline error chip.
+     4. `<!-- LUMEN_THINK_START -->` / `<!-- LUMEN_THINK_END -->`
+        Stream-internal markers from OllamaService. Should never
+        reach a persisted message but we strip them defensively in
+        case the desktop ships them through.
+
+   Additionally: raw tool-call body syntax (`<<<CREATE_FILE: x>>>…
+   <<<END_FILE>>>` and friends) only appears in the live content while
+   the model is mid-stream — once execution finishes the desktop
+   swaps it for a LUMEN_TOOL marker. To avoid dumping the file body
+   into the chat during that window we run a JS port of the
+   desktop's `streamingToolPreview` (same conversion to a `pending`
+   marker). */
 function markdownToHtml(s) {
   if (!s) return '';
 
-  // 1. Extract Lumen tool-call markers BEFORE HTML escaping. The
-  //    marker shape is `<!-- LUMEN_TOOL:id|percent-encoded-arg|status -->`
-  //    (see .agents/knowledgebase.md § "Tool friendly replacement is
-  //    a marker, not text"). Desktop parses these into tool cards;
-  //    we render them as compact pills inline. Replacing with a NUL-
-  //    delimited placeholder keeps the marker contents out of the
-  //    HTML escaper that runs in step 2 — the placeholder itself is
-  //    never an HTML metacharacter so it survives intact.
+  // Phase 0: strip stream-internal think markers if they ever leak
+  // through. They normally get consumed by chat_controller before
+  // anything is persisted to the message, but a future provider
+  // could ship them in the raw content; strip silently.
+  let work = s
+    .replace(/<!-- LUMEN_THINK_START -->/g, '')
+    .replace(/<!-- LUMEN_THINK_END -->/g, '');
+
+  // Phase 1: collapse raw tool-body blocks into pending markers so
+  // the file body never reaches the markdown renderer. Mirrors
+  // `streamingToolPreview` in `tool_segments.dart` — keep these in
+  // sync if you add a new body-shaped tool there.
+  work = collapseRawToolBlocks(work);
+
+  // Phase 2: extract Lumen markers into NUL-delimited placeholders
+  // BEFORE HTML escaping. The placeholders themselves are never
+  // markdown / HTML metacharacters so they survive both the
+  // escaper and the markdown passes intact.
   const toolMarkers = [];
-  let work = s.replace(
+  const thinkMarkers = [];
+  const errMarkers = [];
+
+  // The `\n?` (instead of `\n`) on either side handles the empty-
+  // content edge case the desktop emits when thinking has just
+  // started: `<!-- LUMEN_THINKING active -->\n<!-- /LUMEN_THINKING -->`
+  // — a single newline separator with no content. The desktop's
+  // parser misses this case (renders briefly as raw text); we
+  // catch it here so the phone shows the "Thinking…" pulse from
+  // the very first frame.
+  work = work.replace(
+    /<!-- LUMEN_THINKING(\s+active)? -->\n?([\s\S]*?)\n?<!-- \/LUMEN_THINKING -->/g,
+    (_m, activeFlag, content) => {
+      thinkMarkers.push({ active: !!activeFlag, content });
+      return `\u0000THINK${thinkMarkers.length - 1}\u0000`;
+    }
+  );
+  work = work.replace(
     /<!-- LUMEN_TOOL:([^|]*)\|([^|]*)\|([^\s]*) -->/g,
     (_m, id, arg, status) => {
       toolMarkers.push({ id, arg, status });
       return `\u0000TOOL${toolMarkers.length - 1}\u0000`;
     }
   );
+  work = work.replace(
+    /<!--\s*LUMEN_ERR:([a-z_]+)\|([^|]*?)\s*-->/g,
+    (_m, kind, detail) => {
+      errMarkers.push({ kind, detail });
+      return `\u0000ERR${errMarkers.length - 1}\u0000`;
+    }
+  );
 
-  // 2. Escape HTML; we re-introduce safe markup below.
+  // Phase 3: escape HTML; we re-introduce safe markup below.
   let out = work
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
-  // 3. Fenced code blocks.
+  // Phase 4: fenced code blocks.
   out = out.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, _lang, code) =>
     `<pre><code>${code.replace(/\n$/, '')}</code></pre>`
   );
 
-  // 4. Headers.
+  // Phase 5: headers.
   out = out.replace(/^###### (.+)$/gm, '<h6>$1</h6>');
   out = out.replace(/^##### (.+)$/gm,  '<h5>$1</h5>');
   out = out.replace(/^#### (.+)$/gm,   '<h4>$1</h4>');
@@ -366,19 +425,98 @@ function markdownToHtml(s) {
   out = out.replace(/^## (.+)$/gm,     '<h2>$1</h2>');
   out = out.replace(/^# (.+)$/gm,      '<h1>$1</h1>');
 
-  // 5. Inline code.
+  // Phase 6: inline code.
   out = out.replace(/`([^`\n]+?)`/g, '<code>$1</code>');
 
-  // 6. Bold + italic. Bold first so `***x***` becomes <b><i>x</i></b>.
+  // Phase 7: bold + italic. Bold first so `***x***` becomes <b><i>x</i></b>.
   out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   out = out.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
 
-  // 7. Substitute tool placeholders with rendered pill HTML.
+  // Phase 8: substitute marker placeholders with rendered HTML.
+  out = out.replace(/\u0000THINK(\d+)\u0000/g, (_m, idx) =>
+    renderThinkingBlock(thinkMarkers[+idx])
+  );
   out = out.replace(/\u0000TOOL(\d+)\u0000/g, (_m, idx) =>
     renderToolPill(toolMarkers[+idx])
   );
+  out = out.replace(/\u0000ERR(\d+)\u0000/g, (_m, idx) =>
+    renderErrorChip(errMarkers[+idx])
+  );
 
   return out;
+}
+
+/* Map of body-shaped tool names → { id (lowercase id used in
+   markers), closer (the `<<<END_X>>>` token that terminates this
+   tool's body) }. These are the only tools whose raw bodies dump
+   the file contents into the live chat — short single-line tools
+   like READ_FILE / TREE / SEARCH_TEXT carry no body so the
+   "leaks code mid-stream" failure mode doesn't apply. Add a new
+   entry here when you add a new body-shaped tool to
+   `lib/services/tool_registry.dart`. */
+const RAW_TOOL_BODIES = {
+  CREATE_FILE: { id: 'create_file', closer: 'END_FILE' },
+  EDIT_FILE:   { id: 'edit_file',   closer: 'END_EDIT' },
+  MULTI_EDIT:  { id: 'multi_edit',  closer: 'END_EDIT' },
+  APPEND_FILE: { id: 'append_file', closer: 'END_APPEND' },
+};
+
+/* Replace raw `<<<TOOL: arg>>>…body…<<<END_X>>>` blocks with
+   pending LUMEN_TOOL markers — same conversion the desktop applies
+   in `streamingToolPreview`. Two passes:
+
+     1. Fully-bracketed blocks (opener + body + closer present).
+        Replace whole span. Covers both well-formed mid-stream tool
+        calls AND structurally-malformed ones — the PWA doesn't
+        validate inner shape (no SEARCH/REPLACE check), it just
+        hides the body.
+     2. Trailing incomplete opener (model started a file body but
+        the closer hasn't arrived yet). Replace from the opener to
+        the end of the buffer with a pending marker so the partial
+        body stays hidden until the next delta brings the closer.
+
+   Anything not matching either pass passes through untouched, so a
+   conversational `<<<X>>>` that happens to use triple angle
+   brackets is left alone. */
+function collapseRawToolBlocks(content) {
+  let out = content;
+
+  // Pass 1: complete blocks.
+  for (const [name, { id, closer }] of Object.entries(RAW_TOOL_BODIES)) {
+    const re = new RegExp(
+      `<<<${name}:\\s*([^>\\n]*?)\\s*>>>[\\s\\S]*?<<<${closer}>>>`,
+      'g'
+    );
+    out = out.replace(re, (_m, arg) => toolMarker(id, arg, 'pending'));
+  }
+
+  // Pass 2: trailing incomplete opener. Find the LAST opener in
+  // the buffer; if it has no matching closer between it and the
+  // end of the string, replace from there. We only check the last
+  // opener because the buffer can only have ONE incomplete tail
+  // at a time during streaming.
+  const lastOpenerRe = /<<<(CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):\s*([^>\n]*?)\s*>>>/g;
+  let lastMatch = null;
+  let m;
+  while ((m = lastOpenerRe.exec(out)) !== null) lastMatch = m;
+  if (lastMatch) {
+    const name = lastMatch[1];
+    const arg = lastMatch[2] || '';
+    const meta = RAW_TOOL_BODIES[name];
+    if (meta) {
+      const tail = out.slice(lastMatch.index + lastMatch[0].length);
+      if (!tail.includes(`<<<${meta.closer}>>>`)) {
+        out = out.slice(0, lastMatch.index) +
+              toolMarker(meta.id, arg, 'pending');
+      }
+    }
+  }
+
+  return out;
+}
+
+function toolMarker(id, arg, status) {
+  return `\n<!-- LUMEN_TOOL:${id}|${encodeURIComponent(arg.trim())}|${status} -->\n`;
 }
 
 /* Render a Lumen tool marker as a small inline pill. Mirrors the
@@ -387,7 +525,9 @@ function markdownToHtml(s) {
    pill sits on its own line because marker emission almost always
    ships with surrounding newlines from the agent loop. */
 function renderToolPill({ id, arg, status }) {
-  const ok = status === 'ok';
+  const ok = status === 'ok' || status === 'pending';
+  const pending = status === 'pending';
+  const malformed = status === 'malformed';
   const safeId = escapeHtml(id || 'tool');
   let argText = '';
   try { argText = decodeURIComponent(arg || ''); }
@@ -395,9 +535,74 @@ function renderToolPill({ id, arg, status }) {
   const argHtml = argText
     ? ` <span class="tool-pill__arg">${escapeHtml(argText)}</span>`
     : '';
-  const cls = ok ? 'tool-pill tool-pill--ok' : 'tool-pill tool-pill--err';
-  const icon = ok ? '\u2713' : '!';
+  let cls = 'tool-pill';
+  let icon = '\u2713';
+  if (malformed) {
+    cls = 'tool-pill tool-pill--warn';
+    icon = '!';
+  } else if (!ok) {
+    cls = 'tool-pill tool-pill--err';
+    icon = '!';
+  } else if (pending) {
+    cls = 'tool-pill tool-pill--pending';
+    icon = '\u2026';
+  } else {
+    cls = 'tool-pill tool-pill--ok';
+  }
   return `<span class="${cls}"><span class="tool-pill__icon">${icon}</span>${safeId}${argHtml}</span>`;
+}
+
+/* Render a thinking trace as a collapsible <details> block. Open by
+   default while still streaming so the user can watch reasoning
+   appear; collapsed once complete (matches the desktop's behaviour
+   in `_ThinkingBlock`). The content area renders as monospace,
+   muted text — it's auxiliary, never the answer. We HTML-escape the
+   inner content because thinking traces routinely contain `<` and
+   `>` characters from XML-style tool plans. */
+function renderThinkingBlock({ active, content }) {
+  const safe = escapeHtml(content || '').replace(/\n/g, '<br>');
+  const openAttr = active ? ' open' : '';
+  const labelText = active ? 'Thinking…' : 'Thoughts';
+  const stateCls = active
+    ? 'lumen-thinking lumen-thinking--active'
+    : 'lumen-thinking';
+  return (
+    `<details class="${stateCls}"${openAttr}>` +
+      `<summary class="lumen-thinking__summary">` +
+        `<span class="lumen-thinking__pulse"></span>` +
+        `<span class="lumen-thinking__label">${labelText}</span>` +
+      `</summary>` +
+      `<div class="lumen-thinking__body">${safe}</div>` +
+    `</details>`
+  );
+}
+
+/* Render a provider-error marker as a compact error chip. The
+   desktop renders these as a full Retry-capable card; on the PWA
+   we just want the user to know the turn failed and what kind of
+   failure it was — Retry happens from the desktop or by sending a
+   new message. */
+function renderErrorChip({ kind, detail }) {
+  const safeKind = escapeHtml(kind || 'error');
+  let detailText = '';
+  try { detailText = decodeURIComponent(detail || ''); }
+  catch (_) { detailText = detail || ''; }
+  // Trim noisy provider preambles so the chip stays one-line-ish.
+  detailText = detailText
+    .replace(/^(?:Error[:\s]+)?(?:Anthropic|Gemini|GitHub Models|OpenAI|Ollama)\s*API error\s*\(\d+\)\s*:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (detailText.length > 220) detailText = detailText.slice(0, 217) + '…';
+  const detailHtml = detailText
+    ? ` <span class="error-chip__detail">${escapeHtml(detailText)}</span>`
+    : '';
+  return (
+    `<span class="error-chip">` +
+      `<span class="error-chip__icon">!</span>` +
+      `<span class="error-chip__kind">${safeKind}</span>` +
+      detailHtml +
+    `</span>`
+  );
 }
 
 function escapeHtml(s) {
@@ -661,6 +866,7 @@ async function renderChat(chatId) {
   chat.appendChild(header);
 
   const messages = el('div', { class: 'chat__messages' });
+  _bindAutoScroll(messages);
   chat.appendChild(messages);
 
   const composer = _buildComposer(chatId);
@@ -1003,7 +1209,7 @@ function updateChatThinkingState() {
         el('span', { class: 'thinking__dot' }),
       ]);
       messages.appendChild(thinking);
-      scrollToBottom(messages);
+      _scrollIfPinned(messages);
     }
   } else if (!state.isGenerating && thinking) {
     thinking.remove();
@@ -1040,16 +1246,73 @@ function _buildBubble(msg) {
   return node;
 }
 
+/* Distance-from-bottom threshold (px) used to:
+   - re-engage auto-follow when the user scrolls back near the bottom
+   - decide whether a freshly-rendered bubble should pin to bottom
+   100px is generous enough to handle imprecise touch scrolling on
+   phones (a finger flick rarely lands exactly at scrollHeight). */
+const PIN_SLACK_PX = 100;
+
+/* "Pinned-to-bottom" state lives as a dataset flag on the messages
+   container. Tying it to the DOM node (rather than module state)
+   means each chat screen render starts in the pinned-true state
+   without us having to remember to reset a global on every route
+   change.
+
+   The flag is the source of truth for "should this delta scroll the
+   view?". We deliberately DON'T re-derive it from the layout after a
+   content mutation — that's the bug we're fixing here: appending
+   content grows `scrollHeight` without changing `scrollTop`, so a
+   live `isNearBottom` reading taken after the mutation always reads
+   "no, the user has scrolled up" even when they haven't moved a
+   pixel. The flag, by contrast, only flips on actual user scroll
+   events (and on programmatic scroll-to-bottom, which is a no-op
+   re-affirmation). */
+function _isPinned(messages) {
+  // Default to true — a fresh container with no flag set should
+  // auto-follow the stream. Only an explicit 'false' unpins.
+  return messages.dataset.pinned !== 'false';
+}
+function _setPinned(messages, pinned) {
+  messages.dataset.pinned = pinned ? 'true' : 'false';
+}
+
+/* Bind the scroll listener that maintains the pinned flag. Called
+   from `renderChat` every time the chat screen mounts. The listener
+   checks distance-from-bottom on every scroll frame:
+     - within slack of the bottom → pinned = true (auto-follow on)
+     - past slack from the bottom → pinned = false (user is reading)
+   Using `passive: true` avoids blocking scroll on slow devices
+   (the listener never calls preventDefault). */
+function _bindAutoScroll(messages) {
+  messages.addEventListener('scroll', () => {
+    const distance =
+      messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+    _setPinned(messages, distance < PIN_SLACK_PX);
+  }, { passive: true });
+}
+
+/* Pin to the bottom. Force the flag true (so an in-progress user
+   scroll-up doesn't fight the next delta) and scroll. Two RAF hops
+   handles the "first frame: layout; second frame: scrollHeight is
+   correct" case for media-heavy bubbles (font / image loads after
+   the first frame). For pure text streams the second hop is a
+   harmless no-op. */
 function scrollToBottom(messages) {
-  // Defer one frame so newly-appended bubbles have laid out.
+  _setPinned(messages, true);
   requestAnimationFrame(() => {
     messages.scrollTop = messages.scrollHeight;
+    requestAnimationFrame(() => {
+      messages.scrollTop = messages.scrollHeight;
+    });
   });
 }
 
-function isNearBottom(messages) {
-  const slack = 80;
-  return messages.scrollHeight - messages.scrollTop - messages.clientHeight < slack;
+/* Conditional version: scroll only if the user is currently pinned.
+   Used by streaming-delta callbacks so a user reading scroll-back
+   isn't yanked away from their position. */
+function _scrollIfPinned(messages) {
+  if (_isPinned(messages)) scrollToBottom(messages);
 }
 
 /* ── Streaming hooks (called from event dispatch) ──────────── */
@@ -1066,9 +1329,13 @@ function onMessageAdded(chatId, message) {
   // Don't double-append if a bubble with this id already exists
   // (could happen on a reconnect that replays missed events).
   if (messages.querySelector(`[data-message-id="${CSS.escape(message.id)}"]`)) return;
-  const wasNearBottom = isNearBottom(messages);
+  // For user messages, always pin — the user just hit Send, they
+  // want to see their own bubble. For assistant adds, follow the
+  // existing pinned state.
+  const force = message.role === 'user';
   messages.appendChild(_buildBubble(message));
-  if (wasNearBottom) scrollToBottom(messages);
+  if (force) scrollToBottom(messages);
+  else _scrollIfPinned(messages);
 }
 
 function onMessageDelta(chatId, messageId, content) {
@@ -1090,7 +1357,12 @@ function onMessageDelta(chatId, messageId, content) {
   const inner = bubble.querySelector('.bubble__content');
   // Streaming cursor adds a tasteful "still typing" affordance.
   inner.innerHTML = `${markdownToHtml(content || '')}<span class="bubble__cursor"></span>`;
-  if (isNearBottom(messages)) scrollToBottom(messages);
+  // Use the cached pinned flag rather than recomputing isNearBottom
+  // here — the innerHTML mutation above just grew scrollHeight
+  // without moving scrollTop, so a live distance-from-bottom check
+  // would now read "user has scrolled up" even when they haven't.
+  // The flag is only flipped by genuine user scroll events.
+  _scrollIfPinned(messages);
 }
 
 function onMessageComplete(chatId, messageId) {
@@ -1100,6 +1372,12 @@ function onMessageComplete(chatId, messageId) {
   if (!bubble) return;
   const cursor = bubble.querySelector('.bubble__cursor');
   if (cursor) cursor.remove();
+  // The completion event triggers re-renders elsewhere (e.g. the
+  // thinking block flips from active=true → active=false and
+  // collapses, shrinking the bubble). If the user was following
+  // along at the bottom, re-pin so the answer's last line stays in
+  // view instead of getting pushed below the fold by the collapse.
+  _scrollIfPinned(messages);
 }
 
 function onMessageDeleted(chatId, messageId) {

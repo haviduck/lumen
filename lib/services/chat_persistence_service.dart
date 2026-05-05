@@ -60,6 +60,26 @@ class ChatSession {
   ReasoningEffort reasoningEffort;
   List<PersistedMessage> messages;
 
+  /// LLM-generated summary of dropped-middle history, persisted across
+  /// reloads so a long session that's already paid the summarization
+  /// cost doesn't re-summarize after an app restart. `null` means
+  /// "no cached summary" — either the session is short enough that
+  /// summarization never ran, or summarization is disabled, or the
+  /// last attempt fell back to the deterministic elision placeholder.
+  ///
+  /// Refreshed by `ChatController._maybeSummarizeHistory` when the
+  /// dropped span has grown beyond
+  /// `chat.historySummary.refreshDelta` messages since the cached
+  /// summary was produced. See `lib/providers/chat/history_summarizer.dart`.
+  String? cachedHistorySummary;
+
+  /// Number of dropped (non-tail, non-first-user) messages folded
+  /// into [cachedHistorySummary]. Used as the cache key — when the
+  /// current dropped count exceeds this by `refreshDelta`, the
+  /// cache is stale and the summarizer re-runs. `null` whenever
+  /// [cachedHistorySummary] is `null`.
+  int? cachedHistorySummaryDroppedCount;
+
   ChatSession({
     required this.id,
     required this.title,
@@ -69,6 +89,8 @@ class ChatSession {
     this.model,
     this.reasoningEffort = ReasoningEffort.standard,
     required this.messages,
+    this.cachedHistorySummary,
+    this.cachedHistorySummaryDroppedCount,
   });
 
   Map<String, dynamic> toJson() => {
@@ -80,6 +102,9 @@ class ChatSession {
     'model': model,
     'reasoningEffort': reasoningEffort.id,
     'messages': messages.map((m) => m.toJson()).toList(),
+    if (cachedHistorySummary != null) 'historySummary': cachedHistorySummary,
+    if (cachedHistorySummaryDroppedCount != null)
+      'historySummaryDropped': cachedHistorySummaryDroppedCount,
   };
 
   factory ChatSession.fromJson(Map<String, dynamic> j) => ChatSession(
@@ -93,6 +118,9 @@ class ChatSession {
     messages: ((j['messages'] as List?) ?? const [])
         .map((e) => PersistedMessage.fromJson(e as Map<String, dynamic>))
         .toList(),
+    cachedHistorySummary: j['historySummary'] as String?,
+    cachedHistorySummaryDroppedCount: (j['historySummaryDropped'] as num?)
+        ?.toInt(),
   );
 }
 
@@ -111,6 +139,41 @@ class PersistedMessage {
   /// instead of the multi-paragraph prompt the agent actually reads.
   final String? displayContent;
 
+  /// Wall-clock duration of the entire turn that produced this
+  /// message, in milliseconds. Set on assistant messages only,
+  /// populated by `ChatController._runGenerationLoop` just before
+  /// the message is persisted. `null` for legacy messages stored
+  /// before timing was added, for user messages, and for messages
+  /// where the loop crashed before the timing stamp ran.
+  ///
+  /// Diagnostic-only — used by the chat bubble's small footer and
+  /// by debug logs to pinpoint whether a turn hit Ollama Cloud's
+  /// 182s hard timeout (issue #15973) vs. a local-network glitch
+  /// vs. a model that just "stopped" mid-iteration.
+  final int? totalDurationMs;
+
+  /// Time-to-first-byte for this turn, in milliseconds — measured
+  /// from the moment the controller began the first iteration's
+  /// stream to the first non-empty chunk it received (any chunk
+  /// counts, including the LUMEN_THINK_START sentinel; "first
+  /// activity" is the right signal for diagnosis). `null` if no
+  /// chunk ever arrived, on user messages, or on legacy data.
+  final int? firstByteLatencyMs;
+
+  /// Number of model passes ("iterations") that ran inside the
+  /// agent loop for this turn. A simple Q&A is 1; a tool-heavy
+  /// turn that read a file then edited it then verified is 4.
+  /// Combined with [totalDurationMs] tells you whether the wall
+  /// time was spent on one slow pass vs. many fast passes.
+  final int? iterationCount;
+
+  /// Wall-clock duration of the LAST iteration only, in
+  /// milliseconds. The single most useful number for diagnosing
+  /// the 182s cloud timeout: if total=240s but last=180s, the
+  /// last iteration is what hit the wall and that's where the
+  /// fix has to land.
+  final int? lastIterationDurationMs;
+
   PersistedMessage({
     String? id,
     required this.role,
@@ -119,6 +182,10 @@ class PersistedMessage {
     this.references = const [],
     this.displayContent,
     DateTime? timestamp,
+    this.totalDurationMs,
+    this.firstByteLatencyMs,
+    this.iterationCount,
+    this.lastIterationDurationMs,
   }) : timestamp = timestamp ?? DateTime.now(),
        id = id ?? _generateId();
 
@@ -130,6 +197,11 @@ class PersistedMessage {
     'references': references.map((r) => r.toJson()).toList(),
     if (displayContent != null) 'display': displayContent,
     'ts': timestamp.toIso8601String(),
+    if (totalDurationMs != null) 'durationMs': totalDurationMs,
+    if (firstByteLatencyMs != null) 'ttfbMs': firstByteLatencyMs,
+    if (iterationCount != null) 'iters': iterationCount,
+    if (lastIterationDurationMs != null)
+      'lastIterMs': lastIterationDurationMs,
   };
 
   factory PersistedMessage.fromJson(Map<String, dynamic> j) {
@@ -148,6 +220,10 @@ class PersistedMessage {
           .toList(),
       displayContent: j['display'] as String?,
       timestamp: ts,
+      totalDurationMs: (j['durationMs'] as num?)?.toInt(),
+      firstByteLatencyMs: (j['ttfbMs'] as num?)?.toInt(),
+      iterationCount: (j['iters'] as num?)?.toInt(),
+      lastIterationDurationMs: (j['lastIterMs'] as num?)?.toInt(),
     );
   }
 
