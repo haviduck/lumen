@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' show Random;
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -68,11 +69,11 @@ import 'chat/history_summarizer.dart';
 /// that itself contains `>>>` is pathological and matches the
 /// executor's own behaviour anyway.
 final RegExp _kCompleteToolCall = RegExp(
-  r'<<<(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):.*?>>>'
+  r'<<<(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|EDIT_RANGE|APPEND_FILE):.*?>>>'
   r'.*?'
   r'<<<END_(?:FILE|EDIT|APPEND)>>>'
   r'|'
-  r'<<<(?!(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):)'
+  r'<<<(?!(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|EDIT_RANGE|APPEND_FILE):)'
   r'[A-Z_]+:.*?>>>',
   dotAll: true,
 );
@@ -124,7 +125,7 @@ final RegExp _kTruncatedLengthRe = RegExp(
 /// with text but no work — this trips a specific nudge instead of
 /// silently producing a useless turn.
 final RegExp _kOpenFileToolRe = RegExp(
-  r'<<<(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):',
+  r'<<<(?:CREATE_FILE|EDIT_FILE|MULTI_EDIT|EDIT_RANGE|APPEND_FILE):',
 );
 final RegExp _kCloseFileToolRe = RegExp(r'<<<END_(?:FILE|EDIT|APPEND)>>>');
 
@@ -163,6 +164,80 @@ String _draftWithThinking(
   }
   if (content.isNotEmpty) parts.add(content);
   return parts.join('\n\n');
+}
+
+/// Module-private RNG used by [_generateMarkerNonce]. Kept around as
+/// a single instance (rather than a fresh `Random()` per call) to
+/// amortise the seed cost across the lifetime of the process. We
+/// don't need crypto strength here: the nonce defends against a
+/// model in real-time mimicking a token it hasn't seen, and a
+/// 32-bit space is wildly more than the model can plausibly guess
+/// while generating tokens at hundreds-per-second.
+final Random _markerNonceRng = Random();
+
+/// Per-turn random nonce for the executor's `<!-- LUMEN_TOOL:... -->`
+/// markers. Returns 8 hex chars (≈32 bits of randomness). Generated
+/// fresh in `_runGenerationLoop` for every assistant turn and
+/// stamped onto:
+///   - `ToolExecutor.markerNonce` (so real markers carry it),
+///   - `streamingToolPreview(..., markerNonce: ...)` (so pending
+///     markers carry it AND the impersonation strip pass knows
+///     which markers in the live buffer are "real / from a
+///     previous iteration of this turn" vs "the model just
+///     emitted this in mimicry"),
+///   - `PersistedMessage.toolMarkerNonce` (so the chat parser
+///     validates renders against it).
+///
+/// Per-turn, NOT per-session: a per-session nonce would let the
+/// model copy a verbatim nonce from earlier conversation history
+/// and re-inject it as a "successful" mimicry. Per-turn means the
+/// only valid nonce is one the model has not had access to in
+/// any previous chunk it was trained on or saw streamed back.
+String _generateMarkerNonce() {
+  // Two `nextInt(1 << 16)` calls with a bit-shift give us 32 bits
+  // — Dart's `Random.nextInt(max)` requires `max <= 1 << 32` and
+  // some platforms historically wobbled at the high end of that
+  // range, so two 16-bit chunks composed are the portable pattern.
+  final hi = _markerNonceRng.nextInt(1 << 16);
+  final lo = _markerNonceRng.nextInt(1 << 16);
+  final v = (hi << 16) | lo;
+  return v.toRadixString(16).padLeft(8, '0');
+}
+
+/// Compute the storage key used to record a "blanket approval" for
+/// a specific tool invocation in `_autoApprovedTools`.
+///
+/// Rule:
+///  - For `run_cmd`, return `run_cmd:<binary>` — the binary name is
+///    the first whitespace-separated token of `detail`. Empty /
+///    blank `detail` falls back to the bare `run_cmd` id (treats
+///    it as "all run_cmd" — the most permissive interpretation,
+///    which matches the user's likely intent if they somehow
+///    triggered "Always" on a no-arg run_cmd).
+///  - For every other tool, return the bare tool id. Tools like
+///    `delete_file` / `edit_file` don't gain useful granularity
+///    from per-argument keys — the gate is all-or-nothing for the
+///    permission concept they represent.
+///
+/// Top-level (not a method) so it can be reused by the approval
+/// card without touching `ChatController` instance state. Pure
+/// function: same inputs → same key, no I/O, no side effects.
+///
+/// Cursor / VS Code's terminal-trust list works on the same first-
+/// token granularity ("trust npm" vs "trust each individual npm
+/// install command"). Full-command keying was considered but
+/// rejected as too granular — every flag variation would create a
+/// new entry and the gate would still fire constantly.
+String commandApprovalKey(String toolId, String detail) {
+  if (toolId != 'run_cmd') return toolId;
+  final trimmed = detail.trim();
+  if (trimmed.isEmpty) return toolId;
+  // First whitespace-separated token. `RegExp(r'\s')` covers
+  // spaces / tabs / newlines (an agent that wraps a multi-line
+  // command in one detail string still gets a sensible key).
+  final firstToken = trimmed.split(RegExp(r'\s+')).first;
+  if (firstToken.isEmpty) return toolId;
+  return '$toolId:$firstToken';
 }
 
 /// In-flight approval request shown to the user.
@@ -343,8 +418,10 @@ class ChatController extends ChangeNotifier {
     'create_file',
     'edit_file',
     'multi_edit',
+    'edit_range',
     'append_file',
     'move_file',
+    'copy_file',
     'delete_file',
   };
 
@@ -482,6 +559,26 @@ class ChatController extends ChangeNotifier {
   final Set<String> _generatingSessionIds = <String>{};
   final Map<String, CancellationToken> _cancelTokens =
       <String, CancellationToken>{};
+
+  // ---- live (in-flight) session refs ----
+  // Maps sessionId → the in-memory ChatSession reference that
+  // `_runGenerationLoop` is actively mutating. Populated at the top of
+  // the loop, cleared in `finally`. The reason this exists at all:
+  // tab activation paths (`openSession`, `closeTab`, …) used to
+  // unconditionally reload the session from disk, which loses any
+  // mid-stream content (`<!-- LUMEN_THINKING -->` markers, partial
+  // prose, in-progress tool segments) that the loop wrote in-memory
+  // but hasn't yet persisted at iteration boundaries. Worse, the
+  // disk-load returns a NEW `ChatSession` instance — so `_current`
+  // ends up pointing at a stale copy while the streaming loop keeps
+  // mutating an orphaned reference invisible to the UI. Switching
+  // tabs and switching back made the live thinking badge / tool
+  // segments / streaming cursor vanish until the turn finished.
+  //
+  // `_resolveSessionForActivation` consults this map first so we
+  // hand the activator the SAME reference the loop is writing to,
+  // keeping the UI consistent across tab switches mid-generation.
+  final Map<String, ChatSession> _liveSessions = <String, ChatSession>{};
   final Map<String, PendingApproval> _pendingApprovals =
       <String, PendingApproval>{};
   bool _autoApprove = false;
@@ -542,12 +639,27 @@ class ChatController extends ChangeNotifier {
   // user switched workspaces still resolves to the original context.
   final List<QueuedPrompt> _promptQueue = <QueuedPrompt>[];
   int _nextQueueId = 0;
-  // Per-tool blanket approvals — distinct from `_autoApprove`
+  // Per-approval blanket grants — distinct from `_autoApprove`
   // (the global "approve everything" master switch). Driven by the
-  // approval card's "Allow always" / "Always run" button: clicking
-  // it adds *only this tool's id* here, so future calls of the
-  // same tool skip the prompt without affecting any other gated
-  // tool. Cleared individually from Settings.
+  // approval card's "Always run" / "Allow always" dropdown.
+  //
+  // **Two key shapes** live in this set:
+  //   - **Bare tool id** (e.g. `delete_file`) — legacy/coarse
+  //     semantics: "always allow this whole tool, regardless of
+  //     argument". Used for non-shell tools where the per-call
+  //     argument doesn't add useful trust granularity (the gate
+  //     was always all-or-nothing for them anyway).
+  //   - **Tool id + argument fingerprint** (e.g. `run_cmd:npm`)
+  //     — finer-grained, used for `run_cmd` so the user can
+  //     "always allow npm" without granting blanket permission to
+  //     run *any* shell command. The fingerprint is the first
+  //     whitespace-separated token of the command (the binary
+  //     name). See `commandApprovalKey` for the rule.
+  //
+  // The gate check (`_approveCommandForSession`) consults BOTH
+  // shapes — so a stale bare `run_cmd` entry from a prior code
+  // version still works, and a fresh `run_cmd:git` only grants
+  // git. Cleared individually from Settings → AI/Chat.
   final Set<String> _autoApprovedTools = <String>{};
 
   /// Ring buffer of recent **silently-approved** tool runs. Populated
@@ -1102,6 +1214,62 @@ class ChatController extends ChangeNotifier {
     }
   }
 
+  /// Pick up to three registered tool names that resemble [unknown]
+  /// for the `NearMissShape.unknownTool` nudge. The model invented a
+  /// tool name; the nudge is far more useful when it can say "you
+  /// probably meant `X` or `Y`" than when it just says "see the
+  /// system prompt" and the model loops on the same wrong guess.
+  ///
+  /// The similarity test is intentionally simple and tolerant:
+  ///   - shared prefix of length ≥ 3 (`COPY` ↔ `COPY_FILE`),
+  ///   - either name is a substring of the other (`READ` ↔
+  ///     `READ_FILE`),
+  ///   - share any underscore-separated token of length ≥ 3 so
+  ///     `LIST_FILES` matches `LIST_DIR`, `FIND_FILE` matches
+  ///     `FIND_FILE_RANGE`, `GREP` matches `SEARCH_TEXT` (no — they
+  ///     share no token; that's correct, the candidates list will
+  ///     be empty and the nudge falls back to "re-read the system
+  ///     prompt").
+  ///
+  /// No Levenshtein because the false-positive radius is too wide
+  /// at this length range (5–20 chars). The token-based test
+  /// produces zero matches when the model invented something
+  /// genuinely unrelated, which is the right behaviour — better an
+  /// empty list than a misleading "you meant `EDIT_FILE`?" when the
+  /// model wrote `<<<RUN_TESTS: …>>>`.
+  static List<String> _suggestSimilarTools(
+    String unknown,
+    Set<String> known,
+  ) {
+    if (unknown.isEmpty || known.isEmpty) return const <String>[];
+    final tokensU = unknown.split('_').where((t) => t.length >= 3).toSet();
+    final hits = <String>[];
+    for (final k in known) {
+      if (k == unknown) continue;
+      // Substring either direction.
+      if (k.contains(unknown) || unknown.contains(k)) {
+        hits.add(k);
+        continue;
+      }
+      // Shared 3-char prefix on the first segment.
+      final first = k.split('_').first;
+      final firstU = unknown.split('_').first;
+      if (first.length >= 3 && firstU.length >= 3 &&
+          first.substring(0, 3) == firstU.substring(0, 3)) {
+        hits.add(k);
+        continue;
+      }
+      // Any shared underscore-separated token.
+      final tokensK = k.split('_').where((t) => t.length >= 3).toSet();
+      if (tokensK.intersection(tokensU).isNotEmpty) {
+        hits.add(k);
+      }
+    }
+    // Stable order, capped at 3 — long lists noise the nudge.
+    hits.sort();
+    return hits.take(3).toList();
+  }
+
   /// Splits a prefixed model string into (provider, rawModel).
   static (String, String) _splitModel(String model) {
     final idx = model.indexOf(':');
@@ -1465,9 +1633,9 @@ class ChatController extends ChangeNotifier {
   }
 
   Future<void> openSession(String id) async {
-    final loaded = await persistence.loadSession(id);
-    if (loaded != null) {
-      _current = loaded;
+    final resolved = await _resolveSessionForActivation(id);
+    if (resolved != null) {
+      _current = resolved;
       // Ensure the session has a tab — opening from history (or any
       // non-tab path) should bring it into the tab strip so the user
       // can switch back to it without re-opening.
@@ -1478,6 +1646,32 @@ class ChatController extends ChangeNotifier {
       await _persistOpenTabs();
       notifyListeners();
     }
+  }
+
+  /// Resolve [id] to a `ChatSession` for activation as `_current`.
+  ///
+  /// Prefers the in-flight streaming reference from [_liveSessions]
+  /// when one exists — disk-loading mid-stream returns stale content
+  /// (the LUMEN_THINKING / LUMEN_TOOL markers and partial prose live
+  /// only in-memory until the iteration boundary persists them) and
+  /// orphans the loop's mutations from the UI for the rest of the
+  /// turn. Without this preference, switching to another tab and
+  /// back made thinking badges, tool cards, and the streaming
+  /// cursor vanish until the model finished and we re-loaded.
+  ///
+  /// On the disk-load fallback we also overwrite `_sessions[idx]`
+  /// with the freshly loaded instance so any subsequent generation
+  /// run on this session points at the same reference the activator
+  /// just handed out — i.e. `_current === _sessions[idx]` again.
+  Future<ChatSession?> _resolveSessionForActivation(String id) async {
+    final live = _liveSessions[id];
+    if (live != null) return live;
+    final loaded = await persistence.loadSession(id);
+    if (loaded != null) {
+      final idx = _sessions.indexWhere((s) => s.id == id);
+      if (idx >= 0) _sessions[idx] = loaded;
+    }
+    return loaded;
   }
 
   Future<void> deleteSession(String id) async {
@@ -1521,9 +1715,9 @@ class ChatController extends ChangeNotifier {
             ? _openTabIds.length - 1
             : idx;
         final nextId = _openTabIds[nextIdx];
-        final loaded = await persistence.loadSession(nextId);
-        if (loaded != null) {
-          _current = loaded;
+        final resolved = await _resolveSessionForActivation(nextId);
+        if (resolved != null) {
+          _current = resolved;
           await _persistCurrentSessionId(nextId);
         }
       }
@@ -1543,9 +1737,9 @@ class ChatController extends ChangeNotifier {
       ..clear()
       ..add(keepId);
     if (_current?.id != keepId) {
-      final loaded = await persistence.loadSession(keepId);
-      if (loaded != null) {
-        _current = loaded;
+      final resolved = await _resolveSessionForActivation(keepId);
+      if (resolved != null) {
+        _current = resolved;
         await _persistCurrentSessionId(keepId);
       }
     }
@@ -1563,9 +1757,9 @@ class ChatController extends ChangeNotifier {
     final removed = _openTabIds.sublist(pivotIdx + 1);
     _openTabIds.removeRange(pivotIdx + 1, _openTabIds.length);
     if (_current != null && removed.contains(_current!.id)) {
-      final loaded = await persistence.loadSession(pivotId);
-      if (loaded != null) {
-        _current = loaded;
+      final resolved = await _resolveSessionForActivation(pivotId);
+      if (resolved != null) {
+        _current = resolved;
         await _persistCurrentSessionId(pivotId);
       }
     }
@@ -1876,7 +2070,17 @@ class ChatController extends ChangeNotifier {
       _recordSilentApproval(toolId, detail, reason: 'auto-approve all');
       return true;
     }
-    if (_autoApprovedTools.contains(toolId)) {
+    // Check both the per-argument key (e.g. `run_cmd:npm`) AND the
+    // bare tool id. The richer key is the modern path — added by
+    // the approval strip's "Always" dropdown — and lets the user
+    // grant trust to a specific shell binary without unlocking
+    // every shell command. The bare-id check stays for back-compat
+    // with any pre-existing `run_cmd` entries from earlier builds
+    // and for non-shell tools where per-arg granularity isn't a
+    // thing (delete_file, edit_file, etc. still key by id alone).
+    final cmdKey = commandApprovalKey(toolId, detail);
+    if (_autoApprovedTools.contains(cmdKey) ||
+        (cmdKey != toolId && _autoApprovedTools.contains(toolId))) {
       _recordSilentApproval(toolId, detail, reason: 'always-allow this tool');
       return true;
     }
@@ -1927,16 +2131,37 @@ class ChatController extends ChangeNotifier {
     if (!p.completer.isCompleted) p.completer.complete(approved);
   }
 
-  /// Add or remove a tool from the per-tool blanket-approval set.
-  /// Called from the approval card's "Allow always" button (add) and
-  /// from Settings (remove). Persisted immediately.
-  Future<void> setToolAutoApproved(String toolId, bool approved) async {
+  /// Add or remove a key from the blanket-approval set.
+  ///
+  /// `key` may be a bare tool id (`delete_file`) or a tool-id +
+  /// argument fingerprint (`run_cmd:npm`). The Settings revoke
+  /// chip and the silent-approval audit toast call this with
+  /// whatever key they want gone — the function doesn't try to
+  /// expand bare ids into all matching rich keys (so revoking
+  /// `run_cmd` from Settings doesn't accidentally also revoke
+  /// `run_cmd:npm`, and vice versa). Persisted immediately.
+  Future<void> setToolAutoApproved(String key, bool approved) async {
     final changed = approved
-        ? _autoApprovedTools.add(toolId)
-        : _autoApprovedTools.remove(toolId);
+        ? _autoApprovedTools.add(key)
+        : _autoApprovedTools.remove(key);
     if (!changed) return;
     await prefs.setAutoApprovedTools(_autoApprovedTools.toList());
     notifyListeners();
+  }
+
+  /// Convenience wrapper: register a per-command blanket approval
+  /// for a specific tool invocation. Computes the storage key via
+  /// `commandApprovalKey(toolId, detail)` and forwards to
+  /// [setToolAutoApproved]. Used by the approval strip's "Always"
+  /// dropdown so the call site doesn't have to duplicate the
+  /// key-derivation rule.
+  Future<void> setCommandAutoApproved(
+    String toolId,
+    String detail, {
+    bool approved = true,
+  }) async {
+    final key = commandApprovalKey(toolId, detail);
+    await setToolAutoApproved(key, approved);
   }
 
   /// Wipe every per-tool approval at once. Settings exposes this as
@@ -2235,20 +2460,246 @@ class ChatController extends ChangeNotifier {
   }
 
   String _contentWithReferences(PersistedMessage message) {
+    // Persisted assistant content carries `<!-- LUMEN_TOOL:... -->`
+    // markers (the executor's friendly rewrite of real tool calls),
+    // `<!-- LUMEN_THINKING -->` blocks, and `<!-- LUMEN_ERR -->`
+    // chips. The chat UI parses them into widgets so the user
+    // never sees the raw form.
+    //
+    // **We deliberately send markers verbatim to every model.** An
+    // earlier iteration of this code rewrote markers to friendly
+    // prose ("(Edited file: foo.py)") on the theory that weaker
+    // models mimicking the marker shape was the failure mode worth
+    // fixing. That was wrong on its face — *all* LLMs mimic
+    // patterns they see in context, and the friendly-prose form is
+    // a worse pattern to mimic because the chat panel can't
+    // recognise the resulting prose as a tool card and surfaces it
+    // as bare text (Ollama "weird text reads") or as past-tense
+    // narration without an actual tool firing (Claude
+    // "(Created file: foo.py)" hallucination). The marker form is
+    // syntactically distinct enough that the
+    // [HallucinationDetector.detectNearMissTool] htmlComment shape
+    // catches mimicry at runtime; the auto-continue gate then
+    // nudges the model back to `<<<TOOL: arg>>>` syntax. Trust the
+    // detection layer; don't introduce new mimicable patterns.
     if (message.references.isEmpty) return message.content;
-    final buffer = StringBuffer(message.content.trim());
-    if (buffer.isNotEmpty) buffer.writeln('\n');
-    buffer.writeln('Attached workspace references:');
+
+    // The composer inserts `@<label>` into the textarea when a user
+    // right-clicks "Add to chat" / drops a file. That's purely a
+    // VISUAL cue — no model is trained to interpret `@<path>` as a
+    // file fetch directive (it shapes like a Twitter handle), and
+    // smaller cloud Ollama models (gemma, glm, qwen) routinely
+    // either ignore it, hallucinate that they read the file, or
+    // loop trying to figure out what `@` means. Replace each
+    // attached reference's `@<label>` token with `\`<label>\``
+    // (backtick-wrapped path) before sending — that's natural
+    // prose every model handles cleanly.
+    var bodyText = message.content;
     for (final ref in message.references) {
-      final kind = ref.kind == ChatReferenceKind.folder ? 'folder' : 'file';
-      final label = ref.workspaceRelativePath ?? ref.path;
-      buffer.writeln('- [$kind] $label');
-      buffer.writeln('  absolute path: ${ref.path}');
+      bodyText = bodyText.replaceAll(ref.inlineToken, '`${ref.label}`');
     }
-    buffer.writeln(
-      'Use these as relevant context. Inspect them with file tools before making claims about their contents.',
-    );
+
+    final buffer = StringBuffer(bodyText.trimRight());
+    if (buffer.isNotEmpty) buffer.writeln();
+    for (final ref in message.references) {
+      buffer.writeln();
+      buffer.writeln(_renderReferenceForModel(ref));
+    }
     return buffer.toString().trimRight();
+  }
+
+  /// Maximum size (bytes) of a single attached file we inline into
+  /// the model-bound message. Above this we emit a reference-only
+  /// stub with size info and a `READ_FILE` hint so the model knows
+  /// the right tool/range to call.
+  ///
+  /// 16 KB ≈ ~4k tokens — cheap enough that a few attachments don't
+  /// blow a 32 KB context, large enough to cover most source files.
+  static const int _kReferenceInlineCapBytes = 16 * 1024;
+
+  /// Maximum number of immediate-children entries we list for a
+  /// folder reference. Beyond this we collapse the rest into a
+  /// "...N more entries" line and nudge towards `<<<TREE: …>>>`.
+  static const int _kReferenceFolderEntryCap = 30;
+
+  /// Folder/file basenames we suppress from folder reference
+  /// listings — these are noise (vendored deps, build outputs,
+  /// tooling caches) that almost never represent intent and would
+  /// drown signal entries.
+  static const Set<String> _kReferenceFolderNoise = <String>{
+    'node_modules',
+    '.git',
+    '.dart_tool',
+    'build',
+    'dist',
+    '.next',
+    '.nuxt',
+    '.venv',
+    'venv',
+    '__pycache__',
+    '.idea',
+    '.vscode',
+    '.gradle',
+    'target',
+    '.cache',
+    '.parcel-cache',
+    '.turbo',
+  };
+
+  /// Render a single attached reference (file or folder) as the
+  /// model-bound attachment block. Small text files inline with a
+  /// safe code fence; large/binary files become reference-only
+  /// stubs with size info and an explicit tool hint; folders list
+  /// their direct children up to a cap.
+  String _renderReferenceForModel(ChatReference ref) {
+    if (ref.kind == ChatReferenceKind.folder) {
+      return _renderFolderReference(ref);
+    }
+    return _renderFileReference(ref);
+  }
+
+  String _renderFileReference(ChatReference ref) {
+    final label = ref.label;
+    final pathHint = ref.workspaceRelativePath ?? ref.path;
+    final file = File(ref.path);
+    if (!file.existsSync()) {
+      return 'Attached file `$label`: no longer exists at the time of send.';
+    }
+    int size;
+    try {
+      size = file.lengthSync();
+    } catch (e) {
+      return 'Attached file `$label`: stat failed ($e). '
+          'Try `<<<READ_FILE: $pathHint>>>` if you need to inspect it.';
+    }
+    if (size == 0) {
+      return 'Attached file `$label`: empty (0 bytes).';
+    }
+    if (size > _kReferenceInlineCapBytes) {
+      return 'Attached file `$label` '
+          '(${_humanSize(size)}, over ${_humanSize(_kReferenceInlineCapBytes)} '
+          'inline cap — use `<<<READ_FILE: $pathHint>>>` for the whole file '
+          'or `<<<READ_FILE: $pathHint:1-200>>>` for a range).';
+    }
+    String content;
+    try {
+      content = file.readAsStringSync();
+    } on FileSystemException catch (e) {
+      return 'Attached file `$label`: read failed (${e.message}). '
+          'Try `<<<READ_FILE: $pathHint>>>` if you need to inspect it.';
+    } on FormatException {
+      return 'Attached file `$label` (${_humanSize(size)}): '
+          'binary or non-UTF-8 — use `<<<READ_FILE: $pathHint>>>` if a '
+          'range read makes sense, otherwise treat it as opaque.';
+    } catch (e) {
+      return 'Attached file `$label`: read failed ($e). '
+          'Try `<<<READ_FILE: $pathHint>>>` if you need to inspect it.';
+    }
+    final lineCount = '\n'.allMatches(content).length +
+        (content.isEmpty || content.endsWith('\n') ? 0 : 1);
+    final fence = _safeFenceFor(content);
+    final lang = _languageHintFor(label);
+    final body = content.endsWith('\n') ? content : '$content\n';
+    return 'Attached file `$label` ($lineCount lines, ${_humanSize(size)}):\n'
+        '$fence$lang\n'
+        '$body'
+        '$fence';
+  }
+
+  String _renderFolderReference(ChatReference ref) {
+    final label = ref.label;
+    final pathHint = ref.workspaceRelativePath ?? ref.path;
+    final dir = Directory(ref.path);
+    if (!dir.existsSync()) {
+      return 'Attached folder `$label`: no longer exists at the time of send.';
+    }
+    final shown = <String>[];
+    var totalEntries = 0;
+    var noiseSkipped = 0;
+    try {
+      for (final entry in dir.listSync(followLinks: false)) {
+        totalEntries++;
+        final base = p.basename(entry.path);
+        if (_kReferenceFolderNoise.contains(base)) {
+          noiseSkipped++;
+          continue;
+        }
+        if (shown.length >= _kReferenceFolderEntryCap) continue;
+        if (entry is Directory) {
+          shown.add('  $base/');
+        } else {
+          shown.add('  $base');
+        }
+      }
+    } catch (e) {
+      return 'Attached folder `$label`: list failed ($e). '
+          'Try `<<<TREE: $pathHint>>>` to inspect it.';
+    }
+    if (totalEntries == 0) {
+      return 'Attached folder `$label`: empty.';
+    }
+    shown.sort();
+    final overflow = totalEntries - shown.length - noiseSkipped;
+    final overflowLine = overflow > 0
+        ? '\n  ... ($overflow more entries; use `<<<TREE: $pathHint>>>` to inspect deeply)'
+        : '';
+    final noiseLine = noiseSkipped > 0
+        ? '\n  ... ($noiseSkipped noise entries hidden: '
+            'node_modules / .git / build / etc.)'
+        : '';
+    if (shown.isEmpty) {
+      // Everything was noise — say so explicitly so the model
+      // doesn't think the folder is empty.
+      return 'Attached folder `$label`: $totalEntries entries, all filtered '
+          'as build/cache noise (node_modules, .git, build, etc.). '
+          'Use `<<<TREE: $pathHint>>>` if you need to see them anyway.';
+    }
+    return 'Attached folder `$label` ($totalEntries direct entries):\n'
+        '${shown.join('\n')}$overflowLine$noiseLine';
+  }
+
+  /// Pick a fence length (3+ backticks) that won't be closed by
+  /// content inside [body]. Required when attached content is a
+  /// markdown file with embedded code fences of its own.
+  String _safeFenceFor(String body) {
+    final re = RegExp(r'`{3,}');
+    var maxRun = 2;
+    for (final m in re.allMatches(body)) {
+      final len = m.group(0)!.length;
+      if (len > maxRun) maxRun = len;
+    }
+    return '`' * (maxRun + 1);
+  }
+
+  String _languageHintFor(String label) {
+    final ext = p.extension(label).toLowerCase().replaceFirst('.', '');
+    if (ext.isEmpty) return '';
+    // Whitelist common ones; for everything else just emit the
+    // extension and let the model figure it out.
+    const known = <String>{
+      'dart', 'py', 'js', 'jsx', 'ts', 'tsx', 'json', 'yaml', 'yml',
+      'toml', 'md', 'html', 'css', 'scss', 'sh', 'bash', 'zsh',
+      'ps1', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'swift', 'c',
+      'cc', 'cpp', 'h', 'hpp', 'cs', 'php', 'sql', 'xml', 'svg',
+      'lua', 'r', 'pl', 'ex', 'exs', 'erl', 'hs', 'fs', 'clj',
+      'cljs', 'edn', 'graphql', 'proto', 'cmake', 'makefile',
+      'dockerfile', 'gitignore', 'env', 'ini',
+    };
+    return known.contains(ext) ? ext : ext;
+  }
+
+  String _humanSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      final kb = bytes / 1024.0;
+      return '${kb.toStringAsFixed(kb >= 10 ? 0 : 1)} KB';
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      final mb = bytes / (1024.0 * 1024.0);
+      return '${mb.toStringAsFixed(mb >= 10 ? 0 : 1)} MB';
+    }
+    final gb = bytes / (1024.0 * 1024.0 * 1024.0);
+    return '${gb.toStringAsFixed(gb >= 10 ? 0 : 1)} GB';
   }
 
   /// Run the streaming generation loop against [targetSession] or the
@@ -2273,6 +2724,19 @@ class ChatController extends ChangeNotifier {
     _cancelTokens[sessionId] = cancelToken;
     _generationStartedAtBySession[sessionId] = DateTime.now();
     _lastChunkAtBySession[sessionId] = DateTime.now();
+    // Publish the live reference so tab activation paths
+    // (`openSession`, `closeTab`, …) hand back THIS instance instead
+    // of disk-reloading a stale copy mid-stream. Also sync
+    // `_sessions[idx]` to the same reference — _persistSession
+    // already does this at the end of the turn, but doing it up
+    // front means anything that walks `_sessions` during the turn
+    // sees the live content too (e.g. history dropdown, tab strip).
+    _liveSessions[sessionId] = session;
+    final liveSessionsIdx = _sessions.indexWhere((s) => s.id == sessionId);
+    if (liveSessionsIdx >= 0 &&
+        !identical(_sessions[liveSessionsIdx], session)) {
+      _sessions[liveSessionsIdx] = session;
+    }
     notifyListeners();
 
     // Recover the latest user message + its trimmed text — used for
@@ -2321,6 +2785,28 @@ class ChatController extends ChangeNotifier {
     // per iteration via `iterationHallucinationCount`.
     final hallucinatedPathsAccumulated = <String>[];
     bool halluHaltTriggered = false;
+
+    // Per-turn random hex token baked into every real
+    // `<!-- LUMEN_TOOL:... -->` marker the executor emits during
+    // this turn (and into the `pending` markers the streaming
+    // preview emits while the model is still typing). The chat
+    // panel validates each marker's trailing nonce against the
+    // message's stored `toolMarkerNonce` and silently drops
+    // anything that doesn't match — that's the renderer-side
+    // defense against weak Ollama models latching onto the
+    // marker shape they see in conversation history and emitting
+    // fake "Created"/"Edited" cards with no real tool firing.
+    // Fresh value per turn (not per session) so the model can
+    // never re-inject a nonce it saw in earlier history: this
+    // turn's nonce is, by construction, one the model has not
+    // observed. 8 hex chars (32 bits) is plenty — the model
+    // would have to guess in real time during generation.
+    //
+    // Hoisted ABOVE the try{} so the `catch (e)` block at the
+    // bottom can stamp the same nonce on the error-path
+    // `PersistedMessage` it emits, keeping the per-message
+    // nonce semantics consistent across happy and sad paths.
+    final turnMarkerNonce = _generateMarkerNonce();
 
     try {
       // Tight workspace context. We deliberately do NOT dump a 50-entry
@@ -2501,12 +2987,15 @@ on the next turn — that is real output, not user input.
 - WRONG: `<list_dir>...</list_dir>` (XML closing tag)
 - WRONG: ``` ```LIST_DIR``` ``` (markdown code fence)
 - WRONG: `[LIST_DIR: .]` (square brackets)
+- WRONG: `<!-- LUMEN_TOOL:list_dir|.|ok -->` (HTML comment marker —
+  this is an INTERNAL Lumen display token the chat UI uses AFTER a
+  tool runs; emitting it yourself does NOT call a tool)
 - RIGHT: `<<<LIST_DIR: .>>>` (EXACTLY three `<` and three `>` on each side)
 
 Tool calls written in any of the wrong forms WILL NOT EXECUTE. The IDE's
 parser is strict — it only matches three-bracket syntax. If you find
-yourself writing single-bracket tags out of habit, stop and fix the
-syntax before continuing.
+yourself writing single-bracket tags or HTML-comment markers out of
+habit, stop and fix the syntax before continuing.
 
 **Anti-hallucination rule (critical):**
 - A file you describe as "Created", "Wrote", "Added", "Edited",
@@ -2671,6 +3160,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         webSearch: ollama.webSearch,
         webFetch: ollama.webFetch,
       );
+      executor.markerNonce = turnMarkerNonce;
 
       // Derive a stable `turnId` for this user request. Used to tag
       // every file revision the agent produces during the turn so
@@ -2720,7 +3210,13 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // 14 times if the model edited 14 different things in the
       // same file — the file path lands in the args list anyway).
       final firedAcrossTurn = <FiredTool>[];
-      session.messages.add(PersistedMessage(role: 'assistant', content: ''));
+      session.messages.add(
+        PersistedMessage(
+          role: 'assistant',
+          content: '',
+          toolMarkerNonce: turnMarkerNonce,
+        ),
+      );
       // Mutable: per-iteration tool image attachments are inserted at
       // this index and bump it forward, so subsequent `updateLive`
       // calls keep targeting the live assistant message at its new
@@ -2766,6 +3262,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           role: 'assistant',
           content: content,
           timestamp: originalTs,
+          toolMarkerNonce: turnMarkerNonce,
         );
         if (forceNotify) {
           throttleTimer?.cancel();
@@ -3367,6 +3864,64 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
                       'invocation with the proper close: '
                       '`<<<$toolName: args>>>`, then STOP and '
                       'wait for the real `<tool_result>`.';
+                case NearMissShape.htmlComment:
+                  // `LUMEN_TOOL` is the sentinel returned by the
+                  // detector when the marker had no parseable tool
+                  // id; render a generic version then. Otherwise
+                  // we have the actual tool the model probably
+                  // meant to call.
+                  final isGeneric = toolName == 'LUMEN_TOOL';
+                  final example = isGeneric
+                      ? '<<<TOOL_NAME: args>>>'
+                      : '<<<$toolName: args>>>';
+                  nudge =
+                      'You wrote `<!-- LUMEN_TOOL ... -->` (an '
+                      'HTML comment). NO tool ran. That marker '
+                      'is an INTERNAL display token Lumen '
+                      'generates AFTER your tool actually '
+                      'executes — the chat UI rewrites real '
+                      'tool calls into it for rendering. It is '
+                      'NOT a tool-call syntax. To actually '
+                      'invoke a tool, emit `$example` (three '
+                      'angle brackets each side, no HTML '
+                      'comment, no slash, one tool per '
+                      'response), then STOP and wait for the '
+                      'real `<tool_result>`.';
+                case NearMissShape.unknownTool:
+                  // Build a short list of registered tools whose
+                  // name resembles the unknown one — close
+                  // substring match or shared prefix. Cheap; the
+                  // nudge is far more actionable than "see the
+                  // system prompt" because the model often loops
+                  // on the same wrong name otherwise.
+                  //
+                  // Recomputing the enabled-tool set here rather
+                  // than capturing the `knownNames` from the
+                  // detection site keeps `knownNames` scoped to
+                  // the detector call (where it's actually used)
+                  // and avoids leaking it into the wider
+                  // continuation-decision block.
+                  final enabledNames = <String>{
+                    for (final t in ToolRegistry.all)
+                      if (_enabledTools.contains(t.id))
+                        t.id.toUpperCase(),
+                  };
+                  final candidates = _suggestSimilarTools(
+                    toolName,
+                    enabledNames,
+                  );
+                  final suggestionLine = candidates.isEmpty
+                      ? 'Re-read the tool list in the system prompt.'
+                      : 'Closest registered tools: ${candidates.join(', ')}.';
+                  nudge =
+                      'You called `<<<$toolName: …>>>` but '
+                      '$toolName is not a registered tool — NO '
+                      'tool ran. Lumen only dispatches the tool '
+                      'names listed in your system prompt. '
+                      '$suggestionLine If none fits, ask the user '
+                      'instead of inventing tools. Re-emit ONE '
+                      'real tool call, then STOP and wait for the '
+                      'real `<tool_result>`.';
               }
             } else if (intentWithoutAction) {
               reason = 'intent without action';
@@ -3389,7 +3944,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
               nudge =
                   'You opened a multi-line tool block '
                   '(CREATE_FILE / EDIT_FILE / MULTI_EDIT / '
-                  'APPEND_FILE) but never emitted the matching '
+                  'EDIT_RANGE / APPEND_FILE) but never emitted the matching '
                   'close marker (`<<<END_FILE>>>`, '
                   '`<<<END_EDIT>>>`, or `<<<END_APPEND>>>`). No '
                   'file was created or edited. Each multi-line '
@@ -3547,6 +4102,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         firstByteLatencyMs: firstByteLatencyMs,
         iterationCount: iterationCount > 0 ? iterationCount : null,
         lastIterationDurationMs: lastIterationDurationMs,
+        toolMarkerNonce: liveCurrent.toolMarkerNonce ?? turnMarkerNonce,
       );
       debugPrint(
         '[turn-timing] sessionId=$sessionId '
@@ -3599,6 +4155,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           firstByteLatencyMs: firstByteLatencyMs,
           iterationCount: iterationCount > 0 ? iterationCount : null,
           lastIterationDurationMs: lastIterationDurationMs,
+          toolMarkerNonce: turnMarkerNonce,
         ),
       );
       debugPrint(
@@ -3616,6 +4173,10 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       _pendingApprovals.remove(sessionId);
       _generationStartedAtBySession.remove(sessionId);
       _lastChunkAtBySession.remove(sessionId);
+      // Drop the live ref. By now `_persistSession` has flushed the
+      // final content to disk, so future `openSession` calls can
+      // safely fall back to the disk-load path.
+      _liveSessions.remove(sessionId);
       // Always clear the timeline's chat context so anything that
       // writes to disk *after* the agent run completes (a FS event
       // arriving late, the user manually saving a file, etc.) is

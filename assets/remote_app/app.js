@@ -391,8 +391,18 @@ function markdownToHtml(s) {
       return `\u0000THINK${thinkMarkers.length - 1}\u0000`;
     }
   );
+  // Marker grammar mirrors `tool_segments.dart::parseChatSegments`.
+  // The trailing `|<nonce>` field (8 hex chars) is the desktop's
+  // per-message impersonation defense — see the library doc on
+  // that file. The remote app does NOT validate the nonce here
+  // (it doesn't have access to the message's expected nonce
+  // anyway), it just tolerates the field so real desktop-emitted
+  // markers render correctly. Without the optional alternation
+  // the previous `[^\s]*` capture would greedily eat
+  // `ok|abc12345`, then no status comparison would match and the
+  // chip would render with the wrong style.
   work = work.replace(
-    /<!-- LUMEN_TOOL:([^|]*)\|([^|]*)\|([^\s]*) -->/g,
+    /<!-- LUMEN_TOOL:([^|]*)\|([^|]*)\|(ok|err|pending|malformed)(?:\|[a-f0-9]+)? -->/g,
     (_m, id, arg, status) => {
       toolMarkers.push({ id, arg, status });
       return `\u0000TOOL${toolMarkers.length - 1}\u0000`;
@@ -458,6 +468,7 @@ const RAW_TOOL_BODIES = {
   CREATE_FILE: { id: 'create_file', closer: 'END_FILE' },
   EDIT_FILE:   { id: 'edit_file',   closer: 'END_EDIT' },
   MULTI_EDIT:  { id: 'multi_edit',  closer: 'END_EDIT' },
+  EDIT_RANGE:  { id: 'edit_range',  closer: 'END_EDIT' },
   APPEND_FILE: { id: 'append_file', closer: 'END_APPEND' },
 };
 

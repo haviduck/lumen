@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.2+2
+version: 1.0.3+3
 
 environment:
   sdk: ^3.11.0
@@ -47,6 +47,12 @@ dependencies:
   xterm: ^4.0.0
   flutter_pty: ^0.4.2
   flutter_markdown_plus: ^1.0.3
+  # Promoted from transitive (was pulled in by flutter_markdown_plus)
+  # because we register a custom MarkdownElementBuilder for fenced
+  # code blocks and need direct access to `md.Element`. Pinning here
+  # decouples our code-block rendering from any future shuffling of
+  # flutter_markdown_plus's transitive deps.
+  markdown: ^7.3.1
   youtube_player_iframe: ^5.2.2
   webview_windows:
     path: packages/webview_windows

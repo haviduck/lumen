@@ -63,6 +63,20 @@ practical, and specific to this project.
   the user's own running stack. Suggest the command and let the user run it.
 - One-shot commands that exit on their own (build, test, lint, format,
   install) are fine to invoke directly when the task calls for them.
+
+## Python and environment-bound interpreters
+- Do not run Python scripts (`python foo.py`, `python -m something`,
+  `pytest`, `python -c`, helpers that shell out to a Python entry point)
+  unless the user explicitly asks for it. The agent does not know which
+  interpreter the user wants — conda env, venv, `pyenv`, poetry/pdm/hatch
+  shell, or system Python — and picking wrong installs into the wrong
+  environment, fails on missing dependencies, or silently runs the wrong
+  Python version. Suggest the command (with any activation step) and let the
+  user run it.
+- The same caution applies to other runtimes whose behavior depends on a
+  per-project environment: Ruby behind `bundle exec`, Node behind `nvm`/`fnm`,
+  Java behind `sdkman`, etc. When in doubt, propose the command rather than
+  running it.
 ''';
 
   static const String _knowledgebaseRuleBlock =

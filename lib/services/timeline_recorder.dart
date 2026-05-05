@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
@@ -45,8 +47,10 @@ class TimelineRecorder {
     'create_file',
     'edit_file',
     'multi_edit',
+    'edit_range',
     'append_file',
     'move_file',
+    'copy_file',
     'delete_file',
   };
 
@@ -189,7 +193,18 @@ class TimelineRecorder {
       case 'delete_file':
         rel = match.groupCount >= 1 ? match.group(1)?.trim() : null;
         break;
+      case 'edit_range':
+        // Group 1 is `file:start-end`; the timeline only cares about
+        // the file part. Strip the trailing `:N-M` if present so the
+        // baseline / capture is keyed off the actual path.
+        final raw = match.groupCount >= 1 ? match.group(1)?.trim() : null;
+        if (raw != null) {
+          final m = RegExp(r'^(.*):\d+-\d+$').firstMatch(raw);
+          rel = m != null ? m.group(1)!.trim() : raw;
+        }
+        break;
       case 'move_file':
+      case 'copy_file':
         rel = match.groupCount >= 1 ? match.group(1)?.trim() : null;
         relTarget = match.groupCount >= 2 ? match.group(2)?.trim() : null;
         break;
@@ -199,12 +214,40 @@ class TimelineRecorder {
 
     final before = <String>[];
     final after = <String>[];
-    if (rel != null && rel.isNotEmpty) {
+
+    // Source-side baseline. Only meaningful for tools that *modify*
+    // (or remove) the source — copy doesn't, so the source isn't a
+    // "before" target for the timeline.
+    if (rel != null && rel.isNotEmpty && toolId != 'copy_file') {
       before.add(p.join(workspaceDir, rel));
     }
+
     if (toolId == 'move_file') {
       if (relTarget != null && relTarget.isNotEmpty) {
         after.add(p.join(workspaceDir, relTarget));
+      }
+    } else if (toolId == 'copy_file') {
+      // For a copy, the destination is the only path that gains a
+      // new revision. Two carve-outs:
+      //   - We only track *file* copies. Directory copies can fan
+      //     out to hundreds of created files; emitting a journal
+      //     entry per file would drown the per-message restore UI
+      //     and balloon the timeline DB. Falling back to "no
+      //     entry" keeps the rest of the timeline honest — the
+      //     user can still revert manually by deleting the new
+      //     dir, which is the same shape the copy created.
+      //   - The destination check uses sync IO on the source,
+      //     because `_resolveTargets` itself is sync. The source
+      //     is still on disk after the copy (unlike move), so
+      //     this works equally well from `beforeTool` and
+      //     `afterTool`.
+      if (rel != null && rel.isNotEmpty &&
+          relTarget != null && relTarget.isNotEmpty) {
+        final srcAbs = p.join(workspaceDir, rel);
+        final srcType = FileSystemEntity.typeSync(srcAbs);
+        if (srcType == FileSystemEntityType.file) {
+          after.add(p.join(workspaceDir, relTarget));
+        }
       }
     } else if (rel != null && rel.isNotEmpty && toolId != 'delete_file') {
       after.add(p.join(workspaceDir, rel));
@@ -233,10 +276,14 @@ class TimelineRecorder {
         return 'Edited via tool: edit_file';
       case 'multi_edit':
         return 'Edited via tool: multi_edit';
+      case 'edit_range':
+        return 'Edited via tool: edit_range';
       case 'append_file':
         return 'Appended via tool: append_file';
       case 'move_file':
         return 'Renamed via tool: move_file';
+      case 'copy_file':
+        return 'Copied via tool: copy_file';
       case 'delete_file':
         return 'Deleted via tool: delete_file';
     }

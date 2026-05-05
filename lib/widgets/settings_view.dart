@@ -2555,13 +2555,28 @@ class _SettingsViewState extends State<SettingsView> {
 /// single tool. Used in the Settings → AI/Chat list — see
 /// `Consumer<AppState>` block above the default-model row.
 class _ApprovedToolChip extends StatelessWidget {
+  /// Storage key — either a bare tool id (`delete_file`) or a
+  /// `toolId:fingerprint` composite (`run_cmd:npm`). The chip
+  /// splits the composite for display so the user sees the binary
+  /// they granted ("RUN_CMD `npm`") instead of an opaque
+  /// concatenated string.
   final String toolId;
   final VoidCallback onRevoke;
   const _ApprovedToolChip({required this.toolId, required this.onRevoke});
 
   @override
   Widget build(BuildContext context) {
-    final name = toolId.toUpperCase();
+    // Split rich keys on the first `:`. `delete_file` → ['delete_file'].
+    // `run_cmd:npm` → ['run_cmd', 'npm']. Anything more exotic
+    // (multiple colons) preserves everything after the first `:`
+    // as the fingerprint so a hypothetical future scheme that
+    // includes colons in fingerprints (e.g. `run_cmd:foo:bar`)
+    // still renders sensibly.
+    final colonIdx = toolId.indexOf(':');
+    final hasFingerprint = colonIdx > 0 && colonIdx < toolId.length - 1;
+    final baseId = hasFingerprint ? toolId.substring(0, colonIdx) : toolId;
+    final fingerprint = hasFingerprint ? toolId.substring(colonIdx + 1) : '';
+
     return Container(
       padding: const EdgeInsets.fromLTRB(10, 4, 4, 4),
       decoration: BoxDecoration(
@@ -2572,14 +2587,34 @@ class _ApprovedToolChip extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // Tool id (uppercase) — same dim affordance as before so
+          // the chip's identity reads consistently across bare
+          // tool grants and per-command grants.
           Text(
-            name,
+            baseId.toUpperCase(),
             style: const TextStyle(
               fontFamily: DuckTheme.monoFont,
               fontSize: 11,
-              color: DuckColors.fgPrimary,
+              color: DuckColors.fgSubtle,
+              letterSpacing: 0.4,
             ),
           ),
+          // Fingerprint segment (e.g. `npm`) rendered right of the
+          // tool id with a brighter colour — this is the actual
+          // unit of trust granted, so it earns the visual focus.
+          // Hidden for bare-id keys.
+          if (fingerprint.isNotEmpty) ...[
+            const SizedBox(width: 6),
+            Text(
+              fingerprint,
+              style: const TextStyle(
+                fontFamily: DuckTheme.monoFont,
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: DuckColors.fgPrimary,
+              ),
+            ),
+          ],
           const SizedBox(width: 4),
           Tooltip(
             message: S.settingsAutoApprovedRevoke,

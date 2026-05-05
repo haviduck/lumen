@@ -91,6 +91,22 @@ class ToolExecutor {
   /// directly to arbitrary URLs from the host process.
   WebFetchFn? webFetch;
 
+  /// Per-message random hex token baked into every
+  /// `<!-- LUMEN_TOOL:... -->` marker emitted by `_friendlyReplacement`
+  /// and `_SalvageOutcome.from`. The chat-side renderer validates
+  /// each marker's trailing nonce against the message's stored
+  /// `toolMarkerNonce`; markers with a missing or mismatching
+  /// nonce are treated as model-emitted impersonation and
+  /// stripped from the rendered output.
+  ///
+  /// Set by `ChatController._runGenerationLoop` at the start of
+  /// every assistant turn (fresh value per turn) and cleared
+  /// between turns. `null` means "do not nonce-bind" — useful for
+  /// non-chat invocations of the executor (none today, but the
+  /// API stays usable in tests / scripts without forcing a
+  /// nonce).
+  String? markerNonce;
+
   ToolExecutor({
     required this.workspaceDir,
     required this.approver,
@@ -214,7 +230,7 @@ class ToolExecutor {
     // told exactly what shape was missing and the canonical example
     // it should have followed — small models recover on the second
     // round once they see the right syntax instead of the void.
-    final salvage = _SalvageOutcome.from(processed);
+    final salvage = _SalvageOutcome.from(processed, markerNonce: markerNonce);
     processed = salvage.cleanedContent;
     if (salvage.malformedCount > 0) {
       hasToolCalls = true;
@@ -304,24 +320,41 @@ class ToolExecutor {
   ///   - `Uri.encodeComponent` on the arg keeps `|` / `-->` from
   ///     colliding with the field separator / comment terminator.
   ///
-  /// Format: `<!-- LUMEN_TOOL:<id>|<percent-encoded-arg>|<status> -->`
-  /// where `status` is `ok` or `err`. We surround with `\n` so the
-  /// marker forms its own paragraph in markdown — the chat-side
-  /// parser splits on this, rendering prose as `MarkdownBody` and
-  /// markers as widgets.
+  /// Format: `<!-- LUMEN_TOOL:<id>|<percent-encoded-arg>|<status>|<nonce> -->`
+  /// where `status` is `ok`, `err`, `pending`, or `malformed` and
+  /// `<nonce>` is the per-message random token from [markerNonce]
+  /// (omitted entirely when `markerNonce` is null, preserving the
+  /// pre-binding marker shape for backwards-compat callers and
+  /// tests). We surround with `\n` so the marker forms its own
+  /// paragraph in markdown — the chat-side parser splits on this,
+  /// rendering prose as `MarkdownBody` and markers as widgets.
+  ///
+  /// **Why the trailing nonce field?** Renderer-side validation —
+  /// see `tool_segments.dart::parseChatSegments` and
+  /// `PersistedMessage.toolMarkerNonce` for the full rationale.
+  /// Short version: when a model emits a fake `<!-- LUMEN_TOOL:... -->`
+  /// in its own output (mimicking what it sees in conversation
+  /// history), the fake marker has no way of carrying the right
+  /// nonce, so the renderer can distinguish "marker the executor
+  /// wrote because a real tool ran" from "marker the model wrote
+  /// because it pattern-matched the shape from history".
   String _friendlyReplacement(AgentTool tool, Match m, String rawResult) {
     final isError = _looksLikeFailure(rawResult);
-    // Most tools use capture group 1 as the relevant target. MOVE_FILE is the
-    // exception: group 1 is the source and group 2 is the destination. If we
-    // only encode the source, the chat card tries to open the old path after a
-    // successful move and appears "not clickable" because the file no longer
-    // exists. Preserve both sides so the UI can display/open the destination.
-    final firstArg = tool.id == 'move_file' && m.groupCount >= 2
+    // Most tools use capture group 1 as the relevant target. MOVE_FILE and
+    // COPY_FILE are the exceptions: group 1 is the source and group 2 is the
+    // destination. If we only encode the source, the chat card tries to open
+    // the old path after a successful move (which no longer exists) or the
+    // source path after a copy (correct file, but not what the user just
+    // asked for). Preserve both sides so the UI can display the arrow grammar
+    // and open the destination on click.
+    final isArrowTool = tool.id == 'move_file' || tool.id == 'copy_file';
+    final firstArg = isArrowTool && m.groupCount >= 2
         ? '${m.group(1) ?? ''} -> ${m.group(2) ?? ''}'
         : ((m.groupCount >= 1 ? m.group(1) : '') ?? '');
     final encoded = Uri.encodeComponent(firstArg);
     final status = isError ? 'err' : 'ok';
-    return '\n<!-- LUMEN_TOOL:${tool.id}|$encoded|$status -->\n';
+    final nonceField = markerNonce == null ? '' : '|$markerNonce';
+    return '\n<!-- LUMEN_TOOL:${tool.id}|$encoded|$status$nonceField -->\n';
   }
 
   /// Companion to `_friendlyReplacement` — used by the message-copy
@@ -337,10 +370,14 @@ class ToolExecutor {
         return '(Edited file: `$firstArg`)';
       case 'multi_edit':
         return '(Multi-edited: `$firstArg`)';
+      case 'edit_range':
+        return '(Edited range: `$firstArg`)';
       case 'append_file':
         return '(Appended to: `$firstArg`)';
       case 'move_file':
         return '(Moved: `$firstArg`)';
+      case 'copy_file':
+        return '(Copied: `$firstArg`)';
       case 'read_file':
         return '(Read: `$firstArg`)';
       case 'read_file_range':
@@ -397,7 +434,7 @@ class _SalvageOutcome {
     this.feedback,
   );
 
-  static _SalvageOutcome from(String content) {
+  static _SalvageOutcome from(String content, {String? markerNonce}) {
     final salvage = RegExp(
       r'<<<(CREATE_FILE|EDIT_FILE|MULTI_EDIT|APPEND_FILE):\s*(.*?)\s*>>>'
       r'(?:.*?)'
@@ -406,6 +443,7 @@ class _SalvageOutcome {
     );
     var count = 0;
     final fb = StringBuffer();
+    final nonceField = markerNonce == null ? '' : '|$markerNonce';
     final cleaned = content.replaceAllMapped(salvage, (m) {
       final toolName = m.group(1)!;
       final firstArg = (m.group(2) ?? '').trim();
@@ -422,7 +460,7 @@ class _SalvageOutcome {
         '$example\n',
       );
       final encoded = Uri.encodeComponent(firstArg);
-      return '\n<!-- LUMEN_TOOL:$id|$encoded|malformed -->\n';
+      return '\n<!-- LUMEN_TOOL:$id|$encoded|malformed$nonceField -->\n';
     });
     return _SalvageOutcome._(cleaned, count, fb.toString());
   }

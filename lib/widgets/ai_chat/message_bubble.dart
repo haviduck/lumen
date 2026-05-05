@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:markdown/markdown.dart' as md;
 
 import '../../l10n/strings.dart';
 import '../../services/chat_persistence_service.dart';
@@ -109,6 +110,14 @@ class _MessageBubbleState extends State<MessageBubble> {
   String? _cachedRenderable;
 
   String? _cachedSegmentsSource;
+  String? _cachedSegmentsNonce;
+  // Cache invalidation also keys on the raw message content
+  // because [extractPendingToolBodies] runs over raw, not over the
+  // streaming-preview output. Without these two extras the cache
+  // would freeze on the first sample of bodies and the "Live
+  // preview" region would never update as new tokens stream in.
+  String? _cachedSegmentsRawForBodies;
+  bool? _cachedSegmentsStreaming;
   List<ChatSegment>? _cachedSegments;
 
   Future<void> _copy() async {
@@ -154,7 +163,17 @@ class _MessageBubbleState extends State<MessageBubble> {
     if (!streaming) {
       result = raw;
     } else {
-      final preview = streamingToolPreview(raw);
+      // Pass the message's per-turn nonce so the preview's
+      // pass-0 strip can drop model-emitted impersonation
+      // markers and the pass-1/2/3 emitters bake the right
+      // nonce into pending/malformed markers (so the parser
+      // accepts them as real). Null nonce on legacy messages
+      // keeps the pre-binding behavior — every well-formed
+      // marker survives.
+      final preview = streamingToolPreview(
+        raw,
+        markerNonce: widget.message.toolMarkerNonce,
+      );
       final fenceCount = RegExp(r'```').allMatches(preview).length;
       if (fenceCount.isOdd) {
         // Newline guard: if the unclosed fence is on the same line
@@ -177,12 +196,69 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// [_renderableContent]. The segment parse is cheaper than the
   /// preview but still a full-string regex scan; on a stable bubble
   /// it should be a free read across rebuilds.
+  ///
+  /// While streaming, also walks the raw message content with
+  /// [extractPendingToolBodies] and attaches each pending body to
+  /// the corresponding `pending` body-shaped [ToolSegment] in
+  /// source order. That gives [_FileToolCard] the live bytes to
+  /// surface in its expandable "Live preview" region — the user's
+  /// tail-on-the-stream view for spotting runaway tool calls
+  /// (the "REPLACE REPLACE …" loop class) before the output
+  /// budget burns through.
   List<ChatSegment> _segmentsFor(String content) {
-    if (_cachedSegmentsSource == content && _cachedSegments != null) {
+    final nonce = widget.message.toolMarkerNonce;
+    final raw = widget.message.content;
+    final streaming = widget.isStreaming;
+    if (_cachedSegmentsSource == content &&
+        _cachedSegmentsNonce == nonce &&
+        _cachedSegmentsRawForBodies == raw &&
+        _cachedSegmentsStreaming == streaming &&
+        _cachedSegments != null) {
       return _cachedSegments!;
     }
-    final segs = parseChatSegments(content);
+    // Pass the message's per-turn nonce so the parser drops any
+    // `<!-- LUMEN_TOOL:... -->` whose trailing nonce field
+    // doesn't match — those are model-emitted impersonations of
+    // the marker shape (most common with weak Ollama cloud
+    // models, see `tool_segments.dart` library doc). Legacy
+    // messages with a null nonce render every well-formed
+    // marker as before.
+    final segs = parseChatSegments(content, expectedNonce: nonce);
+    if (streaming) {
+      // Body extraction runs on the *raw* message content
+      // because the streaming-preview pipeline already rewrote
+      // bodies into compact pending markers. Raw + preview are
+      // produced in source order, so a parallel walk over
+      // pending body-shaped segments and the extracted bodies
+      // gets each body to the right segment without any name
+      // matching.
+      final bodies = extractPendingToolBodies(raw);
+      var bodyIdx = 0;
+      void attach(ToolSegment seg) {
+        if (!seg.pending) return;
+        if (!isBodyShapedToolId(seg.toolId)) return;
+        if (bodyIdx >= bodies.length) return;
+        seg.pendingBody = bodies[bodyIdx].body;
+        bodyIdx++;
+      }
+      for (final seg in segs) {
+        if (seg is ToolSegment) {
+          attach(seg);
+        } else if (seg is ToolGroupSegment) {
+          // Defensive: 3+ consecutive same-status same-kind body-
+          // shaped tools could in theory cluster into a group. Walk
+          // into the group so the live preview still attaches in
+          // source order.
+          for (final t in seg.tools) {
+            attach(t);
+          }
+        }
+      }
+    }
     _cachedSegmentsSource = content;
+    _cachedSegmentsNonce = nonce;
+    _cachedSegmentsRawForBodies = raw;
+    _cachedSegmentsStreaming = streaming;
     _cachedSegments = segs;
     return segs;
   }
@@ -423,9 +499,20 @@ class _MessageBubbleState extends State<MessageBubble> {
     // want unified cross-bubble drag. With `selectable: true`,
     // MarkdownBody wraps everything in SelectableText, breaks
     // SelectionArea's drag handling at the bubble boundary.
+    //
+    // **Fenced code blocks are an exception.** The default `pre`
+    // renderer wraps the block in a horizontal `SingleChildScrollView`
+    // whose drag-to-scroll gesture eats `SelectionArea`'s drag
+    // events — users physically couldn't highlight code to copy it.
+    // We override the `pre` builder with `_CodeBlockBuilder` which
+    // renders a Container + selectable text + a dedicated copy chip
+    // (the affordance every chat UI ships, ChatGPT/Cursor/Claude).
     return MarkdownBody(
       data: text,
       selectable: false,
+      builders: <String, MarkdownElementBuilder>{
+        'pre': _CodeBlockBuilder(),
+      },
       styleSheet: MarkdownStyleSheet(
         p: const TextStyle(
           fontSize: 13,
@@ -438,6 +525,10 @@ class _MessageBubbleState extends State<MessageBubble> {
           backgroundColor: DuckColors.bgDeeper,
           color: DuckColors.accentCyan,
         ),
+        // codeblockPadding/Decoration left for parity but `_CodeBlock`
+        // owns its own visuals — these only apply if `pre` somehow
+        // routes back to the default renderer (e.g. an unexpected
+        // pre-without-code element).
         codeblockPadding: const EdgeInsets.all(10),
         codeblockDecoration: BoxDecoration(
           color: DuckColors.bgDeepest,
@@ -449,6 +540,249 @@ class _MessageBubbleState extends State<MessageBubble> {
           borderRadius: BorderRadius.circular(DuckTheme.radiusS),
           border: const Border(
             left: BorderSide(color: DuckColors.accentMint, width: 3),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// MarkdownElementBuilder for fenced code blocks (`<pre><code>...`).
+///
+/// Replaces `flutter_markdown_plus`'s default `pre` renderer (which
+/// nests a horizontal scroll view that eats `SelectionArea` drag
+/// events, leaving users unable to highlight code) with a [_CodeBlock]
+/// widget that owns the copy affordance directly. Falls back to
+/// nothing (returns `null`) for malformed `pre` elements without a
+/// child `code` node — the default renderer will pick those up.
+class _CodeBlockBuilder extends MarkdownElementBuilder {
+  @override
+  bool isBlockElement() => true;
+
+  @override
+  Widget? visitElementAfterWithContext(
+    BuildContext context,
+    md.Element element,
+    TextStyle? preferredStyle,
+    TextStyle? parentStyle,
+  ) {
+    final code = _extractCode(element);
+    if (code == null) return null;
+    return _CodeBlock(code: code, language: _extractLanguage(element));
+  }
+
+  /// Pull the code text out of the `<pre><code>` AST. Walks one level
+  /// deep — markdown spec guarantees fenced blocks are exactly
+  /// `<pre><code>…text…</code></pre>`. If the structure doesn't match
+  /// (some embed widget upstream, malformed input, …), return null
+  /// so the default renderer takes over rather than us silently
+  /// dropping the block.
+  String? _extractCode(md.Element element) {
+    final children = element.children;
+    if (children == null || children.isEmpty) return null;
+    final inner = children.first;
+    if (inner is! md.Element || inner.tag != 'code') return null;
+    return inner.textContent;
+  }
+
+  /// Extract the language hint from the inner `<code>` element's
+  /// `class` attribute (markdown writes it as `language-python` for
+  /// ` ```python `). Returns null when no class is set or the class
+  /// doesn't follow the `language-*` convention — the header strip
+  /// is hidden in that case.
+  String? _extractLanguage(md.Element element) {
+    final children = element.children;
+    if (children == null || children.isEmpty) return null;
+    final inner = children.first;
+    if (inner is! md.Element) return null;
+    final cls = inner.attributes['class'];
+    if (cls == null) return null;
+    const prefix = 'language-';
+    if (!cls.startsWith(prefix)) return null;
+    final lang = cls.substring(prefix.length).trim();
+    return lang.isEmpty ? null : lang;
+  }
+}
+
+/// Visual + interactive code-block widget. Renders a dark mono panel
+/// with an optional language label and a top-right copy chip that
+/// flashes "Copied" for ~1.4s when activated.
+///
+/// **Selection trade-off.** The block's body is a plain `Text` (NOT
+/// `SelectableText`) wrapped in a horizontal scroll view so long
+/// lines stay on one line. Drag-selection inside is partially eaten
+/// by the scroll view (same flutter_markdown_plus bug we couldn't
+/// undo without horizontal scroll), but `SelectionArea`'s
+/// keyboard-driven select-all + drag-from-outside-the-block still
+/// covers it AND the copy chip is the primary affordance. The chip
+/// guarantees recovery for any case the selection drag misses.
+class _CodeBlock extends StatefulWidget {
+  final String code;
+  final String? language;
+
+  const _CodeBlock({required this.code, this.language});
+
+  @override
+  State<_CodeBlock> createState() => _CodeBlockState();
+}
+
+class _CodeBlockState extends State<_CodeBlock> {
+  bool _copied = false;
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: widget.code));
+    if (!mounted) return;
+    // Visual confirmation directly on the chip so the user doesn't
+    // have to glance away to a toast. We still toast for parity with
+    // the bubble-level Copy chip — accessibility (screen readers) +
+    // the toast is the canonical "something happened" signal.
+    setState(() => _copied = true);
+    showDuckToast(context, S.chatMessageCopied);
+    Future.delayed(const Duration(milliseconds: 1400), () {
+      if (!mounted) return;
+      setState(() => _copied = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Trim a single trailing newline (the markdown parser keeps the
+    // closing fence's newline as part of the code text). Visually
+    // equivalent, but pasting into another editor won't add the
+    // phantom blank line.
+    final code = widget.code.endsWith('\n')
+        ? widget.code.substring(0, widget.code.length - 1)
+        : widget.code;
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      decoration: BoxDecoration(
+        color: DuckColors.bgDeepest,
+        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+      ),
+      clipBehavior: Clip.hardEdge,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Header strip — language label (left) + copy chip (right).
+          // Always rendered so the copy affordance is consistent
+          // even on language-less blocks; the language slot collapses
+          // to an empty Spacer when unset.
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 5, 5, 5),
+            decoration: const BoxDecoration(
+              border: Border(
+                bottom: BorderSide(
+                  color: DuckColors.glassSeam,
+                  width: 0.5,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                if (widget.language != null) ...[
+                  Text(
+                    widget.language!.toLowerCase(),
+                    style: const TextStyle(
+                      fontSize: 10.5,
+                      color: DuckColors.fgMuted,
+                      fontFamily: DuckTheme.monoFont,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                ],
+                const Spacer(),
+                _CodeBlockCopyChip(onTap: _copy, copied: _copied),
+              ],
+            ),
+          ),
+          // Body. SelectableText keeps drag-select working *inside*
+          // the block (a small SelectionArea-incompatible carve-out;
+          // SelectableText nested in SelectionArea is supported and
+          // wins for the inner region — outer drag-select still
+          // works for prose, just not from prose into a code block,
+          // which is a sane boundary). Horizontal scroll handles
+          // long lines without forcing line-wrap that would mangle
+          // indentation-sensitive code (Python, YAML).
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            child: SelectableText(
+              code,
+              style: const TextStyle(
+                fontFamily: DuckTheme.monoFont,
+                fontSize: 12,
+                color: DuckColors.fgPrimary,
+                height: 1.45,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Compact copy chip rendered in the code-block header. Keeps a tiny
+/// hover state so it's visibly interactive without dominating the
+/// header strip (mirrors the per-message `_CopyChip` ergonomics, but
+/// at code-block scale rather than bubble scale).
+class _CodeBlockCopyChip extends StatefulWidget {
+  final VoidCallback onTap;
+  final bool copied;
+
+  const _CodeBlockCopyChip({required this.onTap, required this.copied});
+
+  @override
+  State<_CodeBlockCopyChip> createState() => _CodeBlockCopyChipState();
+}
+
+class _CodeBlockCopyChipState extends State<_CodeBlockCopyChip> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = widget.copied ? S.chatCodeBlockCopied : S.chatCodeBlockCopy;
+    final iconColor = widget.copied
+        ? DuckColors.accentMint
+        : (_hover ? DuckColors.fgPrimary : DuckColors.fgMuted);
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: Tooltip(
+        message: label,
+        waitDuration: const Duration(milliseconds: 350),
+        child: InkWell(
+          onTap: widget.onTap,
+          borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+          hoverColor: Colors.transparent,
+          splashColor: Colors.transparent,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  widget.copied ? Icons.check : Icons.content_copy_outlined,
+                  size: 12,
+                  color: iconColor,
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    color: iconColor,
+                    fontFamily: DuckTheme.monoFont,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

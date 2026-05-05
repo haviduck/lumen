@@ -14,6 +14,7 @@ import 'services/window_chrome.dart';
 import 'theme/app_colors.dart';
 import 'theme/app_theme.dart';
 import 'widgets/ai_chat/ai_chat.dart';
+import 'widgets/app_close_guard.dart';
 import 'widgets/common/ambient_background.dart';
 import 'widgets/common/duck_glass.dart';
 import 'widgets/common/fast_popup_menu.dart';
@@ -59,7 +60,13 @@ class LumenApp extends StatelessWidget {
       title: S.appName,
       debugShowCheckedModeBanner: false,
       theme: DuckTheme.build(),
-      home: const RootScreen(),
+      // `AppCloseGuard` sits inside the MaterialApp Navigator (so it
+      // can `showDialog`) and below the AppState `Provider` (so it
+      // can read open files / dirty state). It owns
+      // `windowManager.setPreventClose(true)` for the whole app
+      // lifetime — every native close attempt routes through its
+      // unsaved-changes prompt before the window actually destroys.
+      home: const AppCloseGuard(child: RootScreen()),
     );
   }
 }

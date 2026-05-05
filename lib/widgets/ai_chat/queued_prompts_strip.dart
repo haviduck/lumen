@@ -9,7 +9,7 @@ import '../../theme/app_theme.dart';
 /// generation was in flight.
 ///
 /// Each entry exposes:
-///   - the original prompt text (truncated to two lines),
+///   - the original prompt text (single line, ellipsized),
 ///   - a "Send now" button that cancels the in-flight turn and runs
 ///     this prompt next (skipping any earlier queue entries),
 ///   - a delete button that drops the entry without running it.
@@ -20,6 +20,17 @@ import '../../theme/app_theme.dart';
 ///
 /// Hidden when the queue is empty so the chat layout doesn't gain
 /// an empty band of chrome on a quiet panel.
+///
+/// **Visual weight is intentionally low.** An earlier version of
+/// this strip painted a distinct `bgDeeper` band with a 2px
+/// accent-coloured left stripe, a bold caps-letter "Queued (N)"
+/// header, a hint sentence, and per-entry chip cards (chip bg +
+/// border + 2 lines of text + icon-and-label "Send now" CTA). It
+/// drew the eye too aggressively for what is a passive informational
+/// list — the queue should feel like a quiet pre-input list, not
+/// a banner alert. The current layout sits inline above the input
+/// with no panel chrome, dim single-line rows, and icon-only
+/// actions that surface their verbose labels through tooltips.
 class QueuedPromptsStrip extends StatelessWidget {
   final ChatController controller;
   const QueuedPromptsStrip({super.key, required this.controller});
@@ -29,59 +40,17 @@ class QueuedPromptsStrip extends StatelessWidget {
     final queue = controller.queuedPrompts;
     if (queue.isEmpty) return const SizedBox.shrink();
 
-    return Container(
-      padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
-      decoration: const BoxDecoration(
-        color: DuckColors.bgDeeper,
-        border: Border(
-          top: BorderSide(color: DuckColors.glassSeam, width: 0.5),
-          left: BorderSide(color: DuckColors.accentDuck, width: 2),
-        ),
-      ),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 2, 10, 2),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            children: [
-              const Icon(
-                Icons.schedule_outlined,
-                size: 12,
-                color: DuckColors.accentDuck,
-              ),
-              const SizedBox(width: 6),
-              Text(
-                '${S.chatQueuedHeader} (${queue.length})',
-                style: const TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                  color: DuckColors.fgPrimary,
-                  letterSpacing: 0.4,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  S.chatQueuedHint,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 10.5,
-                    color: DuckColors.fgFaint,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
           for (final entry in queue)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: _QueuedPromptRow(
-                key: ValueKey(entry.id),
-                prompt: entry,
-                onRemove: () => controller.removeQueuedPrompt(entry.id),
-                onSendNow: () => controller.sendQueuedPromptNow(entry.id),
-              ),
+            _QueuedPromptRow(
+              key: ValueKey(entry.id),
+              prompt: entry,
+              onRemove: () => controller.removeQueuedPrompt(entry.id),
+              onSendNow: () => controller.sendQueuedPromptNow(entry.id),
             ),
         ],
       ),
@@ -116,15 +85,37 @@ class _QueuedPromptRowState extends State<_QueuedPromptRow> {
       onExit: (_) => setState(() => _hover = false),
       child: AnimatedContainer(
         duration: DuckMotion.fast,
-        padding: const EdgeInsets.fromLTRB(8, 6, 6, 6),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
         decoration: BoxDecoration(
-          color: _hover ? DuckColors.bgRaisedHi : DuckColors.bgChip,
+          // No baseline background — the row reads as a passive
+          // list entry on the existing chat surface. A very light
+          // `bgRaisedHi` lift on hover signals interactivity
+          // without making the row demand attention at rest.
+          color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
           borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-          border: Border.all(color: DuckColors.glassSeam, width: 0.5),
         ),
         child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
+            // Tiny leading dot — pure visual rhythm marker so the
+            // eye reads the strip as a list of items rather than
+            // free-floating text. 4px circle in `fgFaint` sits on
+            // the boundary of perceptible without contributing
+            // chrome weight.
+            Container(
+              width: 4,
+              height: 4,
+              decoration: const BoxDecoration(
+                color: DuckColors.fgFaint,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 8),
+            // Mint paperclip glyph when the queued prompt carries
+            // attached images — keeps the existing affordance from
+            // the previous design without a chip card around it.
+            // Same colour as the attachment strip so the visual
+            // language is consistent across the input area.
             if (hasImages) ...[
               const Icon(
                 Icons.attach_file,
@@ -136,28 +127,31 @@ class _QueuedPromptRowState extends State<_QueuedPromptRow> {
             Expanded(
               child: Text(
                 p.text,
-                maxLines: 2,
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
-                  fontSize: 11.5,
-                  color: DuckColors.fgPrimary,
-                  height: 1.35,
+                  fontSize: 11,
+                  color: DuckColors.fgMuted,
+                  height: 1.3,
                 ),
               ),
             ),
             const SizedBox(width: 6),
+            // Icon-only actions — labels live in tooltips. The bolt
+            // icon for "send now" carries the existing semantic
+            // (cancel-current-turn-and-run-this-next), but stripped
+            // of the cyan-tinted pill background it used to sit in.
+            // Hover state on each action does the colour work.
             _QueueAction(
               icon: Icons.flash_on_outlined,
-              tooltip: S.chatQueuedSendNowTooltip,
-              accent: DuckColors.accentCyan,
+              tooltip: '${S.chatQueuedSendNow} — ${S.chatQueuedSendNowTooltip}',
+              hoverAccent: DuckColors.accentCyan,
               onTap: widget.onSendNow,
-              label: S.chatQueuedSendNow,
             ),
-            const SizedBox(width: 4),
             _QueueAction(
               icon: Icons.close,
               tooltip: S.chatQueuedRemove,
-              accent: DuckColors.fgMuted,
+              hoverAccent: DuckColors.fgPrimary,
               onTap: widget.onRemove,
             ),
           ],
@@ -167,18 +161,24 @@ class _QueuedPromptRowState extends State<_QueuedPromptRow> {
   }
 }
 
+/// Bare icon-only action button used on the queue rows.
+///
+/// Default state is intentionally near-invisible (`fgFaint`); the
+/// row's hover state pushes a parent background lift behind it,
+/// and this button's own hover bumps the icon to its `hoverAccent`
+/// colour. Two layers of subtle feedback let the user discover the
+/// actions when they're inspecting a row, without the actions
+/// shouting for attention when they're not.
 class _QueueAction extends StatefulWidget {
   final IconData icon;
   final String tooltip;
-  final String? label;
-  final Color accent;
+  final Color hoverAccent;
   final VoidCallback onTap;
   const _QueueAction({
     required this.icon,
     required this.tooltip,
-    required this.accent,
+    required this.hoverAccent,
     required this.onTap,
-    this.label,
   });
 
   @override
@@ -199,35 +199,13 @@ class _QueueActionState extends State<_QueueAction> {
         onExit: (_) => setState(() => _hover = false),
         child: GestureDetector(
           onTap: widget.onTap,
-          child: AnimatedContainer(
-            duration: DuckMotion.fast,
-            padding: EdgeInsets.symmetric(
-              horizontal: widget.label == null ? 4 : 7,
-              vertical: 3,
-            ),
-            decoration: BoxDecoration(
-              color: _hover
-                  ? widget.accent.withValues(alpha: 0.14)
-                  : Colors.transparent,
-              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(widget.icon, size: 12, color: widget.accent),
-                if (widget.label != null) ...[
-                  const SizedBox(width: 4),
-                  Text(
-                    widget.label!,
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w600,
-                      color: widget.accent,
-                      letterSpacing: 0.2,
-                    ),
-                  ),
-                ],
-              ],
+          behavior: HitTestBehavior.opaque,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+            child: Icon(
+              widget.icon,
+              size: 12,
+              color: _hover ? widget.hoverAccent : DuckColors.fgFaint,
             ),
           ),
         ),

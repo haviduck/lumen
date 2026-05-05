@@ -60,6 +60,43 @@ class _ExplorerRedoIntent extends Intent {
   const _ExplorerRedoIntent();
 }
 
+/// F2 (or right-click → Rename) → toggle the selected file/folder
+/// row into inline rename mode. Replaces the previous modal
+/// `AlertDialog` rename which was jarring and forced the user out
+/// of the tree; matches Cursor / VS Code / Windows Explorer where
+/// rename is an in-place text edit on the selected row.
+class _ExplorerRenameIntent extends Intent {
+  const _ExplorerRenameIntent();
+}
+
+/// Plumbing carrier for inline-rename state, passed by reference
+/// down through `_FileTree` to the row that's currently being
+/// renamed. Bundling the four fields here (path + controller +
+/// focus + commit/cancel callbacks) keeps `_FileTree` /
+/// `_FileItemRow` constructors from sprouting four extra params
+/// each — and lets a row decide "am I the one being renamed?"
+/// with a single `session.path == myPath` check.
+///
+/// The wrapper itself is cheap to construct; we rebuild a fresh
+/// instance in `_FileExplorerState.build` whenever rename state
+/// changes so child widgets actually see the prop change. Don't
+/// memoize — equality on closures is unreliable.
+class _RenameSession {
+  final String path;
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final VoidCallback onCommit;
+  final VoidCallback onCancel;
+
+  const _RenameSession({
+    required this.path,
+    required this.controller,
+    required this.focusNode,
+    required this.onCommit,
+    required this.onCancel,
+  });
+}
+
 enum _ExplorerOperationKind { create, copy, move }
 
 class _ExplorerOperation {
@@ -123,6 +160,21 @@ class _FileExplorerState extends State<FileExplorer> {
   final List<_ExplorerOperation> _undoStack = <_ExplorerOperation>[];
   final List<_ExplorerOperation> _redoStack = <_ExplorerOperation>[];
   final FocusNode _focusNode = FocusNode(debugLabel: 'FileExplorer');
+
+  // ── Inline rename state ────────────────────────────────────────
+  // When `_renamingPath != null`, the row matching that path swaps
+  // its `Text` for an inline `TextField` pre-filled with the basename.
+  // Owned by `_FileExplorerState` (NOT the row itself) so that:
+  //   - F2 from anywhere in the explorer can flip a row into rename
+  //     mode without the row needing to expose a setter,
+  //   - the controller / focus-node survive the row's `setState`
+  //     rebuilds (which would otherwise reset the text mid-edit),
+  //   - only one row at a time can be in rename mode (single source
+  //     of truth), so we never end up with two TextFields fighting.
+  // Both controller + focus-node are nulled out on commit/cancel.
+  String? _renamingPath;
+  TextEditingController? _renameController;
+  FocusNode? _renameFocusNode;
   GitIgnoreMatcher? _gitignoreMatcher;
   String? _gitignoreWorkspace;
   int? _gitignoreRefreshTick;
@@ -171,6 +223,8 @@ class _FileExplorerState extends State<FileExplorer> {
   void dispose() {
     _focusPulseTimer?.cancel();
     _focusNode.dispose();
+    _renameController?.dispose();
+    _renameFocusNode?.dispose();
     _scrollController.dispose();
     // Best-effort unregister — if the widget tree is being torn down
     // we may not have a usable BuildContext, hence the try/catch.
@@ -871,6 +925,172 @@ class _FileExplorerState extends State<FileExplorer> {
     showDuckToast(context, msg);
   }
 
+  // ── Inline rename ──────────────────────────────────────────────
+  // Replaces the previous modal `_promptName(... S.explorerRenameTitle)`
+  // path. The `rename` context-menu action and the F2 shortcut both
+  // funnel through `_startRename`, which flips `_renamingPath` so the
+  // matching row rebuilds with an inline `TextField`. Commit / cancel
+  // come back here through callbacks the row plumbing forwards down
+  // the tree (passed as `onCommitRename` / `onCancelRename`).
+  //
+  // Selection rule: pre-select the file's stem (everything before the
+  // last `.`), not the full name — matches Windows Explorer / macOS
+  // Finder so that typing a new name doesn't clobber the extension.
+  // Folders (and dotfiles like `.gitignore`) get the full name
+  // selected because there's no extension to preserve.
+
+  void _startRename(String path) {
+    if (path.isEmpty) return;
+    final type = FileSystemEntity.typeSync(path);
+    if (type == FileSystemEntityType.notFound) return;
+
+    final name = p.basename(path);
+    final isDir = type == FileSystemEntityType.directory;
+    final dot = name.lastIndexOf('.');
+    final selectionEnd = (!isDir && dot > 0) ? dot : name.length;
+
+    _renameController?.dispose();
+    _renameFocusNode?.dispose();
+
+    final controller = TextEditingController(text: name);
+    controller.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: selectionEnd,
+    );
+    final focusNode = FocusNode(debugLabel: 'FileExplorerRename');
+
+    setState(() {
+      _selectedPath = path;
+      _renamingPath = path;
+      _renameController = controller;
+      _renameFocusNode = focusNode;
+    });
+
+    // Defer focus until after the row has rebuilt with the TextField
+    // — requesting it synchronously here lands on a focus node that
+    // isn't attached to any widget yet (silent no-op).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      focusNode.requestFocus();
+    });
+  }
+
+  void _cancelRename() {
+    if (_renamingPath == null) return;
+    final controller = _renameController;
+    final focusNode = _renameFocusNode;
+    setState(() {
+      _renamingPath = null;
+      _renameController = null;
+      _renameFocusNode = null;
+    });
+    controller?.dispose();
+    focusNode?.dispose();
+    // Hand focus back to the explorer panel so the next keypress
+    // (Delete / Ctrl-C / Ctrl-V) doesn't fall through to whatever
+    // gets implicit focus when the TextField unmounts.
+    _focusNode.requestFocus();
+  }
+
+  Future<void> _commitRename() async {
+    final path = _renamingPath;
+    final controller = _renameController;
+    if (path == null || controller == null) return;
+
+    final newName = controller.text.trim();
+    final oldName = p.basename(path);
+
+    if (newName.isEmpty || newName == oldName) {
+      _cancelRename();
+      return;
+    }
+
+    // Reject path-separator chars — both directions, regardless of
+    // host OS. A user typing `foo/bar` here usually wants `foo/bar`
+    // as a literal filename (creating a directory mid-rename is
+    // surprise-y); refusing forces them to be explicit.
+    if (newName.contains('/') ||
+        newName.contains('\\') ||
+        newName.contains(Platform.pathSeparator)) {
+      _toast(context, S.explorerRenameInvalidName);
+      // Re-focus the field so the user can fix the name without
+      // re-triggering rename mode from scratch.
+      _renameFocusNode?.requestFocus();
+      return;
+    }
+
+    final parent = p.dirname(path);
+    final dest = p.join(parent, newName);
+
+    if (FileSystemEntity.typeSync(dest) != FileSystemEntityType.notFound) {
+      _toast(context, S.explorerMoveDestinationExists);
+      _renameFocusNode?.requestFocus();
+      return;
+    }
+
+    final isDir = FileSystemEntity.isDirectorySync(path);
+    final appState = context.read<AppState>();
+
+    try {
+      if (isDir) {
+        await Directory(path).rename(dest);
+      } else {
+        await appState.timeline.ensureBaseline(path);
+        await File(path).rename(dest);
+        await appState.timeline.recordRename(
+          path,
+          dest,
+          origin: TimelineOrigin.explorer,
+          note: 'Renamed in file explorer',
+        );
+      }
+      _recordExplorerOperation(
+        _ExplorerOperation.move(path, dest, isDirectory: isDir),
+      );
+      appState.noteEntityMoved(path, dest);
+      appState.refreshDirectory();
+      // Drop rename UI BEFORE updating the selected path so the
+      // newly-rebuilt row at `dest` doesn't try to re-mount the
+      // TextField using the now-stale `_renamingPath`.
+      _cancelRename();
+      setState(() => _selectedPath = dest);
+    } catch (e) {
+      if (mounted) _toast(context, '${S.error}: $e');
+      _cancelRename();
+    }
+  }
+
+  /// F2 handler — flips the currently selected row into rename mode.
+  /// No-op when nothing is selected or the selection is the workspace
+  /// root (renaming the workspace root is a "lose your IDE state"
+  /// operation; out of scope for inline rename).
+  void _renameSelected() {
+    final path = _selectedPath;
+    if (path == null) return;
+    final workspace = context.read<AppState>().currentDirectory;
+    if (workspace != null && p.equals(path, workspace)) return;
+    _startRename(path);
+  }
+
+  /// Build the `_RenameSession` carrier passed down to `_FileTree`.
+  /// Returns null when no rename is in flight; otherwise bundles the
+  /// owned controller / focus-node / commit / cancel callbacks for
+  /// the row to consume. Built fresh each `build()` so child widgets
+  /// see prop changes (closures don't compare reliably).
+  _RenameSession? _buildRenameSession() {
+    final path = _renamingPath;
+    final controller = _renameController;
+    final focusNode = _renameFocusNode;
+    if (path == null || controller == null || focusNode == null) return null;
+    return _RenameSession(
+      path: path,
+      controller: controller,
+      focusNode: focusNode,
+      onCommit: _commitRename,
+      onCancel: _cancelRename,
+    );
+  }
+
   /// `_FileTree` calls this from `initState` to publish a hit-test
   /// key for its folder row. The key is bound to the row's outer
   /// `Container` (NOT the whole subtree) so cursor hits on expanded
@@ -998,6 +1218,7 @@ class _FileExplorerState extends State<FileExplorer> {
             _ExplorerRedoIntent(),
         SingleActivator(LogicalKeyboardKey.keyY, control: true):
             _ExplorerRedoIntent(),
+        SingleActivator(LogicalKeyboardKey.f2): _ExplorerRenameIntent(),
       },
       child: Actions(
         actions: <Type, Action<Intent>>{
@@ -1063,6 +1284,12 @@ class _FileExplorerState extends State<FileExplorer> {
           _ExplorerRedoIntent: CallbackAction<_ExplorerRedoIntent>(
             onInvoke: (_) {
               _redoExplorerOperation();
+              return null;
+            },
+          ),
+          _ExplorerRenameIntent: CallbackAction<_ExplorerRenameIntent>(
+            onInvoke: (_) {
+              _renameSelected();
               return null;
             },
           ),
@@ -1189,6 +1416,28 @@ class _FileExplorerState extends State<FileExplorer> {
                         Expanded(
                           child: GestureDetector(
                             behavior: HitTestBehavior.translucent,
+                            // Left-click on empty tree area below the
+                            // file list does TWO things:
+                            //   1. Focuses the explorer panel (so
+                            //      Ctrl+V doesn't get routed to the
+                            //      editor / terminal).
+                            //   2. Sets `_selectedPath` to the
+                            //      workspace root, so the workspace
+                            //      header lights up with the cyan
+                            //      stripe + bgChip tint and the
+                            //      user can SEE that "this is where
+                            //      Ctrl+V will paste". Without (2)
+                            //      we'd be relying on the implicit
+                            //      "no selection → root" fallback,
+                            //      which gives no visual feedback
+                            //      and confuses users who just
+                            //      copied a file from Windows
+                            //      Explorer and want to know where
+                            //      it'll land.
+                            onTapDown: (_) {
+                              _focusNode.requestFocus();
+                              _selectPath(dir.path);
+                            },
                             onSecondaryTapDown: (details) {
                               _showEmptyAreaMenu(
                                 context,
@@ -1212,6 +1461,7 @@ class _FileExplorerState extends State<FileExplorer> {
                                   onContextMenuFolder: _showFolderContextMenu,
                                   onExplorerOperation: _recordExplorerOperation,
                                   forcedExpandedPaths: _revealedDirectoryPaths,
+                                  renameSession: _buildRenameSession(),
                                   // Highlight only while a drag is
                                   // actively in flight — the raw
                                   // `_externalDropFolder` value
@@ -1282,12 +1532,17 @@ class _FileExplorerState extends State<FileExplorer> {
           value: 'refresh',
           child: _MenuLabel(label: S.explorerRefresh),
         ),
-        if (_clipboardPath != null) const PopupMenuDivider(),
-        if (_clipboardPath != null)
-          const PopupMenuItem(
-            value: 'paste',
-            child: _MenuLabel(label: S.paste),
-          ),
+        const PopupMenuDivider(),
+        // **Always show Paste** — `_routePaste` consults BOTH the OS
+        // clipboard (Windows Explorer / Finder Ctrl+C) and the
+        // internal in-app clipboard. Hiding the menu item when only
+        // the internal clipboard is empty was the bug that made
+        // "Ctrl+C in Windows Explorer → right-click → Paste" appear
+        // broken even though `_routePaste` handles it correctly.
+        const PopupMenuItem(
+          value: 'paste',
+          child: _MenuLabel(label: S.paste),
+        ),
       ],
     );
     if (!context.mounted || result == null) return;
@@ -1305,7 +1560,7 @@ class _FileExplorerState extends State<FileExplorer> {
         appState.refreshDirectory();
         break;
       case 'paste':
-        await _pasteInto(dir);
+        await _routePaste(dir);
         break;
     }
   }
@@ -1369,11 +1624,13 @@ class _FileExplorerState extends State<FileExplorer> {
             value: 'cut',
             child: _MenuLabel(label: S.menuCut),
           ),
-        if (_clipboardPath != null)
-          const PopupMenuItem(
-            value: 'paste',
-            child: _MenuLabel(label: S.paste),
-          ),
+        // Always show Paste — `_routePaste` falls back to the OS
+        // clipboard when the internal one is empty (e.g. user did
+        // Ctrl+C in Windows Explorer and right-clicked here).
+        const PopupMenuItem(
+          value: 'paste',
+          child: _MenuLabel(label: S.paste),
+        ),
         if (!isRoot) const PopupMenuDivider(),
         if (!isRoot)
           const PopupMenuItem(
@@ -1421,31 +1678,10 @@ class _FileExplorerState extends State<FileExplorer> {
         _cutSelected();
         break;
       case 'paste':
-        await _pasteInto(dir);
+        await _routePaste(dir);
         break;
       case 'rename':
-        final newName = await _promptName(
-          context,
-          S.explorerRenameTitle,
-          initial: dir.path.split(Platform.pathSeparator).last,
-        );
-        if (newName == null || newName.isEmpty) return;
-        try {
-          final parts = dir.path.split(Platform.pathSeparator)..removeLast();
-          final source = dir.path;
-          final dest =
-              parts.join(Platform.pathSeparator) +
-              Platform.pathSeparator +
-              newName;
-          await dir.rename(dest);
-          _recordExplorerOperation(
-            _ExplorerOperation.move(source, dest, isDirectory: true),
-          );
-          appState.noteEntityMoved(source, dest);
-          appState.refreshDirectory();
-        } catch (e) {
-          if (context.mounted) _toast(context, '${S.error}: $e');
-        }
+        _startRename(dir.path);
         break;
       case 'delete':
         await _deletePath(dir.path);
@@ -1525,11 +1761,12 @@ class _FileExplorerState extends State<FileExplorer> {
           value: 'cut',
           child: _MenuLabel(label: S.menuCut),
         ),
-        if (_clipboardPath != null)
-          const PopupMenuItem(
-            value: 'paste',
-            child: _MenuLabel(label: S.paste),
-          ),
+        // Always show Paste — same reasoning as the folder menu.
+        // `_routePaste` handles the OS-clipboard fallback.
+        const PopupMenuItem(
+          value: 'paste',
+          child: _MenuLabel(label: S.paste),
+        ),
         const PopupMenuDivider(),
         const PopupMenuItem(
           value: 'rename',
@@ -1588,31 +1825,10 @@ class _FileExplorerState extends State<FileExplorer> {
         _cutSelected();
         break;
       case 'paste':
-        await _pasteInto(file.parent);
+        await _routePaste(file.parent);
         break;
       case 'rename':
-        final newName = await _promptName(
-          context,
-          S.explorerRenameTitle,
-          initial: file.path.split(Platform.pathSeparator).last,
-        );
-        if (newName == null || newName.isEmpty) return;
-        try {
-          final parts = file.path.split(Platform.pathSeparator)..removeLast();
-          final source = file.path;
-          final dest =
-              parts.join(Platform.pathSeparator) +
-              Platform.pathSeparator +
-              newName;
-          await file.rename(dest);
-          _recordExplorerOperation(
-            _ExplorerOperation.move(source, dest, isDirectory: false),
-          );
-          appState.noteEntityMoved(source, dest);
-          appState.refreshDirectory();
-        } catch (e) {
-          if (context.mounted) _toast(context, '${S.error}: $e');
-        }
+        _startRename(file.path);
         break;
       case 'delete':
         await _deletePath(file.path);
@@ -2129,24 +2345,22 @@ class _ExplorerHeader extends StatefulWidget {
 }
 
 class _ExplorerHeaderState extends State<_ExplorerHeader> {
+  bool _hover = false;
+
   @override
   Widget build(BuildContext context) {
     return MouseRegion(
       cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
       child: InkWell(
         mouseCursor: SystemMouseCursors.click,
-        // Tapping the title row both selects the root (so Ctrl+V
-        // pastes here) AND toggles collapse — same compound
-        // behaviour Cursor's workspace-root row uses. Single tap,
-        // two side effects: `_selectedPath = workspaceRoot`
-        // becomes the destination and the tree open/closed state
-        // flips. Users who want to ONLY toggle without changing
-        // selection can still hit the chevron-only zone visually,
-        // but in practice the row is treated as one control.
-        onTap: () {
-          widget.onSelect();
-          widget.onToggle();
-        },
+        // **Name-area click selects ONLY** — does NOT toggle the
+        // tree. Decoupling these two side-effects fixes the "I just
+        // wanted to make root the paste target, why did my whole
+        // tree collapse?" trap. The chevron icon below is its own
+        // gesture target and handles toggle-only.
+        onTap: widget.onSelect,
         hoverColor: Colors.transparent,
         splashColor: Colors.transparent,
         highlightColor: Colors.transparent,
@@ -2157,21 +2371,50 @@ class _ExplorerHeaderState extends State<_ExplorerHeader> {
           // the chevron stays in the same x-position whether
           // selected or not.
           padding: EdgeInsets.only(left: widget.selected ? 8 : 10, right: 8),
-          decoration: widget.selected
-              ? const BoxDecoration(
-                  border: Border(
+          // Background tint when selected — file rows use `bgChip`
+          // for their selected state, and a 2px stripe alone is
+          // easy to miss against the dark panel. Adding a tint here
+          // (just on the row, not the activity bar above) gives the
+          // user the same "this is the paste target" affordance the
+          // file rows have. Hover state also adds a subtle lift so
+          // users know the row is interactive.
+          decoration: BoxDecoration(
+            color: widget.selected
+                ? DuckColors.bgChip
+                : (_hover ? DuckColors.bgRaisedHi : Colors.transparent),
+            border: widget.selected
+                ? const Border(
                     left: BorderSide(color: DuckColors.accentCyan, width: 2),
-                  ),
-                )
-              : null,
+                  )
+                : null,
+          ),
           child: Row(
             children: [
-              Icon(
-                widget.collapsed
-                    ? Icons.keyboard_arrow_right
-                    : Icons.keyboard_arrow_down,
-                size: 14,
-                color: DuckColors.fgSubtle,
+              // **Chevron-only toggle.** Wrapped in its own
+              // `GestureDetector` (with `behavior: opaque` so it
+              // wins the gesture arena over the parent `InkWell`
+              // for clicks landing on the chevron area). Hits here
+              // ONLY toggle collapse — no selection side-effect —
+              // so users who want to expand/collapse without
+              // changing the paste target can do so. The icon is
+              // padded to a comfortable hit zone (~22px wide)
+              // without making the visible chevron larger.
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: widget.onToggle,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 2,
+                    vertical: 6,
+                  ),
+                  child: Icon(
+                    widget.collapsed
+                        ? Icons.keyboard_arrow_right
+                        : Icons.keyboard_arrow_down,
+                    size: 14,
+                    color: DuckColors.fgSubtle,
+                  ),
+                ),
               ),
               const SizedBox(width: 4),
               Expanded(
@@ -2277,6 +2520,12 @@ class _FileTree extends StatefulWidget {
   final void Function(String path, GlobalKey key)? onRegisterFileRow;
   final void Function(String path, GlobalKey key)? onUnregisterFileRow;
 
+  /// Active inline-rename session, or null when no row is being
+  /// renamed. Forwarded verbatim to every child `_FileTree` /
+  /// `_FileItemRow` so the matching row can swap its `Text` for a
+  /// `TextField`. See `_RenameSession` for the shape.
+  final _RenameSession? renameSession;
+
   const _FileTree({
     required this.directory,
     required this.onContextMenu,
@@ -2294,6 +2543,7 @@ class _FileTree extends StatefulWidget {
     this.onUnregisterFolderHit,
     this.onRegisterFileRow,
     this.onUnregisterFileRow,
+    this.renameSession,
   });
 
   @override
@@ -2483,6 +2733,7 @@ class _FileTreeState extends State<_FileTree> {
                           onUnregisterFolderHit: widget.onUnregisterFolderHit,
                           onRegisterFileRow: widget.onRegisterFileRow,
                           onUnregisterFileRow: widget.onUnregisterFileRow,
+                          renameSession: widget.renameSession,
                         )
                       : _FileItemRow(
                           file: c as File,
@@ -2496,6 +2747,7 @@ class _FileTreeState extends State<_FileTree> {
                           onContextMenu: widget.onContextMenu,
                           onRegisterFileRow: widget.onRegisterFileRow,
                           onUnregisterFileRow: widget.onUnregisterFileRow,
+                          renameSession: widget.renameSession,
                         ),
                 )
                 .toList(),
@@ -2622,6 +2874,7 @@ class _FileTreeState extends State<_FileTree> {
                           onUnregisterFolderHit: widget.onUnregisterFolderHit,
                           onRegisterFileRow: widget.onRegisterFileRow,
                           onUnregisterFileRow: widget.onUnregisterFileRow,
+                          renameSession: widget.renameSession,
                         )
                       : _FileItemRow(
                           file: c as File,
@@ -2635,6 +2888,7 @@ class _FileTreeState extends State<_FileTree> {
                           onContextMenu: widget.onContextMenu,
                           onRegisterFileRow: widget.onRegisterFileRow,
                           onUnregisterFileRow: widget.onUnregisterFileRow,
+                          renameSession: widget.renameSession,
                         ),
                 )
                 .toList(),
@@ -2649,29 +2903,40 @@ class _FileTreeState extends State<_FileTree> {
     bool ignored = false,
     bool highlight = false,
   }) {
+    final session = widget.renameSession;
+    final isRenaming = session != null && session.path == widget.directory.path;
+
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onSecondaryTapDown: (details) {
-          widget.onSelect(widget.directory.path);
-          widget.onContextMenuFolder(
-            context,
-            widget.directory,
-            details.globalPosition,
-          );
-        },
+        // Suppress context menu while inline-renaming so a fumbled
+        // right-click doesn't pop a menu over the active edit field.
+        onSecondaryTapDown: isRenaming
+            ? null
+            : (details) {
+                widget.onSelect(widget.directory.path);
+                widget.onContextMenuFolder(
+                  context,
+                  widget.directory,
+                  details.globalPosition,
+                );
+              },
         child: InkWell(
           mouseCursor: SystemMouseCursors.click,
-          onTap: () {
-            widget.onSelect(widget.directory.path);
-            setState(() {
-              _expanded = !_expanded;
-              if (_expanded) _loadChildren();
-            });
-          },
+          // Disable the toggle while renaming — tapping inside the
+          // TextField shouldn't collapse the parent folder.
+          onTap: isRenaming
+              ? null
+              : () {
+                  widget.onSelect(widget.directory.path);
+                  setState(() {
+                    _expanded = !_expanded;
+                    if (_expanded) _loadChildren();
+                  });
+                },
           child: Container(
             color: highlight
                 ? DuckColors.accentCyan.withValues(alpha: 0.15)
@@ -2697,16 +2962,18 @@ class _FileTreeState extends State<_FileTree> {
                 ),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: Text(
-                    dirName,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: ignored
-                          ? DuckColors.fgMuted
-                          : DuckColors.fgPrimary,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  child: isRenaming
+                      ? _RenameField(session: session)
+                      : Text(
+                          dirName,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: ignored
+                                ? DuckColors.fgMuted
+                                : DuckColors.fgPrimary,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
                 ),
               ],
             ),
@@ -2728,6 +2995,11 @@ class _FileItemRow extends StatefulWidget {
   final void Function(String path, GlobalKey key)? onRegisterFileRow;
   final void Function(String path, GlobalKey key)? onUnregisterFileRow;
 
+  /// Active inline-rename session, or null. When `session.path`
+  /// equals this row's file path, the row swaps its name `Text` for
+  /// an inline `TextField` (see `_RenameField`).
+  final _RenameSession? renameSession;
+
   const _FileItemRow({
     required this.file,
     required this.level,
@@ -2737,6 +3009,7 @@ class _FileItemRow extends StatefulWidget {
     required this.onContextMenu,
     this.onRegisterFileRow,
     this.onUnregisterFileRow,
+    this.renameSession,
   });
 
   @override
@@ -2787,6 +3060,16 @@ class _FileItemRowState extends State<_FileItemRow> {
     final fileName = widget.file.path.split(Platform.pathSeparator).last;
     final appState = context.watch<AppState>();
     final isActive = appState.activeFile?.path == widget.file.path;
+    final session = widget.renameSession;
+    final isRenaming = session != null && session.path == widget.file.path;
+
+    // Skip the draggable wrapper while inline-renaming — picking up
+    // and dragging a row mid-edit makes no sense and would tear the
+    // TextField focus away. Plain row-only path keeps the rename UI
+    // stable until commit/cancel.
+    if (isRenaming) {
+      return _buildRow(fileName, isActive, appState);
+    }
 
     return MouseRegion(
       cursor: SystemMouseCursors.click,
@@ -2835,6 +3118,9 @@ class _FileItemRowState extends State<_FileItemRow> {
   }
 
   Widget _buildRow(String fileName, bool isActive, AppState appState) {
+    final session = widget.renameSession;
+    final isRenaming = session != null && session.path == widget.file.path;
+
     return KeyedSubtree(
       key: _rowKey,
       child: MouseRegion(
@@ -2843,16 +3129,29 @@ class _FileItemRowState extends State<_FileItemRow> {
         onExit: (_) => setState(() => _hover = false),
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onSecondaryTapDown: (details) {
-            widget.onSelect(widget.file.path);
-            widget.onContextMenu(context, widget.file, details.globalPosition);
-          },
+          // Right-click is suppressed during rename — see folder-row
+          // comment for the same reason.
+          onSecondaryTapDown: isRenaming
+              ? null
+              : (details) {
+                  widget.onSelect(widget.file.path);
+                  widget.onContextMenu(
+                    context,
+                    widget.file,
+                    details.globalPosition,
+                  );
+                },
           child: InkWell(
             mouseCursor: SystemMouseCursors.click,
-            onTap: () {
-              widget.onSelect(widget.file.path);
-              appState.openFile(widget.file);
-            },
+            // Disable open-on-tap while renaming so clicking inside
+            // the field (to position the cursor) doesn't open the
+            // file in the editor underneath.
+            onTap: isRenaming
+                ? null
+                : () {
+                    widget.onSelect(widget.file.path);
+                    appState.openFile(widget.file);
+                  },
             child: Container(
               // Active file gets a 2px accentCyan stripe down its leading
               // edge — clear "this is the open file" signal on top of the
@@ -2889,16 +3188,18 @@ class _FileItemRowState extends State<_FileItemRow> {
                   ),
                   const SizedBox(width: 6),
                   Expanded(
-                    child: Text(
-                      fileName,
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        color: widget.ignored
-                            ? DuckColors.fgMuted
-                            : DuckColors.fgPrimary,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                    child: isRenaming
+                        ? _RenameField(session: session)
+                        : Text(
+                            fileName,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: widget.ignored
+                                  ? DuckColors.fgMuted
+                                  : DuckColors.fgPrimary,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
                   ),
                 ],
               ),
@@ -2908,6 +3209,129 @@ class _FileItemRowState extends State<_FileItemRow> {
       ),
     );
   }
+}
+
+/// Inline-rename text field rendered in place of the row's name
+/// `Text` widget while a rename is in progress.
+///
+/// **Owned by `_FileExplorerState`, not by this widget.** The
+/// `TextEditingController` and `FocusNode` come in via the
+/// `_RenameSession` so they survive `_FileExplorerState.setState`
+/// rebuilds without losing the user's typed text or cursor position
+/// (which would happen if we created them locally on every build).
+///
+/// Behaviour:
+/// - **Enter** → commit rename via `session.onCommit`. Validation
+///   (empty / same-name / path-separator chars / collision) lives
+///   in `_FileExplorerState._commitRename`; we don't pre-filter
+///   here.
+/// - **Escape** → cancel via `session.onCancel`. Reverts UI; no
+///   filesystem touch.
+/// - **Focus loss** → also cancels (matches Windows Explorer / VS
+///   Code: clicking outside the inline rename aborts the edit
+///   rather than committing a half-typed name).
+///
+/// Style is intentionally minimal — same monospace-ish 12.5px size
+/// as the surrounding row so the field's height matches the row's
+/// height and the surrounding tree doesn't visually jump when a
+/// row enters/leaves rename mode.
+class _RenameField extends StatefulWidget {
+  final _RenameSession session;
+  const _RenameField({required this.session});
+
+  @override
+  State<_RenameField> createState() => _RenameFieldState();
+}
+
+class _RenameFieldState extends State<_RenameField> {
+  // Track whether the cancel-on-focus-loss handler has already
+  // fired so a commit-driven focus loss (TextField unmounts after
+  // `onCommit` succeeds) doesn't double-fire `onCancel` on the
+  // already-disposed session.
+  bool _settled = false;
+
+  void _handleFocusChange() {
+    final node = widget.session.focusNode;
+    if (!node.hasFocus && !_settled && mounted) {
+      _settled = true;
+      widget.session.onCancel();
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.session.focusNode.addListener(_handleFocusChange);
+  }
+
+  @override
+  void dispose() {
+    // Don't crash if the FocusNode was already disposed by the
+    // session owner during commit/cancel — `removeListener` no-ops
+    // on an already-detached listener but the node itself may be
+    // dead; guard with try/catch.
+    try {
+      widget.session.focusNode.removeListener(_handleFocusChange);
+    } catch (_) {}
+    super.dispose();
+  }
+
+  void _commit() {
+    if (_settled) return;
+    _settled = true;
+    widget.session.onCommit();
+  }
+
+  void _cancel() {
+    if (_settled) return;
+    _settled = true;
+    widget.session.onCancel();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Shortcuts(
+      shortcuts: const <ShortcutActivator, Intent>{
+        SingleActivator(LogicalKeyboardKey.escape): _RenameCancelIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          _RenameCancelIntent: CallbackAction<_RenameCancelIntent>(
+            onInvoke: (_) {
+              _cancel();
+              return null;
+            },
+          ),
+        },
+        child: TextField(
+          controller: widget.session.controller,
+          focusNode: widget.session.focusNode,
+          autofocus: true,
+          maxLines: 1,
+          textInputAction: TextInputAction.done,
+          style: const TextStyle(
+            fontSize: 12.5,
+            color: DuckColors.fgPrimary,
+          ),
+          decoration: const InputDecoration(
+            isDense: true,
+            // No surrounding border / padding — the field is meant
+            // to read as the row's name text temporarily becoming
+            // editable, not as a separate input chip.
+            contentPadding: EdgeInsets.symmetric(vertical: 2),
+            border: InputBorder.none,
+            enabledBorder: InputBorder.none,
+            focusedBorder: InputBorder.none,
+          ),
+          onSubmitted: (_) => _commit(),
+        ),
+      ),
+    );
+  }
+}
+
+class _RenameCancelIntent extends Intent {
+  const _RenameCancelIntent();
 }
 
 class _MenuLabel extends StatelessWidget {

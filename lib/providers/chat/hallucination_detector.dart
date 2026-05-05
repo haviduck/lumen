@@ -34,8 +34,8 @@ library;
 /// which bracket-count shape was wrong so the controller can
 /// build a precise correction nudge.
 ///
-/// Three observed shapes in real usage (qwen3.5:cloud,
-/// glm-5.1:cloud):
+/// Four observed shapes in real usage (qwen3.5:cloud,
+/// glm-5.1:cloud, gemma):
 ///   - `xmlStyle`: `<TOOL: arg>` or `<TOOL>` — single brackets
 ///     on both sides, classic XML-style.
 ///   - `doubleBracket`: `<<TOOL: arg>>` — two brackets on both
@@ -44,7 +44,34 @@ library;
 ///     opening is right (three `<`), but the close is short.
 ///     The most common shape with glm-5.1 because the model
 ///     drops a token at the end.
-enum NearMissShape { xmlStyle, doubleBracket, malformedClose }
+///   - `htmlComment`: `<!-- LUMEN_TOOL:edit_file|...|ok -->` (or
+///     lowercase / dash-separated variants). The model has seen
+///     these markers in conversation history — they're our
+///     internal "tool ran" markers that the executor rewrites
+///     real tool calls into for the chat UI — and started
+///     emitting them as a fake tool-call syntax. NO real tool
+///     runs; the UI parses the marker as if a tool already
+///     completed, and the user gets a hallucinated card. Most
+///     common with weaker Ollama models that latch onto any
+///     repeated structural pattern in their context window.
+///   - `unknownTool`: `<<<COPY_FILE: src -> dst>>>` shape — the
+///     SYNTAX is correct (proper triple-bracket open and close,
+///     colon, args), but the tool name isn't registered. Means
+///     the model is inventing tools (`COPY_FILE` before this
+///     existed, `LIST_FILES`, `GREP`, `RG`, …) instead of using
+///     what's in the system prompt. Without this shape the
+///     `intentWithoutAction` path mis-diagnoses these as "the
+///     model never tool-called" — but it DID, just with a name
+///     we don't dispatch on. Surfacing the unknown name lets us
+///     nudge with "that tool doesn't exist; the registered ones
+///     are: …" so the model can self-correct in one turn.
+enum NearMissShape {
+  xmlStyle,
+  doubleBracket,
+  malformedClose,
+  htmlComment,
+  unknownTool,
+}
 
 class HallucinationDetector {
   /// Threshold for halting a turn when hallucinated file-op claims
@@ -56,15 +83,24 @@ class HallucinationDetector {
   static const int defaultHallucinationThreshold = 3;
 
   /// Tool ids whose presence in the per-turn `firedAcrossTurn`
-  /// list satisfies a "Created / Wrote / Edited `path`" claim.
-  /// Read tools and inspection tools (search_text, list_dir,
-  /// read_file) intentionally not here — claiming "Created foo"
-  /// after only reading foo is a hallucination.
+  /// list satisfies a "Created / Wrote / Edited / Copied `path`"
+  /// claim. Read tools and inspection tools (search_text,
+  /// list_dir, read_file) intentionally not here — claiming
+  /// "Created foo" after only reading foo is a hallucination.
+  ///
+  /// `copy_file` is included because the destination of a copy IS
+  /// a newly-created file, and the model legitimately narrates it
+  /// as "Created `dst.dart`" or "Copied `dst.dart`". MOVE_FILE and
+  /// DELETE_FILE are intentionally NOT here — those don't satisfy
+  /// a creation claim, and the prose-claim regex below doesn't
+  /// include `Moved` / `Deleted` for the same reason.
   static const Set<String> _fileMutationToolIds = <String>{
     'create_file',
     'edit_file',
     'multi_edit',
+    'edit_range',
     'append_file',
+    'copy_file',
   };
 
   /// Detect "intent without action" — the model wrote a brief
@@ -149,10 +185,51 @@ class HallucinationDetector {
 
     final stripped = _stripFencedBlocks(assistantText);
 
+    // Zeroth pass: HTML-comment marker mimicry. Catches
+    // `<!-- LUMEN_TOOL:edit_file|...|ok -->` and lowercase /
+    // dash-separated variants. These are our internal
+    // "executor rewrote your tool call into a marker" form —
+    // when the model sees them in history and emits them as if
+    // they were a tool-call syntax, NO tool runs. Caught here so
+    // the auto-continue gate can nudge with the correct
+    // `<<<TOOL: arg>>>` form. Lexical priority over the
+    // triple/double/xml passes below: those are anchored on
+    // `<[A-Z]` so they would never match `<!--` anyway, but
+    // making the order explicit guards against a future regex
+    // tweak that might.
+    final htmlCommentRe = RegExp(
+      r'<!--\s*LUMEN[\s_-]?TOOL(?::\s*([a-z_]+))?',
+      caseSensitive: false,
+    );
+    final htmlMatch = htmlCommentRe.firstMatch(stripped);
+    if (htmlMatch != null) {
+      // Capture group 1 is the lowercase tool id from the marker
+      // (e.g. `edit_file`). Uppercase to match the convention the
+      // existing nudges use (`<<<EDIT_FILE: …>>>`). Fall back to
+      // a sentinel when the marker doesn't include a tool id —
+      // the controller renders a shape-specific message that
+      // doesn't depend on a known tool name.
+      final captured = (htmlMatch.group(1) ?? '').toUpperCase();
+      final name = captured.isNotEmpty && knownToolNames.contains(captured)
+          ? captured
+          : 'LUMEN_TOOL';
+      return (name: name, shape: NearMissShape.htmlComment);
+    }
+
     // First pass: look for any `<<<TOOL:` opener and check
     // whether it has a proper `>>>` close on the same logical
-    // span. This catches the glm-5.1 "right-open, short-close"
-    // shape (`<<<FIND_FILE: Legend>>`).
+    // span. Two near-miss outcomes from this pass:
+    //   - Known tool name, missing close (`>>` / `>`) → catches
+    //     the glm-5.1 "right-open, short-close" shape
+    //     (`<<<FIND_FILE: Legend>>`). Returned as `malformedClose`.
+    //   - Unknown tool name, proper close → catches the model
+    //     inventing tools (`<<<COPY_FILE: …>>>` before this PR,
+    //     `<<<LIST_FILES: …>>>`, `<<<GREP: …>>>`). Syntax is
+    //     correct, name isn't registered, NO tool runs. Returned
+    //     as `unknownTool` so the controller can nudge with the
+    //     real tool list instead of falling through to the
+    //     generic `intentWithoutAction` message which obscures the
+    //     real failure.
     //
     // Span = until next newline OR next `<<<` (whichever first),
     // because tools are line-oriented and a stray short-close
@@ -163,7 +240,6 @@ class HallucinationDetector {
     final tripleOpenRe = RegExp(r'<<<([A-Z][A-Z0-9_]{2,})\b');
     for (final m in tripleOpenRe.allMatches(stripped)) {
       final name = m.group(1) ?? '';
-      if (!knownToolNames.contains(name)) continue;
       // Skip multi-line tool openers (`<<<EDIT_FILE: foo>>>`
       // followed by a body) — false-positives explode otherwise.
       // Multi-line tools always have their proper close as the
@@ -172,13 +248,39 @@ class HallucinationDetector {
       final spanStart = m.end;
       final spanEnd = _findSpanEnd(stripped, spanStart, 200);
       final span = stripped.substring(spanStart, spanEnd);
-      if (span.contains('>>>')) continue; // proper close exists
-      // No `>>>` in the span; check for short closers `>>` or
-      // `>` (in that priority — prefer reporting the more
-      // specific case).
-      if (RegExp(r'>>(?!>)').hasMatch(span) || RegExp(r'>(?![>])').hasMatch(span)) {
-        return (name: name, shape: NearMissShape.malformedClose);
+      final hasProperClose = span.contains('>>>');
+      if (knownToolNames.contains(name)) {
+        if (hasProperClose) continue; // valid call, not a near-miss
+        // No `>>>` in the span; check for short closers `>>` or
+        // `>` (in that priority — prefer reporting the more
+        // specific case).
+        if (RegExp(r'>>(?!>)').hasMatch(span) ||
+            RegExp(r'>(?![>])').hasMatch(span)) {
+          return (name: name, shape: NearMissShape.malformedClose);
+        }
+        continue;
       }
+      // Unknown name. Only count as `unknownTool` when the close
+      // is well-formed (`>>>`) AND the call shape includes a
+      // colon-args separator OR an immediate close — i.e., it
+      // *looks* like a tool invocation, not a stray template
+      // placeholder like `<<<API_KEY_HERE>>>` which models
+      // sometimes emit in code samples. The `tripleOpenRe` itself
+      // doesn't enforce this, so we re-check the trailing chars
+      // here.
+      if (!hasProperClose) continue;
+      // Discard the `>>>` and everything after; what remains in
+      // `span` is the trailing chars after the tool name. Valid
+      // tool-call shapes leave either a colon (args) or a `>`
+      // (immediate close, no args) here.
+      final closeIdx = span.indexOf('>>>');
+      final between = span.substring(0, closeIdx);
+      final looksLikeCall = between.startsWith(':') ||
+          between.startsWith(' :') ||
+          between.startsWith('>') ||
+          between.isEmpty; // `<<<NAME>>>` no-arg shape
+      if (!looksLikeCall) continue;
+      return (name: name, shape: NearMissShape.unknownTool);
     }
 
     // Second pass: `<<TOOL...>>` (double brackets both sides).
@@ -255,7 +357,7 @@ class HallucinationDetector {
     // matching prose like "Edited a section.").
     final claimRe = RegExp(
       r'''(?<![Ww]ill\s|[Gg]oing\s+to\s|[Pp]lan(?:ning)?\s+to\s|I'?ll\s|[Ww]ould\s|[Cc]ould\s|[Mm]ight\s)'''
-      r'\b(?:Created|Wrote|Added|Edited|Updated|Modified|Saved)\b'
+      r'\b(?:Created|Wrote|Added|Edited|Updated|Modified|Saved|Copied)\b'
       r'''[^`"\n]{0,40}'''
       r'''[`"]?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8})[`"]?''',
     );

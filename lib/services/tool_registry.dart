@@ -297,6 +297,216 @@ class ToolRegistry {
         'blocked by Settings → Rules → Allow agent writes outside workspace.';
   }
 
+  /// Render a numbered audit block for EDIT_RANGE's success result —
+  /// the lines that were actually replaced, formatted exactly like
+  /// READ_FILE so the model can compare its expectations against
+  /// reality. Capped at [cap] lines per side; long ranges get a `…`
+  /// collapse so the success string stays bounded.
+  static String _formatRangeAudit({
+    required int startLine,
+    required List<String> content,
+    int cap = 12,
+  }) {
+    if (content.isEmpty) return '   (empty)';
+    final shown = <String>[];
+    if (content.length <= cap) {
+      for (var i = 0; i < content.length; i++) {
+        shown.add('   ${startLine + i}|${content[i]}');
+      }
+    } else {
+      final headHalf = cap ~/ 2;
+      final tailHalf = cap - headHalf;
+      for (var i = 0; i < headHalf; i++) {
+        shown.add('   ${startLine + i}|${content[i]}');
+      }
+      shown.add('   … (${content.length - cap} more lines elided)');
+      for (var i = content.length - tailHalf; i < content.length; i++) {
+        shown.add('   ${startLine + i}|${content[i]}');
+      }
+    }
+    return shown.join('\n');
+  }
+
+  /// On EDIT_FILE SEARCH-not-found, find the most-similar window in
+  /// the file and render a diagnostic the model can act on without
+  /// re-reading. The current "make sure it matches exactly" error
+  /// leaves the model guessing — and once the model guesses wrong
+  /// twice in a row, it tends to abandon EDIT_FILE and rewrite the
+  /// whole file with CREATE_FILE. This nudge breaks that loop.
+  ///
+  /// Algorithm:
+  ///   1. Tokenise both sides into lines, normalise each line
+  ///      (trim + collapse runs of whitespace) for matching.
+  ///   2. Slide a window of size = SEARCH line count across the
+  ///      file content, score each position by exact-match count
+  ///      after normalisation.
+  ///   3. Tie-break by raw-equality count (catches the case where
+  ///      two windows match the normalised SEARCH but one matches
+  ///      raw bytes more closely — that's the better hint).
+  ///   4. Render the winning region with line numbers, plus a
+  ///      one-line hint about likely diff classes (whitespace,
+  ///      quote style, comments).
+  ///
+  /// Caps the output: 10 lines per side, single hint sentence.
+  /// Returns `null` when the file has fewer lines than SEARCH or
+  /// the best window scored zero — at that point a "closest match"
+  /// would mislead more than help, and the caller falls back to
+  /// the legacy concise error.
+  static String? _editSearchNotFoundHint({
+    required String fileContent,
+    required String searchContent,
+    required String fileName,
+    int linesPerSideCap = 10,
+  }) {
+    final fileLines = fileContent.split('\n');
+    final searchLines = searchContent.split('\n');
+    if (searchLines.isEmpty || fileLines.length < searchLines.length) {
+      return null;
+    }
+    final k = searchLines.length;
+    final normFileLines = fileLines.map(_normaliseLineForMatch).toList();
+    final normSearchLines = searchLines.map(_normaliseLineForMatch).toList();
+
+    int bestStart = -1;
+    int bestNormScore = 0;
+    int bestExactScore = 0;
+    for (var i = 0; i + k <= fileLines.length; i++) {
+      var normScore = 0;
+      var exactScore = 0;
+      for (var j = 0; j < k; j++) {
+        if (normFileLines[i + j] == normSearchLines[j]) normScore++;
+        if (fileLines[i + j] == searchLines[j]) exactScore++;
+      }
+      final betterNorm = normScore > bestNormScore;
+      final tieBreakOnExact = normScore == bestNormScore && exactScore > bestExactScore;
+      if (betterNorm || tieBreakOnExact) {
+        bestStart = i;
+        bestNormScore = normScore;
+        bestExactScore = exactScore;
+      }
+    }
+    if (bestStart < 0 || bestNormScore == 0) return null;
+
+    // Render the winning region. Show the original (un-normalised)
+    // bytes so the model can spot whitespace / quote-style diffs.
+    final firstLine = bestStart + 1; // 1-indexed for display
+    final lastLine = (bestStart + k).clamp(1, fileLines.length);
+    final regionLines = fileLines.sublist(bestStart, bestStart + k);
+
+    String renderSide(List<String> ls, int startLineNo) {
+      if (ls.length <= linesPerSideCap) {
+        return [
+          for (var i = 0; i < ls.length; i++) '   ${startLineNo + i}|${ls[i]}',
+        ].join('\n');
+      }
+      final head = ls.take(linesPerSideCap ~/ 2).toList();
+      final tail = ls.sublist(ls.length - (linesPerSideCap - head.length));
+      final out = <String>[
+        for (var i = 0; i < head.length; i++) '   ${startLineNo + i}|${head[i]}',
+        '   … (${ls.length - linesPerSideCap} more lines elided)',
+        for (var i = 0; i < tail.length; i++)
+          '   ${startLineNo + ls.length - tail.length + i}|${tail[i]}',
+      ];
+      return out.join('\n');
+    }
+
+    String renderSearchSide(List<String> ls) {
+      if (ls.length <= linesPerSideCap) {
+        return ls.map((l) => '   |$l').join('\n');
+      }
+      final head = ls.take(linesPerSideCap ~/ 2).toList();
+      final tail = ls.sublist(ls.length - (linesPerSideCap - head.length));
+      return [
+        ...head.map((l) => '   |$l'),
+        '   … (${ls.length - linesPerSideCap} more lines elided)',
+        ...tail.map((l) => '   |$l'),
+      ].join('\n');
+    }
+
+    // Likely-diff hint. Cheap heuristics — we don't try to compute a
+    // real diff; we just check the most common categories so the
+    // hint is concrete rather than "something is different". Order
+    // matters: indentation is the most-common smaller-model
+    // failure, then quote style, then comments.
+    final hint = _diffHint(regionLines, searchLines);
+
+    return 'EDIT_FILE $fileName: Error: SEARCH not found. '
+        'Closest region in file (lines $firstLine-$lastLine, '
+        '$bestNormScore of $k lines match after whitespace '
+        'normalisation):\n'
+        '${renderSide(regionLines, firstLine)}\n\n'
+        'Your SEARCH:\n'
+        '${renderSearchSide(searchLines)}\n\n'
+        '$hint Re-read the region with '
+        '`<<<READ_FILE: $fileName:$firstLine-$lastLine>>>` and '
+        'rebuild the SEARCH from those exact bytes — or, if the '
+        'edit is targeted at a known line range, prefer EDIT_RANGE '
+        'which addresses by line number and skips text matching '
+        'entirely.';
+  }
+
+  /// Lower-case + trim + collapse internal whitespace runs into a
+  /// single space. Used by the EDIT_FILE closest-match diagnostic
+  /// for line-level normalised comparison; differences kept by this
+  /// normaliser are exactly the ones the model is most likely to
+  /// have got wrong.
+  static String _normaliseLineForMatch(String s) {
+    return s.trim().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  /// One-sentence "what likely differs" hint for the EDIT_FILE
+  /// SEARCH-not-found diagnostic. Always returns SOMETHING — the
+  /// generic fallback ("review whitespace / character differences")
+  /// is still better than the bare error this replaces.
+  static String _diffHint(List<String> fileLines, List<String> searchLines) {
+    final pairs = [
+      for (var i = 0; i < fileLines.length && i < searchLines.length; i++)
+        (fileLines[i], searchLines[i]),
+    ];
+
+    bool indentMismatch() {
+      for (final (f, s) in pairs) {
+        final fLead = RegExp(r'^\s*').firstMatch(f)?.group(0) ?? '';
+        final sLead = RegExp(r'^\s*').firstMatch(s)?.group(0) ?? '';
+        if (fLead != sLead && f.trim() == s.trim()) return true;
+      }
+      return false;
+    }
+
+    bool quoteMismatch() {
+      for (final (f, s) in pairs) {
+        if (f.replaceAll("'", '"') == s.replaceAll("'", '"') && f != s) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    bool tabsVsSpaces() {
+      for (final (f, s) in pairs) {
+        final fHasTab = RegExp(r'^[\t]+').hasMatch(f);
+        final sHasTab = RegExp(r'^[\t]+').hasMatch(s);
+        final fHasSpaces = RegExp(r'^[ ]+').hasMatch(f);
+        final sHasSpaces = RegExp(r'^[ ]+').hasMatch(s);
+        if ((fHasTab && sHasSpaces) || (fHasSpaces && sHasTab)) return true;
+      }
+      return false;
+    }
+
+    if (tabsVsSpaces()) {
+      return 'Likely diff: tabs vs spaces in leading indentation.';
+    }
+    if (indentMismatch()) {
+      return 'Likely diff: indentation depth (your SEARCH has different '
+          'leading whitespace than the file).';
+    }
+    if (quoteMismatch()) {
+      return 'Likely diff: quote style (single vs double quotes).';
+    }
+    return 'Likely diff: whitespace, line endings, or characters changed '
+        'since your last read.';
+  }
+
   static final List<AgentTool> _builtin = [
     AgentTool(
       id: 'create_file',
@@ -418,8 +628,25 @@ class ToolRegistry {
               effectiveContent = normalizedContent;
               effectiveSearch = normalizedSearch;
             } else {
+              // Bail with a concrete diagnostic when we can compute
+              // one — the model gets the closest-matching region of
+              // the file plus a likely-diff hint, instead of the
+              // bare "make sure it matches exactly" error that
+              // tends to send smaller models down the
+              // CREATE_FILE-rewrite-the-whole-thing path. Falls
+              // back to the legacy concise error when the file is
+              // too small or no window scored above zero (in
+              // which case "closest match" would mislead).
+              final hint = _editSearchNotFoundHint(
+                fileContent: normalizedContent,
+                searchContent: normalizedSearch,
+                fileName: fileName,
+              );
+              if (hint != null) return hint;
               return 'EDIT_FILE $fileName: Error: SEARCH block not found in '
-                  'file. Make sure it matches exactly, including whitespace.';
+                  'file. Make sure it matches exactly, including whitespace. '
+                  'For targeted line-range edits prefer EDIT_RANGE — it '
+                  'addresses by line number and skips text matching.';
             }
           }
           // **Uniqueness gate.** Multi-match is the silent-wrong-edit
@@ -578,6 +805,174 @@ class ToolRegistry {
       },
     ),
     AgentTool(
+      id: 'edit_range',
+      name: 'EDIT_RANGE',
+      description:
+          'Replace a 1-indexed inclusive line range with new content. '
+          '**Prefer this over EDIT_FILE for targeted edits** — it avoids '
+          'whitespace / quote-style / paraphrase mismatches because '
+          'addressing is by line number, not by exact text matching. '
+          'Pairs directly with READ_FILE\'s `<lineNo>|<content>` output: '
+          'read the file (or a range), then reuse the line numbers '
+          'verbatim. The success message echoes the OLD lines that were '
+          'replaced so you can audit for staleness — if the file changed '
+          'between your read and your edit, the audit makes it obvious. '
+          'An empty body deletes those lines. Out-of-range requests '
+          'fail with the file\'s actual line count so you can re-aim. '
+          'If the body has `<n>|` line-number prefixes (because you '
+          'pasted READ_FILE output verbatim) they are stripped '
+          'automatically and a note is appended to the result.',
+      syntaxExample:
+          '<<<EDIT_RANGE: filename.ext:42-50>>>\n'
+          'replacement content for those lines\n'
+          '<<<END_EDIT>>>',
+      // Group 1 captures the whole `file:N-M` token so absolute Windows
+      // paths (`C:\foo.dart:42-50`) parse correctly — the parser
+      // splits on the LAST `:digit-digit` suffix in the execute body.
+      pattern: RegExp(
+        r'<<<EDIT_RANGE:\s*(.+?)\s*>>>\s*?\n'
+        r'(.*?)'
+        r'\n?\s*?<<<END_EDIT>>>',
+        dotAll: true,
+      ),
+      execute: (inv) async {
+        final target = inv.match.group(1)!;
+        var body = inv.match.group(2) ?? '';
+        if (inv.workspaceDir == null) {
+          return 'EDIT_RANGE $target: Failed (no workspace open).';
+        }
+        // Parse `<file>:<start>-<end>` off the *last* matching colon
+        // suffix so absolute Windows paths survive. A relative path
+        // never contains a `:N-M` suffix, so the regex is anchored to
+        // end-of-string.
+        final rangeRe = RegExp(r'^(.*):(\d+)-(\d+)\s*$');
+        final m = rangeRe.firstMatch(target);
+        if (m == null) {
+          return 'EDIT_RANGE $target: Error: missing or malformed line '
+              'range. Expected `<file>:<start>-<end>` (1-indexed, '
+              'inclusive). Example: '
+              '`<<<EDIT_RANGE: lib/foo.dart:42-50>>>`.';
+        }
+        final fileName = m.group(1)!;
+        final start = int.parse(m.group(2)!);
+        final end = int.parse(m.group(3)!);
+        if (start < 1 || end < start) {
+          return 'EDIT_RANGE $target: Error: invalid range $start-$end '
+              '(start must be ≥ 1 and end must be ≥ start).';
+        }
+        final filePath = _resolvePath(inv, fileName, forWrite: true);
+        if (filePath == null) {
+          return _outsideWorkspaceBlocked('EDIT_RANGE', fileName);
+        }
+        try {
+          final f = File(filePath);
+          if (!await f.exists()) {
+            return 'EDIT_RANGE $target: Error: file does not exist.';
+          }
+          final raw = await f.readAsString();
+          // Newline-style preservation. We have to know the source's
+          // EOL style and trailing-newline state up front because the
+          // splice path joins with `\n` — without restoration, every
+          // EDIT_RANGE silently converts CRLF→LF and strips the
+          // trailing newline, which breaks downstream tools that
+          // care about either (POSIX-only test runners; some
+          // editors flag a missing terminal newline as an error).
+          final usesCrlf = raw.contains('\r\n');
+          final hadTrailingNewline = raw.endsWith('\n') || raw.endsWith('\r\n');
+          final normalized = usesCrlf ? raw.replaceAll('\r\n', '\n') : raw;
+          final lines = normalized.split('\n');
+          // `split('\n')` on a string ending in `\n` produces a
+          // trailing empty element. Drop it so `lines.length` is the
+          // count of *content* lines, matching what the model sees
+          // in READ_FILE output.
+          if (hadTrailingNewline && lines.isNotEmpty && lines.last.isEmpty) {
+            lines.removeLast();
+          }
+          final total = lines.length;
+          if (end > total) {
+            return 'EDIT_RANGE $target: Error: end line $end is past '
+                'EOF (file has $total line${total == 1 ? '' : 's'}). '
+                'To edit to the end of file, use $start-$total. To '
+                'add new lines past EOF, use APPEND_FILE.';
+          }
+          // Body normalisation. Two layered defences against the
+          // most common copy-paste mistakes:
+          //   1. CRLF in body → join with `\n`-stripped lines so the
+          //      result has uniform EOLs, then re-apply the file's
+          //      style at write time.
+          //   2. `^\s*\d+\|` line-number prefixes on every non-blank
+          //      line → strip them. This is the READ_FILE output
+          //      shape; smaller models routinely paste it back
+          //      verbatim. Detect-and-strip is safer than
+          //      detect-and-refuse: refusing forces a redo over a
+          //      footgun that's purely cosmetic.
+          var bodyNormalised = body.replaceAll('\r\n', '\n');
+          var bodyLines = bodyNormalised.split('\n');
+          if (bodyLines.isNotEmpty && bodyLines.last.isEmpty) {
+            bodyLines.removeLast();
+          }
+          var stripped = false;
+          final prefixRe = RegExp(r'^\s*\d+\|');
+          final nonBlank = bodyLines
+              .where((l) => l.trim().isNotEmpty)
+              .toList();
+          if (nonBlank.isNotEmpty &&
+              nonBlank.every((l) => prefixRe.hasMatch(l))) {
+            bodyLines = bodyLines
+                .map((l) => l.replaceFirst(prefixRe, ''))
+                .toList();
+            stripped = true;
+          }
+          // Snapshot the OLD content for the audit. Keep at most 12
+          // lines per side; longer ranges get a `…` collapse so the
+          // result string doesn't blow context. The model can always
+          // re-read for the full content if needed.
+          final removed = lines.sublist(start - 1, end);
+          final before = lines.sublist(0, start - 1);
+          final after = lines.sublist(end);
+          final spliced = <String>[...before, ...bodyLines, ...after];
+          final joined = spliced.join('\n');
+          final finalContent = hadTrailingNewline ? '$joined\n' : joined;
+          final restored = usesCrlf
+              ? finalContent.replaceAll('\n', '\r\n')
+              : finalContent;
+          // No-op detection. If the splice produced byte-identical
+          // bytes to the original, skip the write — same rationale
+          // as EDIT_FILE / MULTI_EDIT no-op gates: a "Success"
+          // signal that doesn't reflect a real change is the worst
+          // failure mode (model marks task done; user finds
+          // nothing changed).
+          if (restored == raw) {
+            return 'EDIT_RANGE $target: No-op — replacing lines '
+                '$start-$end with this body produces byte-identical '
+                'content. File NOT written. Either the body matches '
+                'the existing range exactly, or your range is '
+                'wrong. Re-read with '
+                '`<<<READ_FILE: $fileName:$start-$end>>>` and try '
+                'again.';
+          }
+          await f.writeAsString(restored);
+          final auditOld = _formatRangeAudit(
+            startLine: start,
+            content: removed,
+            cap: 12,
+          );
+          final newCount = bodyLines.length;
+          final stripNote = stripped
+              ? ' (stripped `<n>|` line-number prefixes from your '
+                  'body — that\'s READ_FILE output format, the file '
+                  'itself doesn\'t contain them)'
+              : '';
+          return 'EDIT_RANGE $target: Success — replaced '
+              '${end - start + 1} line${end - start + 1 == 1 ? '' : 's'} '
+              'with $newCount line${newCount == 1 ? '' : 's'}$stripNote.\n'
+              'Replaced content was:\n$auditOld';
+        } catch (e) {
+          return 'EDIT_RANGE $target: Error: $e';
+        }
+      },
+    ),
+    AgentTool(
       id: 'append_file',
       name: 'APPEND_FILE',
       description:
@@ -674,6 +1069,120 @@ class ToolRegistry {
           return 'MOVE_FILE $src -> $dst: Success';
         } catch (e) {
           return 'MOVE_FILE $src -> $dst: Error: $e';
+        }
+      },
+    ),
+    AgentTool(
+      id: 'copy_file',
+      name: 'COPY_FILE',
+      description:
+          'Copy a file or directory. Both paths are relative to the '
+          'workspace; the destination parent directory is created if '
+          'needed. Refuses if the destination already exists (use '
+          'DELETE_FILE first if you really mean to clobber). Directory '
+          'copies are recursive but skip the standard noise dirs '
+          '(node_modules, .git, .dart_tool, build, dist, .venv, '
+          '__pycache__, target, …) and refuse if the source contains '
+          'more than $_kCopyMaxFiles files or '
+          '${_kCopyMaxBytes ~/ (1024 * 1024)} MiB total — narrow the '
+          'scope or copy a subtree instead. Symlinks are not '
+          'followed (loop / escape risk).',
+      syntaxExample: '<<<COPY_FILE: src/path -> dst/path>>>',
+      pattern: RegExp(r'<<<COPY_FILE:\s*(.+?)\s*->\s*(.+?)\s*>>>'),
+      execute: (inv) async {
+        final src = inv.match.group(1)!;
+        final dst = inv.match.group(2)!;
+        if (inv.workspaceDir == null) {
+          return 'COPY_FILE $src -> $dst: Failed (no workspace open).';
+        }
+        final srcPath = _resolvePath(inv, src, forWrite: false);
+        final dstPath = _resolvePath(inv, dst, forWrite: true);
+        if (srcPath == null) {
+          return 'COPY_FILE $src -> $dst: Failed (no workspace open).';
+        }
+        if (dstPath == null) {
+          return _outsideWorkspaceBlocked('COPY_FILE', dst);
+        }
+        try {
+          final srcType = await FileSystemEntity.type(srcPath);
+          if (srcType == FileSystemEntityType.notFound) {
+            return 'COPY_FILE $src -> $dst: Error: source does not exist.';
+          }
+          final dstType = await FileSystemEntity.type(dstPath);
+          if (dstType != FileSystemEntityType.notFound) {
+            return 'COPY_FILE $src -> $dst: Error: destination already '
+                'exists.';
+          }
+          await Directory(p.dirname(dstPath)).create(recursive: true);
+
+          // Single-file path. Plain `File.copy` preserves bytes
+          // (binary-safe — no UTF-8 round-trip), is atomic on most
+          // filesystems, and is the only call we need.
+          if (srcType == FileSystemEntityType.file) {
+            await File(srcPath).copy(dstPath);
+            return 'COPY_FILE $src -> $dst: Success';
+          }
+
+          // Directory path. Recursive copy is built on a manual
+          // walker (NOT `Directory.list(recursive: true)`) so we
+          // can prune the noise dirs *during* descent — listing a
+          // 200k-file `node_modules` only to filter it after is
+          // wasteful and on Windows can take long enough that the
+          // tool feels hung. Two phases:
+          //   1. Survey: walk once counting files / bytes, refuse
+          //      early if over caps. Avoids the half-copied
+          //      directory failure mode where we discover at file
+          //      #800 of 1100 that we should have refused — by
+          //      that point the partial copy is sitting on disk.
+          //   2. Execute: walk again copying. Trades a re-walk for
+          //      the safety of all-or-nothing semantics. The
+          //      survey is cheap (no IO per file beyond `length`).
+          if (srcType == FileSystemEntityType.directory) {
+            final survey = await _surveyDirectoryForCopy(
+              root: Directory(srcPath),
+            );
+            if (survey.fileCount > _kCopyMaxFiles) {
+              return 'COPY_FILE $src -> $dst: Error: source contains '
+                  '${survey.fileCount} files (cap $_kCopyMaxFiles). '
+                  'Narrow the scope or copy a subtree instead.';
+            }
+            if (survey.totalBytes > _kCopyMaxBytes) {
+              final mib = (survey.totalBytes / (1024 * 1024))
+                  .toStringAsFixed(1);
+              return 'COPY_FILE $src -> $dst: Error: source totals '
+                  '$mib MiB (cap '
+                  '${_kCopyMaxBytes ~/ (1024 * 1024)} MiB). Narrow '
+                  'the scope or copy a subtree instead.';
+            }
+            if (survey.skippedSymlinks > 0) {
+              // Tell the model up front so it doesn't claim a
+              // verbatim copy and then get surprised when a
+              // dependent symlink is missing.
+              debugPrint(
+                'COPY_FILE $src -> $dst: skipped '
+                '${survey.skippedSymlinks} symlinks',
+              );
+            }
+            for (final f in survey.files) {
+              final rel = p.relative(f.path, from: srcPath);
+              final destFile = p.join(dstPath, rel);
+              await Directory(p.dirname(destFile)).create(recursive: true);
+              await f.copy(destFile);
+            }
+            final summary =
+                'directory copied, ${survey.fileCount} file'
+                '${survey.fileCount == 1 ? '' : 's'}'
+                '${survey.skippedSymlinks > 0 ? ', skipped ${survey.skippedSymlinks} symlink${survey.skippedSymlinks == 1 ? '' : 's'}' : ''}';
+            return 'COPY_FILE $src -> $dst: Success ($summary)';
+          }
+
+          // Non-file, non-directory (link, pipe, …). We can't
+          // sensibly copy these — refuse with a clear message
+          // rather than half-doing it.
+          return 'COPY_FILE $src -> $dst: Error: source is not a regular '
+              'file or directory.';
+        } catch (e) {
+          return 'COPY_FILE $src -> $dst: Error: $e';
         }
       },
     ),
@@ -1884,6 +2393,78 @@ class ToolRegistry {
     '.lumen',
     '.duckoff',
   };
+
+  /// Per-call caps for COPY_FILE on a directory source. Sized so the
+  /// common cases ("copy this asset folder", "duplicate this module")
+  /// always pass, while a misfire ("copy the whole repo") gets caught
+  /// with a clear error before the tool starts writing. Both caps
+  /// are evaluated *after* `_treeIgnore` filtering, so a typical
+  /// monorepo with `node_modules` is judged on the source files
+  /// actually being copied, not the dependency graveyard.
+  static const int _kCopyMaxFiles = 1000;
+  static const int _kCopyMaxBytes = 100 * 1024 * 1024;
+
+  /// Two-phase recursive walk used by COPY_FILE on a directory
+  /// source. Returns every regular file under [root] that we would
+  /// copy, along with the cumulative byte count and a tally of
+  /// skipped symlinks (purely for the summary line).
+  ///
+  /// Pruning happens *during* descent: any directory whose basename
+  /// is in [_treeIgnore] is not entered. Listing a 200k-file
+  /// `node_modules` only to filter it after is wasteful and on
+  /// Windows can take long enough that the tool feels hung.
+  ///
+  /// Symlinks (file or directory) are skipped silently. Following
+  /// them risks descent loops and lets a bad source escape the
+  /// workspace boundary that `_resolvePath` already enforced — the
+  /// destination would be inside the workspace, but the *contents*
+  /// could be anywhere on disk. Refusing entirely is the only
+  /// stance that doesn't leak the boundary.
+  static Future<({int fileCount, int totalBytes, int skippedSymlinks, List<File> files})>
+      _surveyDirectoryForCopy({required Directory root}) async {
+    final files = <File>[];
+    int totalBytes = 0;
+    int skippedSymlinks = 0;
+
+    Future<void> walk(Directory dir) async {
+      final entities = dir.listSync(followLinks: false);
+      for (final entity in entities) {
+        final base = p.basename(entity.path);
+        if (_treeIgnore.contains(base)) continue;
+        final stat = await entity.stat();
+        if (stat.type == FileSystemEntityType.link) {
+          skippedSymlinks += 1;
+          continue;
+        }
+        if (entity is File) {
+          files.add(entity);
+          totalBytes += stat.size;
+          if (files.length > _kCopyMaxFiles ||
+              totalBytes > _kCopyMaxBytes) {
+            // Bail out of the walk early once we've blown either
+            // cap. The caller already returns an error before any
+            // bytes are written, so we avoid surveying a runaway
+            // source longer than necessary.
+            return;
+          }
+        } else if (entity is Directory) {
+          await walk(entity);
+          if (files.length > _kCopyMaxFiles ||
+              totalBytes > _kCopyMaxBytes) {
+            return;
+          }
+        }
+      }
+    }
+
+    await walk(root);
+    return (
+      fileCount: files.length,
+      totalBytes: totalBytes,
+      skippedSymlinks: skippedSymlinks,
+      files: files,
+    );
+  }
 
   /// Binary extensions skipped by SEARCH_TEXT.
   static const _binaryExts = <String>{

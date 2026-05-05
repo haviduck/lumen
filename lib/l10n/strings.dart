@@ -142,6 +142,16 @@ class S {
   static const String chatMessageCopy = 'Copy message';
   static const String chatMessageCopied = 'Message copied to clipboard';
 
+  // Per-fenced-code-block copy chip + transient "Copied" label.
+  // Lives in the top-right corner of every code block rendered by
+  // the chat (custom MarkdownElementBuilder for `pre`). Existed
+  // because `flutter_markdown_plus` wraps fenced blocks in a
+  // horizontal SingleChildScrollView, which intercepts pointer
+  // drags so SelectionArea can't drag-select the contents — users
+  // had no way to grab a snippet without the chip.
+  static const String chatCodeBlockCopy = 'Copy code';
+  static const String chatCodeBlockCopied = 'Copied';
+
   // Provider-error card (rendered when a chat turn ends with a
   // recognisable transient/auth/network error from the provider).
   static const String providerErrorOverloaded = 'Provider is overloaded';
@@ -247,9 +257,10 @@ class S {
   static const String thinkingDone = 'Thought process';
 
   // Queued prompts (composed while the agent is still generating).
-  static const String chatQueuedHeader = 'Queued';
-  static const String chatQueuedHint =
-      'Prompts you send while the agent is generating land here and run in order when the current turn finishes.';
+  // The strip itself is intentionally chrome-light — no header /
+  // hint text — so `chatQueuedHeader` / `chatQueuedHint` from the
+  // older heavy design were dropped. Tooltips on the icon-only
+  // actions now carry the explanation for first-time users.
   static const String chatQueuedSendNow = 'Send now';
   static const String chatQueuedRemove = 'Remove';
   static const String chatQueuedSendNowTooltip =
@@ -593,6 +604,13 @@ class S {
   static const String explorerNewFolderTitle = 'New Folder';
   static const String explorerRenameTitle = 'Rename';
   static const String explorerNamePlaceholder = 'Name';
+  // Inline rename (F2 / right-click → Rename) — error toasts.
+  // Path-separator chars in a rename would punch the file out of
+  // its parent dir, which is a "moved your file by accident" trap;
+  // refuse instead and let the user cut/paste explicitly.
+  static const String explorerRenameInvalidName =
+      'A name cannot contain "\\" or "/".';
+  static const String explorerRenameSameName = 'New name is the same.';
   static const String explorerMoveDestinationExists =
       'A file or folder with that name already exists in the destination.';
   static const String explorerMoveIntoSelf =
@@ -914,6 +932,7 @@ class S {
   static const String toolPendingEdit = 'Editing';
   static const String toolPendingDelete = 'Deleting';
   static const String toolPendingMove = 'Moving';
+  static const String toolPendingCopy = 'Copying';
   static const String toolPendingRead = 'Reading';
   static const String toolPendingRun = 'Running';
   static const String toolPendingAppend = 'Appending';

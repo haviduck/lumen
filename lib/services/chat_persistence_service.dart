@@ -174,6 +174,35 @@ class PersistedMessage {
   /// fix has to land.
   final int? lastIterationDurationMs;
 
+  /// Per-message random hex string baked into every real
+  /// `<!-- LUMEN_TOOL:... -->` marker the executor emits while
+  /// producing this message. The chat-side renderer
+  /// (`tool_segments.dart::parseChatSegments`) only renders a
+  /// marker as a real tool card when the marker's trailing nonce
+  /// equals this field; markers without a nonce or with a
+  /// mismatching one are treated as model-emitted impersonation
+  /// (the failure mode where weak Ollama models latch onto the
+  /// HTML-comment shape they see in history and emit fake
+  /// "Created"/"Edited" chips with no real tool firing) and are
+  /// stripped from the rendered output.
+  ///
+  /// `null` for two cases:
+  ///   1. **Legacy messages** persisted before nonce-binding
+  ///      shipped — their markers don't carry a nonce field, the
+  ///      renderer keeps the pre-binding behavior (accept any
+  ///      well-formed marker as real).
+  ///   2. **Non-assistant messages** (user, system, tool) which
+  ///      never contain executor markers in the first place.
+  ///
+  /// New assistant turns generate a fresh nonce in
+  /// `ChatController._runGenerationLoop` and stamp it here before
+  /// persisting. The nonce is intentionally per-message (not
+  /// per-session): a per-session nonce would let the model copy
+  /// the value out of conversation history and re-inject it as a
+  /// successful mimicry; a per-message nonce changes every turn
+  /// so the only valid nonce is one the model has never seen.
+  final String? toolMarkerNonce;
+
   PersistedMessage({
     String? id,
     required this.role,
@@ -186,6 +215,7 @@ class PersistedMessage {
     this.firstByteLatencyMs,
     this.iterationCount,
     this.lastIterationDurationMs,
+    this.toolMarkerNonce,
   }) : timestamp = timestamp ?? DateTime.now(),
        id = id ?? _generateId();
 
@@ -202,6 +232,7 @@ class PersistedMessage {
     if (iterationCount != null) 'iters': iterationCount,
     if (lastIterationDurationMs != null)
       'lastIterMs': lastIterationDurationMs,
+    if (toolMarkerNonce != null) 'toolNonce': toolMarkerNonce,
   };
 
   factory PersistedMessage.fromJson(Map<String, dynamic> j) {
@@ -224,6 +255,7 @@ class PersistedMessage {
       firstByteLatencyMs: (j['ttfbMs'] as num?)?.toInt(),
       iterationCount: (j['iters'] as num?)?.toInt(),
       lastIterationDurationMs: (j['lastIterMs'] as num?)?.toInt(),
+      toolMarkerNonce: j['toolNonce'] as String?,
     );
   }
 
