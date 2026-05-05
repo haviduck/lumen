@@ -75,6 +75,8 @@ class _SettingsViewState extends State<SettingsView> {
   late double _fontSize;
   late int _tabSize;
   late bool _wordWrap;
+  bool _showLineNumbers = true;
+  bool _minimap = false;
   late bool _autoApprove;
   late bool _reduceMotion;
   late bool _reduceTransparency;
@@ -860,14 +862,14 @@ class _SettingsViewState extends State<SettingsView> {
         _settingToggle(
           label: S.settingsShowLineNumbers,
           description: S.settingsShowLineNumbersDesc,
-          value: true,
-          onChanged: (_) {},
+          value: _showLineNumbers,
+          onChanged: (v) => setState(() => _showLineNumbers = v),
         ),
         _settingToggle(
           label: S.settingsMinimap,
           description: S.settingsMinimapDesc,
-          value: false,
-          onChanged: (_) {},
+          value: _minimap,
+          onChanged: (v) => setState(() => _minimap = v),
         ),
       ],
     );

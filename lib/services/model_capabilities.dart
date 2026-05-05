@@ -127,44 +127,4 @@ class ModelCapabilities {
         return false;
     }
   }
-
-  /// Returns true when the model has a known, repeated track record of
-  /// fabricating tool execution in this codebase's agent loop —
-  /// emitting `<tool_result>` blocks itself, malformed `<<<TOOL>>>`
-  /// syntax that doesn't match any registered tool, or inventing tool
-  /// output (fake bedrock IDs like `toolu_bdrk_*`, imagined file
-  /// listings, fictional project structure).
-  ///
-  /// Surfaced by the chat composer as a warning chip next to the
-  /// model picker so users know the risk before kicking off a long
-  /// agentic task. The runtime hallucination cut in
-  /// `chat_controller.dart` (`_runGenerationLoop`) detects and
-  /// aborts the worst-case fabrication cascade, but tasks against a
-  /// flagged model may still fail to complete. The warning sets
-  /// expectations and points at known-reliable alternatives.
-  ///
-  /// **Conservative on purpose:** flag only model families with a
-  /// reproducible, observable hallucination pattern. Don't flag
-  /// models we just suspect — false positives push users away from
-  /// usable models and erode trust in the warning. The current
-  /// flagged list is "DeepSeek family" (any provider) — that's
-  /// where the observed pattern lives. Extend deliberately.
-  static bool hasHighHallucinationRisk({
-    required String provider,
-    required String rawModel,
-  }) {
-    final lower = rawModel.toLowerCase();
-
-    // **DeepSeek family.** Observed in practice (Ollama cloud
-    // `deepseek-v4-pro:cloud`, `deepseek-r1:cloud`, GitHub Models
-    // `deepseek/deepseek-*`): malformed tool syntax (`<</TREE: .>>>`,
-    // `<</tool_name/"TREE: .">>`), self-emitted `<tool_result>` with
-    // fabricated content (fake `toolu_bdrk_*` ids, invented `Cargo.toml`
-    // / `App.tsx` listings on a Flutter Windows project, imagined
-    // multi-step "tool runs"), and inability to recover from corrective
-    // nudges. True regardless of provider — same model, same problem.
-    if (lower.contains('deepseek')) return true;
-
-    return false;
-  }
 }

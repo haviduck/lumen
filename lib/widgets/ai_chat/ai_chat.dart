@@ -17,7 +17,6 @@ import '../../providers/app_state.dart';
 import '../../providers/chat_controller.dart';
 import '../../providers/media_controller.dart';
 import '../../services/chat_persistence_service.dart';
-import '../../services/model_capabilities.dart';
 import '../../services/reasoning_effort.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
@@ -2301,21 +2300,6 @@ class _ModelPicker extends StatelessWidget {
     return fullId.substring(idx + 1);
   }
 
-  /// Whether the `provider:model` id points at a model with a known
-  /// hallucination track record (see
-  /// `ModelCapabilities.hasHighHallucinationRisk`). Splits the id
-  /// the same way `ChatController._splitModel` does so the two
-  /// stay consistent — anything without a `:` is treated as Ollama.
-  static bool _isRisky(String fullId) {
-    final idx = fullId.indexOf(':');
-    final provider = idx > 0 ? fullId.substring(0, idx) : 'ollama';
-    final raw = idx > 0 ? fullId.substring(idx + 1) : fullId;
-    return ModelCapabilities.hasHighHallucinationRisk(
-      provider: provider,
-      rawModel: raw,
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final key = GlobalKey();
@@ -2332,19 +2316,13 @@ class _ModelPicker extends StatelessWidget {
         chat.availableModels.isNotEmpty;
     final compact = _compactModelLabel(chat.selectedModel);
     final model = stale ? '$compact (unavailable)' : compact;
-    final isRisky = _isRisky(chat.selectedModel);
     // Tooltip carries the FULL provider:model so the user can still
     // identify which provider routes the badge — useful when two
     // providers expose models with the same short name (e.g. a
-    // llama3 on both Ollama and Groq). Risky models append the
-    // hallucination warning so the chip's tooltip alone tells the
-    // user what's wrong even before they hover the warning icon.
-    final baseTooltip = stale
+    // llama3 on both Ollama and Groq).
+    final tooltipMessage = stale
         ? '${S.chatModel}: ${chat.selectedModel} (unavailable)'
         : '${S.chatModel}: ${chat.selectedModel}';
-    final tooltipMessage = isRisky
-        ? '$baseTooltip\n\n${S.chatModelHallucinationRiskTooltip}'
-        : baseTooltip;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -2411,23 +2389,6 @@ class _ModelPicker extends StatelessWidget {
                                   ),
                                 ),
                               ),
-                              // Inline warning icon for high-hallucination-risk
-                              // models so the user sees the risk BEFORE picking,
-                              // not just after. Tooltip carries the full
-                              // explanation; the icon alone is the at-a-glance
-                              // signal.
-                              if (_isRisky(m)) ...[
-                                const SizedBox(width: 6),
-                                Tooltip(
-                                  message:
-                                      S.chatModelHallucinationRiskTooltip,
-                                  child: const Icon(
-                                    Icons.warning_amber_rounded,
-                                    size: 13,
-                                    color: DuckColors.stateWarn,
-                                  ),
-                                ),
-                              ],
                             ],
                           ),
                         ),
@@ -2525,19 +2486,6 @@ class _ModelPicker extends StatelessWidget {
                         ),
                       ),
                     ),
-                    // At-a-glance warning when the active model has a
-                    // known hallucination pattern. Outer Tooltip already
-                    // carries the long-form explanation (we appended it
-                    // above when isRisky); the icon is the visible hook
-                    // that gets the user to hover in the first place.
-                    if (isRisky) ...[
-                      const SizedBox(width: 4),
-                      const Icon(
-                        Icons.warning_amber_rounded,
-                        size: 12,
-                        color: DuckColors.stateWarn,
-                      ),
-                    ],
                     const SizedBox(width: 4),
                     const Icon(
                       Icons.expand_more,
