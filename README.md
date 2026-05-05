@@ -14,7 +14,10 @@ The project is currently focused on Windows desktop development, with Flutter pl
 - File timeline/history for user saves, agent edits, filesystem events, and restore flows.
 - Optional integrations for GitNexus, Syncthing, workspace backups, and media playback.
 
-## Requirements
+## Grab it from Releases 
+[https://github.com/haviduck/lumen/releases](Releases over yonder)
+
+## Build Requirements
 
 - Windows 10 or later for the primary desktop target.
 - Flutter SDK with desktop support enabled.
@@ -47,7 +50,7 @@ flutter config --enable-windows-desktop
 Clone the repository and install dependencies:
 
 ```powershell
-git clone https://github.com/<your-org-or-user>/lumen.git
+git clone https://github.com/haviduck/lumen.git
 cd lumen
 flutter pub get
 ```
