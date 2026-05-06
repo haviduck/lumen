@@ -22,6 +22,9 @@ class PreferencesService {
   static const String _kGithubModelsOrg = 'githubModels.organization';
   static const String _kGithubUnavailableModels =
       'githubModels.unavailableModels';
+  static const String _kCopilotApiKey = 'copilot.apiKey';
+  static const String _kCopilotUseLoggedInUser = 'copilot.useLoggedInUser';
+  static const String _kCopilotUnavailableModels = 'copilot.unavailableModels';
   static const String _kOpenaiApiKey = 'openai.apiKey';
   static const String _kEnabledProviders = 'llm.enabledProviders';
   static const String _kAutoApprove = 'agent.autoApproveCommands';
@@ -234,6 +237,21 @@ class PreferencesService {
       (await _p).getStringList(_kGithubUnavailableModels) ?? const <String>[];
   Future<void> setGithubUnavailableModels(List<String> v) async =>
       (await _p).setStringList(_kGithubUnavailableModels, v);
+
+  Future<String> getCopilotApiKey() async =>
+      (await _p).getString(_kCopilotApiKey) ?? '';
+  Future<void> setCopilotApiKey(String v) async =>
+      (await _p).setString(_kCopilotApiKey, v.trim());
+
+  Future<bool> getCopilotUseLoggedInUser() async =>
+      (await _p).getBool(_kCopilotUseLoggedInUser) ?? true;
+  Future<void> setCopilotUseLoggedInUser(bool v) async =>
+      (await _p).setBool(_kCopilotUseLoggedInUser, v);
+
+  Future<List<String>> getCopilotUnavailableModels() async =>
+      (await _p).getStringList(_kCopilotUnavailableModels) ?? const <String>[];
+  Future<void> setCopilotUnavailableModels(List<String> v) async =>
+      (await _p).setStringList(_kCopilotUnavailableModels, v);
 
   Future<String> getOpenaiApiKey() async =>
       (await _p).getString(_kOpenaiApiKey) ?? '';

@@ -409,6 +409,7 @@ List<String> _providers(List<String> models) {
     'gemini',
     'claude',
     'github',
+    'copilot',
     'openai',
   ];
   return set.toList()..sort((a, b) {
@@ -438,6 +439,7 @@ String _prettyProvider(String provider) {
     'gemini' => S.providerGemini,
     'claude' => S.providerClaude,
     'github' => S.providerGithub,
+    'copilot' => S.providerCopilot,
     'openai' => S.providerOpenAI,
     _ => provider,
   };

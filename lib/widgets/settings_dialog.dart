@@ -113,6 +113,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
                         S.providerOllama,
                         S.providerGemini,
                         S.providerClaude,
+                        S.providerGithub,
+                        S.providerCopilot,
                         S.providerOpenAI,
                       ])
                         Row(
@@ -377,6 +379,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       await a.updateProviderSettings(
                         githubModelsApiKey: a.githubModelsApiKey,
                         githubModelsOrganization: a.githubModelsOrganization,
+                        copilotApiKey: a.copilotApiKey,
+                        copilotUseLoggedInUser: a.copilotUseLoggedInUser,
                         enabledProviders: _enabledProviders,
                         ollamaEndpoint: _ollamaEndpointCtrl.text,
                         ollamaApiKey: a.ollamaApiKey,

@@ -630,26 +630,17 @@ class _AiChatState extends State<AiChat> {
           final VoidCallback? onRestore;
           if (m.role == 'user') {
             scope = BubbleRestoreScope.chatRewind;
-            final gathered = _gatherChatRewindData(
-              appState,
-              chat,
-              msgs,
-              index,
-            );
+            final gathered = _gatherChatRewindData(appState, chat, msgs, index);
             restoreCount = gathered.fileChangeCount;
             followupCount = gathered.followupMessageCount;
             // Show the chip when there's *anything* to revert — file
             // changes or just messages. Don't show on the trailing
             // user bubble that has nothing after it (nothing to
             // rewind to).
-            final canRewind = !isStreaming &&
-                (restoreCount > 0 || followupCount > 0);
+            final canRewind =
+                !isStreaming && (restoreCount > 0 || followupCount > 0);
             onRestore = canRewind
-                ? () => _confirmAndRewindChat(
-                      appState,
-                      index,
-                      gathered,
-                    )
+                ? () => _confirmAndRewindChat(appState, index, gathered)
                 : null;
           } else {
             scope = BubbleRestoreScope.assistantTurn;
@@ -1116,206 +1107,207 @@ class _AiChatState extends State<AiChat> {
     return CompositedTransformTarget(
       link: _slash.layerLink,
       child: AnimatedContainer(
-      duration: DuckMotion.fast,
-      curve: DuckMotion.standard,
-      decoration: BoxDecoration(
-        color: DuckColors.bgChip,
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        border: Border.all(
-          color: _referenceDragOver
-              ? DuckColors.accentMint
-              : chat.isGenerating
-              ? DuckColors.accentCyan
-              : DuckColors.border,
+        duration: DuckMotion.fast,
+        curve: DuckMotion.standard,
+        decoration: BoxDecoration(
+          color: DuckColors.bgChip,
+          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+          border: Border.all(
+            color: _referenceDragOver
+                ? DuckColors.accentMint
+                : chat.isGenerating
+                ? DuckColors.accentCyan
+                : DuckColors.border,
+          ),
+          boxShadow: chat.isGenerating || _referenceDragOver
+              ? DuckTheme.shadowGlow
+              : null,
         ),
-        boxShadow: chat.isGenerating || _referenceDragOver
-            ? DuckTheme.shadowGlow
-            : null,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Shortcuts(
-            shortcuts: const <ShortcutActivator, Intent>{
-              SingleActivator(LogicalKeyboardKey.keyV, control: true):
-                  _ComposerPasteIntent(),
-            },
-            child: Actions(
-              actions: <Type, Action<Intent>>{
-                _ComposerPasteIntent: CallbackAction<_ComposerPasteIntent>(
-                  onInvoke: (_) {
-                    unawaited(_pasteIntoComposer(chat));
-                    return null;
-                  },
-                ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Shortcuts(
+              shortcuts: const <ShortcutActivator, Intent>{
+                SingleActivator(LogicalKeyboardKey.keyV, control: true):
+                    _ComposerPasteIntent(),
               },
-              child: Focus(
-                onKeyEvent: (node, event) {
-                  if (_slash.onKey(event) == SlashKeyHandling.handled) {
-                    return KeyEventResult.handled;
-                  }
-                  if (event is KeyDownEvent &&
-                      event.logicalKey == LogicalKeyboardKey.enter) {
-                    if (!HardwareKeyboard.instance.isShiftPressed) {
-                      send();
+              child: Actions(
+                actions: <Type, Action<Intent>>{
+                  _ComposerPasteIntent: CallbackAction<_ComposerPasteIntent>(
+                    onInvoke: (_) {
+                      unawaited(_pasteIntoComposer(chat));
+                      return null;
+                    },
+                  ),
+                },
+                child: Focus(
+                  onKeyEvent: (node, event) {
+                    if (_slash.onKey(event) == SlashKeyHandling.handled) {
                       return KeyEventResult.handled;
                     }
-                  }
-                  return KeyEventResult.ignored;
-                },
-                child: TextField(
-                  focusNode: _focus,
-                  controller: _input,
-                  maxLines: 8,
-                  minLines: 2,
-                  textInputAction: TextInputAction.newline,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: DuckColors.fgPrimary,
-                  ),
-                  decoration: const InputDecoration(
-                    hintText: S.chatPlaceholder,
-                    hintStyle: TextStyle(
-                      color: DuckColors.fgMuted,
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.enter) {
+                      if (!HardwareKeyboard.instance.isShiftPressed) {
+                        send();
+                        return KeyEventResult.handled;
+                      }
+                    }
+                    return KeyEventResult.ignored;
+                  },
+                  child: TextField(
+                    focusNode: _focus,
+                    controller: _input,
+                    maxLines: 8,
+                    minLines: 2,
+                    textInputAction: TextInputAction.newline,
+                    style: const TextStyle(
                       fontSize: 13,
+                      color: DuckColors.fgPrimary,
                     ),
-                    border: InputBorder.none,
-                    enabledBorder: InputBorder.none,
-                    focusedBorder: InputBorder.none,
-                    fillColor: Colors.transparent,
-                    filled: false,
-                    contentPadding: EdgeInsets.fromLTRB(12, 10, 12, 4),
+                    decoration: const InputDecoration(
+                      hintText: S.chatPlaceholder,
+                      hintStyle: TextStyle(
+                        color: DuckColors.fgMuted,
+                        fontSize: 13,
+                      ),
+                      border: InputBorder.none,
+                      enabledBorder: InputBorder.none,
+                      focusedBorder: InputBorder.none,
+                      fillColor: Colors.transparent,
+                      filled: false,
+                      contentPadding: EdgeInsets.fromLTRB(12, 10, 12, 4),
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-          // ── Bottom action row: attach + send/stop ──
-          Padding(
-            padding: const EdgeInsets.only(left: 8, right: 6, bottom: 4),
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final compact = constraints.maxWidth < 230;
-                return Row(
-                  children: [
-                    Tooltip(
-                      message: S.chatAttachImage,
-                      child: MouseRegion(
-                        cursor: SystemMouseCursors.click,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(
-                            DuckTheme.radiusS,
-                          ),
-                          onTap: () => _attachImage(chat),
-                          child: const Padding(
-                            padding: EdgeInsets.all(4),
-                            child: Icon(
-                              Icons.attach_file,
-                              size: 15,
-                              color: DuckColors.fgMuted,
+            // ── Bottom action row: attach + send/stop ──
+            Padding(
+              padding: const EdgeInsets.only(left: 8, right: 6, bottom: 4),
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final compact = constraints.maxWidth < 230;
+                  return Row(
+                    children: [
+                      Tooltip(
+                        message: S.chatAttachImage,
+                        child: MouseRegion(
+                          cursor: SystemMouseCursors.click,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(
+                              DuckTheme.radiusS,
+                            ),
+                            onTap: () => _attachImage(chat),
+                            child: const Padding(
+                              padding: EdgeInsets.all(4),
+                              child: Icon(
+                                Icons.attach_file,
+                                size: 15,
+                                color: DuckColors.fgMuted,
+                              ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                    // Reasoning-effort dial — sits between attach
-                    // and auto-approve. Cycles Off → Standard →
-                    // Deep on tap. Translates to a real native
-                    // API param (Anthropic `thinking`, Gemini
-                    // `thinkingConfig`, OpenAI `reasoning_effort`)
-                    // when the active model supports it; falls
-                    // back to a system-prompt directive on
-                    // non-Ollama models that lack native support
-                    // (Haiku, gpt-4o, Gemini 2.0). The pill flags
-                    // which mode is in effect via tooltip wording.
-                    //
-                    // Hidden entirely on Ollama / Ollama Cloud:
-                    // Ollama auto-enables thinking for capable
-                    // models server-side (per
-                    // https://docs.ollama.com/capabilities/thinking)
-                    // and the dial's only effect there would have
-                    // been a weak prompt-suffix directive that
-                    // small local models routinely ignore. Showing
-                    // a control that does nothing real is dishonest
-                    // UX — see
-                    // `ChatController.reasoningEffortPillApplicableForCurrentModel`.
-                    if (chat.reasoningEffortPillApplicableForCurrentModel) ...[
-                      const SizedBox(width: 4),
-                      _ReasoningEffortPill(
-                        effort: chat.reasoningEffort,
-                        isNative: chat.reasoningEffortIsNativeForCurrentModel,
-                        compact: compact,
-                        onCycle: () => chat.setReasoningEffort(
-                          _cycleEffort(chat.reasoningEffort),
-                        ),
-                      ),
-                    ],
-                    const SizedBox(width: 4),
-                    // Auto-approve toggle pill — full label at normal
-                    // chat widths; icon-only below ~230px so the
-                    // composer never overflows when the sidebar is
-                    // intentionally squeezed narrow.
-                    Flexible(
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: _AutoApproveTogglePill(
-                          on: chat.autoApprove,
+                      // Reasoning-effort dial — sits between attach
+                      // and auto-approve. Cycles Off → Standard →
+                      // Deep on tap. Translates to a real native
+                      // API param (Anthropic `thinking`, Gemini
+                      // `thinkingConfig`, OpenAI `reasoning_effort`)
+                      // when the active model supports it; falls
+                      // back to a system-prompt directive on
+                      // non-Ollama models that lack native support
+                      // (Haiku, gpt-4o, Gemini 2.0). The pill flags
+                      // which mode is in effect via tooltip wording.
+                      //
+                      // Hidden entirely on Ollama / Ollama Cloud:
+                      // Ollama auto-enables thinking for capable
+                      // models server-side (per
+                      // https://docs.ollama.com/capabilities/thinking)
+                      // and the dial's only effect there would have
+                      // been a weak prompt-suffix directive that
+                      // small local models routinely ignore. Showing
+                      // a control that does nothing real is dishonest
+                      // UX — see
+                      // `ChatController.reasoningEffortPillApplicableForCurrentModel`.
+                      if (chat
+                          .reasoningEffortPillApplicableForCurrentModel) ...[
+                        const SizedBox(width: 4),
+                        _ReasoningEffortPill(
+                          effort: chat.reasoningEffort,
+                          isNative: chat.reasoningEffortIsNativeForCurrentModel,
                           compact: compact,
-                          onChanged: () =>
-                              chat.setAutoApprove(!chat.autoApprove),
+                          onCycle: () => chat.setReasoningEffort(
+                            _cycleEffort(chat.reasoningEffort),
+                          ),
+                        ),
+                      ],
+                      const SizedBox(width: 4),
+                      // Auto-approve toggle pill — full label at normal
+                      // chat widths; icon-only below ~230px so the
+                      // composer never overflows when the sidebar is
+                      // intentionally squeezed narrow.
+                      Flexible(
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: _AutoApproveTogglePill(
+                            on: chat.autoApprove,
+                            compact: compact,
+                            onChanged: () =>
+                                chat.setAutoApprove(!chat.autoApprove),
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 4),
-                    if (chat.isGenerating)
-                      Tooltip(
-                        message: S.chatStop,
-                        child: MouseRegion(
-                          cursor: SystemMouseCursors.click,
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(
-                              DuckTheme.radiusS,
+                      const SizedBox(width: 4),
+                      if (chat.isGenerating)
+                        Tooltip(
+                          message: S.chatStop,
+                          child: MouseRegion(
+                            cursor: SystemMouseCursors.click,
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(
+                                DuckTheme.radiusS,
+                              ),
+                              onTap: chat.cancelGeneration,
+                              child: const Padding(
+                                padding: EdgeInsets.all(4),
+                                child: Icon(
+                                  Icons.stop_circle,
+                                  size: 17,
+                                  color: DuckColors.stateError,
+                                ),
+                              ),
                             ),
-                            onTap: chat.cancelGeneration,
-                            child: const Padding(
-                              padding: EdgeInsets.all(4),
-                              child: Icon(
-                                Icons.stop_circle,
-                                size: 17,
-                                color: DuckColors.stateError,
+                          ),
+                        )
+                      else
+                        Tooltip(
+                          message: S.chatSend,
+                          child: MouseRegion(
+                            cursor: SystemMouseCursors.click,
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(
+                                DuckTheme.radiusS,
+                              ),
+                              onTap: send,
+                              child: const Padding(
+                                padding: EdgeInsets.all(4),
+                                child: Icon(
+                                  Icons.send,
+                                  size: 17,
+                                  color: DuckColors.accentCyan,
+                                ),
                               ),
                             ),
                           ),
                         ),
-                      )
-                    else
-                      Tooltip(
-                        message: S.chatSend,
-                        child: MouseRegion(
-                          cursor: SystemMouseCursors.click,
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(
-                              DuckTheme.radiusS,
-                            ),
-                            onTap: send,
-                            child: const Padding(
-                              padding: EdgeInsets.all(4),
-                              child: Icon(
-                                Icons.send,
-                                size: 17,
-                                color: DuckColors.accentCyan,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                );
-              },
+                    ],
+                  );
+                },
+              ),
             ),
-          ),
-        ],
-      ),
+          ],
+        ),
       ),
     );
   }
@@ -1606,6 +1598,7 @@ class _ModelSelectionPanelState extends State<_ModelSelectionPanel> {
       'gemini',
       'claude',
       'github',
+      'copilot',
       'openai',
     ];
     return set.toList()..sort((a, b) {
@@ -1869,6 +1862,7 @@ String _prettyProvider(String provider) {
     'gemini' => S.providerGemini,
     'claude' => S.providerClaude,
     'github' => S.providerGithub,
+    'copilot' => S.providerCopilot,
     'openai' => S.providerOpenAI,
     _ => provider,
   };

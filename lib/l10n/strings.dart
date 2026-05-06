@@ -489,6 +489,12 @@ class S {
       'Get an API key at console.anthropic.com.';
   static const String llmProvidersGithubHint =
       'GitHub PAT with the Models: read scope (NOT GitHub Copilot).';
+  static const String llmProvidersCopilotHint =
+      'Use your paid GitHub Copilot entitlement. Token auth needs a fine-grained PAT with Copilot Requests permission.';
+  static const String llmProvidersCopilotUseLoggedIn =
+      'Use logged-in GitHub user when token is blank';
+  static const String llmProvidersCopilotLoginHint =
+      'For first-time setup, click Sign in to Copilot, then run /login in the terminal that opens.';
   static const String llmProvidersOpenaiHint =
       'OpenAI placeholder — saved for when the integration ships.';
   static const String llmProvidersApiKeyHint = 'Paste API key…';
@@ -1083,6 +1089,7 @@ class S {
   static const String providerGemini = 'Gemini';
   static const String providerClaude = 'Claude';
   static const String providerGithub = 'GitHub Models';
+  static const String providerCopilot = 'GitHub Copilot';
   static const String providerOpenAI = 'OpenAI';
   static const String settingsEndpointUrl = 'Endpoint URL';
   static const String settingsApiKey = 'API Key';
@@ -1149,6 +1156,40 @@ class S {
   static const String settingsGithubResetHiddenBtn = 'Reset hidden list';
   static const String settingsGithubResetHiddenDone =
       'Hidden list cleared. Save to refresh the picker.';
+  static const String settingsCopilotSection = 'GitHub Copilot';
+  static const String settingsCopilotApiKeyDesc =
+      'Optional fine-grained GitHub personal access token with Copilot Requests permission. Classic ghp_ tokens are not supported by the Copilot SDK. Leave blank and enable logged-in user auth to use the GitHub account already signed in on this machine.';
+  static const String settingsCopilotUseLoggedInLabel =
+      'Use logged-in GitHub user';
+  static const String settingsCopilotUseLoggedInDesc =
+      'When no token is set, ask the Copilot SDK to use the machine\'s logged-in GitHub/Copilot identity.';
+  static const String settingsCopilotTestBtn = 'Test Copilot';
+  static const String settingsCopilotTestingBtn = 'Testing...';
+  static const String settingsCopilotLoginBtn = 'Sign in to Copilot';
+  static const String settingsCopilotLoginLaunchingBtn = 'Opening...';
+  static const String copilotNoAuth =
+      'Error: No GitHub Copilot authentication configured.';
+  static const String copilotNoAuthSettings =
+      'No token configured and logged-in user auth is disabled.';
+  static const String copilotBridgeNotReady = 'Copilot bridge is not ready.';
+  static const String copilotInstallNode =
+      'Node.js is required for GitHub Copilot. Install Node from nodejs.org and restart Lumen.';
+  static const String copilotConnectedPrefix = 'Connected.';
+  static const String copilotConnectedSuffix =
+      'Copilot models available. Save to apply.';
+  static const String copilotConnectionFailed = 'Copilot connection failed';
+  static const String copilotErrorPrefix = 'GitHub Copilot error';
+  static const String copilotNoResponse =
+      'No response from GitHub Copilot for 6 minutes.';
+  static const String copilotLoginLaunched =
+      'Copilot login terminal opened. Run /login there, finish GitHub auth, then test again.';
+  static const String copilotLoginFailed = 'Could not open Copilot login';
+  static const String copilotLoginTerminalIntro =
+      'Lumen opened the bundled GitHub Copilot CLI for first-time auth.';
+  static const String copilotLoginTerminalCommand =
+      'If you are not signed in, type /login and follow the browser/device-flow instructions.';
+  static const String copilotLoginTerminalDone =
+      'Return to Lumen and click Test Copilot after login completes.';
   static const String settingsOpenAISection = 'OpenAI';
   static const String settingsOpenAIApiKeyDesc =
       'API key for OpenAI (coming soon).';
@@ -1715,8 +1756,10 @@ class S {
   static const String sshVaultImportConfig = 'Import from ~/.ssh/config';
   static const String sshVaultImportConfigDone = 'Imported {N} hosts';
   static String sshVaultImportConfigDoneFmt(int n) => 'Imported $n hosts';
-  static const String sshVaultImportConfigNone = 'No hosts found in ~/.ssh/config';
-  static const String sshVaultImportConfigFailed = 'Failed to read ~/.ssh/config';
+  static const String sshVaultImportConfigNone =
+      'No hosts found in ~/.ssh/config';
+  static const String sshVaultImportConfigFailed =
+      'Failed to read ~/.ssh/config';
 
   // Host editor dialog
   static const String sshHostFieldLabel = 'Label';
@@ -1772,6 +1815,7 @@ class S {
   static const String sshUploadFailed = 'Upload failed';
   static const String sshUploadDirsUnsupported =
       "Folders can't be uploaded yet — drop individual files instead.";
+
   /// Header above the upload-dialog file list. Plural-aware via the
   /// `n == 1 ? 'file' : 'files'` branch — Dart i18n in this codebase
   /// is intl-by-hand; nothing fancier.
@@ -1779,6 +1823,7 @@ class S {
       '${n == 1 ? '1 file' : '$n files'}  ·  $size';
   static String sshUploadGroupFolderFmt(int files, String size) =>
       '${files == 1 ? '1 file' : '$files files'}  ·  $size';
+
   /// Sub-line under the header when symlinks / unreadable entries
   /// were skipped during the walk. We only render this when at
   /// least one of the counts is non-zero.
@@ -1788,12 +1833,14 @@ class S {
     if (unreadable > 0) bits.add('$unreadable unreadable');
     return 'Skipped: ${bits.join(', ')}';
   }
+
   /// Used when the walk produced ZERO uploadable items — distinct
   /// from the generic "upload failed" so the user knows they didn't
   /// actually drop anything we could read.
   static String sshUploadSkippedAllFmt(int symlinks, int unreadable) {
     return "Nothing to upload — ${sshUploadSkippedFmt(symlinks, unreadable).toLowerCase()}";
   }
+
   static String sshUploadDoneWithSkipsFmt(int uploaded, int skipped) =>
       'Uploaded $uploaded · skipped $skipped (already exist)';
   static String sshUploadAggregateProgressFmt(int done, int total) =>
@@ -1805,8 +1852,7 @@ class S {
   static const String sshOpenRemoteFile = 'Open remote file...';
   static const String sshOpenRemoteFilePathHint = '/etc/hosts';
   // Remote file browser dialog
-  static String sshRemoteBrowserTitleFmt(String host) =>
-      'Browse $host';
+  static String sshRemoteBrowserTitleFmt(String host) => 'Browse $host';
   static const String sshRemoteBrowserUp = 'Go up one level';
   static const String sshRemoteBrowserHome = 'Home';
   static const String sshRemoteBrowserRefresh = 'Refresh';
@@ -1844,8 +1890,7 @@ class S {
       "files, logs — anything you want pulled down without leaving the shell.";
 
   // lumen-grab UX (toasts + conflict dialog)
-  static const String sshGrabConflictTitle =
-      'Local file already exists';
+  static const String sshGrabConflictTitle = 'Local file already exists';
   static const String sshGrabConflictBody =
       'A file with the same name already exists in your project. What '
       "should we do with the file you're grabbing?";
@@ -1904,7 +1949,8 @@ class S {
       'File looks binary. Open as text anyway?';
   static const String sshRemoteFileSaved = 'Saved to remote';
   static const String sshRemoteFileSaveFailed = 'Save to remote failed';
-  static const String sshRemoteFileConflictTitle = 'Remote changed since you opened it';
+  static const String sshRemoteFileConflictTitle =
+      'Remote changed since you opened it';
   static const String sshRemoteFileConflictBody =
       'The file on the remote has been modified since you opened it. '
       'Saving now will overwrite those changes.';

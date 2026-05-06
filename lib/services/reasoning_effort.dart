@@ -10,7 +10,7 @@
 ///    has a real API knob that allocates internal "thinking" tokens
 ///    before the model emits user-visible output:
 ///      - Anthropic (Claude Opus 4+, Sonnet 4+): `thinking.budget_tokens`
-///      - OpenAI / GitHub Models (gpt-5 family, o-series): `reasoning_effort`
+///      - OpenAI / GitHub Models / Copilot (gpt-5 family, o-series): `reasoning_effort`
 ///      - Google Gemini (2.5 family): `generationConfig.thinkingConfig.thinkingBudget`
 ///    These actually change how the model works — slower + more expensive,
 ///    measurably more careful.
@@ -40,27 +40,23 @@
 /// The composer pill picks the right mechanism automatically — see
 /// [ReasoningEffortHelper.modelSupportsNative] and
 /// [ReasoningEffortHelper.promptDirectiveFor].
-enum ReasoningEffort {
-  off,
-  standard,
-  deep,
-}
+enum ReasoningEffort { off, standard, deep }
 
 /// Stable serialisation tokens for persistence. Don't rename — these
 /// land in `<session>.json` on disk.
 extension ReasoningEffortIds on ReasoningEffort {
   String get id => switch (this) {
-        ReasoningEffort.off => 'off',
-        ReasoningEffort.standard => 'standard',
-        ReasoningEffort.deep => 'deep',
-      };
+    ReasoningEffort.off => 'off',
+    ReasoningEffort.standard => 'standard',
+    ReasoningEffort.deep => 'deep',
+  };
 }
 
 ReasoningEffort reasoningEffortFromId(String? id) => switch (id) {
-      'off' => ReasoningEffort.off,
-      'deep' => ReasoningEffort.deep,
-      _ => ReasoningEffort.standard,
-    };
+  'off' => ReasoningEffort.off,
+  'deep' => ReasoningEffort.deep,
+  _ => ReasoningEffort.standard,
+};
 
 class ReasoningEffortHelper {
   /// True if [rawModel] (provider-stripped, e.g. `claude-sonnet-4-6`,
@@ -91,6 +87,7 @@ class ReasoningEffortHelper {
         // 2.5 family ships thinkingConfig. 2.0 doesn't.
         return lower.contains('2.5');
       case 'github':
+      case 'copilot':
       case 'openai':
         // gpt-5 family + o-series accept reasoning_effort. Older
         // chat models (gpt-4o, gpt-4.1) don't. The provider id may

@@ -103,11 +103,12 @@ class ModelTier {
   };
 
   static const ModelTier pro = ModelTier._(ModelTierLevel.pro, _pro);
-  static const ModelTier standard =
-      ModelTier._(ModelTierLevel.standard, _standard);
+  static const ModelTier standard = ModelTier._(
+    ModelTierLevel.standard,
+    _standard,
+  );
   static const ModelTier lite = ModelTier._(ModelTierLevel.lite, _lite);
-  static const ModelTier legacy =
-      ModelTier._(ModelTierLevel.legacy, _legacy);
+  static const ModelTier legacy = ModelTier._(ModelTierLevel.legacy, _legacy);
 
   /// Classify a (provider, raw model, capabilities) tuple.
   ///
@@ -137,6 +138,7 @@ class ModelTier {
         if (m.contains('flash')) return pro; // 2.5 Flash handles all tools.
         return pro;
       case 'github':
+      case 'copilot':
         // OpenAI-shaped catalog. mini / nano → Standard, rest → Pro.
         if (m.contains('mini') || m.contains('nano')) return standard;
         if (m.startsWith('openai/') || m.startsWith('xai/')) return pro;

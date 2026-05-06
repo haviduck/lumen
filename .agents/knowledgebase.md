@@ -39,6 +39,23 @@ Three derived getters drive the UI:
 
 If you add a new place where the model surface changes (new provider, key change, daemon state flip), wire `chat.reloadModels()` into it. Without it the picker is stale until next save.
 
+## GitHub Copilot provider
+
+Copilot is a separate provider namespace from GitHub Models:
+- `github:<publisher/model>` = GitHub Models REST inference (`https://models.github.ai`).
+- `copilot:<model>` = GitHub Copilot via the local Node bridge and `@github/copilot-sdk`.
+
+The Copilot bridge lives in `assets/bin/copilot/` and is materialised by `lib/services/copilot_provisioner.dart` into `<appSupport>/bin/copilot/`. The provisioner copies `bridge.js` + `package.json`, runs `npm install --omit=dev --no-audit --no-fund` only when the asset sha changes or `node_modules/` is missing, then returns the real `bridge.js` path. Node must be on PATH; this is the same broad prerequisite as GitNexus.
+
+Runtime flow:
+- `CopilotService` owns one local `node bridge.js` child process and talks line-delimited JSON over stdio. No TCP server is opened.
+- Auth precedence: non-empty `copilot.apiKey` -> SDK `githubToken`; otherwise `copilot.useLoggedInUser == true` -> SDK `useLoggedInUser:true`.
+- First-time setup: Settings -> General -> GitHub Copilot has a "Sign in to Copilot" button. It provisions the local bridge, opens the bundled `node_modules/.bin/copilot` CLI in a real terminal, and the user runs `/login` there. This avoids requiring a global `npm install -g @github/copilot`; Lumen's app-support install is enough.
+- Model discovery must use the SDK's real `client.listModels()` result. Do not silently fall back to a hardcoded model list when authenticated; that masks org/policy/auth failures and makes Settings report fake success.
+- `ChatController` routes `copilot:` models through `CopilotService.generateChatStream`, title summaries through `summarizeTitle`, and marks Copilot as native-tool capable.
+- Native tool calls: the bridge registers SDK `defineTool` handlers for Lumen's JSON schemas, emits a `tool_call` event to Dart, and waits. `CopilotService` converts that to `NativeToolUseMarker`, asks the bridge to cancel the current SDK turn, and lets Lumen's existing native-tool loop execute the tool + include the tool result in the next prompt iteration. This keeps approvals, timeline logging, and single-tool-per-iteration behaviour inside Lumen.
+- Provider display helpers must stay in sync: `widgets/ai_chat/ai_chat.dart::_providers/_prettyProvider` and `widgets/ai_chat/model_management_panel.dart::_providers/_prettyProvider` both include `copilot` after `github`.
+
 ## Ollama specifics — the thing that bit us
 
 `OllamaService.getModels()` previously returned `['llama3','mistral','phi3']` as a fallback when `/api/tags` failed. This produced ghost entries in the picker on PCs without Ollama running and was the root cause of "models didn't show up after setting endpoint" reports.

@@ -139,6 +139,7 @@ flutter:
     - assets/bin/rg/LICENSE-MIT
     - assets/bin/rg/UNLICENSE
     - assets/bin/rg/COPYING
+    - assets/bin/copilot/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

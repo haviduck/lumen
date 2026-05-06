@@ -23,7 +23,7 @@ class ModelCapabilities {
 
   /// True when the model accepts inline image inputs (multimodal
   /// vision). Caller passes the provider tag (e.g. `'claude'`,
-  /// `'gemini'`, `'github'`, `'openai'`, `'ollama'`) and the
+  /// `'gemini'`, `'github'`, `'copilot'`, `'openai'`, `'ollama'`) and the
   /// provider-stripped raw model id (e.g. `'claude-sonnet-4-6'`,
   /// not `'claude:claude-sonnet-4-6'`).
   ///
@@ -72,6 +72,7 @@ class ModelCapabilities {
             lower.contains('vision');
 
       case 'github':
+      case 'copilot':
       case 'openai':
         // OpenAI / GitHub Models: gpt-4o family, gpt-4-turbo with
         // vision, gpt-4.1, gpt-5 family, o1/o3/o4 reasoning models

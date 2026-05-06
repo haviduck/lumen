@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
+import '../services/copilot_service.dart';
 import '../services/gitnexus_service.dart';
 import '../services/github_models_service.dart';
 import '../services/syncthing_service.dart';
@@ -63,6 +64,12 @@ class _SettingsViewState extends State<SettingsView> {
   bool _githubTesting = false;
   String? _githubTestMessage;
   bool? _githubTestOk;
+  late TextEditingController _copilotKeyCtrl;
+  late bool _copilotUseLoggedInUser;
+  bool _copilotTesting = false;
+  bool _copilotLoginLaunching = false;
+  String? _copilotTestMessage;
+  bool? _copilotTestOk;
   late TextEditingController _openaiKeyCtrl;
 
   // API key visibility toggles
@@ -70,6 +77,7 @@ class _SettingsViewState extends State<SettingsView> {
   bool _showGeminiKey = false;
   bool _showClaudeKey = false;
   bool _showGithubKey = false;
+  bool _showCopilotKey = false;
   bool _showOpenaiKey = false;
   bool _showStApiKey = false;
 
@@ -169,6 +177,8 @@ class _SettingsViewState extends State<SettingsView> {
     _claudeKeyCtrl = TextEditingController(text: a.anthropicApiKey);
     _githubKeyCtrl = TextEditingController(text: a.githubModelsApiKey);
     _githubOrgCtrl = TextEditingController(text: a.githubModelsOrganization);
+    _copilotKeyCtrl = TextEditingController(text: a.copilotApiKey);
+    _copilotUseLoggedInUser = a.copilotUseLoggedInUser;
     _openaiKeyCtrl = TextEditingController(text: a.openaiApiKey);
     _editorTheme = a.editorTheme;
     _fontSize = a.editorFontSize;
@@ -220,6 +230,7 @@ class _SettingsViewState extends State<SettingsView> {
     _claudeKeyCtrl.dispose();
     _githubKeyCtrl.dispose();
     _githubOrgCtrl.dispose();
+    _copilotKeyCtrl.dispose();
     _openaiKeyCtrl.dispose();
     _toolCompressionThresholdCtrl.dispose();
     _historySummaryMaxCharsCtrl.dispose();
@@ -243,6 +254,8 @@ class _SettingsViewState extends State<SettingsView> {
       anthropicApiKey: _claudeKeyCtrl.text,
       githubModelsApiKey: _githubKeyCtrl.text,
       githubModelsOrganization: _githubOrgCtrl.text,
+      copilotApiKey: _copilotKeyCtrl.text,
+      copilotUseLoggedInUser: _copilotUseLoggedInUser,
       openaiApiKey: _openaiKeyCtrl.text,
     );
     await a.updateEditorSettings(
@@ -277,8 +290,7 @@ class _SettingsViewState extends State<SettingsView> {
     );
     await a.updateHistorySummarySettings(
       enabled: _historySummaryEnabled,
-      maxChars:
-          parsedHistoryMaxChars == null || parsedHistoryMaxChars <= 0
+      maxChars: parsedHistoryMaxChars == null || parsedHistoryMaxChars <= 0
           ? 1200
           : parsedHistoryMaxChars,
       refreshDelta:
@@ -345,6 +357,44 @@ class _SettingsViewState extends State<SettingsView> {
       _githubTesting = false;
       _githubTestOk = result.ok;
       _githubTestMessage = result.message;
+    });
+  }
+
+  Future<void> _testCopilotConnection() async {
+    setState(() {
+      _copilotTesting = true;
+      _copilotTestMessage = null;
+      _copilotTestOk = null;
+    });
+    final svc = CopilotService(
+      apiKey: _copilotKeyCtrl.text.trim(),
+      useLoggedInUser: _copilotUseLoggedInUser,
+    );
+    final result = await svc.testConnection();
+    await svc.dispose();
+    if (!mounted) return;
+    setState(() {
+      _copilotTesting = false;
+      _copilotTestOk = result.ok;
+      _copilotTestMessage = result.message;
+    });
+  }
+
+  Future<void> _openCopilotLoginTerminal() async {
+    setState(() {
+      _copilotLoginLaunching = true;
+      _copilotTestMessage = null;
+      _copilotTestOk = null;
+    });
+    final result = await context
+        .read<AppState>()
+        .copilotService
+        .openLoginTerminal();
+    if (!mounted) return;
+    setState(() {
+      _copilotLoginLaunching = false;
+      _copilotTestOk = result.ok;
+      _copilotTestMessage = result.message;
     });
   }
 
@@ -547,6 +597,7 @@ class _SettingsViewState extends State<SettingsView> {
                 S.providerGemini,
                 S.providerClaude,
                 S.providerGithub,
+                S.providerCopilot,
                 S.providerOpenAI,
               ])
                 Padding(
@@ -772,6 +823,129 @@ class _SettingsViewState extends State<SettingsView> {
                   showDuckToast(context, S.settingsGithubResetHiddenDone);
                 },
               ),
+            ),
+          ),
+        ),
+        _divider(),
+        _sectionLabel(S.settingsCopilotSection),
+        _settingRow(
+          label: S.settingsApiKey,
+          description: S.settingsCopilotApiKeyDesc,
+          child: SizedBox(
+            width: 320,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _apiKeyField(
+                  controller: _copilotKeyCtrl,
+                  visible: _showCopilotKey,
+                  onToggle: (v) => _showCopilotKey = v,
+                ),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text(
+                    S.settingsCopilotUseLoggedInLabel,
+                    style: TextStyle(fontSize: 12.5),
+                  ),
+                  subtitle: const Text(
+                    S.settingsCopilotUseLoggedInDesc,
+                    style: TextStyle(fontSize: 11, color: DuckColors.fgSubtle),
+                  ),
+                  value: _copilotUseLoggedInUser,
+                  onChanged: (v) => setState(() => _copilotUseLoggedInUser = v),
+                  activeThumbColor: DuckColors.accentCyan,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  S.llmProvidersCopilotLoginHint,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: DuckColors.fgSubtle,
+                    height: 1.35,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        side: const BorderSide(
+                          color: DuckColors.glassSeam,
+                          width: 0.5,
+                        ),
+                      ),
+                      icon: _copilotLoginLaunching
+                          ? const SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 1.5,
+                              ),
+                            )
+                          : const Icon(Icons.login, size: 14),
+                      label: Text(
+                        _copilotLoginLaunching
+                            ? S.settingsCopilotLoginLaunchingBtn
+                            : S.settingsCopilotLoginBtn,
+                        style: const TextStyle(fontSize: 11.5),
+                      ),
+                      onPressed: _copilotLoginLaunching
+                          ? null
+                          : _openCopilotLoginTerminal,
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        side: const BorderSide(
+                          color: DuckColors.glassSeam,
+                          width: 0.5,
+                        ),
+                      ),
+                      icon: _copilotTesting
+                          ? const SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 1.5,
+                              ),
+                            )
+                          : const Icon(Icons.check_circle_outline, size: 14),
+                      label: Text(
+                        _copilotTesting
+                            ? S.settingsCopilotTestingBtn
+                            : S.settingsCopilotTestBtn,
+                        style: const TextStyle(fontSize: 11.5),
+                      ),
+                      onPressed: _copilotTesting
+                          ? null
+                          : _testCopilotConnection,
+                    ),
+                  ],
+                ),
+                if (_copilotTestMessage != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _copilotTestMessage!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _copilotTestOk == true
+                          ? DuckColors.stateOk
+                          : DuckColors.stateError,
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
         ),

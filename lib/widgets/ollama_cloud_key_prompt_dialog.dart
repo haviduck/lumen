@@ -81,6 +81,8 @@ class _OllamaCloudKeyPromptDialogState
       anthropicApiKey: state.anthropicApiKey,
       githubModelsApiKey: state.githubModelsApiKey,
       githubModelsOrganization: state.githubModelsOrganization,
+      copilotApiKey: state.copilotApiKey,
+      copilotUseLoggedInUser: state.copilotUseLoggedInUser,
       openaiApiKey: state.openaiApiKey,
     );
     if (!mounted) return;
@@ -169,24 +171,21 @@ class _OllamaCloudKeyPromptDialogState
                     vertical: 10,
                   ),
                   border: OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(DuckTheme.radiusS),
+                    borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                     borderSide: const BorderSide(
                       color: DuckColors.glassSeam,
                       width: 0.5,
                     ),
                   ),
                   enabledBorder: OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(DuckTheme.radiusS),
+                    borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                     borderSide: const BorderSide(
                       color: DuckColors.glassSeam,
                       width: 0.5,
                     ),
                   ),
                   focusedBorder: OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(DuckTheme.radiusS),
+                    borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                     borderSide: const BorderSide(
                       color: DuckColors.accentCyan,
                       width: 1,
@@ -240,8 +239,7 @@ class _OllamaCloudKeyPromptDialogState
                         vertical: 10,
                       ),
                       shape: RoundedRectangleBorder(
-                        borderRadius:
-                            BorderRadius.circular(DuckTheme.radiusS),
+                        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                       ),
                       textStyle: const TextStyle(
                         fontSize: 13,

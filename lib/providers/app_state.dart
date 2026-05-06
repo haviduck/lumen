@@ -9,6 +9,7 @@ import '../services/anthropic_service.dart';
 import '../services/auto_backup_scheduler.dart';
 import '../services/backup_service.dart';
 import '../services/chat_persistence_service.dart';
+import '../services/copilot_service.dart';
 import '../services/file_kind.dart';
 import '../services/gemini_service.dart';
 import '../services/gitnexus_service.dart';
@@ -70,12 +71,14 @@ class AppState extends ChangeNotifier {
   final GeminiService _geminiService = GeminiService();
   final AnthropicService _anthropicService = AnthropicService();
   final GitHubModelsService _githubModelsService = GitHubModelsService();
+  final CopilotService _copilotService = CopilotService();
   // Public read-only handles so features outside the chat flow can
   // reach the configured clients without re-deriving from prefs.
   OllamaService get ollamaService => _ollamaService;
   GeminiService get geminiService => _geminiService;
   AnthropicService get anthropicService => _anthropicService;
   GitHubModelsService get githubModelsService => _githubModelsService;
+  CopilotService get copilotService => _copilotService;
   final WorkspaceService _workspaceService = WorkspaceService();
   final PreferencesService prefs = PreferencesService();
   final ChatPersistenceService _persistence = ChatPersistenceService();
@@ -160,11 +163,12 @@ class AppState extends ChangeNotifier {
   /// main.dart so any save path (Ctrl+S, menu, save-all) uses the
   /// same UX without each call site reimplementing the prompt.
   /// Default: "cancel on conflict" — safer than silent overwrite.
-  SshConflictResolver _sshConflictResolver = ({
-    required RemoteFileOrigin origin,
-    required int? currentSize,
-    required int? currentMtime,
-  }) async => false;
+  SshConflictResolver _sshConflictResolver =
+      ({
+        required RemoteFileOrigin origin,
+        required int? currentSize,
+        required int? currentMtime,
+      }) async => false;
 
   /// Caller-provided closure that prompts the user when a `lumen-grab`
   /// download is about to overwrite an existing file in the project.
@@ -172,11 +176,12 @@ class AppState extends ChangeNotifier {
   /// Default: "cancel on collision" — safer than silent overwrite,
   /// and the user can always re-run the grab after deleting / moving
   /// the existing file.
-  SshGrabConflictResolver _sshGrabConflictResolver = ({
-    required String existingLocalPath,
-    required String remotePath,
-    required String hostLabel,
-  }) async => SshGrabConflictDecision.cancel;
+  SshGrabConflictResolver _sshGrabConflictResolver =
+      ({
+        required String existingLocalPath,
+        required String remotePath,
+        required String hostLabel,
+      }) async => SshGrabConflictDecision.cancel;
 
   void bindSsh(
     SshController controller, {
@@ -267,6 +272,8 @@ class AppState extends ChangeNotifier {
   String _anthropicApiKey = '';
   String _githubModelsApiKey = '';
   String _githubModelsOrganization = '';
+  String _copilotApiKey = '';
+  bool _copilotUseLoggedInUser = true;
   String _openaiApiKey = '';
   bool _toolCompressionEnabled = false;
   String _toolCompressionModel = '';
@@ -357,6 +364,8 @@ class AppState extends ChangeNotifier {
   String get anthropicApiKey => _anthropicApiKey;
   String get githubModelsApiKey => _githubModelsApiKey;
   String get githubModelsOrganization => _githubModelsOrganization;
+  String get copilotApiKey => _copilotApiKey;
+  bool get copilotUseLoggedInUser => _copilotUseLoggedInUser;
   String get openaiApiKey => _openaiApiKey;
   bool get toolCompressionEnabled => _toolCompressionEnabled;
   String get toolCompressionModel => _toolCompressionModel;
@@ -418,6 +427,7 @@ class AppState extends ChangeNotifier {
       gemini: _geminiService,
       anthropic: _anthropicService,
       github: _githubModelsService,
+      copilot: _copilotService,
       persistence: _persistence,
       rules: rules,
       prefs: prefs,
@@ -491,6 +501,7 @@ class AppState extends ChangeNotifier {
     timeline.dispose();
     gitnexus.removeListener(_onGitnexusChanged);
     gitnexus.dispose();
+    unawaited(_copilotService.dispose());
     remote.dispose();
     super.dispose();
   }
@@ -503,6 +514,8 @@ class AppState extends ChangeNotifier {
     _anthropicApiKey = await prefs.getAnthropicApiKey();
     _githubModelsApiKey = await prefs.getGithubModelsApiKey();
     _githubModelsOrganization = await prefs.getGithubModelsOrganization();
+    _copilotApiKey = await prefs.getCopilotApiKey();
+    _copilotUseLoggedInUser = await prefs.getCopilotUseLoggedInUser();
     _openaiApiKey = await prefs.getOpenaiApiKey();
     _toolCompressionEnabled = await prefs.getToolCompressionEnabled();
     _toolCompressionModel = await prefs.getToolCompressionModel();
@@ -516,6 +529,8 @@ class AppState extends ChangeNotifier {
     _anthropicService.apiKey = _anthropicApiKey;
     _githubModelsService.apiKey = _githubModelsApiKey;
     _githubModelsService.organization = _githubModelsOrganization;
+    _copilotService.apiKey = _copilotApiKey;
+    _copilotService.useLoggedInUser = _copilotUseLoggedInUser;
     _githubModelsService.unavailableModels
       ..clear()
       ..addAll(await prefs.getGithubUnavailableModels());
@@ -526,6 +541,16 @@ class AppState extends ChangeNotifier {
       // block the error-rendering pipeline.
       await prefs.setGithubUnavailableModels(
         _githubModelsService.unavailableModels.toList(),
+      );
+      await chat.reloadModels(enabledProviders: _enabledProviders);
+      notifyListeners();
+    };
+    _copilotService.unavailableModels
+      ..clear()
+      ..addAll(await prefs.getCopilotUnavailableModels());
+    _copilotService.onUnavailableModelDiscovered = (id) async {
+      await prefs.setCopilotUnavailableModels(
+        _copilotService.unavailableModels.toList(),
       );
       await chat.reloadModels(enabledProviders: _enabledProviders);
       notifyListeners();
@@ -614,6 +639,8 @@ class AppState extends ChangeNotifier {
     required String anthropicApiKey,
     required String githubModelsApiKey,
     required String githubModelsOrganization,
+    required String copilotApiKey,
+    required bool copilotUseLoggedInUser,
     required String openaiApiKey,
   }) async {
     _enabledProviders = enabledProviders;
@@ -623,6 +650,8 @@ class AppState extends ChangeNotifier {
     _anthropicApiKey = anthropicApiKey;
     _githubModelsApiKey = githubModelsApiKey;
     _githubModelsOrganization = githubModelsOrganization.trim();
+    _copilotApiKey = copilotApiKey.trim();
+    _copilotUseLoggedInUser = copilotUseLoggedInUser;
     _openaiApiKey = openaiApiKey;
     _ollamaService.baseUrl = _ollamaEndpoint;
     _ollamaService.apiKey = _ollamaApiKey;
@@ -630,6 +659,8 @@ class AppState extends ChangeNotifier {
     _anthropicService.apiKey = _anthropicApiKey;
     _githubModelsService.apiKey = _githubModelsApiKey;
     _githubModelsService.organization = _githubModelsOrganization;
+    _copilotService.apiKey = _copilotApiKey;
+    _copilotService.useLoggedInUser = _copilotUseLoggedInUser;
     await prefs.setEnabledProviders(enabledProviders.toList());
     await prefs.setEndpoint(ollamaEndpoint);
     await prefs.setOllamaApiKey(_ollamaApiKey);
@@ -637,6 +668,8 @@ class AppState extends ChangeNotifier {
     await prefs.setAnthropicApiKey(anthropicApiKey);
     await prefs.setGithubModelsApiKey(githubModelsApiKey);
     await prefs.setGithubModelsOrganization(_githubModelsOrganization);
+    await prefs.setCopilotApiKey(_copilotApiKey);
+    await prefs.setCopilotUseLoggedInUser(_copilotUseLoggedInUser);
     await prefs.setOpenaiApiKey(openaiApiKey);
     await chat.reloadModels(enabledProviders: _enabledProviders);
     notifyListeners();
@@ -1169,9 +1202,7 @@ class AppState extends ChangeNotifier {
         return next;
       }
     }
-    throw StateError(
-      'Too many sibling collisions for $originalPath',
-    );
+    throw StateError('Too many sibling collisions for $originalPath');
   }
 
   Future<String> restoreTimelineChangesForMessage(

@@ -50,7 +50,9 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
   late final TextEditingController _claudeCtrl;
   late final TextEditingController _githubCtrl;
   late final TextEditingController _githubOrgCtrl;
+  late final TextEditingController _copilotCtrl;
   late final TextEditingController _openaiCtrl;
+  bool _copilotUseLoggedInUser = true;
 
   bool _saving = false;
 
@@ -64,8 +66,11 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
     _geminiCtrl = TextEditingController(text: state.geminiApiKey);
     _claudeCtrl = TextEditingController(text: state.anthropicApiKey);
     _githubCtrl = TextEditingController(text: state.githubModelsApiKey);
-    _githubOrgCtrl =
-        TextEditingController(text: state.githubModelsOrganization);
+    _githubOrgCtrl = TextEditingController(
+      text: state.githubModelsOrganization,
+    );
+    _copilotCtrl = TextEditingController(text: state.copilotApiKey);
+    _copilotUseLoggedInUser = state.copilotUseLoggedInUser;
     _openaiCtrl = TextEditingController(text: state.openaiApiKey);
   }
 
@@ -77,6 +82,7 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
     _claudeCtrl.dispose();
     _githubCtrl.dispose();
     _githubOrgCtrl.dispose();
+    _copilotCtrl.dispose();
     _openaiCtrl.dispose();
     super.dispose();
   }
@@ -103,6 +109,8 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
       anthropicApiKey: _claudeCtrl.text.trim(),
       githubModelsApiKey: _githubCtrl.text.trim(),
       githubModelsOrganization: _githubOrgCtrl.text.trim(),
+      copilotApiKey: _copilotCtrl.text.trim(),
+      copilotUseLoggedInUser: _copilotUseLoggedInUser,
       openaiApiKey: _openaiCtrl.text.trim(),
     );
     if (!mounted) return;
@@ -207,6 +215,32 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
                               controller: _githubOrgCtrl,
                               obscure: false,
                               hintText: S.settingsGithubOrgHint,
+                            ),
+                          ],
+                        ),
+                      ),
+                      _ProviderCard(
+                        id: 'GitHub Copilot',
+                        label: S.providerCopilot,
+                        hint: S.llmProvidersCopilotHint,
+                        enabled: _enabled.contains('GitHub Copilot'),
+                        onToggle: (v) => _toggle('GitHub Copilot', v),
+                        body: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _ApiKeyField(controller: _copilotCtrl),
+                            const SizedBox(height: 8),
+                            SwitchListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: const Text(
+                                S.llmProvidersCopilotUseLoggedIn,
+                                style: TextStyle(fontSize: 12),
+                              ),
+                              value: _copilotUseLoggedInUser,
+                              onChanged: (v) =>
+                                  setState(() => _copilotUseLoggedInUser = v),
+                              activeThumbColor: DuckColors.accentCyan,
                             ),
                           ],
                         ),
@@ -419,10 +453,7 @@ class _LabeledField extends StatelessWidget {
           decoration: InputDecoration(
             isDense: true,
             hintText: hintText ?? S.llmProvidersApiKeyHint,
-            hintStyle: const TextStyle(
-              fontSize: 12,
-              color: DuckColors.fgFaint,
-            ),
+            hintStyle: const TextStyle(fontSize: 12, color: DuckColors.fgFaint),
             filled: true,
             fillColor: DuckColors.bgRaised,
             contentPadding: const EdgeInsets.symmetric(

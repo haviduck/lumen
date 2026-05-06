@@ -175,9 +175,7 @@ List<ChatSegment> parseChatSegments(String content, {String? expectedNonce}) {
   var processed = content;
   for (var t = thinkMatches.length - 1; t >= 0; t--) {
     final m = thinkMatches[t];
-    processed = processed.replaceRange(
-      m.start, m.end, '\u0000THINK:$t\u0000',
-    );
+    processed = processed.replaceRange(m.start, m.end, '\u0000THINK:$t\u0000');
   }
 
   // Combined matcher — alternation between LUMEN_TOOL and LUMEN_ERR.
@@ -250,9 +248,7 @@ List<ChatSegment> parseChatSegments(String content, {String? expectedNonce}) {
       );
       final detail = Uri.decodeComponent(detailRaw);
       raw.add(
-        ProviderErrorSegment(
-          ProviderError(kind: kind, rawDetail: detail),
-        ),
+        ProviderErrorSegment(ProviderError(kind: kind, rawDetail: detail)),
       );
     } else if (m.group(7) != null) {
       final idx = int.parse(m.group(7)!);
@@ -372,7 +368,9 @@ String stripMarkersForCopy(String content) {
   });
   // Strip thinking blocks — copy gets the answer, not the trace.
   s = s.replaceAll(
-    RegExp(r'<!-- LUMEN_THINKING[^>]* -->\n[\s\S]*?\n<!-- /LUMEN_THINKING -->\n*'),
+    RegExp(
+      r'<!-- LUMEN_THINKING[^>]* -->\n[\s\S]*?\n<!-- /LUMEN_THINKING -->\n*',
+    ),
     '',
   );
   return s;
@@ -582,8 +580,7 @@ const Set<String> _kBodyShapedToolIds = <String>{
 /// [MessageBubble._segmentsFor] to decide which pending segments
 /// should have their live body attached. Kept as a function rather
 /// than exporting the set so callers can't mutate it.
-bool isBodyShapedToolId(String toolId) =>
-    _kBodyShapedToolIds.contains(toolId);
+bool isBodyShapedToolId(String toolId) => _kBodyShapedToolIds.contains(toolId);
 
 /// Catch tool-shaped blocks where opener AND closer are both present
 /// but step 1's strict per-tool regex rejected them. Replaces the
@@ -1114,7 +1111,7 @@ class _ProviderErrorCardState extends State<ProviderErrorCard> {
     s = s.replaceFirst(
       RegExp(
         r'^(?:Error[:\s]+)?'
-        r'(?:Anthropic|Gemini|GitHub Models|OpenAI|Ollama)'
+        r'(?:Anthropic|Gemini|GitHub Models|GitHub Copilot|OpenAI|Ollama)'
         r'\s*API error\s*\(\d+\)\s*:\s*',
         caseSensitive: false,
       ),
@@ -1586,9 +1583,8 @@ class _FileToolCardState extends State<_FileToolCard> {
     // opener has streamed but no body bytes have arrived yet) —
     // showing an empty disclosure is just visual noise.
     final body = s.pendingBody ?? '';
-    final hasLiveBody = s.pending &&
-        _kBodyShapedToolIds.contains(s.toolId) &&
-        body.isNotEmpty;
+    final hasLiveBody =
+        s.pending && _kBodyShapedToolIds.contains(s.toolId) && body.isNotEmpty;
     // Click semantics:
     //   - Settled non-delete file op: open the file (existing UX).
     //   - Pending body-shaped tool with body bytes: toggle the
@@ -1633,7 +1629,9 @@ class _FileToolCardState extends State<_FileToolCard> {
     // "Edited") and the accent colour.
     final isError = !s.pending && !s.ok;
     return MouseRegion(
-      cursor: cardClickable ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      cursor: cardClickable
+          ? SystemMouseCursors.click
+          : SystemMouseCursors.basic,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
       child: GestureDetector(
@@ -1776,10 +1774,7 @@ class _FileToolCardState extends State<_FileToolCard> {
 class _LiveBodyPanel extends StatelessWidget {
   final String body;
   final ScrollController scrollController;
-  const _LiveBodyPanel({
-    required this.body,
-    required this.scrollController,
-  });
+  const _LiveBodyPanel({required this.body, required this.scrollController});
 
   @override
   Widget build(BuildContext context) {
@@ -2015,11 +2010,7 @@ class _InspectionBadgeState extends State<_InspectionBadge> {
             if (segment.pending)
               const _PendingDot()
             else
-              Icon(
-                _iconForInspection(segment.toolId),
-                size: 11,
-                color: accent,
-              ),
+              Icon(_iconForInspection(segment.toolId), size: 11, color: accent),
             const SizedBox(width: 6),
             Text(
               _actionLabel(segment),

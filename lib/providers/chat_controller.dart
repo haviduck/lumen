@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import '../l10n/strings.dart';
 import '../services/agent_terminal_bridge.dart';
 import '../services/anthropic_service.dart';
+import '../services/copilot_service.dart';
 import '../services/github_models_service.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/external_tool_loader.dart';
@@ -162,7 +163,9 @@ String _draftWithThinking(
     // Wrap thinking in markers the UI can parse. The `active` attr
     // tells the renderer whether to show the spinner or collapse.
     final attr = isThinking ? ' active' : '';
-    parts.add('<!-- LUMEN_THINKING$attr -->\n$thinkContent\n<!-- /LUMEN_THINKING -->');
+    parts.add(
+      '<!-- LUMEN_THINKING$attr -->\n$thinkContent\n<!-- /LUMEN_THINKING -->',
+    );
   } else if (isThinking) {
     // Thinking just started, no content yet — emit empty block with
     // active flag so the UI shows "Thinking…" immediately.
@@ -435,6 +438,7 @@ class ChatController extends ChangeNotifier {
   final GeminiService gemini;
   final AnthropicService anthropic;
   final GitHubModelsService github;
+  final CopilotService copilot;
   final ChatPersistenceService persistence;
   final RulesService rules;
   final PreferencesService prefs;
@@ -478,6 +482,7 @@ class ChatController extends ChangeNotifier {
     required this.gemini,
     required this.anthropic,
     required this.github,
+    required this.copilot,
     required this.persistence,
     required this.rules,
     required this.prefs,
@@ -1029,6 +1034,12 @@ class ChatController extends ChangeNotifier {
         all.addAll(models.map((m) => 'github:$m'));
       } catch (_) {}
     }
+    if (enabled.contains('GitHub Copilot')) {
+      try {
+        final models = await copilot.getModels();
+        all.addAll(models.map((m) => 'copilot:$m'));
+      } catch (_) {}
+    }
     // OpenAI placeholder — add when implemented.
 
     // Single source-of-truth sort. Sorting the full prefixed name
@@ -1063,6 +1074,9 @@ class ChatController extends ChangeNotifier {
     if (enabled.contains('GitHub Models') && await github.isReachable()) {
       return true;
     }
+    if (enabled.contains('GitHub Copilot') && await copilot.isReachable()) {
+      return true;
+    }
     return false;
   }
 
@@ -1081,6 +1095,7 @@ class ChatController extends ChangeNotifier {
       'gemini' => 'Gemini',
       'claude' => 'Claude',
       'github' => 'GitHub Models',
+      'copilot' => 'GitHub Copilot',
       // Both `ollama` and `ollama-cloud` map to the same enabled-
       // provider toggle in Settings — the namespace split is for
       // display / routing only.
@@ -1097,6 +1112,8 @@ class ChatController extends ChangeNotifier {
         return anthropic.generateChat(messages, model: rawModel, token: token);
       case 'github':
         return github.generateChat(messages, model: rawModel, token: token);
+      case 'copilot':
+        return copilot.generateChat(messages, model: rawModel, token: token);
       case 'ollama-cloud':
         return ollama.generateChat(
           messages,
@@ -1234,12 +1251,13 @@ class ChatController extends ChangeNotifier {
   /// Claude / Gemini / Ollama Cloud …" — not surfaced today but
   /// available to the prompt builder).
   static String _prettyProviderLabel(String provider) => switch (provider) {
-        'gemini' => 'Gemini',
-        'claude' => 'Claude',
-        'github' => 'GitHub Models',
-        'ollama-cloud' => 'Ollama Cloud',
-        _ => 'Ollama',
-      };
+    'gemini' => 'Gemini',
+    'claude' => 'Claude',
+    'github' => 'GitHub Models',
+    'copilot' => 'GitHub Copilot',
+    'ollama-cloud' => 'Ollama Cloud',
+    _ => 'Ollama',
+  };
 
   /// Whether this turn should use native tool calling for the given
   /// (provider, model). Defers to per-provider strategy classes:
@@ -1268,6 +1286,8 @@ class ChatController extends ChangeNotifier {
       case 'gemini':
         return true;
       case 'github':
+        return true;
+      case 'copilot':
         return true;
       case 'ollama':
       case 'ollama-cloud':
@@ -1303,6 +1323,7 @@ class ChatController extends ChangeNotifier {
       'gemini' => 'Gemini',
       'claude' => 'Claude',
       'github' => 'GitHub Models',
+      'copilot' => 'GitHub Copilot',
       // `ollama` and `ollama-cloud` are both gated by the single
       // 'Ollama' provider toggle — the namespace split is purely
       // for picker grouping and route selection.
@@ -1335,6 +1356,15 @@ class ChatController extends ChangeNotifier {
         return;
       case 'github':
         yield* github.generateChatStream(
+          messages,
+          model: rawModel,
+          token: token,
+          effort: effort,
+          nativeToolIds: nativeToolIds,
+        );
+        return;
+      case 'copilot':
+        yield* copilot.generateChatStream(
           messages,
           model: rawModel,
           token: token,
@@ -1381,6 +1411,8 @@ class ChatController extends ChangeNotifier {
         return anthropic.summarizeTitle(firstMessage, model: rawModel);
       case 'github':
         return github.summarizeTitle(firstMessage, model: rawModel);
+      case 'copilot':
+        return copilot.summarizeTitle(firstMessage, model: rawModel);
       case 'ollama-cloud':
         return ollama.summarizeTitle(
           firstMessage,
@@ -2627,7 +2659,8 @@ class ChatController extends ChangeNotifier {
       return 'Attached file `$label`: read failed ($e). '
           'Try `<<<READ_FILE: $pathHint>>>` if you need to inspect it.';
     }
-    final lineCount = '\n'.allMatches(content).length +
+    final lineCount =
+        '\n'.allMatches(content).length +
         (content.isEmpty || content.endsWith('\n') ? 0 : 1);
     final fence = _safeFenceFor(content);
     final lang = _languageHintFor(label);
@@ -2677,7 +2710,7 @@ class ChatController extends ChangeNotifier {
         : '';
     final noiseLine = noiseSkipped > 0
         ? '\n  ... ($noiseSkipped noise entries hidden: '
-            'node_modules / .git / build / etc.)'
+              'node_modules / .git / build / etc.)'
         : '';
     if (shown.isEmpty) {
       // Everything was noise — say so explicitly so the model
@@ -2709,13 +2742,60 @@ class ChatController extends ChangeNotifier {
     // Whitelist common ones; for everything else just emit the
     // extension and let the model figure it out.
     const known = <String>{
-      'dart', 'py', 'js', 'jsx', 'ts', 'tsx', 'json', 'yaml', 'yml',
-      'toml', 'md', 'html', 'css', 'scss', 'sh', 'bash', 'zsh',
-      'ps1', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'swift', 'c',
-      'cc', 'cpp', 'h', 'hpp', 'cs', 'php', 'sql', 'xml', 'svg',
-      'lua', 'r', 'pl', 'ex', 'exs', 'erl', 'hs', 'fs', 'clj',
-      'cljs', 'edn', 'graphql', 'proto', 'cmake', 'makefile',
-      'dockerfile', 'gitignore', 'env', 'ini',
+      'dart',
+      'py',
+      'js',
+      'jsx',
+      'ts',
+      'tsx',
+      'json',
+      'yaml',
+      'yml',
+      'toml',
+      'md',
+      'html',
+      'css',
+      'scss',
+      'sh',
+      'bash',
+      'zsh',
+      'ps1',
+      'rb',
+      'go',
+      'rs',
+      'java',
+      'kt',
+      'kts',
+      'swift',
+      'c',
+      'cc',
+      'cpp',
+      'h',
+      'hpp',
+      'cs',
+      'php',
+      'sql',
+      'xml',
+      'svg',
+      'lua',
+      'r',
+      'pl',
+      'ex',
+      'exs',
+      'erl',
+      'hs',
+      'fs',
+      'clj',
+      'cljs',
+      'edn',
+      'graphql',
+      'proto',
+      'cmake',
+      'makefile',
+      'dockerfile',
+      'gitignore',
+      'env',
+      'ini',
     };
     return known.contains(ext) ? ext : ext;
   }
@@ -2914,8 +2994,8 @@ class ChatController extends ChangeNotifier {
       // pill being invisible to the user means they didn't actively
       // ask for it on this turn.
       final (selectedProvider, selectedRawModel) = _splitModel(modelForTurn);
-      final ReasoningEffort? effort = (selectedProvider == 'ollama' ||
-              selectedProvider == 'ollama-cloud')
+      final ReasoningEffort? effort =
+          (selectedProvider == 'ollama' || selectedProvider == 'ollama-cloud')
           ? null
           : session.reasoningEffort;
       // When `effort == null` the prompt-suffix path early-returns
@@ -2945,8 +3025,8 @@ class ChatController extends ChangeNotifier {
       // Capability fetch is cached on `OllamaService`, so this is
       // a no-op on iteration 2+ and only adds latency on first
       // turn against a freshly-introduced model.
-      final tierCapabilities = (selectedProvider == 'ollama' ||
-              selectedProvider == 'ollama-cloud')
+      final tierCapabilities =
+          (selectedProvider == 'ollama' || selectedProvider == 'ollama-cloud')
           ? await ollama.getModelCapabilities(
               selectedRawModel,
               forceCloud: selectedProvider == 'ollama-cloud',
@@ -2957,8 +3037,9 @@ class ChatController extends ChangeNotifier {
         rawModel: selectedRawModel,
         capabilities: tierCapabilities,
       );
-      final tieredEnabledTools = _enabledTools
-          .intersection(modelTier.allowedToolIds);
+      final tieredEnabledTools = _enabledTools.intersection(
+        modelTier.allowedToolIds,
+      );
       debugPrint(
         '[tier] provider=$selectedProvider model=$selectedRawModel '
         'tier=${modelTier.level.name} '
@@ -2966,20 +3047,22 @@ class ChatController extends ChangeNotifier {
         'native=$useNativeTools',
       );
 
-      final systemPrompt = SystemPromptBuilder.build(SystemPromptInputs(
-        workspacePath: workspacePath,
-        activeFilePath: activeFilePath,
-        openFilePaths: openFilePaths,
-        compiledRules: compiledRules,
-        compiledSkills: compiledSkills,
-        enabledToolIds: tieredEnabledTools,
-        allowOutsideWorkspaceWrites: allowOutsideWorkspaceWrites,
-        resumedAfterPause: resumedAfterPause,
-        effort: effort,
-        effortIsNative: effortIsNative,
-        useNativeTools: useNativeTools,
-        providerLabel: _prettyProviderLabel(selectedProvider),
-      ));
+      final systemPrompt = SystemPromptBuilder.build(
+        SystemPromptInputs(
+          workspacePath: workspacePath,
+          activeFilePath: activeFilePath,
+          openFilePaths: openFilePaths,
+          compiledRules: compiledRules,
+          compiledSkills: compiledSkills,
+          enabledToolIds: tieredEnabledTools,
+          allowOutsideWorkspaceWrites: allowOutsideWorkspaceWrites,
+          resumedAfterPause: resumedAfterPause,
+          effort: effort,
+          effortIsNative: effortIsNative,
+          useNativeTools: useNativeTools,
+          providerLabel: _prettyProviderLabel(selectedProvider),
+        ),
+      );
 
       final apiMessages = <Map<String, dynamic>>[
         {'role': 'system', 'content': systemPrompt},
@@ -3435,23 +3518,38 @@ class ChatController extends ChangeNotifier {
           // ── Thinking-marker state machine ──
           if (chunk == OllamaService.thinkStartMarker) {
             inThinkPhase = true;
-            updateLive(_draftWithThinking(
-              aggregated, iterBuf.toString(), thinkBuf.toString(), true,
-            ));
+            updateLive(
+              _draftWithThinking(
+                aggregated,
+                iterBuf.toString(),
+                thinkBuf.toString(),
+                true,
+              ),
+            );
             continue;
           }
           if (chunk == OllamaService.thinkEndMarker) {
             inThinkPhase = false;
-            updateLive(_draftWithThinking(
-              aggregated, iterBuf.toString(), thinkBuf.toString(), false,
-            ));
+            updateLive(
+              _draftWithThinking(
+                aggregated,
+                iterBuf.toString(),
+                thinkBuf.toString(),
+                false,
+              ),
+            );
             continue;
           }
           if (inThinkPhase) {
             thinkBuf.write(chunk);
-            updateLive(_draftWithThinking(
-              aggregated, iterBuf.toString(), thinkBuf.toString(), true,
-            ));
+            updateLive(
+              _draftWithThinking(
+                aggregated,
+                iterBuf.toString(),
+                thinkBuf.toString(),
+                true,
+              ),
+            );
             continue;
           }
 
@@ -3569,9 +3667,7 @@ class ChatController extends ChangeNotifier {
           if ((selectedProvider == 'ollama-cloud' ||
                   (selectedProvider == 'ollama' &&
                       OllamaService.isCloudModel(selectedRawModel))) &&
-              DateTime.now()
-                      .difference(iterationStartedAt)
-                      .inMilliseconds >
+              DateTime.now().difference(iterationStartedAt).inMilliseconds >
                   175000) {
             iterBuf.write('\n<!-- LUMEN_TRUNCATED:length -->\n');
             debugPrint(
@@ -3585,9 +3681,14 @@ class ChatController extends ChangeNotifier {
           // The live message shows previous-iterations aggregated +
           // current iteration's running buffer + thinking section,
           // separated by blank lines.
-          updateLive(_draftWithThinking(
-            aggregated, iterBuf.toString(), thinkBuf.toString(), false,
-          ));
+          updateLive(
+            _draftWithThinking(
+              aggregated,
+              iterBuf.toString(),
+              thinkBuf.toString(),
+              false,
+            ),
+          );
         }
         if (cancelToken.isCancelled) {
           aggregated += '${aggregated.isEmpty ? '' : '\n\n'}_(stopped)_';
@@ -3799,15 +3900,15 @@ class ChatController extends ChangeNotifier {
             // as if the user had pasted code and either commented
             // on it or expanded scope; the XML-ish framing fixes
             // that without forcing native APIs.
-            apiMessages
-                .add({'role': 'assistant', 'content': executableRaw});
+            apiMessages.add({'role': 'assistant', 'content': executableRaw});
             final toolFeedback = await _compressToolFeedback(
               pass.toolFeedback,
               token: cancelToken,
             );
             apiMessages.add(<String, dynamic>{
               'role': 'user',
-              'content': '<tool_result>\n${toolFeedback.trimRight()}\n'
+              'content':
+                  '<tool_result>\n${toolFeedback.trimRight()}\n'
                   '</tool_result>',
             });
           }
@@ -3911,8 +4012,7 @@ class ChatController extends ChangeNotifier {
                 shape: hit.shape,
                 enabledToolIds: <String>{
                   for (final t in ToolRegistry.all)
-                    if (tieredEnabledTools.contains(t.id))
-                      t.id.toUpperCase(),
+                    if (tieredEnabledTools.contains(t.id)) t.id.toUpperCase(),
                 },
               );
             } else if (intentWithoutAction) {
