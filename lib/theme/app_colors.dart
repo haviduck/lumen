@@ -38,6 +38,16 @@ class DuckColors {
   // ── Foregrounds — cool blue-gray, NOT warm ──
   static const Color fgPrimary = Color(0xFFD8DEE9);
   static const Color pearlWhite = Color(0xFFECEFF4);
+  // Secondary body text — visibly dimmer than [fgPrimary] but still
+  // fully readable on the dark surfaces. Lands closer to [fgMuted]
+  // than [fgPrimary] (~28% luminance drop from primary). Used for
+  // the assistant reply prose so a glance at the chat distinguishes
+  // user-typed text (bright [fgPrimary]) from model replies
+  // (dimmed). Tuned iteratively against Cursor's chat reference —
+  // a 7% drop read as a no-op, 22% was the right direction but
+  // still too close to primary; the current value is the one that
+  // actually carries the user/model visual hierarchy.
+  static const Color fgSecondary = Color(0xFF9CA6B7);
   static const Color fgMuted = Color(0xFF7B88A1);
   static const Color fgSubtle = Color(0xFF4B5163);
   static const Color fgFaint = Color(0xFF3B4252);

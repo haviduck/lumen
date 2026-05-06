@@ -32,6 +32,22 @@ class SshLumenGrabRequest {
   const SshLumenGrabRequest({required this.hostId, required this.remotePath});
 }
 
+/// Closure invoked by [SshController._runConnect] right after a
+/// session reaches `connected`, asking the user whether Lumen should
+/// SFTP-upload + source the session-scoped shell helpers
+/// (`lumen-edit`, `lumen-grab`, OSC 7 cwd reporting) into the new
+/// shell.
+///
+/// Returning `true` lets the controller proceed with the existing
+/// auto-install flow (uploads a self-deleting script to `/tmp` and
+/// types `. <path>` into the shell). Returning `false` skips the
+/// upload entirely so nothing is left on the remote.
+///
+/// The closure runs on a context owned by the call site (typically a
+/// top-level shell context captured before the picker pops), so it
+/// can safely outlive the connect future.
+typedef SshHelpersInstallPrompter = Future<bool> Function(SshHost host);
+
 /// State of a single live SSH session in the UI.
 enum SshSessionState { connecting, connected, disconnected, failed }
 
@@ -136,6 +152,7 @@ class SshController extends ChangeNotifier {
   SshHostKeyHandler? _lastHostKeyHandler;
   SshPasswordRequester? _lastPasswordRequester;
   SshPassphraseRequester? _lastPassphraseRequester;
+  SshHelpersInstallPrompter? _lastHelpersInstallPrompter;
 
   /// Broadcasts whenever the terminal stream contains an OSC 1337
   /// `LumenEdit=<path>` payload — typically produced by the bundled
@@ -190,15 +207,23 @@ class SshController extends ChangeNotifier {
   /// over a `BuildContext` that's still mounted by the time the
   /// connect resolves — typically a top-level shell context, NOT a
   /// dialog/sheet that the user just dismissed.
+  ///
+  /// [helpersInstallPrompter] is invoked once per successful connect,
+  /// asking the user whether Lumen should auto-install the shell
+  /// shortcuts (`lumen-edit`, `lumen-grab`, OSC 7 cwd reporting). When
+  /// `null` or returning `false`, the install step is skipped
+  /// entirely — nothing is uploaded to the remote.
   Future<SshSessionEntry> connectToHost(
     SshHost host, {
     required SshHostKeyHandler hostKeyHandler,
     required SshPasswordRequester passwordRequester,
     required SshPassphraseRequester passphraseRequester,
+    SshHelpersInstallPrompter? helpersInstallPrompter,
   }) async {
     _lastHostKeyHandler = hostKeyHandler;
     _lastPasswordRequester = passwordRequester;
     _lastPassphraseRequester = passphraseRequester;
+    _lastHelpersInstallPrompter = helpersInstallPrompter;
 
     final id = '${host.id}-${DateTime.now().millisecondsSinceEpoch}';
     final terminal = Terminal(
@@ -249,6 +274,7 @@ class SshController extends ChangeNotifier {
       hostKeyHandler: hostKeyHandler,
       passwordRequester: passwordRequester,
       passphraseRequester: passphraseRequester,
+      helpersInstallPrompter: helpersInstallPrompter,
     ));
     return entry;
   }
@@ -258,6 +284,7 @@ class SshController extends ChangeNotifier {
     required SshHostKeyHandler hostKeyHandler,
     required SshPasswordRequester passwordRequester,
     required SshPassphraseRequester passphraseRequester,
+    SshHelpersInstallPrompter? helpersInstallPrompter,
   }) async {
     try {
       final conn = await _clientService.connect(
@@ -329,9 +356,17 @@ class SshController extends ChangeNotifier {
       entry.state = SshSessionState.connected;
       notifyListeners();
 
-      // Auto-inject the shell helpers (`lumen-edit`, `lumen-grab`,
-      // OSC 7 cwd reporting) into the freshly opened session by
-      // SFTP-uploading a self-deleting script and sourcing it.
+      // Optionally inject the shell helpers (`lumen-edit`,
+      // `lumen-grab`, OSC 7 cwd reporting) into the freshly opened
+      // session — gated on a per-connect user prompt. When the
+      // prompt is null or the user declines, NOTHING is uploaded;
+      // the remote stays untouched.
+      //
+      // When the user accepts, the helpers ride in via a
+      // SFTP-uploaded self-deleting script that we then source.
+      // The script's last statement `rm -f`s itself, so even if
+      // the user disconnects mid-session the file doesn't linger
+      // (it's gone the moment the source completed).
       //
       // Why upload + source instead of typing the body inline?
       // dartssh2's shell channel runs in canonical mode — the
@@ -347,13 +382,34 @@ class SshController extends ChangeNotifier {
       // Why fire-and-forget (`unawaited`)?
       // The `_runConnect` future completes once the connection is
       // ready; callers (the activity-bar fast menu, `connectToHost`)
-      // shouldn't block on the cosmetic install. SFTP failure or a
-      // mid-paste channel close are caught + swallowed inside
+      // shouldn't block on the install prompt or its follow-on
+      // SFTP work. Prompt dismiss / SFTP failure / mid-paste
+      // channel close are all caught + swallowed inside
       // `_autoInstallShellHelpers`; the user just doesn't get
       // helpers that session. No error spam.
       unawaited(() async {
         await Future<void>.delayed(const Duration(milliseconds: 250));
         // Bail if the session was closed during the wait window.
+        if (entry.shell == null ||
+            entry.state != SshSessionState.connected) {
+          return;
+        }
+        // Ask the user. No prompter wired ⇒ skip silently (keeps
+        // headless / test paths happy without a default-on opt-in).
+        if (helpersInstallPrompter == null) return;
+        bool accepted;
+        try {
+          accepted = await helpersInstallPrompter(entry.host);
+        } catch (e) {
+          // Prompter blew up (e.g. captured BuildContext was
+          // unmounted). Treat as "no" — never inject without an
+          // explicit yes.
+          debugPrint('[ssh] helpers install prompter threw: $e');
+          return;
+        }
+        if (!accepted) return;
+        // Re-check session liveness after the user-interaction
+        // window: they may have left the dialog open for a while.
         if (entry.shell == null ||
             entry.state != SshSessionState.connected) {
           return;
@@ -432,6 +488,7 @@ class SshController extends ChangeNotifier {
     final hk = _lastHostKeyHandler;
     final pwd = _lastPasswordRequester;
     final pph = _lastPassphraseRequester;
+    final hip = _lastHelpersInstallPrompter;
 
     final entry = _sessions.firstWhere(
       (s) => s.id == id,
@@ -452,6 +509,7 @@ class SshController extends ChangeNotifier {
       hostKeyHandler: hk,
       passwordRequester: pwd,
       passphraseRequester: pph,
+      helpersInstallPrompter: hip,
     );
   }
 

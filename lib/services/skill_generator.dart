@@ -261,93 +261,198 @@ class SkillGenerator {
   // ── prompt construction ─────────────────────────────────────────────
 
   static const String _systemInstructions =
-      'You configure capabilities for the Lumen IDE\'s coding agent. '
-      'You produce two kinds of artifacts: TOOLS (shell commands the '
-      'agent invokes) and SKILLS (markdown instruction sets the agent '
-      'reads and follows). Reply with ONLY a JSON object — no prose, '
-      'no markdown fences, no preamble or postamble.';
+      'You are a senior engineer joining a real project on day one. '
+      'Your task: write the SHORT, BATTLE-TESTED CHEATSHEET that a '
+      'thoughtful colleague would hand a brand-new contributor. The '
+      'audience is Lumen IDE\'s coding agent (an LLM that pair-programs '
+      'in this repo). It already knows how to read files, search, run '
+      'tests, and use git. You DO NOT teach it programming — you teach '
+      'it THIS PROJECT\'s opinionated conventions, the gotchas, the '
+      '"every new dev makes this mistake" warnings.\n\n'
+      'You produce two kinds of artifacts:\n'
+      '  • TOOLS — shell commands the agent invokes via a regex marker.\n'
+      '  • SKILLS — markdown instructions the agent reads every turn.\n\n'
+      'Quality bar: every artifact you emit must save the agent a '
+      'wrong turn it would otherwise take. Generic advice ("write '
+      'clean code", "follow conventions") is NOISE — those bytes '
+      'pollute every system prompt for the entire life of the '
+      'workspace. Better to emit ONE great skill than five mediocre '
+      'ones. If you can\'t name a concrete file path, manifest entry, '
+      'or framework idiom from the project context, you\'re guessing '
+      '— and you should output fewer artifacts.\n\n'
+      'Reply with ONLY a JSON object — no prose, no markdown fences, '
+      'no preamble or postamble.';
 
   /// Shared block describing the artifact schema + the
   /// tool-vs-skill decision rule. Reused by `_buildPrompt` (multi)
   /// and `_buildCustomPrompt` (single) so the rules don't drift.
+  ///
+  /// Heavily revised in 2026-05 — the previous block was schematically
+  /// correct but produced bland skills (bullet-point platitudes, no
+  /// project grounding, generic triggers). The juice-up encodes the
+  /// quality bar in the prompt itself: contrastive GOOD vs BAD
+  /// examples, hard rules against vague language, mandatory project
+  /// references, trigger discipline, and a self-check pass before
+  /// JSON emission. The schema and downstream validation are
+  /// unchanged so the parser doesn't drift.
   static String get _schemaAndRules => r'''
-ARTIFACT KINDS (this is the most important rule)
+ARTIFACT KINDS — TOOL vs SKILL
 You produce a JSON object: {"artifacts": [...]}.
 Each entry is EITHER a tool OR a skill.
 
-CHOOSE TOOL when the user wants the agent to RUN something:
-- run tests, lint, typecheck, build, deploy, format
-- start a dev server, run a migration, hit an endpoint
-- scaffold a file with a deterministic output
-- inspect git / disk / process state
-Tool schema (every field required):
-  {
-    "kind": "tool",
-    "id": "snake_case_unique_id",
-    "name": "UPPER_SNAKE_CASE",
-    "description": "What it does, when to use it. 1-2 sentences.",
-    "syntax": "<<<NAME: arg>>> or <<<NAME>>> when no arg",
-    "pattern": "<<<NAME:\\s*(.*?)\\s*>>>",
-    "command": ["binary", "arg1", "$1"],
-    "requiresApproval": true,
-    "defaultEnabled": false
-  }
+PICK TOOL when the answer is "run a deterministic shell command":
+  test runners, linters, formatters, build/typecheck steps,
+  migrations, dev servers, git inspection, smoke-test endpoints.
 
-CHOOSE SKILL when the user wants the agent to FOLLOW conventions:
-- design system / UI consistency / styling rules
-- code style / naming / file organization
-- domain knowledge / project conventions
-- architectural patterns / "how we structure X here"
-- review checklists / what to avoid
-Skills are READ, not invoked. They become part of the system prompt.
-Skill schema (every field required):
-  {
-    "kind": "skill",
-    "id": "snake_case_unique_id",
-    "name": "Short Title Case label, like a doc heading",
-    "description": "1-line summary shown in the manage UI.",
-    "trigger": "Plain-language description of WHEN the agent should apply this. e.g. 'When creating dashboard pages or styling components.' Or 'always' for unconditional.",
-    "body": "Full markdown body the agent reads. Use ## subheadings, bullet lists, DO/DONT pairs, code blocks for example fragments. NO frontmatter inside this field — Lumen wraps it. Do not write '## Workspace skills' — Lumen adds the header."
-  }
+PICK SKILL when the answer is "write something / make a judgement
+call / follow a convention":
+  design system rules, code style, file/module organization,
+  domain vocabulary, architectural patterns, review checklists,
+  "we always do X / never do Y here" tribal knowledge,
+  framework-idiomatic patterns specific to THIS project.
 
-DECISION HEURISTIC
-- "Generate / scaffold / make a thing" with hardcoded structure → SKILL
-  (so the agent can vary the output to fit the project, not a rigid template).
-- "Run / check / lint / format / build / test / hit URL" → TOOL.
-- "Be consistent / follow this style / match this design / always do X" → SKILL.
-- "How do I X in this repo" answers / domain rules → SKILL.
+If the answer involves an LLM doing creative writing or making a
+choice, it's a SKILL. Period. Don't make tools whose body is a
+giant `node -e ...` or `python -c ...` script — that's just an
+LLM-shaped problem dressed up as a shell command.
 
-RULES (apply to both kinds)
-- Output ONLY the JSON object {"artifacts": [...]}. No prose. No markdown fences.
-- "id" must be snake_case, unique within the response.
-- DO NOT duplicate built-in agent tool ids:
-  create_file, edit_file, multi_edit, append_file, move_file, read_file,
-  read_file_range, list_dir, tree, search_text, find_file, glob,
-  delete_file, git_status, git_diff, run_cmd, verify.
+────────────────────────────────────────────────────────────
+SKILL SCHEMA (every field required)
+{
+  "kind": "skill",
+  "id": "snake_case_unique_id",
+  "name": "Short Title Case heading",
+  "description": "1-line summary shown in the manage UI.",
+  "trigger": "Plain-language SPECIFIC condition. NOT 'always' / 'when coding' / 'when relevant'.",
+  "body": "Markdown body. Use ## subheadings, DO/DONT pairs, fenced code blocks for fragments. NO YAML frontmatter — Lumen wraps it. Do not write '## Workspace skills' — Lumen adds that header."
+}
 
-TOOL-ONLY RULES
-- "pattern" must be a valid regex with capture groups for any args.
-- "command" is the OS-level command. Use $1, $2... to refer to regex
-  capture groups; escape literal dollars as $$.
-- requiresApproval: true for ANY command that mutates state, builds,
-  installs, deploys, runs servers, sends network requests, or modifies
-  files. Read-only inspection commands can be false.
-- defaultEnabled: true for read-only / inspection tools, false for
-  mutating ones (so the user opts in deliberately the first time).
-- DO NOT generate a tool whose body is a giant inline `node -e ...`
-  or `python -c ...` script that hardcodes a stack the user did not
-  specify. If the request needs hardcoded React/Vue/etc. structure,
-  that is a SKILL, not a tool.
-- DO NOT generate UI / design / "writing" tools — they need an LLM,
-  not a shell command. Make those a SKILL instead.
+TRIGGER DISCIPLINE (this is the lever that makes skills useful)
+A skill's trigger is the condition under which the agent MUST
+re-read it. A trigger like "always" or "when coding" means it
+fires on every turn, drowning out the genuinely-applicable rules.
+Be precise:
+  GOOD: "When editing files under lib/widgets/ai_chat/ or building chat UI."
+  GOOD: "When the user asks for a new HTTP route or modifies api/routes.py."
+  GOOD: "When generating SQL migrations under db/migrations/."
+  BAD:  "always"
+  BAD:  "when coding"
+  BAD:  "when the user mentions UI"   (too vague)
+  BAD:  "when relevant"               (lazy)
+At most ONE skill per response may be 'always' (and only if the
+content is a project-wide invariant, e.g. "this is a Dart 3 / null-
+safe project; never write null-unsafe APIs").
 
-SKILL-ONLY RULES
-- "body" should be 4-30 markdown lines. Concrete and actionable, not
-  generic. Reference real concepts the agent will see in the project.
+BODY DISCIPLINE
+- 4-30 markdown lines. SHORTER IS BETTER. The agent reads this
+  every turn it triggers — every line costs token budget.
+- Every skill MUST reference at least TWO concrete things from the
+  project context: file paths, manifest entries, framework idioms
+  the project actually uses, or named conventions visible in the
+  manifest previews. If you can't, you're inventing — drop the skill.
 - Prefer DO / DON'T pairs over abstract principles.
-- If you reference design tokens / component names / file paths,
-  use the user's project context where possible. Do not invent
-  framework details the project clearly does not use.
+- Code fragments OK in fenced blocks. Keep them tiny — a
+  representative shape, not a full implementation.
+- Use the project's own vocabulary. If the manifest says "panels",
+  don't write "components". If it says "cards", don't write "tiles".
+
+GOOD vs BAD SKILLS — internalize this contrast before writing
+
+BAD (do NOT emit anything like this):
+  name:    "General Best Practices"
+  trigger: "always"
+  body:    "## Be Consistent\n- Follow conventions.\n- Write clean code.\n- Use meaningful names.\n- Keep functions small."
+WHY BAD: every line is true for every project that has ever existed.
+Provides zero project-specific signal. Tokens wasted forever.
+
+GOOD (this is the bar):
+  name:    "Dashboard layout grid"
+  trigger: "When creating, modifying, or styling pages under src/pages/dashboard/."
+  body:    "## Layout grid\n- Sidebar: 240px fixed; collapses to 56px below 1024px (see src/components/Sidebar.tsx).\n- Header: 56px sticky; uses tokens from design/tokens.json.\n- Main content: max-width 1280px, 24px gutter.\n\n## Components, not chrome\n- Stat cards: ALWAYS the existing <StatCard> from src/components/StatCard.tsx — never new chrome.\n- Charts: Recharts. Provide an empty state for every chart.\n\n## Don't\n- Don't introduce new accent colors. The four tokens in design/tokens.json are exhaustive."
+WHY GOOD: anchored to specific files. Names a real component. Calls
+out a specific anti-pattern (introducing new accent colors). The
+agent saves a real wrong turn.
+
+────────────────────────────────────────────────────────────
+TOOL SCHEMA (every field required)
+{
+  "kind": "tool",
+  "id": "snake_case_unique_id",
+  "name": "UPPER_SNAKE_CASE",
+  "description": "What it does AND when to use it. 1-2 sentences.",
+  "syntax": "<<<NAME: arg>>>  or  <<<NAME>>>  when no arg",
+  "pattern": "<<<NAME:\\s*(.*?)\\s*>>>",
+  "command": ["binary", "arg1", "$1"],
+  "requiresApproval": true,
+  "defaultEnabled": false
+}
+
+TOOL RULES
+- "pattern" must be a valid regex; capture groups for every arg.
+- "command" is the OS-level argv. Use $1, $2 … for regex captures.
+  Escape literal dollars as $$.
+- requiresApproval: true for ANY command that mutates state — builds,
+  installs, deploys, runs servers, sends network requests, modifies
+  files. Read-only inspection commands can be false.
+- defaultEnabled: true ONLY for read-only inspection. Mutating
+  tools default off so the user opts in deliberately.
+- The agent already has builtins for the boring stuff. DO NOT
+  duplicate any of these ids:
+    create_file, edit_file, multi_edit, append_file, move_file,
+    read_file, read_file_range, list_dir, tree, search_text,
+    find_file, glob, delete_file, git_status, git_diff, run_cmd,
+    verify.
+
+────────────────────────────────────────────────────────────
+ANTI-PATTERNS — REJECT THESE BEFORE EMITTING
+
+Do NOT emit a skill that:
+  ✗ has trigger "always" / "when coding" / "when relevant"
+    (unless it's a single project-wide invariant)
+  ✗ is generic enough to apply to any project (clean code,
+    write tests, use meaningful names, prefer composition)
+  ✗ paraphrases the framework's own docs (the agent already
+    knows React / Flutter / Django basics)
+  ✗ explains what built-in agent tools already do
+    (don't write "use search_text to find files" — the agent
+    knows)
+  ✗ has more than 30 body lines — split or trim
+  ✗ has fewer than two concrete project references — drop it
+
+Do NOT emit a tool that:
+  ✗ inlines a multi-line `node -e` / `python -c` / `bash -c`
+    script that hardcodes stack-specific structure (that's a
+    SKILL — let the LLM produce idiomatic output)
+  ✗ does design / UI / "writing" work (LLM, not shell)
+  ✗ requires the user to install a binary the project context
+    doesn't already reference
+  ✗ duplicates a builtin (see the list above)
+
+────────────────────────────────────────────────────────────
+QUANTITY GUIDANCE
+Better fewer + great than more + diluted. A typical project
+deserves 2-4 high-density skills + 1-2 tools, not 5-7 mediocre
+artifacts. If after reviewing the project context you can only
+think of ONE great skill, emit one. Lumen will accept it.
+
+────────────────────────────────────────────────────────────
+SELF-CHECK BEFORE EMITTING JSON
+Walk through every artifact one more time:
+  1. Does each skill name at least two concrete things from the
+     project context?
+  2. Is every trigger specific enough that the agent would NOT
+     re-read it on unrelated turns?
+  3. Could any skill body be cut by 30%+ without losing signal?
+     If yes — cut.
+  4. Have I avoided every anti-pattern above?
+  5. Is each artifact id unique snake_case, not colliding with
+     a builtin tool?
+If any answer is no, fix it before emitting. If you cannot fix it,
+drop that artifact. Quantity is never a goal.
+
+OUTPUT FORMAT
+Reply with ONLY: {"artifacts": [...]}. No prose, no fences, no
+explanation. The shape is parsed strictly.
 ''';
 
   String _buildPrompt({
@@ -361,24 +466,39 @@ SKILL-ONLY RULES
     final userHints = extraContext.isEmpty ? '(none provided)' : extraContext;
     return '''
 USER INTENT
-The user is starting work on this project and chose the following
-archetype(s) — bias your picks toward what these stacks typically need:
+The user just opened a fresh project in Lumen. They've told you the
+project archetype(s) so you can bias toward what these stacks
+typically need:
 
 $kindLines
 
 ADDITIONAL CONTEXT FROM USER
 $userHints
 
-PROJECT CONTEXT
+PROJECT CONTEXT (top-level entries + manifest previews)
 $projectContext
+
+YOUR JOB
+Write the cheatsheet for the agent that pair-programs in this repo.
+Read the project context above CAREFULLY. Notice the framework, the
+file layout, the test runner, the linters, the conventions implied
+by manifest entries (e.g. lint rules in pubspec.yaml, scripts in
+package.json, dependencies in Cargo.toml). Then ask yourself:
+"What are the top 2-4 things a senior contributor would tell a new
+hire about THIS project that they wouldn't already know from
+reading the framework's docs?"
+
+Those are your skills. Optionally add 1-2 tools for repetitive
+shell tasks the agent will need (test, lint, build, dev server).
 
 $_schemaAndRules
 
 REQUIRED OUTPUT
-A JSON object with an "artifacts" array of 3-7 entries, mixed tools
-and skills as appropriate for the project. A dashboard project, for
-example, might get 1-2 tools (lint, build) and 1-2 skills (design
-system conventions, accessibility checklist). Quality over quantity.
+A JSON object {"artifacts": [...]} with 2-5 entries. Quality is
+not negotiable — emit fewer if you cannot meet the bar. Do NOT
+pad with generic advice; the validator will accept the result
+even if you only emit one artifact, but the user is much worse
+off with five mediocre entries than two great ones.
 
 Begin.
 ''';
@@ -390,19 +510,29 @@ Begin.
   }) {
     return '''
 USER REQUEST
-The user wants ONE focused capability for the Lumen agent.
+The user wants ONE focused capability for the Lumen agent. Their
+words below — translate them into the most useful artifact you can.
 
 Their idea: ${request.name}
 Their details: ${request.details.trim().isEmpty ? '(none provided)' : request.details.trim()}
 
-PROJECT CONTEXT
+PROJECT CONTEXT (top-level entries + manifest previews)
 $projectContext
+
+YOUR JOB
+Decide whether the request is best served as a TOOL (deterministic
+shell command) or a SKILL (instructions the agent reads). Then
+build it as a senior engineer would — concrete, anchored to the
+project context above, NOT a generic recipe. If the request is
+vague, take the most charitable interpretation and ground it in
+the actual project rather than inventing a one-size-fits-all
+template.
 
 $_schemaAndRules
 
 REQUIRED OUTPUT
-A JSON object with an "artifacts" array containing EXACTLY ONE entry
-— pick tool or skill based on the decision heuristic above.
+A JSON object with an "artifacts" array containing EXACTLY ONE
+entry — pick tool or skill based on the decision heuristic above.
 
 EXAMPLE OUTPUTS (for shape reference only, do NOT copy content)
 

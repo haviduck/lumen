@@ -514,9 +514,18 @@ class _MessageBubbleState extends State<MessageBubble> {
         'pre': _CodeBlockBuilder(),
       },
       styleSheet: MarkdownStyleSheet(
+        // Assistant reply prose intentionally renders dimmer than
+        // user-typed text (which uses [fgPrimary] in
+        // `_buildUserMessage`). Same blue-grey hue, ~28% lower
+        // luminance — the gap that actually reads on a glance as
+        // "model side, not me" without the prose ever feeling
+        // unreadable. Code blocks, tool cards, and accents keep
+        // their full brightness; only free-form reply prose is
+        // dimmed, since that's the part where the user/model
+        // contrast carries hierarchy.
         p: const TextStyle(
           fontSize: 13,
-          color: DuckColors.fgPrimary,
+          color: DuckColors.fgSecondary,
           height: 1.5,
         ),
         code: const TextStyle(

@@ -1494,6 +1494,30 @@ class ChatController extends ChangeNotifier {
     );
   }
 
+  /// True when the reasoning-effort dial is meaningful for the
+  /// currently selected model and should be visible in the composer.
+  ///
+  /// Ollama / Ollama Cloud is excluded: Ollama auto-enables thinking
+  /// for capable models (per
+  /// https://docs.ollama.com/capabilities/thinking — "Thinking is
+  /// enabled by default in the CLI and API for supported models")
+  /// and we deliberately don't send `think: true` from the wire path.
+  /// The dial's only effect on Ollama would have been a system-prompt
+  /// directive, which is weak on the small local models that are
+  /// Ollama's actual sweet spot. Hiding the pill is honest UX —
+  /// rather than a control that quietly does nothing real.
+  ///
+  /// For everyone else (Claude Opus 4+/Sonnet 4+, Gemini 2.5,
+  /// gpt-5/o-series) the dial drives a real API budget knob, so it
+  /// stays visible. Models on those providers that lack native support
+  /// (Haiku, gpt-4o, Gemini 2.0) keep the prompt-suffix fallback
+  /// behaviour they had before — same UX as today, just minus Ollama.
+  bool get reasoningEffortPillApplicableForCurrentModel {
+    final (provider, _) = _splitModel(_selectedModel);
+    if (provider == 'ollama' || provider == 'ollama-cloud') return false;
+    return true;
+  }
+
   /// True when the currently selected model can accept inline image
   /// inputs. Used to suppress the chat composer's image-attach
   /// affordance for text-only models so the user doesn't paste an
@@ -2876,11 +2900,29 @@ class ChatController extends ChangeNotifier {
       }
 
       // Reasoning-effort prompt fallback for providers/models that
-      // don't accept a native reasoning param (Ollama, older OpenAI,
-      // Claude Haiku, Gemini 2.0). When native IS supported, we trust
-      // the API knob and skip the suffix.
-      final effort = session.reasoningEffort;
+      // don't accept a native reasoning param (older OpenAI, Claude
+      // Haiku, Gemini 2.0). When native IS supported, we trust the
+      // API knob and skip the suffix.
+      //
+      // Ollama / Ollama Cloud is excluded entirely (the composer
+      // pill is hidden there — see
+      // `reasoningEffortPillApplicableForCurrentModel`). If the user
+      // had `effort` set on a previous Claude/Gemini turn and then
+      // switches to Ollama mid-session, `session.reasoningEffort`
+      // still holds the old value. Force `effort = null` here so the
+      // suffix doesn't leak through into the Ollama prompt — the
+      // pill being invisible to the user means they didn't actively
+      // ask for it on this turn.
       final (selectedProvider, selectedRawModel) = _splitModel(modelForTurn);
+      final ReasoningEffort? effort = (selectedProvider == 'ollama' ||
+              selectedProvider == 'ollama-cloud')
+          ? null
+          : session.reasoningEffort;
+      // When `effort == null` the prompt-suffix path early-returns
+      // regardless of `effortIsNative`; we still pass the real value
+      // through for non-Ollama providers so the docstring's contract
+      // (`effortIsNative == true` → skip suffix even with non-null
+      // effort, because the API knob handles it) keeps holding.
       final effortIsNative = ReasoningEffortHelper.modelSupportsNative(
         provider: selectedProvider,
         rawModel: selectedRawModel,

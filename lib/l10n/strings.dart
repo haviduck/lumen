@@ -203,13 +203,23 @@ class S {
   static const String providerErrorHideDetails = 'Hide details';
   static const String providerErrorOpenSettings = 'Open settings';
 
-  // Stall warning shown as a quiet footer below the streaming
-  // assistant bubble when a generation has been silent (no chunks)
-  // for ~30s. The verbose "model may be stuck" copy was retired
-  // when the strip moved out of the above-input dock — the new
-  // shape is a discrete timer + Stop chip that lets the timer's
-  // location (under the live message) carry the meaning.
-  static String chatStallSilence(int seconds) => '${seconds}s silence';
+  // Stall hints rendered as a quiet footer below the streaming
+  // assistant bubble. Three escalating stages of inactivity copy
+  // tied to inter-chunk silence (NOT total elapsed — see
+  // [ChatController.silenceDuration]):
+  //   - >=60s  → chatStallTakingLonger  ("warm" hint, no chrome)
+  //   - >=90s  → chatStallStillThinking ("warm" hint, no chrome)
+  //   - >=120s → chatStallFrozen        ("cold" hint + subtle Stop)
+  // Below 60s the strip is hidden entirely so the streaming
+  // progress bar carries the "in flight" signal alone. The earlier
+  // 30s timer + red Stop chip felt alarmist on legitimately slow
+  // local models; this softer cadence lets the user read the
+  // situation before the UI starts demanding action.
+  static const String chatStallTakingLonger =
+      'This is taking longer than usual';
+  static const String chatStallStillThinking = 'Still thinking';
+  static const String chatStallFrozen =
+      'This chat may be frozen — you can stop and try again';
   static const String chatStallStop = 'Stop';
 
   // Per-turn timing footer rendered at the bottom of finished
@@ -428,6 +438,30 @@ class S {
       'browser hand-off has to happen against your own session.';
   static const String ollamaCopyCommand = 'Copy';
   static const String ollamaCopiedToast = 'Command copied to clipboard.';
+
+  // Ollama Cloud key prompt — narrow, single-purpose dialog inserted
+  // at the top of the new-project wizard when the user has no
+  // Ollama Cloud API key set yet. Goal is to give the skill
+  // generator (the very next wizard step) a frontier-tier cloud
+  // model to work with — pasting an Ollama Cloud key is the single
+  // fastest path to one. Skip is always non-destructive.
+  static const String ollamaCloudKeyPromptTitle =
+      'Use Ollama Cloud for skill generation?';
+  static const String ollamaCloudKeyPromptBody =
+      'The next step asks an LLM to design workspace skills tailored '
+      'to this project. With an Ollama Cloud key, Lumen routes that '
+      'one-off generation through a frontier model (Qwen 3 Coder, '
+      'GPT-OSS 120B, …) — dramatically better skills than a small '
+      'local model can produce. Paste a key from ollama.com or skip; '
+      'you can add one later in Settings → AI / Chat.';
+  static const String ollamaCloudKeyPromptFieldLabel = 'OLLAMA CLOUD API KEY';
+  static const String ollamaCloudKeyPromptFieldHint = 'sk-…';
+  static const String ollamaCloudKeyPromptHelper =
+      'The key is stored locally in your Lumen preferences. It is '
+      'used only for requests you initiate.';
+  static const String ollamaCloudKeyPromptUse = 'Use this key';
+  static const String ollamaCloudKeyPromptSkip = 'Skip — local only';
+  static const String ollamaCloudKeySavedToast = 'Ollama Cloud key saved.';
 
   // LLM providers onboarding (new-project wizard step). Lets a
   // first-time user paste API keys for each cloud provider next to a
@@ -1842,6 +1876,28 @@ class S {
       'Tip: paste these into ~/.bashrc or ~/.zshrc to make them stick across '
       'sessions. The "Install for this session" button only sets them up '
       'in the current shell.';
+
+  // Per-connect prompt asking the user whether to inject the
+  // session-scoped shell helpers (`lumen-edit`, `lumen-grab`,
+  // OSC 7 cwd reporting) into the freshly opened SSH session.
+  // Displayed once per connect; declining skips the SFTP upload
+  // entirely so nothing is left behind on the remote.
+  static const String sshHelpersPromptTitle = 'Enable Lumen shortcuts?';
+  static const String sshHelpersPromptBody =
+      'Lumen can add a few shell shortcuts to this session so you can '
+      'open and download remote files straight from the terminal:';
+  static const String sshHelpersPromptBulletEdit =
+      'lumen-edit <file>  ·  open a remote file in your editor (saves go back via SFTP).';
+  static const String sshHelpersPromptBulletGrab =
+      'lumen-grab <file>  ·  copy a remote file into your open Lumen workspace.';
+  static const String sshHelpersPromptBulletCwd =
+      'cwd reporting  ·  drag-drop uploads land in the directory you\'re actually in.';
+  static const String sshHelpersPromptFootnote =
+      'A small script is uploaded to /tmp, sourced once, then deleted by '
+      'itself. Nothing else is changed on the remote — and you can decline '
+      'safely if you don\'t need this.';
+  static const String sshHelpersPromptAccept = 'Enable shortcuts';
+  static const String sshHelpersPromptSkip = 'Not now';
   static const String sshRemoteFileTooLarge =
       'File is too large to open in the editor (>5 MB). Use the terminal to inspect.';
   static const String sshRemoteFileBinary =

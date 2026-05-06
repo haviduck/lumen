@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
+import 'package:re_editor/re_editor.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
@@ -1437,6 +1438,15 @@ class _FileToolCardState extends State<_FileToolCard> {
   String _targetPath() {
     final s = widget.segment;
     String relPath = s.firstArg.trim();
+    // Strip the trailing `#Lstart[-end]` line-range hint baked into
+    // firstArg by `_friendlyReplacement`. Stripped here so the path
+    // resolution below sees a clean filename. The line range itself
+    // stays accessible via `_lineRange()` for the chip display and
+    // the click-to-line jump.
+    final hashIdx = relPath.lastIndexOf('#L');
+    if (hashIdx > 0) {
+      relPath = relPath.substring(0, hashIdx);
+    }
     if ((s.toolId == 'move_file' || s.toolId == 'copy_file') &&
         relPath.contains('->')) {
       relPath = relPath.split('->').last.trim();
@@ -1456,6 +1466,27 @@ class _FileToolCardState extends State<_FileToolCard> {
     return relPath.trim();
   }
 
+  /// Parsed line range from the `#Lstart[-end]` suffix on firstArg.
+  /// Returns null when the marker carries no range (read tools,
+  /// errors, legacy markers from before the line-hint plumbing).
+  ///
+  /// Two return shapes share one parser: single-line edits emit
+  /// `#L42` (start == end), multi-line edits emit `#L42-58`. Both
+  /// are normalised to a `(start, end)` record where end falls back
+  /// to start when the range is collapsed.
+  ({int start, int end})? _lineRange() {
+    final raw = widget.segment.firstArg;
+    final hashIdx = raw.lastIndexOf('#L');
+    if (hashIdx < 0) return null;
+    final tail = raw.substring(hashIdx + 2);
+    final m = RegExp(r'^(\d+)(?:-(\d+))?$').firstMatch(tail);
+    if (m == null) return null;
+    final start = int.tryParse(m.group(1)!);
+    if (start == null) return null;
+    final end = int.tryParse(m.group(2) ?? '$start') ?? start;
+    return (start: start, end: end);
+  }
+
   Future<void> _openFile(BuildContext context) async {
     final s = widget.segment;
     if (s.pending || s.toolId == 'delete_file') return;
@@ -1469,6 +1500,68 @@ class _FileToolCardState extends State<_FileToolCard> {
     if (!await f.exists()) return;
     await state.openFile(f);
     state.ideActions.revealFileExplorerPath(f.path);
+    // Jump the editor to the touched line range when one is known.
+    // The editor needs a frame to mount/swap controllers after the
+    // tab change `openFile` triggers, so we retry briefly. 8 × 50ms
+    // (~400ms total) is well under "user notices a delay" while
+    // covering even slow file-load paths.
+    final range = _lineRange();
+    if (range != null) {
+      await _scrollEditorToLine(state, range.start, range.end);
+    }
+  }
+
+  /// Reveal the touched line span and highlight it.
+  ///
+  /// Two things have to happen here that aren't automatic in
+  /// `re_editor`:
+  ///
+  /// 1. **Scroll**. Setting `selection` does NOT move the viewport
+  ///    — that's a render-layer concern. We have to call
+  ///    `makePositionCenterIfInvisible` to pull the touched line
+  ///    into view. `CenterIfInvisible` (vs `Visible`) avoids
+  ///    yanking the viewport when the line is already on screen,
+  ///    which is the common case right after the agent edits a
+  ///    file the user is already looking at.
+  ///
+  /// 2. **Highlight**. A `CodeLineSelection.collapsed` is just a
+  ///    blinking caret — invisible at a glance. We instead set a
+  ///    non-collapsed selection from `(start, 0)` to the END of
+  ///    the last touched line; the editor renders that span using
+  ///    `selectionColor` (themed `DuckColors.editorSelection`),
+  ///    matching the "click a stack-trace line" affordance every
+  ///    serious IDE shows.
+  ///
+  /// Inputs are 1-based line numbers from the `#Lstart-end` marker
+  /// suffix (matches GitHub's URL convention). Clamped against the
+  /// current document length so a stale marker pointing past EOF
+  /// (file shrunk after the edit) lands on the last line instead
+  /// of throwing.
+  Future<void> _scrollEditorToLine(
+    AppState state,
+    int startLine,
+    int endLine,
+  ) async {
+    for (var i = 0; i < 8; i++) {
+      final ed = state.ideActions.activeEditor;
+      if (ed != null && ed.lineCount > 0) {
+        final maxIdx = ed.lineCount - 1;
+        final startIdx = (startLine - 1).clamp(0, maxIdx);
+        final endIdx = (endLine - 1).clamp(startIdx, maxIdx);
+        final endLineLength = ed.codeLines[endIdx].length;
+        ed.selection = CodeLineSelection(
+          baseIndex: startIdx,
+          baseOffset: 0,
+          extentIndex: endIdx,
+          extentOffset: endLineLength,
+        );
+        ed.makePositionCenterIfInvisible(
+          CodeLinePosition(index: startIdx, offset: 0),
+        );
+        return;
+      }
+      await Future.delayed(const Duration(milliseconds: 50));
+    }
   }
 
   @override
@@ -1599,6 +1692,26 @@ class _FileToolCardState extends State<_FileToolCard> {
                       ),
                     ),
                   ),
+                  // Touched-line-range chip. Edit-shaped tools
+                  // populate `#Lstart[-end]` on `firstArg`; we render
+                  // it as `· L42` (or `· L42-58`) so the user can see
+                  // the touched span at a glance. Click semantics
+                  // unchanged from the row — clicking opens the file
+                  // and `_openFile` jumps the editor to the start
+                  // line.
+                  if (_lineRange() case final range?) ...[
+                    const SizedBox(width: 6),
+                    Text(
+                      range.start == range.end
+                          ? '· L${range.start}'
+                          : '· L${range.start}-${range.end}',
+                      style: const TextStyle(
+                        fontFamily: DuckTheme.monoFont,
+                        fontSize: 10.5,
+                        color: DuckColors.fgFaint,
+                      ),
+                    ),
+                  ],
                   if (hasLiveBody)
                     Padding(
                       padding: const EdgeInsets.only(left: 6),

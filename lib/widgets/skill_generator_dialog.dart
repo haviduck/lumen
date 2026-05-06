@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
 import '../services/skill_generator.dart';
+import '../services/skill_model_picker.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import 'common/duck_glass.dart';
@@ -88,10 +89,18 @@ class _SkillGeneratorDialogState extends State<_SkillGeneratorDialog> {
       return;
     }
 
+    // Force a frontier cloud model when an Ollama Cloud key is set
+    // — skill generation is one-off JSON work that benefits enormously
+    // from instruction-strong models, regardless of which chat model
+    // the user has selected for streaming. See [pickSkillModel] for
+    // the full rule (and why we don't just use selectedModel).
+    final pickedModel = await pickSkillModel(appState);
+    if (!mounted) return;
+
     final gen = SkillGenerator(
       generateChat: appState.chat.generateUtilityText,
       isReadyCheck: appState.chat.isReachable,
-      model: appState.chat.selectedModel,
+      model: pickedModel,
     );
 
     setState(() {

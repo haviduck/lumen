@@ -460,6 +460,22 @@ class ToolRegistry {
     return s.trim().replaceAll(RegExp(r'\s+'), ' ');
   }
 
+  /// 1-based line number of the byte at [byteOffset] in [text].
+  /// Used by edit-shaped tools to compute a `lines N-M` hint for
+  /// the success message — `_friendlyReplacement` parses the hint
+  /// and bakes it into the LUMEN_TOOL marker so the chat-side
+  /// `_FileToolCard` can render a "L42" chip and pass the range
+  /// to the editor on click.
+  static int _lineNumberAt(String text, int byteOffset) {
+    if (byteOffset <= 0) return 1;
+    final upTo = byteOffset > text.length ? text.length : byteOffset;
+    var line = 1;
+    for (var i = 0; i < upTo; i++) {
+      if (text.codeUnitAt(i) == 0x0A) line++;
+    }
+    return line;
+  }
+
   /// One-sentence "what likely differs" hint for the EDIT_FILE
   /// SEARCH-not-found diagnostic. Always returns SOMETHING — the
   /// generic fallback ("review whitespace / character differences")
@@ -566,9 +582,17 @@ class ToolRegistry {
           }
           await f.parent.create(recursive: true);
           await f.writeAsString(content);
+          // Whole-file line range — `lines 1-N`. Useful for overwrite
+          // (the chip jumps to top of the rewritten file); for fresh
+          // files `1-N` is mostly cosmetic but keeps the chip
+          // grammar uniform across edit-shaped tools.
+          final totalLines = '\n'.allMatches(content).length + 1;
+          final lineHint = totalLines == 1
+              ? 'lines 1'
+              : 'lines 1-$totalLines';
           return overwrite
-              ? 'CREATE_FILE $fileName: Success (overwrote existing file)'
-              : 'CREATE_FILE $fileName: Success';
+              ? 'CREATE_FILE $fileName: Success (overwrote existing file, $lineHint)'
+              : 'CREATE_FILE $fileName: Success ($lineHint)';
         } catch (e) {
           return 'CREATE_FILE $fileName: Error: $e';
         }
@@ -670,6 +694,22 @@ class ToolRegistry {
                 'uniquely identify ONE site, or use MULTI_EDIT to target '
                 'multiple sites explicitly.';
           }
+          // Compute the line range of the matched region BEFORE the
+          // replace (so the line numbers refer to where the edit
+          // landed in the post-write file). After REPLACE shifts the
+          // tail, the start line is unchanged — `start` was a
+          // function of bytes preceding the match, which we did not
+          // touch. The end line equals start + (lines in REPLACE) - 1.
+          // For a single-line search we report just `start`; for a
+          // multi-line search we report `start-end`.
+          final matchOffset = effectiveContent.indexOf(effectiveSearch);
+          final startLine = _lineNumberAt(effectiveContent, matchOffset);
+          final replaceLines = '\n'.allMatches(replace).length;
+          final endLine = startLine + replaceLines;
+          final lineHint = replaceLines == 0
+              ? 'lines $startLine'
+              : 'lines $startLine-$endLine';
+
           final result = effectiveContent.replaceFirst(
             effectiveSearch,
             replace,
@@ -698,7 +738,7 @@ class ToolRegistry {
                 'and try again.';
           }
           await f.writeAsString(result);
-          return 'EDIT_FILE $fileName: Success (1 replacement made)';
+          return 'EDIT_FILE $fileName: Success (1 replacement made, $lineHint)';
         } catch (e) {
           return 'EDIT_FILE $fileName: Error: $e';
         }
@@ -765,12 +805,22 @@ class ToolRegistry {
                 'found in body.';
           }
           // Atomic: apply all edits to an in-memory copy first;
-          // only write back if every SEARCH found its match.
+          // only write back if every SEARCH found its match. Also
+          // record each edit's start-line in the post-write file for
+          // the click-to-line chip; we report the FIRST match as the
+          // canonical jump target (where the user's reading focus
+          // wants to land) and surface the spread (`first..last`) in
+          // the success message so the model sees the full set.
           final originalContent = await f.readAsString();
           var content = originalContent;
+          final editStartLines = <int>[];
           for (var i = 0; i < edits.length; i++) {
             final e = edits[i];
+            // Record the line of the match against the CURRENT (in-
+            // progress) content snapshot — same view the user will
+            // see after the write completes for this chunk.
             if (content.contains(e.search)) {
+              editStartLines.add(_lineNumberAt(content, content.indexOf(e.search)));
               content = content.replaceFirst(e.search, e.replace);
               continue;
             }
@@ -778,6 +828,10 @@ class ToolRegistry {
             final normalizedContent = content.replaceAll('\r\n', '\n');
             final normalizedSearch = e.search.replaceAll('\r\n', '\n');
             if (normalizedContent.contains(normalizedSearch)) {
+              editStartLines.add(_lineNumberAt(
+                normalizedContent,
+                normalizedContent.indexOf(normalizedSearch),
+              ));
               content = normalizedContent.replaceFirst(
                 normalizedSearch,
                 e.replace,
@@ -804,7 +858,23 @@ class ToolRegistry {
                 'change content.';
           }
           await f.writeAsString(content);
-          return 'MULTI_EDIT $fileName: Success (${edits.length} edits applied)';
+          // Build the line hint. Single-edit case mirrors EDIT_FILE
+          // ("lines 42"); multi-edit reports the first match line as
+          // the click target (`lines 42`) and lists the rest in the
+          // human-readable success suffix so the model can scan
+          // them too. We deliberately use just the FIRST line number
+          // so the regex `lines N(?:-M)?` in `_friendlyReplacement`
+          // picks it up cleanly without us having to parse multi-
+          // range hints — the chip is one line; the prose carries
+          // the spread.
+          final firstLine = editStartLines.isEmpty
+              ? null
+              : editStartLines.first;
+          final lineHint = firstLine == null ? '' : ', lines $firstLine';
+          final spread = editStartLines.length > 1
+              ? ' [${editStartLines.join(", ")}]'
+              : '';
+          return 'MULTI_EDIT $fileName: Success (${edits.length} edits applied$lineHint$spread)';
         } catch (e) {
           return 'MULTI_EDIT $fileName: Error: $e';
         }
@@ -969,9 +1039,17 @@ class ToolRegistry {
                   'body — that\'s READ_FILE output format, the file '
                   'itself doesn\'t contain them)'
               : '';
+          // The post-write end line equals the original start +
+          // however many lines the new body has - 1. Single-line
+          // body collapses to `lines $start` for the chip; multi-
+          // line spans `start-newEnd`.
+          final newEnd = start + newCount - 1;
+          final lineHint = newCount <= 1
+              ? 'lines $start'
+              : 'lines $start-$newEnd';
           return 'EDIT_RANGE $target: Success — replaced '
               '${end - start + 1} line${end - start + 1 == 1 ? '' : 's'} '
-              'with $newCount line${newCount == 1 ? '' : 's'}$stripNote.\n'
+              'with $newCount line${newCount == 1 ? '' : 's'} ($lineHint)$stripNote.\n'
               'Replaced content was:\n$auditOld';
         } catch (e) {
           return 'EDIT_RANGE $target: Error: $e';
@@ -1009,7 +1087,21 @@ class ToolRegistry {
           // text onto the previous last line. Cheap to read the
           // last byte; saves a real corruption class.
           var toWrite = content;
+          // Track the line count BEFORE the append so we can build a
+          // `lines firstAppended-lastAppended` hint for the chip.
+          // Cheap re-read of the existing content; APPEND_FILE
+          // already requires hitting disk for the end-of-file
+          // sentinel byte, so the extra read is in the noise.
+          int existingLines = 0;
           if (await f.exists()) {
+            final existing = await f.readAsString();
+            existingLines = '\n'.allMatches(existing).length;
+            // If the file doesn't end in a newline, the last line
+            // isn't terminated, and our append-with-prepended-\n
+            // means the new content starts on a NEW line. Adjust.
+            if (existing.isNotEmpty && !existing.endsWith('\n')) {
+              existingLines += 1;
+            }
             final raf = await f.open();
             try {
               final len = await raf.length();
@@ -1026,7 +1118,13 @@ class ToolRegistry {
             }
           }
           await f.writeAsString(toWrite, mode: FileMode.append);
-          return 'APPEND_FILE $fileName: Success';
+          final appendedLines = '\n'.allMatches(content).length + 1;
+          final firstNew = existingLines + 1;
+          final lastNew = existingLines + appendedLines;
+          final lineHint = appendedLines <= 1
+              ? 'lines $firstNew'
+              : 'lines $firstNew-$lastNew';
+          return 'APPEND_FILE $fileName: Success ($lineHint)';
         } catch (e) {
           return 'APPEND_FILE $fileName: Error: $e';
         }

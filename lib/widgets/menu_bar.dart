@@ -18,6 +18,7 @@ import 'gitnexus_dialog.dart';
 import 'llm_providers_setup_dialog.dart';
 import 'lock_screen.dart';
 import 'manual_skill_dialog.dart';
+import 'ollama_cloud_key_prompt_dialog.dart';
 import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
 
@@ -722,6 +723,15 @@ Future<void> _runNewProjectWizardFromMenu(
   final firstRun = await _isLumenFirstRun(state);
   if (context.mounted && firstRun) {
     await showOllamaSetupDialog(context);
+  }
+  // Narrow Ollama Cloud key prompt — first-run only AND only when
+  // no key is set yet. Lives between the Ollama daemon dialog and
+  // the broader LLM providers dialog so the user can seed a cloud
+  // key specifically for the skill generator without committing to
+  // configuring every provider. Mirrors `welcome_screen.dart` —
+  // keep the two wizard sequences in sync.
+  if (context.mounted && firstRun && state.ollamaApiKey.isEmpty) {
+    await showOllamaCloudKeyPromptDialog(context);
   }
   if (context.mounted && firstRun) {
     await showLlmProvidersSetupDialog(context);

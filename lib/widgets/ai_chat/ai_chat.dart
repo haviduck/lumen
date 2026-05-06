@@ -507,11 +507,6 @@ class _AiChatState extends State<AiChat> {
                       )
                     else ...[
                       Expanded(child: _buildMessageList(chat)),
-                      if (chat.isGenerating)
-                        const Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 16.0),
-                          child: LinearProgressIndicator(minHeight: 2),
-                        ),
                       // Empty-response strip — surfaces after a
                       // turn ends with no visible content / tools
                       // / errors. Distinct from the stall strip
@@ -1223,24 +1218,38 @@ class _AiChatState extends State<AiChat> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 4),
                     // Reasoning-effort dial — sits between attach
                     // and auto-approve. Cycles Off → Standard →
                     // Deep on tap. Translates to a real native
                     // API param (Anthropic `thinking`, Gemini
                     // `thinkingConfig`, OpenAI `reasoning_effort`)
                     // when the active model supports it; falls
-                    // back to a system-prompt directive on local
-                    // / older models. The pill flags which mode
-                    // is in effect via tooltip wording.
-                    _ReasoningEffortPill(
-                      effort: chat.reasoningEffort,
-                      isNative: chat.reasoningEffortIsNativeForCurrentModel,
-                      compact: compact,
-                      onCycle: () => chat.setReasoningEffort(
-                        _cycleEffort(chat.reasoningEffort),
+                    // back to a system-prompt directive on
+                    // non-Ollama models that lack native support
+                    // (Haiku, gpt-4o, Gemini 2.0). The pill flags
+                    // which mode is in effect via tooltip wording.
+                    //
+                    // Hidden entirely on Ollama / Ollama Cloud:
+                    // Ollama auto-enables thinking for capable
+                    // models server-side (per
+                    // https://docs.ollama.com/capabilities/thinking)
+                    // and the dial's only effect there would have
+                    // been a weak prompt-suffix directive that
+                    // small local models routinely ignore. Showing
+                    // a control that does nothing real is dishonest
+                    // UX — see
+                    // `ChatController.reasoningEffortPillApplicableForCurrentModel`.
+                    if (chat.reasoningEffortPillApplicableForCurrentModel) ...[
+                      const SizedBox(width: 4),
+                      _ReasoningEffortPill(
+                        effort: chat.reasoningEffort,
+                        isNative: chat.reasoningEffortIsNativeForCurrentModel,
+                        compact: compact,
+                        onCycle: () => chat.setReasoningEffort(
+                          _cycleEffort(chat.reasoningEffort),
+                        ),
                       ),
-                    ),
+                    ],
                     const SizedBox(width: 4),
                     // Auto-approve toggle pill — full label at normal
                     // chat widths; icon-only below ~230px so the

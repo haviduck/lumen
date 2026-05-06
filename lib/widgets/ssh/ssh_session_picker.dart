@@ -6,6 +6,7 @@ import '../../providers/ssh_controller.dart';
 import '../../services/ssh/ssh_host.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import 'ssh_helpers_install_prompt.dart';
 import 'ssh_host_dialog.dart';
 import 'ssh_host_key_prompt.dart';
 import 'ssh_password_prompt.dart';
@@ -231,6 +232,8 @@ class SshSessionPickerSheet extends StatelessWidget {
           showSshPasswordPrompt(rootContext, host: host),
       passphraseRequester: (host) =>
           showSshPasswordPrompt(rootContext, host: host, passphrase: true),
+      helpersInstallPrompter: (host) =>
+          showSshHelpersInstallPrompt(rootContext, host: host),
     );
   }
 }

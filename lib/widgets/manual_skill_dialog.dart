@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
 import '../services/skill_generator.dart';
+import '../services/skill_model_picker.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import 'common/duck_glass.dart';
@@ -57,10 +58,18 @@ class _ManualSkillDialogState extends State<_ManualSkillDialog> {
       return;
     }
 
+    // Force a frontier cloud model when an Ollama Cloud key is set
+    // (same rule the new-project wizard uses — see
+    // [pickSkillModel] for the full rationale). Skill generation
+    // is one-off JSON work; the chat-streaming model is rarely
+    // the right choice here.
+    final pickedModel = await pickSkillModel(appState);
+    if (!mounted) return;
+
     final gen = SkillGenerator(
       generateChat: appState.chat.generateUtilityText,
       isReadyCheck: appState.chat.isReachable,
-      model: appState.chat.selectedModel,
+      model: pickedModel,
     );
     final result = await gen.generateCustom(
       widget.workspacePath,

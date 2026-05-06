@@ -11,6 +11,7 @@ import 'common/ambient_background.dart';
 import 'common/duck_toast.dart';
 import 'gitnexus_dialog.dart';
 import 'llm_providers_setup_dialog.dart';
+import 'ollama_cloud_key_prompt_dialog.dart';
 import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
 
@@ -47,19 +48,42 @@ class WelcomeScreen extends StatelessWidget {
   ///   1. **Ollama setup** — first-run only. Detects whether the
   ///      `ollama` CLI is installed and the daemon is reachable;
   ///      shows download/run/pull/signin instructions when not.
-  ///   2. **LLM providers** — first-run only. Lets the user paste
+  ///   2. **Ollama Cloud key prompt** — first-run only AND no
+  ///      Ollama Cloud key set yet. Narrow single-field dialog that
+  ///      offers to seed an Ollama Cloud key specifically because
+  ///      the next step (skill generation) is dramatically better
+  ///      with a frontier-tier cloud model. Skipping is fine — the
+  ///      skill generator falls back to whatever model is selected.
+  ///   3. **LLM providers** — first-run only. Lets the user paste
   ///      API keys for cloud providers (Gemini, Claude, GitHub
   ///      Models, OpenAI) so the rest of the wizard (skill
   ///      generator) actually has an LLM to call.
-  ///   3. **Skill generator** — asks an LLM to bootstrap
+  ///   4. **Skill generator** — asks an LLM to bootstrap
   ///      `.lumen/tools/` and `.lumen/skills/` for this project.
-  ///   4. **GitNexus** — `npx gitnexus analyze` the workspace.
-  ///   5. **Syncthing** — share with already-paired devices.
+  ///      When an Ollama Cloud key is set (from any source — pasted
+  ///      in step 2, in step 3, or pre-existing) the generator
+  ///      forces a frontier cloud model regardless of the user's
+  ///      currently selected chat model. See `pickSkillModel` in
+  ///      `services/skill_model_picker.dart`.
+  ///   5. **GitNexus** — `npx gitnexus analyze` the workspace.
+  ///   6. **Syncthing** — share with already-paired devices.
   ///
-  /// Steps 1 and 2 only fire when `_isLumenFirstRun` returns true so
-  /// repeat users (who already have at least one provider working)
-  /// don't get nagged on every new project. Steps 3-5 always offer
-  /// — they're per-workspace concerns, not per-installation ones.
+  /// Steps 1, 2, and 3 only fire when `_isLumenFirstRun` returns
+  /// true so repeat users (who already have at least one provider
+  /// working) don't get nagged on every new project. Steps 4-6
+  /// always offer — they're per-workspace concerns, not
+  /// per-installation ones.
+  ///
+  /// **Why a dedicated Ollama Cloud step instead of folding it into
+  /// the LLM providers grid.** The full LLM providers dialog is a
+  /// dense 4-card grid; on a brand-new install the user will see
+  /// it anyway. The dedicated Ollama-cloud prompt fires *before*
+  /// that grid for a single, narrow reason (seeding a cloud key
+  /// specifically for the skill generator) and is much faster to
+  /// dismiss when the user just wants to skim through. Two prompts
+  /// is fine because they have different intents — one is "do you
+  /// want a strong skill-generator model?", the other is "what
+  /// providers do you want enabled long-term?".
   Future<void> _runNewProjectWizard(
     BuildContext context,
     AppState state,
@@ -68,6 +92,15 @@ class WelcomeScreen extends StatelessWidget {
     final firstRun = await _isLumenFirstRun(state);
     if (context.mounted && firstRun) {
       await showOllamaSetupDialog(context);
+    }
+    // Re-read state.ollamaApiKey lazily on every guard so a key
+    // pasted in the previous step (or via Syncthing-restored prefs)
+    // suppresses this prompt without us needing to thread the
+    // updated value through.
+    if (context.mounted &&
+        firstRun &&
+        state.ollamaApiKey.isEmpty) {
+      await showOllamaCloudKeyPromptDialog(context);
     }
     if (context.mounted && firstRun) {
       await showLlmProvidersSetupDialog(context);

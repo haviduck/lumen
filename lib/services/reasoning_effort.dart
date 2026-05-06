@@ -16,12 +16,26 @@
 ///    measurably more careful.
 ///
 /// 2. **Prompt-suffix fallback** for providers/models without a native
-///    knob (Ollama, older OpenAI models, Claude Haiku). A short directive
-///    is appended to the system prompt instructing the model to be more
-///    thorough. Less effective than (1) but better than nothing — and
-///    that's the entire reason this enum/helper exists rather than a
-///    plain prompt-suffix toggle: hiding the implementation behind one
-///    Off/Standard/Deep dial gives consistent UX regardless of provider.
+///    knob (older OpenAI models, Claude Haiku, Gemini 2.0). A short
+///    directive is appended to the system prompt instructing the model
+///    to be more thorough. Less effective than (1) but better than
+///    nothing — and that's the entire reason this enum/helper exists
+///    rather than a plain prompt-suffix toggle: hiding the
+///    implementation behind one Off/Standard/Deep dial gives consistent
+///    UX regardless of provider.
+///
+/// **Ollama / Ollama Cloud is no longer in the prompt-suffix path.**
+/// As of v1.4.x, Ollama auto-enables thinking server-side for capable
+/// models (per https://docs.ollama.com/capabilities/thinking — "Thinking
+/// is enabled by default in the CLI and API for supported models") and
+/// we deliberately omit `think` from the wire payload. The composer
+/// pill is hidden on Ollama models (see
+/// `ChatController.reasoningEffortPillApplicableForCurrentModel`) and
+/// `ChatController._runGenerationLoop` forces `effort = null` for
+/// Ollama turns so a stale value carried over from a Claude/Gemini
+/// turn doesn't leak into the Ollama prompt. [modelSupportsNative]
+/// still returns `false` for Ollama (it really doesn't take a native
+/// param) — the suppression happens one layer up.
 ///
 /// The composer pill picks the right mechanism automatically — see
 /// [ReasoningEffortHelper.modelSupportsNative] and

@@ -436,13 +436,53 @@ class ToolExecutor {
     // asked for). Preserve both sides so the UI can display the arrow grammar
     // and open the destination on click.
     final isArrowTool = tool.id == 'move_file' || tool.id == 'copy_file';
-    final firstArg = isArrowTool && m.groupCount >= 2
+    var firstArg = isArrowTool && m.groupCount >= 2
         ? '${m.group(1) ?? ''} -> ${m.group(2) ?? ''}'
         : ((m.groupCount >= 1 ? m.group(1) : '') ?? '');
+
+    // **Line-range hint** (2026-05). Edit-shaped tools record the
+    // touched line range in their success message as ` lines N-M`
+    // (or just ` lines N` for a single-line touch). When present
+    // and not an error, fold it into the firstArg as a `#L42-58`
+    // suffix so the chat-side `_FileToolCard` can render a trailing
+    // line-number chip AND pass the range to the editor when the
+    // user clicks the row. GitHub URL fragment shape is
+    // intentional — it's a familiar `path#Lstart-end` convention
+    // and it round-trips cleanly through `Uri.encodeComponent`
+    // (the `#` becomes `%23`, decoded back on the other side).
+    if (!isError) {
+      final range = _extractLineRange(rawResult);
+      if (range != null) {
+        firstArg = '$firstArg#L$range';
+      }
+    }
     final encoded = Uri.encodeComponent(firstArg);
     final status = isError ? 'err' : 'ok';
     final nonceField = markerNonce == null ? '' : '|$markerNonce';
     return '\n<!-- LUMEN_TOOL:${tool.id}|$encoded|$status$nonceField -->\n';
+  }
+
+  /// Parse the `lines N-M` (or `lines N`) hint each edit-shaped tool
+  /// appends to its success message. Returns the canonical chip
+  /// string (`'42'` or `'42-58'`) ready to splice into a
+  /// `path#L<range>` URL fragment, or `null` when the result has no
+  /// such hint (read-only tools, errors, legacy bodies).
+  ///
+  /// Multi-range success messages (MULTI_EDIT) are summarised by
+  /// taking the FIRST range — that's where the user's reading focus
+  /// jumps when they click the card. The full list still lives in
+  /// the model-facing tool feedback for context.
+  static String? _extractLineRange(String rawResult) {
+    final m = RegExp(
+      r'lines\s+(\d+)(?:\s*-\s*(\d+))?',
+      caseSensitive: false,
+    ).firstMatch(rawResult);
+    if (m == null) return null;
+    final start = m.group(1);
+    final end = m.group(2);
+    if (start == null) return null;
+    if (end == null || end == start) return start;
+    return '$start-$end';
   }
 
   /// Companion to `_friendlyReplacement` — used by the message-copy
