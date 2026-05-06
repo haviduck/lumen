@@ -8,7 +8,13 @@ class S {
 
   // App / common
   static const String appName = 'Lumen';
-  static const String tagline = 'With love from Norway';
+  // Welcome-screen tagline. Sub-heading under the app name on the
+  // welcome panel — short, ~40 chars max so it fits the panel
+  // chrome without wrapping. Currently a tongue-in-cheek line; the
+  // earlier "With love from Norway" was retired when the author
+  // decided the welcome panel needed less sincerity. Keep this
+  // string punchy if you change it again.
+  static const String tagline = 'the user is getting frustrated';
   static const String save = 'Save';
   static const String cancel = 'Cancel';
   static const String close = 'Close';
@@ -577,6 +583,15 @@ class S {
 
   // About
   static const String aboutLegalese = 'Built with Flutter.';
+  // About-dialog body. Surfaces in `widgets/about_dialog.dart`
+  // under the Lumen wordmark. Intentionally short and personal —
+  // the dialog is a "hi, this is who made the thing" surface, not
+  // a feature list. If you grow it past ~3 lines, the dialog's
+  // fixed 420 px width will start to feel cramped — bump the
+  // dialog width before lengthening the copy.
+  static const String aboutDescription =
+      'I needed a tool that fitted my needs and work methods.\n\n'
+      'Hope it fits yours.';
 
   // Explorer
   static const String explorerNewFolder = 'New Folder';
@@ -881,14 +896,17 @@ class S {
   static const String mediaPlacementChat = 'In chat';
   static const String mediaPlacementChatDesc =
       'Top of chat panel. Scales 16:9 with chat width.';
-  static const String mediaPlacementEditor = 'Side column';
+  static const String mediaPlacementEditor = 'Right of editor';
   static const String mediaPlacementEditorDesc =
-      'Stacked alongside SSH and Teams in the right-of-editor column.';
-  // Retained for ABI safety. v1.4 lifted SSH / Teams / Watch into a
-  // shared full-height side column so Teams no longer evicts watch-
-  // media to chat. The string is no longer surfaced anywhere.
+      'Docks to the side of the code editor, above the terminal.';
+  // v1.5: surfaced again. SSH and Teams own the editor side stack
+  // when they're up; watch-media falls back to the chat panel for
+  // the duration. Shown as an inline notice under the placement
+  // chips in `_MediaUrlDialog` when the override is currently
+  // active. Generic "SSH or Teams" wording keeps it accurate
+  // without listing every possible occupant of the side stack.
   static const String mediaTeamsForcesChat =
-      'Teams is already using the editor split, so this media will open in the chat panel.';
+      'SSH or Teams is using the side panel, so this media will open in the chat panel for now.';
 
   // Editor tab context menu.
   static const String tabClose = 'Close';

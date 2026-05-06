@@ -3,8 +3,10 @@ import 'package:provider/provider.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/media_controller.dart';
+import '../../providers/ssh_controller.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import '../side_panes_column.dart';
 import 'duck_glass.dart';
 
 /// Watch-media prompt — pretty glass dialog with URL field +
@@ -127,20 +129,27 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
               // URL input — pill-shaped chip surface with cyan focus.
               _UrlField(controller: _ctrl, focus: _focus, onSubmit: _submit),
               const SizedBox(height: 14),
-              Consumer<MediaController>(
-                // v1.4: dropped the `_TeamsActiveNotice` short-
-                // circuit. Pre-v1.4, when Teams was active we'd
-                // hide the placement chooser and tell the user
-                // "this will open in chat" — because the editor
-                // right-slot was a single-webview surface. The
-                // side-panes column hosts SSH / Teams / Watch
-                // simultaneously now, so the chooser stays live
-                // regardless of Teams' state.
-                builder: (context, media, _) {
-                  return const Column(
+              Consumer2<MediaController, SshController>(
+                // v1.5: when SSH or Teams is currently using the
+                // editor side stack, the user's "side" placement
+                // for watch-media gets overridden to chat (see
+                // `SidePanesColumn.watchForcedToChat`). The chip
+                // chooser still surfaces both options so the
+                // user's persisted preference is visible — we
+                // just add an inline notice explaining that the
+                // editor-placement option will defer to chat
+                // until SSH/Teams steps aside. Without this
+                // notice the user would set "side" and watch the
+                // video appear in chat, with no clue why.
+                builder: (context, media, ssh, _) {
+                  final forced = SidePanesColumn.watchForcedToChat(
+                    ssh: ssh,
+                    media: media,
+                  );
+                  return Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
+                      const Text(
                         S.mediaPlacementLabel,
                         style: TextStyle(
                           fontSize: 11,
@@ -149,8 +158,12 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
                           fontWeight: FontWeight.w500,
                         ),
                       ),
-                      SizedBox(height: 8),
-                      _PlacementChips(),
+                      const SizedBox(height: 8),
+                      const _PlacementChips(),
+                      if (forced) ...[
+                        const SizedBox(height: 8),
+                        const _ForcedToChatNotice(),
+                      ],
                     ],
                   );
                 },
@@ -391,6 +404,50 @@ class _PlacementChipState extends State<_PlacementChip> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Inline notice rendered under the placement chips when SSH or
+/// Teams is currently occupying the editor's side stack — in that
+/// case the user's "side" placement gets overridden to chat (see
+/// `SidePanesColumn.watchForcedToChat`). Surfacing the override
+/// keeps the dialog honest: the chip stays selectable so the
+/// preference can be set, but the user knows the video will land
+/// in chat right now.
+class _ForcedToChatNotice extends StatelessWidget {
+  const _ForcedToChatNotice();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: DuckColors.bgChip,
+        border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+      ),
+      child: const Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.info_outline,
+            size: 13,
+            color: DuckColors.fgSubtle,
+          ),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              S.mediaTeamsForcesChat,
+              style: TextStyle(
+                fontSize: 11.5,
+                color: DuckColors.fgMuted,
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

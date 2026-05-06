@@ -9,52 +9,80 @@ import '../theme/app_colors.dart';
 import 'common/media_pane_chrome.dart';
 import 'ssh/remote_pane.dart';
 
-/// Full-height side column hosting SSH, Teams, and watch-media
-/// (YouTube/Twitch/etc.) as a vertical stack. Sits to the LEFT of
-/// the AI chat sidebar and to the RIGHT of the (Editor + Terminal)
-/// column at the IDE root layout level.
+/// Vertical stack hosting SSH ("Remote"), Teams, and watch-media as a
+/// single side pane mounted to the RIGHT of the code editor (above
+/// the terminal). Sits inside the editor's horizontal split — see
+/// `widgets/editor/editor.dart::_EditorState.build`.
 ///
-/// Architectural note — the v1.0 SSH/Teams split was nested INSIDE
-/// the editor pane, which made the editor cramped whenever any
-/// remote surface was open. v1.4 lifts the column to a sibling of
-/// the editor stack so the editor keeps full height regardless of
-/// how many side panes the user has live. See
-/// `lib/main.dart::_LayoutForMode` for the wiring.
+/// Architectural history (read before refactoring):
 ///
-/// Ordering: SSH (top), Teams (middle), Watch-media (bottom). This
-/// matches the screenshot the user provided when designing the
-/// layout, and roughly groups by "interactive" → "passive": SSH is
-/// most-used, Teams holds focus when in a meeting, and watch-media
-/// is ambient. If we expose the order as a user preference later,
-/// this widget is the one place to thread it through.
+/// - **v1.0–v1.3:** SSH / Teams shared the editor's right slot, but
+///   only one could mount at a time (right-slot was a single Area).
+/// - **v1.4:** Lifted out into a full-height side column at the IDE
+///   root layout level so SSH / Teams / Watch could coexist as a
+///   vertical stack. Trade-off: the editor lost its full height
+///   whenever ANY pane was open, and the column read as a separate
+///   skinny strip detached from the workbench.
+/// - **v1.5 (current):** Lifted back DOWN into the editor area, this
+///   time as a real vertical-stack widget rather than a single-Area
+///   right slot. SSH / Teams stack on top of each other; the
+///   terminal still spans the full workbench width below. Watch
+///   media's "side" placement also lives here, BUT only when nothing
+///   else is occupying the slot — when SSH or Teams is active, watch
+///   is forced into the chat panel via [watchForcedToChat] (the
+///   user's explicit ask: "YouTube alongside SSH/Teams is too much").
 ///
 /// Visibility — this widget assumes its parent has already gated on
 /// `shouldMount(...)` returning true; it does NOT short-circuit to
 /// `SizedBox.shrink()` itself because the parent's
 /// `MultiSplitViewController` decides whether to allocate an Area at
-/// all (and `multi_split_view` 3.6.1's `initialAreas` is consumed
-/// once). See `_LayoutForMode._rebuildControllers` — it rebuilds
-/// the root controller whenever `showSidePanes` flips.
+/// all, and `multi_split_view` 3.6.1's `initialAreas` is consumed
+/// once. See `editor.dart::_buildIdeBody` — it remounts the
+/// horizontal split (via a ValueKey on the active-pane signature)
+/// whenever the visible-pane set changes.
 class SidePanesColumn extends StatelessWidget {
   const SidePanesColumn({super.key});
 
-  /// Pure helper — true when the column has at least one active
-  /// pane to render. Used by `_IdeShell` to decide whether to ask
-  /// `_LayoutForMode` for the Area at all. Centralised here so
-  /// every callsite agrees on what counts as "live".
+  /// True when watch-media's "side" placement is currently being
+  /// overridden because something more important (SSH or Teams) is
+  /// already living in the side stack.
   ///
-  /// Note: this intentionally checks `MediaPlacement.editor` for
-  /// watch-media — the user explicitly chose to dock it here. When
-  /// placement is `chat`, watch-media renders in the AI chat panel
-  /// instead and the side column doesn't claim space for it.
+  /// Consumers:
+  /// - [SidePanesColumn] itself excludes watch when this is true.
+  /// - `ai_chat.dart` renders watch in the chat panel when this is
+  ///   true (regardless of `media.placement`).
+  /// - `media_url_prompt.dart` disables the editor-placement chip
+  ///   and shows a hint when this is true.
+  ///
+  /// Intentional non-symmetry: SSH and Teams DON'T have a similar
+  /// "forced-to-chat" rule because they're not chat-mountable — they
+  /// only ever live in the side stack. Watch is the only multi-home
+  /// surface, hence the special-case.
+  static bool watchForcedToChat({
+    required SshController ssh,
+    required MediaController media,
+  }) {
+    return ssh.hasSessions || media.hasTeams;
+  }
+
+  /// Pure helper — true when the side pane has at least one body to
+  /// render. Used by `editor.dart` to decide whether to add the
+  /// right-slot Area to the editor's horizontal split. Centralised
+  /// here so every callsite agrees on what counts as "live".
+  ///
+  /// Watch-media counts ONLY when `placement == editor` AND nothing
+  /// is forcing it to chat. This way the user's "side" preference is
+  /// preserved when SSH/Teams aren't around, but yields gracefully
+  /// when they are.
   static bool shouldMount({
     required SshController ssh,
     required MediaController media,
   }) {
     final showSsh = ssh.hasSessions;
     final showTeams = media.hasTeams;
-    final showWatch =
-        media.hasMedia && media.placement == MediaPlacement.editor;
+    final showWatch = media.hasMedia &&
+        media.placement == MediaPlacement.editor &&
+        !watchForcedToChat(ssh: ssh, media: media);
     return showSsh || showTeams || showWatch;
   }
 
@@ -65,15 +93,21 @@ class SidePanesColumn extends StatelessWidget {
 
     final showSsh = ssh.hasSessions;
     final showTeams = media.hasTeams;
-    final showWatch =
-        media.hasMedia && media.placement == MediaPlacement.editor;
+    // Watch is suppressed in the side stack whenever SSH/Teams are
+    // also active — see [watchForcedToChat] for the rationale. This
+    // is the only enforcement point for that rule on the side-stack
+    // side; the chat-panel side reads the same helper to decide
+    // whether to mount its own watch view.
+    final showWatch = media.hasMedia &&
+        media.placement == MediaPlacement.editor &&
+        !watchForcedToChat(ssh: ssh, media: media);
 
-    // Same multi_split_view 3.6.1 landmine as editor.dart's
-    // _buildRightSlot: `initialAreas` is consumed once at mount,
-    // so when the active-pane count changes (e.g. user opens
-    // Teams while SSH is already up) we MUST remount the inner
-    // split. The ValueKey, derived from the active-pane signature,
-    // forces a fresh State and therefore a fresh controller.
+    // Same multi_split_view 3.6.1 landmine as editor.dart's outer
+    // horizontal split: `initialAreas` is consumed once at mount,
+    // so when the active-pane count changes we MUST remount the
+    // inner split. The ValueKey, derived from the active-pane
+    // signature, forces a fresh State and therefore a fresh
+    // controller.
     final activeKeys = <String>[
       if (showSsh) 'ssh',
       if (showTeams) 'teams',
@@ -90,9 +124,9 @@ class SidePanesColumn extends StatelessWidget {
 
     if (activeKeys.length == 1) {
       // Single-pane shortcut — avoids the divider chrome and the
-      // mount/unmount churn of an inner MultiSplitView when the
-      // user only has one surface live. Keeps the very common
-      // "just SSH" case zero-overhead.
+      // mount/unmount churn of an inner MultiSplitView when only
+      // one surface is live. Keeps the very common "just SSH"
+      // case zero-overhead.
       if (showSsh) return const _RemoteSlot();
       if (showTeams) return _MediaSlotPane(media: media, slot: MediaSlot.teams);
       return _MediaSlotPane(media: media, slot: MediaSlot.watch);
@@ -103,9 +137,9 @@ class SidePanesColumn extends StatelessWidget {
     // a concrete `size:` is set — flex-sized areas can't be
     // floored. The 80px tall pane that you'd otherwise want as a
     // safety floor is enforced visually by the chrome strip
-    // inside each pane (RemotePane / MediaPaneChrome are at
-    // least ~26px each), so collapsing past usefulness still
-    // shows you which pane you're shrinking.
+    // inside each pane (RemotePane / MediaPaneChrome are at least
+    // ~26px each), so collapsing past usefulness still shows you
+    // which pane you're shrinking.
     final areas = <Area>[
       if (showSsh)
         Area(flex: flex, builder: (_, _) => const _RemoteSlot()),
@@ -144,10 +178,10 @@ class _RemoteSlot extends StatelessWidget {
 
 /// Renders a single Webview-backed media pane (Teams or watch).
 ///
-/// Lifted verbatim from the old `_EditorMediaPane` private class
-/// in `editor.dart` — the editor no longer mounts media itself in
-/// v1.4, so this widget is now the only consumer of
-/// `MediaController.webviewFor(slot)` from the side-panes side.
+/// Lifted verbatim from the v1.0–v1.3 `_EditorMediaPane` private
+/// class in `editor.dart` — the editor no longer mounts media
+/// itself, so this widget is now the only consumer of
+/// `MediaController.webviewFor(slot)` from the side-stack side.
 /// The chat-placement variant continues to live in `ai_chat.dart`.
 class _MediaSlotPane extends StatelessWidget {
   final MediaController media;

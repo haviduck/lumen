@@ -31,7 +31,6 @@ import 'widgets/file_explorer/file_explorer.dart';
 import 'widgets/lock_screen.dart';
 import 'widgets/menu_bar.dart';
 import 'widgets/overlays/overlay_host.dart';
-import 'widgets/side_panes_column.dart';
 import 'widgets/terminal/terminal_pane.dart';
 import 'widgets/welcome_screen.dart';
 
@@ -264,15 +263,14 @@ class _IdeShell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    // Watch SSH + Media so the side-panes column is mounted /
-    // unmounted as soon as either controller flips. The visibility
-    // flag is passed to `_LayoutForMode` which rebuilds its root
-    // `MultiSplitViewController` whenever it changes (the
-    // multi_split_view 3.6.1 `initialAreas` landmine — see the
-    // class doc on `_LayoutForModeState`).
-    final ssh = context.watch<SshController>();
-    final media = context.watch<MediaController>();
-    final showSidePanes = SidePanesColumn.shouldMount(ssh: ssh, media: media);
+    // v1.5: side-panes (SSH/Teams/Watch) are mounted INSIDE the
+    // editor area now (see `editor.dart::build`), so the IDE shell
+    // no longer needs to watch SSH/Media at this level. The editor
+    // self-decides whether to allocate a right slot. Removing the
+    // watch here also avoids spurious re-runs of
+    // `_LayoutForMode.didUpdateWidget` when SSH/Media flip — the
+    // root layout is genuinely orthogonal to side-pane state in
+    // v1.5.
     return _GlobalShortcuts(
       child: OverlayHost(
         child: Scaffold(
@@ -291,7 +289,6 @@ class _IdeShell extends StatelessWidget {
                     child: _LayoutForMode(
                       mode: state.viewMode,
                       chatHidden: state.chatHidden,
-                      showSidePanes: showSidePanes,
                     ),
                   ),
                   const _StatusBar(),
@@ -383,16 +380,9 @@ class _LayoutForMode extends StatefulWidget {
   // *is* the chat-only layout so toggling chat-hidden there would
   // produce an empty workspace.
   final bool chatHidden;
-  // v1.4: full-height column hosting SSH / Teams / Watch-media
-  // sits between the (Editor + Terminal) column and the chat
-  // sidebar. We mount the Area only when something is live so an
-  // empty strip never claims width. `_IdeShell` computes this
-  // from `SidePanesColumn.shouldMount(ssh, media)`.
-  final bool showSidePanes;
   const _LayoutForMode({
     required this.mode,
     required this.chatHidden,
-    required this.showSidePanes,
   });
 
   @override
@@ -403,27 +393,26 @@ class _LayoutForModeState extends State<_LayoutForMode> {
   static const double _chatOptimalWidth = 340;
   static const double _chatMinWidth = 260;
   static const double _chatSnapThreshold = 24;
-  static const double _sidePanesOptimalWidth = 380;
-  static const double _sidePanesMinWidth = 260;
   // Floor on the (Editor + Terminal) workbench column. Without
-  // this, the side-panes divider could be dragged so far left
-  // that the editor disappears entirely with no way to recover
-  // (the divider becomes invisible too once its handle has zero
-  // width to live on). 480 px is enough to comfortably show a
-  // code line at 96-char width plus the editor gutter, and still
-  // leaves the user a usable column on a 1080p secondary monitor.
+  // this, the chat divider could be dragged so far left that the
+  // editor disappears entirely with no way to recover (the
+  // divider becomes invisible too once its handle has zero width
+  // to live on). 480 px is enough to comfortably show a code line
+  // at 96-char width plus the editor gutter, and still leaves the
+  // user a usable column on a 1080p secondary monitor.
   static const double _workbenchMinWidth = 480;
 
   MultiSplitViewController? _root;
   MultiSplitViewController? _centerVertical;
   Axis _rootAxis = Axis.horizontal;
 
-  // Indices in the root area list — used by the divider chrome
-  // helpers (`_snapChatSidebarIfNearOptimal`, the bullet handle
-  // on the chat divider). Both used to be hard-coded to the
-  // chat-divider position; now that the side-panes Area can sit
-  // between center and chat, we record where each lives at
-  // rebuild time and consult these fields instead.
+  // Index of the chat divider in the root area list. v1.5 layout
+  // simplified back to [Explorer | Workbench | Chat?] — the
+  // side-panes Area is gone (moved INSIDE the editor area in
+  // `editor.dart`), so the chat divider is always at index 1
+  // when chat is visible. Kept as a recorded field rather than a
+  // bare constant so the chrome helpers stay readable and
+  // future layout reshuffles don't have to chase a magic number.
   int _chatAreaIndex = -1;
   int _chatDividerIndex = -1;
 
@@ -436,17 +425,15 @@ class _LayoutForModeState extends State<_LayoutForMode> {
   @override
   void didUpdateWidget(covariant _LayoutForMode oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // Rebuild whenever the mode, the chat-hidden flag, OR the
-    // side-panes-visible flag changes — all three feed into which
-    // `Area`s the root `MultiSplitView` ends up holding, and
-    // `MultiSplitViewController.areas` can't be mutated after
-    // construction without surprises, so a fresh controller is
-    // the cleanest path. (multi_split_view 3.6.1 specifically: any
-    // attempt to swap the areas list on an existing controller is
-    // silently ignored.)
+    // Rebuild whenever the mode or the chat-hidden flag changes
+    // — both feed into which `Area`s the root `MultiSplitView`
+    // ends up holding, and `MultiSplitViewController.areas` can't
+    // be mutated after construction without surprises, so a fresh
+    // controller is the cleanest path. (multi_split_view 3.6.1
+    // specifically: any attempt to swap the areas list on an
+    // existing controller is silently ignored.)
     if (oldWidget.mode != widget.mode ||
-        oldWidget.chatHidden != widget.chatHidden ||
-        oldWidget.showSidePanes != widget.showSidePanes) {
+        oldWidget.chatHidden != widget.chatHidden) {
       _rebuildControllers();
     }
   }
@@ -461,27 +448,23 @@ class _LayoutForModeState extends State<_LayoutForMode> {
           ],
         );
         _rootAxis = Axis.horizontal;
-        // Build root areas in order; track chat-area-index for
-        // the divider helpers as we go. Layout from L→R is:
-        //   [Explorer] [Editor+Terminal] [Chat?] [SidePanes?]
+        // Layout from L→R is: [Explorer] [Editor+Terminal] [Chat?]
         //
-        // Why chat sits BEFORE side-panes despite chat being the
-        // "right sidebar" mentally: chat is the user's active
-        // collaboration surface (typing, reading replies), so it
-        // earns the slot adjacent to the editor where focus
-        // already lives. Side-panes hold passive surfaces (Teams,
-        // YouTube, SSH sessions you're not currently typing in),
-        // so they get pushed to the very edge to stay out of the
-        // editor's peripheral vision.
+        // SSH / Teams / Watch (the "side panes") used to live as a
+        // 4th Area here in v1.4. v1.5 moved them INSIDE the
+        // editor area as a horizontal split inside the workbench
+        // top half, so the terminal still spans the full
+        // workbench width below them. The reasoning is two-fold:
+        // (a) the editor + side panes read as a single unit
+        // again, matching the user's mental model from v1.0–v1.3;
+        // (b) the terminal stops being half-width when SSH is
+        // open, which was a frequent footgun.
         final areas = <Area>[
           Area(size: 240, min: 220, builder: (c, a) => const FileExplorer()),
           Area(
             flex: 1,
-            // `min:` floors the editor column so dragging either
-            // the chat divider or the side-panes divider left
-            // can't make the editor vanish (the previous bug —
-            // divider was draggable all the way to the file
-            // explorer's right edge).
+            // `min:` floors the workbench column so dragging the
+            // chat divider left can't make the editor vanish.
             min: _workbenchMinWidth,
             builder: (c, a) => MultiSplitView(
               axis: Axis.vertical,
@@ -493,10 +476,6 @@ class _LayoutForModeState extends State<_LayoutForMode> {
           _chatAreaIndex = areas.length;
           // Divider N sits BETWEEN areas N and N+1; the chat
           // divider is the one immediately before the chat area.
-          // With chat at index 2 (right of the workbench) the
-          // chat divider is always divider 1 — no longer
-          // dependent on whether side-panes are mounted, since
-          // chat now sits BEFORE side-panes.
           _chatDividerIndex = areas.length - 1;
           areas.add(
             Area(
@@ -508,15 +487,6 @@ class _LayoutForModeState extends State<_LayoutForMode> {
         } else {
           _chatAreaIndex = -1;
           _chatDividerIndex = -1;
-        }
-        if (widget.showSidePanes) {
-          areas.add(
-            Area(
-              size: _sidePanesOptimalWidth,
-              min: _sidePanesMinWidth,
-              builder: (c, a) => const SidePanesColumn(),
-            ),
-          );
         }
         _root = MultiSplitViewController(areas: areas);
         break;
@@ -543,11 +513,11 @@ class _LayoutForModeState extends State<_LayoutForMode> {
 
   void _snapChatSidebarIfNearOptimal(int dividerIndex) {
     if (widget.mode != DuckViewMode.normal || widget.chatHidden) return;
-    // Chat divider position varies depending on whether the
-    // SidePanes Area is mounted:
-    //   - chat-only: dividers go [0]=explorer/workbench [1]=workbench/chat
-    //   - chat + side-panes: [0]=explorer/workbench [1]=workbench/sidePanes [2]=sidePanes/chat
-    // `_chatDividerIndex` is recorded by `_rebuildControllers`.
+    // v1.5: chat divider is always at index 1 when chat is
+    // visible (no side-panes Area between workbench and chat
+    // anymore). `_chatDividerIndex` is recorded by
+    // `_rebuildControllers` to keep this resilient to future
+    // layout reshuffles.
     if (_chatDividerIndex < 0 || dividerIndex != _chatDividerIndex) return;
     if (_root == null || _chatAreaIndex < 0) return;
     if (_root!.areasCount <= _chatAreaIndex) return;

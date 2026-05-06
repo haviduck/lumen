@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../l10n/strings.dart';
 import '../theme/app_colors.dart';
 
 class AboutDialog extends StatelessWidget {
@@ -40,7 +41,7 @@ class AboutDialog extends StatelessWidget {
 
             // App name
             const Text(
-              'Lumen',
+              S.appName,
               style: TextStyle(
                 fontSize: 32,
                 fontWeight: FontWeight.w200,
@@ -64,10 +65,7 @@ class AboutDialog extends StatelessWidget {
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 32),
               child: Text(
-                'The other IDEs didn\'t fit my sloppy, ADHD-riddled way of life. '
-                'I needed proper old-school backups via zip, Syncthing, and a '
-                'simple way to add Ollama LLMs without becoming homeless.\n\n'
-                'Hope it fits your needs as well. If not \u2014 suck it.',
+                S.aboutDescription,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 12.5,
@@ -127,7 +125,7 @@ class AboutDialog extends StatelessWidget {
                     ),
                   ),
                   child: const Text(
-                    'Close',
+                    S.close,
                     style: TextStyle(fontSize: 12, color: DuckColors.fgMuted),
                   ),
                 ),

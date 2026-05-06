@@ -10,6 +10,8 @@ import 'package:provider/provider.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
+import '../../providers/media_controller.dart';
+import '../../providers/ssh_controller.dart';
 import '../../services/file_kind.dart';
 import '../../services/language_detector.dart';
 import '../../theme/app_colors.dart';
@@ -18,6 +20,7 @@ import '../common/fast_popup_menu.dart';
 import '../menu_bar.dart';
 import '../process_manager/process_manager_view.dart';
 import '../settings_view.dart';
+import '../side_panes_column.dart';
 import '../common/duck_toast.dart';
 import 'autocomplete_overlay.dart';
 import 'binary_preview.dart';
@@ -300,20 +303,77 @@ class _EditorState extends State<Editor> {
     );
   }
 
+  // Default + minimum width for the side-panes slot when it's
+  // mounted next to the IDE body. Mirrors the v1.4 root-layout
+  // sizing so the muscle-memory width is preserved across the
+  // v1.4 → v1.5 lift-back-into-editor.
+  static const double _sidePanesOptimalWidth = 380;
+  static const double _sidePanesMinWidth = 260;
+  static const double _ideBodyMinWidth = 360;
+
   @override
   Widget build(BuildContext context) {
-    // v1.4: the editor is now JUST the IDE body (tab bar + editor
-    // pane(s)). Previously this build method also wrapped a
-    // horizontal `MultiSplitView` to host the SSH "Remote" pane
-    // and the Teams / Watch-media pane to the right. Both have
-    // been lifted up into the dedicated `SidePanesColumn` widget,
-    // which is a sibling of the (Editor + Terminal) column at the
-    // root layout level (`_LayoutForMode`). The lift gives the
-    // editor full vertical height regardless of how many side
-    // panes are open, and lets SSH / Teams / Watch-media stack
-    // vertically in their own resizable column instead of
-    // fighting for the editor's right slot.
+    // v1.5 layout: the editor is `_buildIdeBody` (tab bar + editor
+    // pane(s)) PLUS — when SSH / Teams / Watch are live — a
+    // resizable side stack to its right. Terminal still spans the
+    // full workbench width below (it's a sibling Area in the outer
+    // vertical split owned by `_LayoutForMode`, not nested
+    // here).
+    //
+    // History: v1.0–v1.3 had a similar setup but the right slot
+    // was a single Area that could only host one of SSH or Teams
+    // at a time. v1.4 lifted SSH/Teams/Watch out into a separate
+    // full-height column at the root, which gave them coexistence
+    // but detached the column from the workbench visually. v1.5
+    // brings them back into the editor area as a real
+    // vertical-stack side pane (`SidePanesColumn`), so the
+    // workbench reads as a single unit again while preserving
+    // multi-pane coexistence. Terminal keeps full-workbench width
+    // because the side-stack lives only in the top half of the
+    // workbench's vertical split.
+    final ssh = context.watch<SshController>();
+    final media = context.watch<MediaController>();
+    final showSidePanes = SidePanesColumn.shouldMount(ssh: ssh, media: media);
+
+    if (!showSidePanes) {
+      return _buildIdeBody(context);
+    }
+
+    // multi_split_view 3.6.1 captured-closure landmine — same one
+    // documented in v1.1's editor refactor and v1.4's
+    // `SidePanesColumn`. The Area builders MUST be tear-offs of
+    // instance methods (or const widget references), never inline
+    // lambdas that close over per-build state, because
+    // `initialAreas` is consumed once at mount and the captured
+    // closure is the only one that ever fires for that area's
+    // lifetime. The ValueKey on the MultiSplitView (constant for
+    // the duration of "side panes are mounted") forces a fresh
+    // mount when the side-pane visibility flag flips, sidestepping
+    // the same trap from the other direction.
+    return MultiSplitView(
+      key: const ValueKey('editor-with-side-panes'),
+      axis: Axis.horizontal,
+      initialAreas: [
+        Area(
+          flex: 1,
+          min: _ideBodyMinWidth,
+          builder: _buildIdeBodyArea,
+        ),
+        Area(
+          size: _sidePanesOptimalWidth,
+          min: _sidePanesMinWidth,
+          builder: _buildSidePanesArea,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildIdeBodyArea(BuildContext context, Area area) {
     return _buildIdeBody(context);
+  }
+
+  Widget _buildSidePanesArea(BuildContext context, Area area) {
+    return const SidePanesColumn();
   }
 
   /// The "IDE body" — tab bar + active pane(s). Reads `AppState`

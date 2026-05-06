@@ -16,6 +16,7 @@ import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
 import '../../providers/chat_controller.dart';
 import '../../providers/media_controller.dart';
+import '../../providers/ssh_controller.dart';
 import '../../services/chat_persistence_service.dart';
 import '../../services/reasoning_effort.dart';
 import '../../theme/app_colors.dart';
@@ -24,6 +25,7 @@ import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
 import '../common/image_lightbox.dart';
 import '../common/media_pane_chrome.dart';
+import '../side_panes_column.dart';
 import 'approval_card.dart';
 import 'chat_tab_strip.dart';
 import 'empty_response_strip.dart';
@@ -460,16 +462,28 @@ class _AiChatState extends State<AiChat> {
                 ),
                 child: Column(
                   children: [
-                    // Media player only renders here when the user
-                    // has selected `MediaPlacement.chat`. When the
-                    // placement is `editor`, the editor area
-                    // hosts the same `Webview()` instead.
-                    Consumer<MediaController>(
-                      builder: (context, media, _) {
-                        if (!media.hasMedia ||
-                            media.placement != MediaPlacement.chat) {
+                    // Watch-media renders here whenever the
+                    // EFFECTIVE placement is `chat`. That's true
+                    // either because the user explicitly chose
+                    // chat-placement, OR because SSH/Teams is
+                    // currently occupying the side stack and watch
+                    // has been forced to the chat panel (see
+                    // `SidePanesColumn.watchForcedToChat` for the
+                    // rule). The two cases produce the same visual
+                    // — the user just sees their video in the
+                    // chat panel — so we don't differentiate.
+                    Consumer2<MediaController, SshController>(
+                      builder: (context, media, ssh, _) {
+                        if (!media.hasMedia) {
                           return const SizedBox.shrink();
                         }
+                        final forced = SidePanesColumn.watchForcedToChat(
+                          ssh: ssh,
+                          media: media,
+                        );
+                        final renderHere =
+                            media.placement == MediaPlacement.chat || forced;
+                        if (!renderHere) return const SizedBox.shrink();
                         return _buildChatMediaPanel(media);
                       },
                     ),
