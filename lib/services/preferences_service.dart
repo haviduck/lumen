@@ -136,6 +136,18 @@ class PreferencesService {
   // analyzer (no analyzer = no-op).
   static const String _kAgentAutoVerifyAfterEdits =
       'agent.autoVerifyAfterEdits';
+  // Hard override that flips every provider back to Lumen's classic
+  // text-grammar `<<<TOOL>>>` protocol even when the routed model
+  // supports native function calling. Default false — native tool
+  // calling is the better path on every provider that supports it
+  // (Anthropic, Gemini, OpenAI/GitHub Models, Ollama with capable
+  // models). Surfaced in Settings → AI / Chat as an escape hatch
+  // for users hitting bugs in the native adapter or who explicitly
+  // want the legacy renderer's behaviour. The native path falls
+  // back to text grammar automatically for Ollama models without
+  // tools capability — this flag only forces text grammar when the
+  // native path WOULD have been chosen.
+  static const String _kForceTextGrammarTools = 'chat.tools.forceTextGrammar';
   // List of tool ids the user has clicked "Always allow" on. Each
   // entry bypasses the approval card per-tool — distinct from the
   // global `agent.autoApproveCommands` flag, which is a master
@@ -325,6 +337,11 @@ class PreferencesService {
       (await _p).getBool(_kAgentAutoVerifyAfterEdits) ?? true;
   Future<void> setAgentAutoVerifyAfterEdits(bool v) async =>
       (await _p).setBool(_kAgentAutoVerifyAfterEdits, v);
+
+  Future<bool> getForceTextGrammarTools() async =>
+      (await _p).getBool(_kForceTextGrammarTools) ?? false;
+  Future<void> setForceTextGrammarTools(bool v) async =>
+      (await _p).setBool(_kForceTextGrammarTools, v);
 
   Future<String> getEditorTheme() async {
     final p = await _p;

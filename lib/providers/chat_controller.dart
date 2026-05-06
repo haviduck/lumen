@@ -23,10 +23,16 @@ import '../services/recent_edits_tracker.dart';
 import '../services/timeline_service.dart';
 import '../services/tool_executor.dart';
 import '../services/tool_registry.dart';
+import '../services/tools/model_tier.dart';
+import '../services/tools/native_tool_format.dart';
+import '../services/tools/tool_schemas.dart';
 import '../services/workspace_skills_service.dart';
+import 'chat/generation_loop_types.dart';
 import 'chat/hallucination_detector.dart';
 import 'chat/history_compressor.dart';
 import 'chat/history_summarizer.dart';
+import 'chat/retry_nudges.dart';
+import 'chat/system_prompt_builder.dart';
 
 /// Matches a single COMPLETE Lumen tool-call block in a streaming
 /// buffer. Used by the agent loop to enforce single-tool-per-iteration
@@ -1214,68 +1220,64 @@ class ChatController extends ChangeNotifier {
     }
   }
 
-  /// Pick up to three registered tool names that resemble [unknown]
-  /// for the `NearMissShape.unknownTool` nudge. The model invented a
-  /// tool name; the nudge is far more useful when it can say "you
-  /// probably meant `X` or `Y`" than when it just says "see the
-  /// system prompt" and the model loops on the same wrong guess.
-  ///
-  /// The similarity test is intentionally simple and tolerant:
-  ///   - shared prefix of length ≥ 3 (`COPY` ↔ `COPY_FILE`),
-  ///   - either name is a substring of the other (`READ` ↔
-  ///     `READ_FILE`),
-  ///   - share any underscore-separated token of length ≥ 3 so
-  ///     `LIST_FILES` matches `LIST_DIR`, `FIND_FILE` matches
-  ///     `FIND_FILE_RANGE`, `GREP` matches `SEARCH_TEXT` (no — they
-  ///     share no token; that's correct, the candidates list will
-  ///     be empty and the nudge falls back to "re-read the system
-  ///     prompt").
-  ///
-  /// No Levenshtein because the false-positive radius is too wide
-  /// at this length range (5–20 chars). The token-based test
-  /// produces zero matches when the model invented something
-  /// genuinely unrelated, which is the right behaviour — better an
-  /// empty list than a misleading "you meant `EDIT_FILE`?" when the
-  /// model wrote `<<<RUN_TESTS: …>>>`.
-  static List<String> _suggestSimilarTools(
-    String unknown,
-    Set<String> known,
-  ) {
-    if (unknown.isEmpty || known.isEmpty) return const <String>[];
-    final tokensU = unknown.split('_').where((t) => t.length >= 3).toSet();
-    final hits = <String>[];
-    for (final k in known) {
-      if (k == unknown) continue;
-      // Substring either direction.
-      if (k.contains(unknown) || unknown.contains(k)) {
-        hits.add(k);
-        continue;
-      }
-      // Shared 3-char prefix on the first segment.
-      final first = k.split('_').first;
-      final firstU = unknown.split('_').first;
-      if (first.length >= 3 && firstU.length >= 3 &&
-          first.substring(0, 3) == firstU.substring(0, 3)) {
-        hits.add(k);
-        continue;
-      }
-      // Any shared underscore-separated token.
-      final tokensK = k.split('_').where((t) => t.length >= 3).toSet();
-      if (tokensK.intersection(tokensU).isNotEmpty) {
-        hits.add(k);
-      }
-    }
-    // Stable order, capped at 3 — long lists noise the nudge.
-    hits.sort();
-    return hits.take(3).toList();
-  }
-
   /// Splits a prefixed model string into (provider, rawModel).
   static (String, String) _splitModel(String model) {
     final idx = model.indexOf(':');
     if (idx > 0) return (model.substring(0, idx), model.substring(idx + 1));
     // Legacy / unprefixed — assume Ollama.
     return ('ollama', model);
+  }
+
+  /// Pretty display name for a provider id. Used in the system
+  /// prompt's identity preamble so the model has a stable
+  /// self-identifier across providers ("You are Lumen running on
+  /// Claude / Gemini / Ollama Cloud …" — not surfaced today but
+  /// available to the prompt builder).
+  static String _prettyProviderLabel(String provider) => switch (provider) {
+        'gemini' => 'Gemini',
+        'claude' => 'Claude',
+        'github' => 'GitHub Models',
+        'ollama-cloud' => 'Ollama Cloud',
+        _ => 'Ollama',
+      };
+
+  /// Whether this turn should use native tool calling for the given
+  /// (provider, model). Defers to per-provider strategy classes:
+  ///
+  /// - Anthropic / Gemini / GitHub Models: hardcoded `true` once their
+  ///   adapters land in Stage B; until then this returns `false` so
+  ///   the existing text-grammar path keeps working unmodified.
+  /// - Ollama (local + cloud): consults
+  ///   [OllamaService.modelSupportsTools] which calls `/api/show`
+  ///   once and caches the answer. Models without the `tools`
+  ///   capability fall back to text grammar.
+  ///
+  /// User override: `chat.tools.forceTextGrammar` preference flips
+  /// every provider back to the text-grammar path. Useful when a
+  /// provider's native-tools implementation is misbehaving and the
+  /// user wants Lumen's classic behaviour as an escape hatch.
+  Future<bool> _shouldUseNativeTools({
+    required String provider,
+    required String rawModel,
+  }) async {
+    final force = await prefs.getForceTextGrammarTools();
+    if (force) return false;
+    switch (provider) {
+      case 'claude':
+        return true;
+      case 'gemini':
+        return true;
+      case 'github':
+        return true;
+      case 'ollama':
+      case 'ollama-cloud':
+        return await ollama.modelSupportsTools(
+          rawModel,
+          forceCloud: provider == 'ollama-cloud',
+        );
+      default:
+        return false;
+    }
   }
 
   /// Route streaming chat generation through the right backend based on
@@ -1293,6 +1295,7 @@ class ChatController extends ChangeNotifier {
     required String model,
     CancellationToken? token,
     ReasoningEffort? effort,
+    Set<String>? nativeToolIds,
   }) async* {
     final (provider, rawModel) = _splitModel(model);
     final enabled = (await prefs.getEnabledProviders()).toSet();
@@ -1318,6 +1321,7 @@ class ChatController extends ChangeNotifier {
           model: rawModel,
           token: token,
           effort: effort,
+          nativeToolIds: nativeToolIds,
         );
         return;
       case 'claude':
@@ -1326,6 +1330,7 @@ class ChatController extends ChangeNotifier {
           model: rawModel,
           token: token,
           effort: effort,
+          nativeToolIds: nativeToolIds,
         );
         return;
       case 'github':
@@ -1334,6 +1339,7 @@ class ChatController extends ChangeNotifier {
           model: rawModel,
           token: token,
           effort: effort,
+          nativeToolIds: nativeToolIds,
         );
         return;
       case 'ollama-cloud':
@@ -1344,6 +1350,7 @@ class ChatController extends ChangeNotifier {
           model: rawModel,
           token: token,
           forceCloud: true,
+          nativeToolIds: nativeToolIds,
         );
         return;
       case 'ollama':
@@ -1355,6 +1362,7 @@ class ChatController extends ChangeNotifier {
           messages,
           model: rawModel,
           token: token,
+          nativeToolIds: nativeToolIds,
         );
         return;
     }
@@ -2811,31 +2819,11 @@ class ChatController extends ChangeNotifier {
     try {
       // Tight workspace context. We deliberately do NOT dump a 50-entry
       // root listing anymore — most of those slots are noise (`build/`,
-      // `.dart_tool/`, `.gitnexus/`, …) and the model can `<<<TREE: .>>>`
-      // if it actually needs to see the layout. Active file + open tabs
-      // are the bits the user genuinely wants the agent to be aware of
-      // ("redesign the sidebar" implicitly means the file the user is
-      // looking at).
-      String workspaceContext = 'No workspace open.';
-      if (workspacePath != null) {
-        final ctxBuf = StringBuffer();
-        ctxBuf.writeln('Working directory: $workspacePath');
-        if (activeFilePath != null) {
-          ctxBuf.writeln(
-            'Active file (user is currently looking at this): '
-            '$activeFilePath',
-          );
-        }
-        if (openFilePaths != null && openFilePaths.isNotEmpty) {
-          final shown = openFilePaths.take(20).join(', ');
-          final trailing = openFilePaths.length > 20
-              ? ' (+${openFilePaths.length - 20} more)'
-              : '';
-          ctxBuf.writeln('Open editor tabs: $shown$trailing');
-        }
-        workspaceContext = ctxBuf.toString().trimRight();
-      }
-
+      // `.dart_tool/`, `.gitnexus/`, …) and the model can request a
+      // `tree` / `<<<TREE: .>>>` if it actually needs the layout. Active
+      // file + open tabs are the bits the user genuinely wants the
+      // agent to be aware of ("redesign the sidebar" implicitly means
+      // the file the user is looking at).
       final compiledRules = await rules.compileForPrompt(workspacePath);
       // Reload + compile workspace skills (`.lumen/skills/*.md`) for
       // injection under `## Workspace skills`. Best-effort: a parse
@@ -2850,13 +2838,6 @@ class ChatController extends ChangeNotifier {
           debugPrint('skills compileForPrompt failed: $e');
         }
       }
-      final toolDocs = ToolRegistry.all
-          .where((t) => _enabledTools.contains(t.id))
-          .map(
-            (t) =>
-                '- ${t.name}: ${t.description}\n  Syntax:\n    ${t.syntaxExample}',
-          )
-          .join('\n');
       final allowOutsideWorkspaceWrites = await prefs
           .getAgentAllowOutsideWorkspaceWrites();
       // Pref read once up-front. Mid-turn changes don't take effect
@@ -2904,125 +2885,59 @@ class ChatController extends ChangeNotifier {
         provider: selectedProvider,
         rawModel: selectedRawModel,
       );
-      final effortBlock = (!effortIsNative && effort != ReasoningEffort.off)
-          ? '${ReasoningEffortHelper.promptDirectiveFor(effort)}\n\n'
-          : '';
 
-      // Provider-neutral system prompt. **Every** provider in this
-      // codebase uses the same `<<<TOOL>>>` text protocol — we don't
-      // call native function/tool APIs anywhere. So discipline rules
-      // apply uniformly; there is no "Claude is special" branch.
-      final pauseLine = resumedAfterPause
-          ? '\n- This session is resuming after a long pause (30+ min). '
-                'The user is starting a new ask, even if it looks brief — '
-                'do NOT pick up where the previous turn left off.'
-          : '';
+      // Decide whether this turn uses native tool calling. Determined
+      // per-(provider, model) — the strategy resolver consults
+      // capability detection (Ollama `/api/show` cache, hard-coded
+      // yes for Anthropic/OpenAI/Gemini). Drives both the system
+      // prompt shape (drop text-grammar tool docs) and the per-
+      // provider request adapter (attach `tools[]`).
+      final useNativeTools = await _shouldUseNativeTools(
+        provider: selectedProvider,
+        rawModel: selectedRawModel,
+      );
 
-      final systemPrompt =
-          '''You are Lumen, the AI coding assistant built into the Lumen IDE.
-You are a senior software engineer working as the user's pair programmer.
-Not a Q&A bot — propose, execute, verify, and report back concisely.
+      // Tier the model so weaker models see a smaller tool surface.
+      // The tier intersects with the user's enabled-tools set —
+      // user toggles still win, the tier just clips the maximum.
+      // Capability fetch is cached on `OllamaService`, so this is
+      // a no-op on iteration 2+ and only adds latency on first
+      // turn against a freshly-introduced model.
+      final tierCapabilities = (selectedProvider == 'ollama' ||
+              selectedProvider == 'ollama-cloud')
+          ? await ollama.getModelCapabilities(
+              selectedRawModel,
+              forceCloud: selectedProvider == 'ollama-cloud',
+            )
+          : const <String>{};
+      final modelTier = ModelTier.classify(
+        provider: selectedProvider,
+        rawModel: selectedRawModel,
+        capabilities: tierCapabilities,
+      );
+      final tieredEnabledTools = _enabledTools
+          .intersection(modelTier.allowedToolIds);
+      debugPrint(
+        '[tier] provider=$selectedProvider model=$selectedRawModel '
+        'tier=${modelTier.level.name} '
+        'tools=${tieredEnabledTools.length}/${_enabledTools.length} '
+        'native=$useNativeTools',
+      );
 
-## Conversation continuity
-Treat messages above the latest user message as HISTORY. Tools already
-ran; files were already written. Only respond to the LATEST user
-message. If it's a greeting, acknowledgement, or unclear, ask what
-they want next — do NOT re-execute prior requests "to be helpful".$pauseLine
-
-## Interpreting short user replies
-When the user replies with one word or a very short phrase
-("continue", "go", "next", "more", "keep going", "and?",
-"yes", "ok", "do it"), they are asking you to make PROGRESS
-on the ORIGINAL task. Do NOT interpret these as "repeat my
-previous tool with different arguments" or "continue the
-read I started". Reread the latest substantive user message
-— the one that established the actual task — and pick the
-next concrete action toward completing it. If the original
-task is genuinely finished, ask the user what they want next
-instead of inventing more work.
-
-## Workspace
-$workspaceContext
-
-$effortBlock## Tools
-Invoke a tool by emitting its EXACT syntax. The tool runs and you
-receive its output back as `<tool_result>...</tool_result>` content
-on the next turn — that is real output, not user input.
-
-**Discipline (applies to every provider):**
-- Output AT MOST ONE tool call per response. After it, STOP and wait
-  for the `<tool_result>`. Then decide your next step.
-- **Tool calls are the ONLY way real changes happen.** Describing an
-  edit in prose ("I'll update the styles to use a dark gradient...")
-  does NOT modify the file. The user only sees changes that ran
-  through an actual `<<<TOOL>>>` invocation. If you intend to edit,
-  emit the tool call. If you only want to describe what you're
-  about to do, prefix with one short prose line, then emit the
-  tool. Never narrate a completed edit you did not actually issue.
-- **NEVER write `<tool_result>...</tool_result>` blocks yourself.**
-  Those messages appear ONLY in subsequent turns, generated by Lumen
-  AFTER a real tool has actually run. If you write `<tool_result>`
-  content in your own response, no tool has run — you are
-  hallucinating execution. Lumen detects this and cuts your stream.
-- Read before editing. Use READ_FILE (optionally with `:start-end`)
-  or SEARCH_TEXT to ground edits in actual code.
-- **For existing files, ALWAYS use EDIT_FILE or MULTI_EDIT. NEVER use
-  CREATE_FILE on a file that exists** — it forces you to retype the
-  entire file, wastes minutes of generation time on big files, and
-  risks dropping content you didn't mean to remove. CREATE_FILE is
-  only for genuinely new files. If you intend a full rewrite, use
-  one MULTI_EDIT with a single search/replace covering the whole
-  body — that still goes through the diff path.
-- A `<tool_result>` line starting with `[FAILED]` means the call did
-  NOT execute. Do not claim success. Re-read the file and retry.
-- After source-code edits, finish with `<<<VERIFY>>>`. If it reports
-  issues, fix them and call VERIFY again.
-- Before starting a dev server / watcher with RUN_CMD, CHECK_URL the
-  expected port first. If reachable, the user already has it running
-  — do NOT spawn a duplicate.
-- ${allowOutsideWorkspaceWrites ? 'Built-in mutation tools may write outside the workspace when explicitly targeted with absolute/parent paths. Prefer in-workspace edits unless the user asks otherwise.' : 'Built-in mutation tools cannot write outside the active workspace. Reads outside are fine. If a write outside is needed, ask the user to enable Settings → Rules → Allow agent writes outside workspace.'}
-
-**Common syntax mistakes — DO NOT MAKE THESE:**
-- WRONG: `<LIST_DIR: .>` (single angle brackets — XML style)
-- WRONG: `<list_dir>...</list_dir>` (XML closing tag)
-- WRONG: ``` ```LIST_DIR``` ``` (markdown code fence)
-- WRONG: `[LIST_DIR: .]` (square brackets)
-- WRONG: `<!-- LUMEN_TOOL:list_dir|.|ok -->` (HTML comment marker —
-  this is an INTERNAL Lumen display token the chat UI uses AFTER a
-  tool runs; emitting it yourself does NOT call a tool)
-- RIGHT: `<<<LIST_DIR: .>>>` (EXACTLY three `<` and three `>` on each side)
-
-Tool calls written in any of the wrong forms WILL NOT EXECUTE. The IDE's
-parser is strict — it only matches three-bracket syntax. If you find
-yourself writing single-bracket tags or HTML-comment markers out of
-habit, stop and fix the syntax before continuing.
-
-**Anti-hallucination rule (critical):**
-- A file you describe as "Created", "Wrote", "Added", "Edited",
-  "Updated", "Modified", or "Saved" MUST have been touched by an
-  actual `<<<CREATE_FILE: ...>>>` / `<<<EDIT_FILE: ...>>>` /
-  `<<<MULTI_EDIT: ...>>>` / `<<<APPEND_FILE: ...>>>` tool call in
-  THIS turn or a previous turn. Never claim file ops you did not
-  invoke as tools.
-- If you are about to write "Created `src/foo.tsx`" but you have
-  not actually emitted a CREATE_FILE block for it, STOP. Either
-  emit the tool call now, or describe it as planned ("I will
-  create `src/foo.tsx`") instead of claimed ("Created
-  `src/foo.tsx`"). The IDE checks claims against actually-fired
-  tools; persistent hallucinated claims will halt the turn.
-
-$toolDocs
-
-## How to work
-1. Stay focused on what the user actually asked. Don't broaden scope
-   unprompted, don't run unrelated installs, don't "fix" tangential
-   issues unless they explicitly block the task.
-2. Stream a one-line plan or progress note BEFORE each tool call so
-   the user sees what you're about to do.
-3. When you're done, give a short summary of what changed. Don't
-   re-narrate every tool you ran — the chat already shows those as
-   cards.
-${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules\n' : ''}${compiledSkills.isNotEmpty ? '\n$compiledSkills\n' : ''}''';
+      final systemPrompt = SystemPromptBuilder.build(SystemPromptInputs(
+        workspacePath: workspacePath,
+        activeFilePath: activeFilePath,
+        openFilePaths: openFilePaths,
+        compiledRules: compiledRules,
+        compiledSkills: compiledSkills,
+        enabledToolIds: tieredEnabledTools,
+        allowOutsideWorkspaceWrites: allowOutsideWorkspaceWrites,
+        resumedAfterPause: resumedAfterPause,
+        effort: effort,
+        effortIsNative: effortIsNative,
+        useNativeTools: useNativeTools,
+        providerLabel: _prettyProviderLabel(selectedProvider),
+      ));
 
       final apiMessages = <Map<String, dynamic>>[
         {'role': 'system', 'content': systemPrompt},
@@ -3113,7 +3028,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         workspaceDir: workspacePath,
         approver: (toolId, label, detail) =>
             _approveCommandForSession(sessionId, toolId, label, detail),
-        enabledTools: _enabledTools,
+        enabledTools: tieredEnabledTools,
         recorder: tlRecorder,
         allowWritesOutsideWorkspace: allowOutsideWrites,
         // Hand the per-turn cancel token down so RUN_CMD (and any
@@ -3316,6 +3231,15 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       const cutOnFirstTool = true;
       int? firstToolEnd;
 
+      // **Native tool call cut.** When the routed provider supports
+      // native tool calling AND the user hasn't forced text grammar,
+      // the per-iteration scan watches for `NativeToolUseMarker`
+      // chunks. The first one we see captures the parsed call,
+      // splices the marker out of the visible buffer, and breaks
+      // the stream — same single-tool-per-iter discipline as text
+      // grammar, just with a structured payload.
+      NativeToolUse? pendingNativeToolUse;
+
       // **Hallucinated `<tool_result>` cut.** The assistant should
       // never emit `<tool_result>` in its own stream — those blocks
       // are user-role messages we inject AFTER a real tool runs.
@@ -3350,11 +3274,23 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       const int maxAutoContinues = 3;
       int autoContinueCount = 0;
 
+      // Compute the native-tools surface ONCE per turn. Intersects
+      // tiered enabled tools with the schema-registered tool ids so
+      // the wire `tools[]` array reflects the user's choices, the
+      // model's tier, AND the schema layer.
+      final nativeToolIdsForTurn = useNativeTools
+          ? <String>{
+              for (final s in ToolSchemas.all)
+                if (tieredEnabledTools.contains(s.id)) s.id,
+            }
+          : null;
+
       while (keepLooping && i < maxIters && !cancelToken.isCancelled) {
         i++;
         firstToolEnd = null;
         hallucinationCutAt = null;
         hallucinationDetected = false;
+        pendingNativeToolUse = null;
         final iterBuf = StringBuffer();
         // **Runaway-loop guards** (set during streaming, checked
         // post-stream). Two trips:
@@ -3440,6 +3376,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
           model: modelForTurn,
           token: cancelToken,
           effort: effort,
+          nativeToolIds: nativeToolIdsForTurn,
         )) {
           if (cancelToken.isCancelled) break;
 
@@ -3474,6 +3411,39 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
               aggregated, iterBuf.toString(), thinkBuf.toString(), true,
             ));
             continue;
+          }
+
+          // ── Native tool_use marker — emitted by provider services
+          //    when the model invoked a tool via the structured
+          //    `tools[]` API. Single tool per iteration; on hit we
+          //    splice the marker out of the visible stream, capture
+          //    the parsed call, and break out so the executor
+          //    dispatches and the next iteration sends the
+          //    tool_result back. Same single-tool boundary as the
+          //    text-grammar `cutOnFirstTool` path, just for native
+          //    callers. We only need to scan when native is active
+          //    (cheap when the marker isn't present).
+          if (nativeToolIdsForTurn != null &&
+              chunk.contains(NativeToolUseMarker.prefix)) {
+            // Append everything BEFORE the marker to iterBuf so the
+            // assistant's prose preceding the tool call survives
+            // verbatim; we'll save the parsed call separately.
+            final localStart = chunk.indexOf(NativeToolUseMarker.prefix);
+            if (localStart > 0) {
+              iterBuf.write(chunk.substring(0, localStart));
+            }
+            // The provider yields the marker in a single chunk
+            // (it's built atomically via NativeToolUseMarker.build),
+            // so a tryParse on the full chunk should always succeed.
+            // If not, fall through to the regular content path —
+            // worst case the marker leaks into the visible stream
+            // as an HTML comment (markdown-ignored) instead of
+            // breaking the turn.
+            final parsed = NativeToolUseMarker.tryParse(chunk);
+            if (parsed != null) {
+              pendingNativeToolUse = parsed;
+              break;
+            }
           }
 
           // ── Normal content chunk (non-thinking) ──
@@ -3537,6 +3507,39 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             break;
           }
 
+          // ── Ollama Cloud 182s wall — proactive cut ─────────────
+          // Ollama Cloud has an unfixed-upstream 182-second hard
+          // request timeout
+          // (https://github.com/ollama/ollama/issues/15973). When
+          // we get close, we proactively close our own stream by
+          // emitting a synthetic truncation marker. The auto-
+          // continue gate then fires with the truncation reason
+          // and the next iteration starts fresh — which avoids the
+          // network-error path (where the wall surfaces as a
+          // ClientException) AND lets the model continue from
+          // where it left off. We only apply this on cloud routes
+          // where the wall actually exists; local Ollama doesn't
+          // have a comparable timeout.
+          //
+          // Threshold of 175s leaves a 7-second margin for our
+          // request-roundtrip overhead and for the model to flush
+          // any in-flight tokens.
+          if ((selectedProvider == 'ollama-cloud' ||
+                  (selectedProvider == 'ollama' &&
+                      OllamaService.isCloudModel(selectedRawModel))) &&
+              DateTime.now()
+                      .difference(iterationStartedAt)
+                      .inMilliseconds >
+                  175000) {
+            iterBuf.write('\n<!-- LUMEN_TRUNCATED:length -->\n');
+            debugPrint(
+              '[ollama-cloud-precut] sessionId=$sessionId '
+              'iters=$i model=$modelForTurn '
+              'elapsed=${DateTime.now().difference(iterationStartedAt).inSeconds}s',
+            );
+            break;
+          }
+
           // The live message shows previous-iterations aggregated +
           // current iteration's running buffer + thinking section,
           // separated by blank lines.
@@ -3590,8 +3593,30 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             : cleanedRaw.substring(0, cutAt).trimRight();
         // Run the executor on the raw text. `processedResponse` has
         // tool-call syntax rewritten to friendly placeholders.
+        // In native-tools mode this almost always produces zero
+        // hits — the model invokes tools structurally — but it's
+        // cheap to run and catches the case where a model emits
+        // both a native tool_use AND a stray `<<<TOOL>>>` (we'd
+        // want both to fire so the visible chat doesn't drop
+        // either). Pure-text mode flows entirely through this.
         final pass = await executor.run(executableRaw);
         firedAcrossTurn.addAll(pass.firedTools);
+
+        // Dispatch any pending native tool_use captured during
+        // streaming. This is the structured-tools counterpart to
+        // the text-grammar dispatch above; both feed into the same
+        // `firedAcrossTurn` list so the rest of the loop (auto-
+        // verify, hallucination detection, tasks-log) treats both
+        // paths uniformly.
+        ToolPassResult? nativePass;
+        if (pendingNativeToolUse != null) {
+          final ntu = pendingNativeToolUse;
+          nativePass = await executor.runNativeToolCall(
+            toolId: ntu.name,
+            args: ntu.arguments,
+          );
+          firedAcrossTurn.addAll(nativePass.firedTools);
+        }
         // End-of-iteration timing stamp. Includes both streaming
         // wall-clock AND executor wall-clock (tool runs). That's
         // the right boundary because the user perceives both as
@@ -3675,35 +3700,75 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
               '<!-- LUMEN_THINKING -->\n$thinkStr\n<!-- /LUMEN_THINKING -->\n\n';
         }
         aggregated += pass.processedResponse.trim();
+        // Native-tool dispatch's friendly LUMEN_TOOL marker carries
+        // a leading newline for paragraph framing, so we just
+        // append it after the prose.
+        if (nativePass != null) {
+          aggregated += nativePass.processedResponse;
+        }
         // Snap the live message to the cleaned-up version. Force
         // notify so the executor's "raw → friendly" rewrite is
         // visible immediately, not on the next throttle tick.
         updateLive(aggregated, forceNotify: true);
 
-        if (pass.hasToolCalls) {
-          // For the model's history, send the RAW (unprocessed)
-          // assistant text — the model needs to see its own tool
-          // calls verbatim so the next turn's context lines up.
-          apiMessages.add({'role': 'assistant', 'content': executableRaw});
-          // Tool output is framed as a `<tool_result>` block so the
-          // model can clearly distinguish tool output from genuine
-          // user input. Smaller / quantized cloud models (Qwen-Coder,
-          // Gemma cloud, DeepSeek) routinely treated `Tool Feedback:`
-          // as if the user had pasted code and either commented on
-          // it or expanded scope; the explicit XML-ish framing is a
-          // strong enough signal to fix that without us moving to
-          // native tool-calling APIs.
-          final toolFeedback = await _compressToolFeedback(
-            pass.toolFeedback,
-            token: cancelToken,
-          );
-          final feedback = <String, dynamic>{
-            'role': 'user',
-            'content':
-                '<tool_result>\n${toolFeedback.trimRight()}\n'
-                '</tool_result>',
-          };
-          apiMessages.add(feedback);
+        // Treat either text-grammar OR native tool dispatch as
+        // "tools fired this iteration" so the conversation loop
+        // continues, the auto-continue gate stays inert, and the
+        // tasks-log gets its entry.
+        final hadAnyTool = pass.hasToolCalls || nativePass != null;
+        if (hadAnyTool) {
+          if (nativePass != null && pendingNativeToolUse != null) {
+            final ntu = pendingNativeToolUse;
+            // Native path: assistant message carries prose +
+            // structured `tool_use` envelope; the tool reply is a
+            // dedicated `role: 'tool'` entry referencing the same
+            // id. Provider services translate this into their
+            // wire-native shape.
+            apiMessages.add(<String, dynamic>{
+              'role': 'assistant',
+              'content': executableRaw,
+              'tool_use': {
+                'id': ntu.id,
+                'name': ntu.name,
+                'arguments': ntu.arguments,
+              },
+            });
+            final toolFeedback = await _compressToolFeedback(
+              nativePass.toolFeedback,
+              token: cancelToken,
+            );
+            apiMessages.add(<String, dynamic>{
+              'role': 'tool',
+              'tool_use_id': ntu.id,
+              // Ollama links replies to calls by tool NAME (the
+              // `tool_name` field in `role: 'tool'` messages),
+              // not by the synthesized id used by Anthropic /
+              // OpenAI. Stamping both lets each provider's
+              // translator pick the linkage it needs.
+              'tool_name': ntu.name,
+              'content': toolFeedback.trimRight(),
+            });
+          } else {
+            // Text-grammar path: send the RAW (unprocessed) assistant
+            // text so the model sees its own tool calls verbatim,
+            // and frame tool output as a `<tool_result>` block.
+            // Smaller / quantized cloud models (Qwen-Coder, Gemma
+            // cloud, DeepSeek) routinely treated `Tool Feedback:`
+            // as if the user had pasted code and either commented
+            // on it or expanded scope; the XML-ish framing fixes
+            // that without forcing native APIs.
+            apiMessages
+                .add({'role': 'assistant', 'content': executableRaw});
+            final toolFeedback = await _compressToolFeedback(
+              pass.toolFeedback,
+              token: cancelToken,
+            );
+            apiMessages.add(<String, dynamic>{
+              'role': 'user',
+              'content': '<tool_result>\n${toolFeedback.trimRight()}\n'
+                  '</tool_result>',
+            });
+          }
         } else {
           // ── Auto-verify gate (Issue: "look for errors before done") ──
           // The model thinks it's done. Before letting the loop close,
@@ -3774,210 +3839,52 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
                   executableRaw.trim().isEmpty ||
                   (_kOpenFileToolRe.hasMatch(executableRaw) &&
                       !_kCloseFileToolRe.hasMatch(executableRaw)))) {
-            // ── Auto-continue gate ────────────────────────────────
-            // Four triggers, bounded to [_maxAutoContinues] recovery
-            // attempts per turn:
+            // ── Auto-continue gate (consolidated) ──────────────
+            // Six recoverable failure modes, ranked by precedence:
+            //   1. hallucinated <tool_result>    (hallucinationDetected)
+            //   2. tool-syntax near-miss         (nearMissTool != null)
+            //   3. intent without action         (intentWithoutAction)
+            //   4. incomplete multi-line tool    (hasIncompleteFileTool)
+            //   5. truncation at output cap      (wasTruncated)
+            //   6. empty / thinking-no-output    (executableRaw.trim().isEmpty)
             //
-            //   1. **Truncation** — the upstream API cut the stream
-            //      at the model's output token cap. Continue from
-            //      where it left off.
-            //
-            //   2. **Hallucinated `<tool_result>`** — the model
-            //      started fabricating tool execution. We cut the
-            //      stream before any imagined output landed; tell
-            //      it that no tool ran and what the real syntax is.
-            //
-            //   3. **Empty** — the model emitted nothing useful
-            //      (the cloud-Ollama "just stops" exhaustion
-            //      pattern). Nudge it to either commit to a tool
-            //      call or explain what it needs.
-            //
-            //   4. **Incomplete file-tool block** — the model
-            //      opened `<<<CREATE_FILE: ...>>>` (or EDIT_FILE /
-            //      MULTI_EDIT / APPEND_FILE) but never emitted the
-            //      matching `<<<END_FILE>>>` (or END_EDIT /
-            //      END_APPEND). Common with smaller Ollama-hosted
-            //      models (glm-5.1:cloud and similar) that narrate
-            //      "Now creating X" with the opener but skip the
-            //      body and close, leaving the executor with
-            //      nothing to fire. This case used to be caught by
-            //      the closeless-babble guard before it was
-            //      removed for false-positiving on legitimate
-            //      Claude multi-tool output — Claude always closes
-            //      its blocks, so this targeted check is safe.
-            //
-            // Each gets a reason-specific nudge so the model has
-            // concrete guidance instead of a generic "try again".
+            // Each maps to a [RetryReason]; nudge prose lives in
+            // `chat/retry_nudges.dart` so this block stays
+            // control-flow only. Bounded to `maxAutoContinues=3`
+            // attempts per turn — beyond that we surface the
+            // empty-response strip.
             final hasIncompleteFileTool =
                 _kOpenFileToolRe.hasMatch(executableRaw) &&
                 !_kCloseFileToolRe.hasMatch(executableRaw);
             autoContinueCount++;
-            final String reason;
-            final String nudge;
+            final RetryReason reason;
+            NudgeContext? nudgeCtx;
             if (hallucinationDetected) {
-              reason = 'hallucinated tool_result';
-              nudge =
-                  'I cut your stream because you started writing a '
-                  '`<tool_result>` block. NO tool has actually run. '
-                  'Those messages come ONLY from Lumen, in '
-                  'subsequent turns, AFTER a real tool executes — '
-                  'never from you. To actually invoke a tool, '
-                  'output exactly `<<<TOOL_NAME: args>>>` (three '
-                  'angle brackets each side, no slash, no closing '
-                  'tag), one tool per response, then STOP and wait '
-                  'for the real `<tool_result>` to come back. Do '
-                  'not narrate or simulate tool output yourself.';
+              reason = RetryReason.hallucinatedToolResult;
             } else if (nearMissTool != null) {
               final hit = nearMissTool;
-              final toolName = hit.name;
-              reason = 'tool syntax near-miss ($toolName, '
-                  '${hit.shape.name})';
-              switch (hit.shape) {
-                case NearMissShape.xmlStyle:
-                  nudge =
-                      'You wrote `<$toolName: ...>` (single '
-                      'angle brackets — XML style). NO tool '
-                      'ran. Lumen\'s parser requires EXACTLY '
-                      'three angle brackets on each side: '
-                      '`<<<$toolName: args>>>`. Re-emit the '
-                      'same invocation with three brackets each '
-                      'side, one tool per response, then STOP '
-                      'and wait for the real `<tool_result>`.';
-                case NearMissShape.doubleBracket:
-                  nudge =
-                      'You wrote `<<$toolName: ...>>` (TWO '
-                      'angle brackets each side). NO tool ran. '
-                      'Lumen\'s parser requires EXACTLY THREE '
-                      'angle brackets on each side: '
-                      '`<<<$toolName: args>>>`. Add one more '
-                      '`<` and one more `>` and re-emit, one '
-                      'tool per response, then STOP and wait '
-                      'for the real `<tool_result>`.';
-                case NearMissShape.malformedClose:
-                  nudge =
-                      'You opened the tool correctly with '
-                      '`<<<$toolName:` (three `<`) but the '
-                      'CLOSING brackets were short — only one '
-                      'or two `>` instead of three. NO tool '
-                      'ran. The close MUST be exactly `>>>` '
-                      '(three angle brackets). Re-emit the '
-                      'invocation with the proper close: '
-                      '`<<<$toolName: args>>>`, then STOP and '
-                      'wait for the real `<tool_result>`.';
-                case NearMissShape.htmlComment:
-                  // `LUMEN_TOOL` is the sentinel returned by the
-                  // detector when the marker had no parseable tool
-                  // id; render a generic version then. Otherwise
-                  // we have the actual tool the model probably
-                  // meant to call.
-                  final isGeneric = toolName == 'LUMEN_TOOL';
-                  final example = isGeneric
-                      ? '<<<TOOL_NAME: args>>>'
-                      : '<<<$toolName: args>>>';
-                  nudge =
-                      'You wrote `<!-- LUMEN_TOOL ... -->` (an '
-                      'HTML comment). NO tool ran. That marker '
-                      'is an INTERNAL display token Lumen '
-                      'generates AFTER your tool actually '
-                      'executes — the chat UI rewrites real '
-                      'tool calls into it for rendering. It is '
-                      'NOT a tool-call syntax. To actually '
-                      'invoke a tool, emit `$example` (three '
-                      'angle brackets each side, no HTML '
-                      'comment, no slash, one tool per '
-                      'response), then STOP and wait for the '
-                      'real `<tool_result>`.';
-                case NearMissShape.unknownTool:
-                  // Build a short list of registered tools whose
-                  // name resembles the unknown one — close
-                  // substring match or shared prefix. Cheap; the
-                  // nudge is far more actionable than "see the
-                  // system prompt" because the model often loops
-                  // on the same wrong name otherwise.
-                  //
-                  // Recomputing the enabled-tool set here rather
-                  // than capturing the `knownNames` from the
-                  // detection site keeps `knownNames` scoped to
-                  // the detector call (where it's actually used)
-                  // and avoids leaking it into the wider
-                  // continuation-decision block.
-                  final enabledNames = <String>{
-                    for (final t in ToolRegistry.all)
-                      if (_enabledTools.contains(t.id))
-                        t.id.toUpperCase(),
-                  };
-                  final candidates = _suggestSimilarTools(
-                    toolName,
-                    enabledNames,
-                  );
-                  final suggestionLine = candidates.isEmpty
-                      ? 'Re-read the tool list in the system prompt.'
-                      : 'Closest registered tools: ${candidates.join(', ')}.';
-                  nudge =
-                      'You called `<<<$toolName: …>>>` but '
-                      '$toolName is not a registered tool — NO '
-                      'tool ran. Lumen only dispatches the tool '
-                      'names listed in your system prompt. '
-                      '$suggestionLine If none fits, ask the user '
-                      'instead of inventing tools. Re-emit ONE '
-                      'real tool call, then STOP and wait for the '
-                      'real `<tool_result>`.';
-              }
+              reason = RetryReason.nearMissTool;
+              nudgeCtx = nearMissContext(
+                toolName: hit.name,
+                shape: hit.shape,
+                enabledToolIds: <String>{
+                  for (final t in ToolRegistry.all)
+                    if (tieredEnabledTools.contains(t.id))
+                      t.id.toUpperCase(),
+                },
+              );
             } else if (intentWithoutAction) {
-              reason = 'intent without action';
-              nudge =
-                  'You committed to an action ("Let me read…", '
-                  '"I\'ll check…", or similar) but never actually '
-                  'invoked the tool. Saying you will do something '
-                  'is not the same as doing it — the IDE only '
-                  'sees a tool call when you emit '
-                  '`<<<TOOL_NAME: args>>>` in your response, with '
-                  'three angle brackets each side. Either emit '
-                  'the tool call you committed to NOW, one tool '
-                  'per response, then stop and wait for the '
-                  '`<tool_result>` — or, if you genuinely don\'t '
-                  'know what to call, ask the user a concrete '
-                  'question. Do not narrate intent with no '
-                  'follow-through.';
+              reason = RetryReason.intentWithoutAction;
             } else if (hasIncompleteFileTool) {
-              reason = 'incomplete tool block';
-              nudge =
-                  'You opened a multi-line tool block '
-                  '(CREATE_FILE / EDIT_FILE / MULTI_EDIT / '
-                  'EDIT_RANGE / APPEND_FILE) but never emitted the matching '
-                  'close marker (`<<<END_FILE>>>`, '
-                  '`<<<END_EDIT>>>`, or `<<<END_APPEND>>>`). No '
-                  'file was created or edited. Each multi-line '
-                  'tool needs THREE parts on separate lines: '
-                  'opening marker, the body content, then the '
-                  'matching close marker. Re-emit ONE complete '
-                  'tool block — opening, body, AND close — in '
-                  'this response, then stop and wait for the '
-                  'tool_result. Do not narrate "now creating X" '
-                  'without the close marker; that produces nothing.';
+              reason = RetryReason.incompleteFileTool;
             } else if (wasTruncated) {
-              reason = 'truncation';
-              nudge =
-                  'Your previous response was cut at the output '
-                  'token cap before you finished. Continue from '
-                  'where you left off. Prefer EDIT_FILE / '
-                  'MULTI_EDIT over CREATE_FILE so you do not '
-                  'have to retype content you already produced.';
+              reason = RetryReason.truncation;
             } else {
-              reason = thinkStr.isNotEmpty ? 'thinking but no output' : 'empty';
-              nudge = thinkStr.isNotEmpty
-                  ? 'You reasoned internally but produced no visible '
-                    'output. Your thinking was received — now commit to '
-                    'an action: emit the appropriate tool call '
-                    '(one per response, then wait for <tool_result>), '
-                    'or provide a brief answer. Do not stay silent after '
-                    'thinking.'
-                  : 'Your previous response had no content. Either '
-                    'complete the task with the appropriate tool '
-                    'call (one per response, then wait for '
-                    '<tool_result>), or briefly say what you need '
-                    'from me to proceed. Do not stay silent.';
+              reason = thinkStr.isNotEmpty
+                  ? RetryReason.thinkingNoOutput
+                  : RetryReason.empty;
             }
+            final nudge = buildNudge(reason, extra: nudgeCtx);
             // Only persist a non-empty assistant turn — Anthropic
             // 400s on empty assistant content and Gemini's
             // alternating-roles merge gets confused. The empty
@@ -3991,7 +3898,7 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
             if (aggregated.isNotEmpty) aggregated += '\n\n';
             final remaining = maxAutoContinues - autoContinueCount;
             aggregated +=
-                '_(auto-continued — $reason. '
+                '_(auto-continued — ${retryTag(reason)}. '
                 '${remaining > 0 ? 'Attempt $autoContinueCount/$maxAutoContinues.' : 'Final attempt.'})_';
             updateLive(aggregated, forceNotify: true);
             // keepLooping stays true; next iteration runs.
@@ -4008,6 +3915,32 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
       // stale "still streaming" indicator visible).
       throttleTimer?.cancel();
       throttleTimer = null;
+
+      // ── Iteration-cap footer ──────────────────────────────────
+      // The loop's `while` condition is
+      // `keepLooping && i < maxIters && !cancelToken.isCancelled`.
+      // When the loop exits because `i >= maxIters` (instead of a
+      // clean `keepLooping = false` on done or user cancellation)
+      // `keepLooping` is still true. Without a visible footer the
+      // user sees the chat just stop streaming mid-agentic-loop
+      // with NO indication that we hit the cap — historically the
+      // #1 "chat just dies" report. The footer pairs with the
+      // `[turn-timing]` debugPrint below for terminal-grep
+      // diagnosis. Runaway-guard / hallucination-halt paths can't
+      // reach this gate: runaway-guard `break`s on iter < maxIters
+      // and hallucination-halt sets `keepLooping = false`, so
+      // gating on `keepLooping && i >= maxIters` is sufficient
+      // and there's no need to negate them explicitly.
+      if (!cancelToken.isCancelled && keepLooping && i >= maxIters) {
+        aggregated += S.chatIterationCapHit(maxIters);
+        updateLive(aggregated, forceNotify: true);
+        debugPrint(
+          '[iteration-cap] sessionId=$sessionId '
+          'iters=$i model=$modelForTurn '
+          'autoContinues=$autoContinueCount '
+          'firedTools=${firedAcrossTurn.length}',
+        );
+      }
 
       // ── Hallucination halt warning ────────────────────────────
       // If [halluHaltTriggered] flipped during the loop, append a
@@ -4110,6 +4043,10 @@ ${compiledRules.isNotEmpty ? '\n## Project Rules (always follow)\n$compiledRules
         'ttfb=${firstByteLatencyMs ?? -1}ms '
         'iters=$iterationCount '
         'lastIter=${lastIterationDurationMs ?? -1}ms '
+        'firedTools=${firedAcrossTurn.length} '
+        'tools=[${firedAcrossTurn.map((f) => f.id).join(",")}] '
+        'tier=${modelTier.level.name} '
+        'native=$useNativeTools '
         'cancelled=${cancelToken.isCancelled}',
       );
 

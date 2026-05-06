@@ -124,13 +124,20 @@ class HallucinationDetector {
   ///   2. The response is short (≤ [_kIntentMaxChars]) — long
   ///      multi-paragraph answers aren't this failure mode.
   ///   3. The trailing prose ends with a colon (the strongest
-  ///      "tool call should have followed" signal) OR contains a
-  ///      `Let me <verb>` / `I'll <verb>` / `I will <verb>` /
-  ///      `Going to <verb>` commitment with an action verb
-  ///      ([_actionVerbs]) AND ends without the kind of
-  ///      conversational closer that signals "waiting for user"
-  ///      (a question mark, "?", indicates the model handed
-  ///      back to the user — leave it alone).
+  ///      "tool call should have followed" signal), OR contains
+  ///      a commitment phrase (`Let me`, `I'll`, `I will`,
+  ///      `Going to`, `First, let me`, `Now I'll`) followed
+  ///      within ~80 chars by an action verb in any inflection
+  ///      (`read | reads | reading | readed`). The window-based
+  ///      match catches the common "Let me start by reading…"
+  ///      pattern where the immediate next word is a filler
+  ///      ("start", "begin", "first") and the real verb sits
+  ///      a few words later as a gerund. False positives at
+  ///      this layer are bounded by the auto-continue retry
+  ///      cap; recovered cases (model finally invokes the
+  ///      tool) are far more valuable than the rare miss.
+  ///   4. A trailing question mark short-circuits — "?" means
+  ///      the model handed back to the user; leave it alone.
   static bool detectIntentWithoutAction(String assistantText) {
     if (assistantText.isEmpty) return false;
     final stripped = _stripFencedBlocks(assistantText)
@@ -142,14 +149,29 @@ class HallucinationDetector {
 
     if (stripped.endsWith(':')) return true;
 
-    final intentRe = RegExp(
-      r'\b(?:Let me|I[\u2019\x27]?ll|I will|Going to|Now I[\u2019\x27]?ll|First[,]? let me)\s+'
-      r'([a-z]+)\b',
+    // Match a commitment phrase, then look for ANY action verb in
+    // any inflection within the next 80 chars. This is the
+    // permissive form of the old "exact next word must be an
+    // action verb" rule — wide enough to catch "Let me start by
+    // looking at App.tsx" / "I'll begin by reading the
+    // BubbleBackground component" / "First, let me explore the
+    // styles", which the strict form missed because it stopped
+    // at "start" / "begin" / "explore".
+    final commitRe = RegExp(
+      r'\b(?:Let me|I[\u2019\x27]?ll|I will|Going to|'
+      r'Now I[\u2019\x27]?ll|First[,]? let me|First[,]? I[\u2019\x27]?ll|'
+      r'Let me start|Let me begin|Let me first)\b',
       caseSensitive: false,
     );
-    for (final m in intentRe.allMatches(stripped)) {
-      final verb = (m.group(1) ?? '').toLowerCase();
-      if (_actionVerbs.contains(verb)) return true;
+    for (final m in commitRe.allMatches(stripped)) {
+      final scanFrom = m.end;
+      final scanTo = (scanFrom + 80).clamp(0, stripped.length);
+      final span = stripped.substring(scanFrom, scanTo).toLowerCase();
+      for (final verb in _actionVerbs) {
+        if (RegExp('\\b$verb(?:s|es|ed|ing)?\\b').hasMatch(span)) {
+          return true;
+        }
+      }
     }
     return false;
   }
@@ -164,15 +186,35 @@ class HallucinationDetector {
   static const int _kIntentMaxChars = 800;
 
   /// Verbs that almost always imply a tool call should have
-  /// followed. Conservative on purpose — "think", "consider",
-  /// "ponder", "wonder" intentionally NOT here because those
-  /// are legit chat verbs the model uses without tools.
+  /// followed. Includes both direct action verbs (`read`, `edit`,
+  /// `run`) AND recon-flavored verbs (`understand`, `review`,
+  /// `investigate`) that small / cloud-Ollama models routinely
+  /// commit to without follow-through. Conservative on intentional
+  /// chat verbs — "think", "consider", "ponder", "wonder",
+  /// "imagine", "guess" stay OFF the list because those are legit
+  /// reasoning patterns where no tool should fire.
+  ///
+  /// The detector matches any inflection (`read | reads | reading
+  /// | readed`) so we don't have to enumerate every form here.
   static const Set<String> _actionVerbs = <String>{
     'read', 'check', 'look', 'examine', 'find', 'search', 'list',
     'see', 'view', 'inspect', 'identify', 'analyze', 'analyse',
     'fix', 'edit', 'update', 'create', 'write', 'modify',
     'run', 'execute', 'test', 'verify', 'open', 'load', 'fetch',
     'grep', 'scan',
+    // Added 2026-05 after observing gemma4:31b and deepseek-v4-pro
+    // commit-and-stop with these recon verbs and never invoke a
+    // tool. "Let me start by understanding…" / "Let me begin by
+    // exploring the codebase" / "First, let me review the
+    // structure" all need to fire the detector now.
+    'understand', 'review', 'explore', 'investigate', 'gather',
+    'dig', 'walk', 'browse', 'trace',
+    // Direct mutation verbs the small-model commit-and-stop
+    // pattern also lands on. "I'll add bubble animation",
+    // "I'll implement the change", "Going to remove the dead
+    // code". Same false-positive bound as the recon set.
+    'add', 'remove', 'delete', 'implement', 'build', 'install',
+    'refactor', 'rename', 'move',
   };
 
   /// `(toolName, shape)` describing the first near-miss found in

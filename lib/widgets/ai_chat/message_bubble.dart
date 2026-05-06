@@ -1282,72 +1282,86 @@ class _ThinkingBlockState extends State<_ThinkingBlock>
     super.dispose();
   }
 
+  bool _hover = false;
+
   @override
   Widget build(BuildContext context) {
     final hasContent = widget.content.trim().isNotEmpty;
+    final clickable = hasContent;
+    // 2026-05 visual de-clutter pass: the previous bordered + tinted-bg
+    // chip card competed visually with file-tool cards and turned a
+    // typical agentic turn ("think → tool → think → tool → …") into a
+    // wall of equally-loud chrome. Slim treatment: borderless, no
+    // baseline tint, hover lift only — same grammar as the queued-
+    // prompts strip rows. Expanded content area unchanged so the
+    // user can still read the full reasoning trace.
     return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.only(bottom: 4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          GestureDetector(
-            onTap: hasContent ? () => setState(() => _expanded = !_expanded) : null,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: DuckColors.bgDeeper.withValues(alpha: 0.6),
-                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                border: Border.all(
-                  color: DuckColors.fgSubtle.withValues(alpha: 0.4),
-                  width: 0.5,
+          MouseRegion(
+            cursor: clickable ? SystemMouseCursors.click : SystemMouseCursors.basic,
+            onEnter: (_) => setState(() => _hover = true),
+            onExit: (_) => setState(() => _hover = false),
+            child: GestureDetector(
+              onTap: clickable ? () => setState(() => _expanded = !_expanded) : null,
+              behavior: HitTestBehavior.opaque,
+              child: AnimatedContainer(
+                duration: DuckMotion.fast,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                decoration: BoxDecoration(
+                  color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
+                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                 ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (widget.isActive)
-                    AnimatedBuilder(
-                      animation: _pulseController,
-                      builder: (_, child) => Opacity(
-                        opacity: 0.4 + 0.6 * _pulseController.value,
-                        child: child,
-                      ),
-                      child: Icon(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (widget.isActive)
+                      AnimatedBuilder(
+                        animation: _pulseController,
+                        builder: (_, child) => Opacity(
+                          opacity: 0.4 + 0.6 * _pulseController.value,
+                          child: child,
+                        ),
+                        child: Icon(
+                          Icons.psychology,
+                          size: 12,
+                          color: DuckColors.accentPurple,
+                        ),
+                      )
+                    else
+                      Icon(
                         Icons.psychology,
-                        size: 14,
-                        color: DuckColors.accentPurple,
+                        size: 12,
+                        color: DuckColors.fgFaint,
                       ),
-                    )
-                  else
-                    Icon(
-                      Icons.psychology,
-                      size: 14,
-                      color: DuckColors.fgMuted,
+                    const SizedBox(width: 5),
+                    Text(
+                      widget.isActive
+                          ? S.thinkingActive
+                          : S.thinkingDone,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: widget.isActive
+                            ? DuckColors.accentPurple
+                            : DuckColors.fgSubtle,
+                        fontStyle: FontStyle.italic,
+                      ),
                     ),
-                  const SizedBox(width: 6),
-                  Text(
-                    widget.isActive
-                        ? S.thinkingActive
-                        : S.thinkingDone,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: widget.isActive
-                          ? DuckColors.accentPurple
-                          : DuckColors.fgMuted,
-                      fontStyle: FontStyle.italic,
-                    ),
-                  ),
-                  if (hasContent && !widget.isActive) ...[
-                    const SizedBox(width: 4),
-                    Icon(
-                      _expanded
-                          ? Icons.expand_less
-                          : Icons.expand_more,
-                      size: 14,
-                      color: DuckColors.fgMuted,
-                    ),
+                    if (hasContent && !widget.isActive) ...[
+                      const SizedBox(width: 2),
+                      Icon(
+                        _expanded
+                            ? Icons.expand_less
+                            : Icons.expand_more,
+                        size: 12,
+                        color: DuckColors.fgFaint,
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
@@ -1362,7 +1376,7 @@ class _ThinkingBlockState extends State<_ThinkingBlock>
                   color: DuckColors.bgDeepest.withValues(alpha: 0.5),
                   borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                   border: Border.all(
-                    color: DuckColors.fgSubtle.withValues(alpha: 0.3),
+                    color: DuckColors.fgSubtle.withValues(alpha: 0.25),
                     width: 0.5,
                   ),
                 ),

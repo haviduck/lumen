@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
+import 'tools/native_tool_format.dart';
 
 /// Talks to GitHub Models inference API (https://models.github.ai).
 ///
@@ -67,6 +68,7 @@ class GitHubModelsService {
     required int maxTokens,
     double temperature = 0.7,
     ReasoningEffort? effort,
+    Set<String>? nativeToolIds,
   }) {
     // GitHub Models accepts only string `content` for now (per current docs).
     // We flatten any image attachments to a textual placeholder so a multimodal
@@ -76,14 +78,47 @@ class GitHubModelsService {
     for (final m in messages) {
       final role = m['role'] as String;
       final content = m['content'] as String? ?? '';
+
+      // Native tool-result reply. OpenAI/GitHub-compatible shape uses
+      // `role: 'tool'` with `tool_call_id` referencing the assistant's
+      // earlier `tool_calls[i].id`.
+      if (role == 'tool') {
+        converted.add({
+          'role': 'tool',
+          'tool_call_id': (m['tool_use_id'] as String?) ?? '',
+          'content': content,
+        });
+        continue;
+      }
+
       final images = (m['images'] as List<dynamic>? ?? const []).length;
       final extra = images > 0 ? '\n\n[+$images image(s) attached]' : '';
-      converted.add({
+      final entry = <String, dynamic>{
         'role': role == 'assistant'
             ? 'assistant'
             : (role == 'system' ? 'system' : 'user'),
         'content': '$content$extra',
-      });
+      };
+
+      // Native tool_use carried on an assistant turn. OpenAI shape:
+      // `tool_calls: [{id, type: "function", function: {name, arguments}}]`
+      // with `arguments` as a JSON-encoded STRING (not an object).
+      final toolUse = m['tool_use'];
+      if (role == 'assistant' && toolUse is Map<String, dynamic>) {
+        final args =
+            (toolUse['arguments'] as Map?)?.cast<String, dynamic>() ?? {};
+        entry['tool_calls'] = <Map<String, dynamic>>[
+          {
+            'id': (toolUse['id'] as String?) ?? '',
+            'type': 'function',
+            'function': {
+              'name': (toolUse['name'] as String?) ?? '',
+              'arguments': jsonEncode(args),
+            },
+          },
+        ];
+      }
+      converted.add(entry);
     }
 
     final body = <String, dynamic>{
@@ -92,6 +127,11 @@ class GitHubModelsService {
       'temperature': temperature,
       'max_tokens': maxTokens,
     };
+
+    if (nativeToolIds != null && nativeToolIds.isNotEmpty) {
+      body['tools'] = NativeToolDefinitions.forOpenAi(nativeToolIds);
+      body['tool_choice'] = 'auto';
+    }
 
     // **Reasoning effort** — gpt-5 family + o-series accept the
     // `reasoning_effort` field (low/medium/high). gpt-4o / gpt-4.1 /
@@ -158,6 +198,7 @@ class GitHubModelsService {
     CancellationToken? token,
     Duration idleTimeout = const Duration(minutes: 3),
     ReasoningEffort? effort,
+    Set<String>? nativeToolIds,
   }) async* {
     if (token?.isCancelled == true) return;
     if (apiKey.isEmpty) {
@@ -174,6 +215,7 @@ class GitHubModelsService {
         model: model,
         maxTokens: 8192,
         effort: effort,
+        nativeToolIds: nativeToolIds,
       )..['stream'] = true;
       final url = '$baseUrl$_inferencePath';
       // Verifies the exact wire-level model id and endpoint, since GitHub's
@@ -207,6 +249,16 @@ class GitHubModelsService {
             },
           );
 
+      // OpenAI streams native `tool_calls` as per-index deltas: each
+      // chunk's `delta.tool_calls[i]` may carry `id` once, then a
+      // sequence of `function.arguments` partial-JSON strings. We
+      // accumulate per-index until `finish_reason: tool_calls` (or
+      // the stream closes), then emit one NativeToolUseMarker for
+      // the FIRST assembled call (single-tool-per-iter discipline).
+      final toolCallId = <int, String>{};
+      final toolCallName = <int, String>{};
+      final toolCallArgs = <int, StringBuffer>{};
+
       await for (final line in lineStream) {
         if (token?.isCancelled == true) return;
         if (line.isEmpty || !line.startsWith('data: ')) continue;
@@ -221,13 +273,64 @@ class GitHubModelsService {
           if (choices.isEmpty) continue;
           final choice = choices.first as Map<String, dynamic>;
           final delta = choice['delta'] as Map<String, dynamic>? ?? const {};
+
+          // Text content (most common case).
           final text = delta['content'] as String? ?? '';
           if (text.isNotEmpty) yield text;
-          // OpenAI-compatible truncation signal: `finish_reason: 'length'`
-          // on the final chunk means we hit `max_tokens`. Surface a
-          // hidden marker so the controller can auto-continue.
+
+          // Streamed native tool_calls (OpenAI shape).
+          final tcs = delta['tool_calls'] as List<dynamic>?;
+          if (tcs != null) {
+            for (final raw in tcs) {
+              final tc = raw as Map<String, dynamic>;
+              final idx = (tc['index'] as int?) ?? 0;
+              final id = tc['id'] as String?;
+              if (id != null && id.isNotEmpty) {
+                toolCallId[idx] = id;
+              }
+              final fn = tc['function'] as Map<String, dynamic>?;
+              if (fn != null) {
+                final name = fn['name'] as String?;
+                if (name != null && name.isNotEmpty) {
+                  toolCallName[idx] = name;
+                }
+                final argsPart = fn['arguments'] as String?;
+                if (argsPart != null && argsPart.isNotEmpty) {
+                  (toolCallArgs[idx] ??= StringBuffer()).write(argsPart);
+                }
+              }
+            }
+          }
+
+          // OpenAI-compatible truncation / tool_calls finish signals.
           final finishReason = choice['finish_reason'] as String?;
-          if (finishReason == 'length') {
+          if (finishReason == 'tool_calls' || finishReason == 'function_call') {
+            // Flush every assembled tool call as a NativeToolUseMarker.
+            // Cap at the FIRST one to mirror Lumen's single-tool-per-iter
+            // discipline — extras would just be ignored by the controller.
+            final indices = toolCallId.keys.toList()..sort();
+            for (final idx in indices) {
+              final id = toolCallId[idx] ?? '';
+              final name = toolCallName[idx] ?? '';
+              final raw = toolCallArgs[idx]?.toString() ?? '';
+              Map<String, dynamic> args;
+              try {
+                args = raw.isEmpty
+                    ? <String, dynamic>{}
+                    : (jsonDecode(raw) as Map).cast<String, dynamic>();
+              } catch (e) {
+                debugPrint(
+                  'GitHub Models tool_call arg parse failed: $e ($raw)',
+                );
+                args = <String, dynamic>{};
+              }
+              yield NativeToolUseMarker.build(
+                id: id, name: name, arguments: args,
+              );
+              // Single-tool boundary — emit only the first.
+              break;
+            }
+          } else if (finishReason == 'length') {
             yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
           }
         } catch (e) {

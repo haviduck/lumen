@@ -251,6 +251,24 @@ class S {
       'Qwen Coder, GLM, or Gemini variants tend to obey custom '
       'tool syntax better than thinking-only Ollama models.';
 
+  // Iteration-cap footer surfaced when the agent loop exhausted its
+  // [ChatController.maxIters] budget without the model finishing on
+  // its own. Distinct from the empty-response strip (no chunks ever
+  // arrived) and the hallucination warning (claims without tools) —
+  // here the model DID produce output and DID call tools, it just
+  // didn't converge on "done" within the iteration budget. Common on
+  // weaker / smaller models that get stuck re-reading the same file
+  // or repeatedly trying a near-miss EDIT_FILE that keeps failing.
+  static String chatIterationCapHit(int cap) =>
+      '\n\n_(stopped — agent loop hit its $cap-iteration budget '
+      'without converging. The model produced output but didn\'t '
+      'finish the task on its own. Try a more specific follow-up '
+      '("just fix the import", "stop and summarise what you tried"), '
+      'or rewind via the message menu and re-prompt with a tighter '
+      'scope. Persistent loops here usually mean the model is fighting '
+      'a tool failure it can\'t recover from — switching to a stronger '
+      'model often resolves it.)_';
+
   // Empty-response strip — surfaces after a turn ends with no visible
   // content, no tool calls, no error. Common Ollama failure mode where
   // the stream closes cleanly but the model produced nothing useful.

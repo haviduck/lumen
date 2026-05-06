@@ -96,19 +96,38 @@ class HistoryCompressor {
   }
 
   static bool _isToolResultMessage(Map<String, dynamic> m) {
-    if (m['role'] != 'user') return false;
+    final role = m['role'];
+    // Native-tools shape (Anthropic / Gemini / OpenAI / Ollama tool path).
+    // Translated to provider-specific tool_result blocks at request
+    // time; compression of stale entries works the same way.
+    if (role == 'tool') return true;
+    if (role != 'user') return false;
     final content = m['content'];
     return content is String && content.contains('<tool_result>');
   }
 
-  /// Replace the inner body of a `<tool_result>...</tool_result>` block
-  /// with a one-line summary. Multiple blocks in the same string
-  /// (rare — happens when adjacent tool calls were merged before the
-  /// per-iteration framing landed) are each shrunk independently.
+  /// Replace the inner body of a tool_result with a one-line summary.
+  /// Handles BOTH shapes:
+  ///
+  /// - Text-grammar: `<tool_result>...</tool_result>` blocks inside a
+  ///   user-role message's `content` string.
+  /// - Native: a `role: 'tool'` message whose entire `content` IS the
+  ///   tool output (no XML wrapper).
   ///
   /// Visible only via [compressForWire]; not exported because the
   /// regex shape is an implementation detail.
   static String _stubForToolResult(String original) {
+    // Native shape — entire string IS the tool output. Compose the
+    // stub directly without trying to find XML boundaries.
+    if (!original.contains('<tool_result>')) {
+      final inner = original.trim();
+      if (inner.isEmpty) return '(elided: empty)';
+      final firstLine = inner.split('\n').first.trim();
+      final preview = firstLine.length > _previewMaxChars
+          ? '${firstLine.substring(0, _previewMaxChars)}…'
+          : firstLine;
+      return '(elided: ${inner.length} chars — "$preview")';
+    }
     final re = RegExp(r'<tool_result>([\s\S]*?)</tool_result>');
     return original.replaceAllMapped(re, (match) {
       final inner = (match.group(1) ?? '').trim();

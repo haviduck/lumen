@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
+import 'tools/native_tool_format.dart';
 
 /// Detect image MIME type from base64 data by inspecting magic bytes.
 /// Falls back to image/jpeg since that's what our resize pipeline produces.
@@ -73,6 +74,7 @@ class AnthropicService {
     required int maxTokens,
     double temperature = 0.7,
     ReasoningEffort? effort,
+    Set<String>? nativeToolIds,
   }) {
     final systemParts = <String>[];
     final converted = <Map<String, dynamic>>[];
@@ -85,9 +87,43 @@ class AnthropicService {
         continue;
       }
 
+      // Native tool-result reply (came from the executor in a prior
+      // iteration). Anthropic encodes this as a `user` message
+      // carrying a single `tool_result` content block referencing
+      // the assistant's `tool_use_id`.
+      if (role == 'tool') {
+        final toolUseId = (m['tool_use_id'] as String?) ?? '';
+        converted.add({
+          'role': 'user',
+          'content': <Map<String, dynamic>>[
+            {
+              'type': 'tool_result',
+              'tool_use_id': toolUseId,
+              'content': content,
+            },
+          ],
+        });
+        continue;
+      }
+
       final blocks = <Map<String, dynamic>>[];
       if (content.isNotEmpty) {
         blocks.add({'type': 'text', 'text': content});
+      }
+
+      // Native tool_use carried on an assistant turn. Anthropic
+      // requires the tool_use block alongside the prose in the
+      // SAME assistant message, otherwise the next tool_result
+      // can't reference the id.
+      final toolUse = m['tool_use'];
+      if (role == 'assistant' && toolUse is Map<String, dynamic>) {
+        blocks.add({
+          'type': 'tool_use',
+          'id': (toolUse['id'] as String?) ?? '',
+          'name': (toolUse['name'] as String?) ?? '',
+          'input':
+              (toolUse['arguments'] as Map?)?.cast<String, dynamic>() ?? {},
+        });
       }
 
       final images = m['images'] as List<dynamic>? ?? [];
@@ -140,6 +176,15 @@ class AnthropicService {
     };
     if (systemParts.isNotEmpty) {
       body['system'] = systemParts.join('\n\n');
+    }
+
+    // Attach native tool definitions when the caller wants the
+    // structured `tools[]` path. We let Claude choose freely
+    // (tool_choice: auto) — forcing a tool with `tool_choice:
+    // {type: "tool", name: "..."}` would break the agentic loop.
+    if (nativeToolIds != null && nativeToolIds.isNotEmpty) {
+      body['tools'] = NativeToolDefinitions.forAnthropic(nativeToolIds);
+      body['tool_choice'] = {'type': 'auto'};
     }
 
     // **Extended thinking** — Claude Opus 4+ / Sonnet 4+ accept a
@@ -249,8 +294,20 @@ class AnthropicService {
     List<Map<String, dynamic>> messages, {
     String model = 'claude-sonnet-4-6',
     CancellationToken? token,
-    Duration idleTimeout = const Duration(minutes: 3),
+    // Bumped from 3 → 6 minutes (2026-05). Extended-thinking on Opus
+    // 4.7+ with high effort can legitimately go 3+ minutes between
+    // SSE deltas while reasoning server-side — the old 3-min idle
+    // window was killing long-form Claude turns mid-thought, and
+    // the closed sink surfaced as a clean "stream ended" with no
+    // visible signal to the user (the controller's auto-continue
+    // gate doesn't fire when the partial content is non-empty,
+    // which is the typical Opus-mid-reasoning shape). 6 minutes
+    // covers Anthropic's documented worst-case adaptive thinking
+    // duration with margin; genuine network stalls past this
+    // bound are exceptionally rare and the user can Stop+retry.
+    Duration idleTimeout = const Duration(minutes: 6),
     ReasoningEffort? effort,
+    Set<String>? nativeToolIds,
   }) async* {
     if (token?.isCancelled == true) return;
     if (apiKey.isEmpty) {
@@ -267,6 +324,7 @@ class AnthropicService {
         model: model,
         maxTokens: 16384,
         effort: effort,
+        nativeToolIds: nativeToolIds,
       )..['stream'] = true;
 
       final req = http.Request('POST', Uri.parse('$baseUrl/v1/messages'))
@@ -290,6 +348,18 @@ class AnthropicService {
             },
           );
 
+      // Per-content-block bookkeeping for native tool_use parsing.
+      // Anthropic SSE emits content blocks one at a time, indexed
+      // by `obj['index']`; tool_use blocks open with a
+      // `content_block_start` carrying id+name, then stream
+      // `input_json_delta` chunks of partial JSON, then
+      // `content_block_stop` signals end. We buffer per-index and
+      // emit a `NativeToolUseMarker` on close.
+      final blockType = <int, String>{};
+      final blockToolId = <int, String>{};
+      final blockToolName = <int, String>{};
+      final blockToolInput = <int, StringBuffer>{};
+
       await for (final line in lineStream) {
         if (token?.isCancelled == true) return;
         if (line.isEmpty || !line.startsWith('data: ')) continue;
@@ -299,21 +369,64 @@ class AnthropicService {
         try {
           final obj = jsonDecode(data) as Map<String, dynamic>;
           final type = obj['type'] as String? ?? '';
-          if (type == 'content_block_delta') {
-            // With extended thinking enabled, the SSE stream emits two
-            // delta types: `thinking_delta` (carries `delta.thinking`,
-            // model's internal reasoning) and `text_delta` (carries
-            // `delta.text`, user-visible response). We only forward
-            // `text_delta` — thinking is for the model's benefit, not
-            // the chat panel. Anthropic guarantees thinking blocks
-            // arrive BEFORE text blocks, so by the time `text_delta`
-            // chunks start flowing the model is already past the
-            // reasoning phase.
+          if (type == 'content_block_start') {
+            final idx = (obj['index'] as int?) ?? -1;
+            final cb =
+                obj['content_block'] as Map<String, dynamic>? ?? const {};
+            final cbType = cb['type'] as String? ?? '';
+            blockType[idx] = cbType;
+            if (cbType == 'tool_use') {
+              blockToolId[idx] = (cb['id'] as String?) ?? '';
+              blockToolName[idx] = (cb['name'] as String?) ?? '';
+              blockToolInput[idx] = StringBuffer();
+            }
+          } else if (type == 'content_block_stop') {
+            final idx = (obj['index'] as int?) ?? -1;
+            if (blockType[idx] == 'tool_use') {
+              final id = blockToolId[idx] ?? '';
+              final name = blockToolName[idx] ?? '';
+              final raw = blockToolInput[idx]?.toString() ?? '';
+              Map<String, dynamic> args;
+              try {
+                args = raw.isEmpty
+                    ? <String, dynamic>{}
+                    : (jsonDecode(raw) as Map).cast<String, dynamic>();
+              } catch (e) {
+                debugPrint(
+                  'Anthropic tool_use arg parse failed: $e ($raw)',
+                );
+                args = <String, dynamic>{};
+              }
+              yield NativeToolUseMarker.build(
+                id: id, name: name, arguments: args,
+              );
+            }
+            blockType.remove(idx);
+            blockToolId.remove(idx);
+            blockToolName.remove(idx);
+            blockToolInput.remove(idx);
+          } else if (type == 'content_block_delta') {
+            // With extended thinking enabled, the SSE stream emits
+            // multiple delta types: `thinking_delta` (carries
+            // `delta.thinking`, model's internal reasoning),
+            // `text_delta` (carries `delta.text`, user-visible
+            // response), and `input_json_delta` (carries
+            // `delta.partial_json`, native tool_use args streamed
+            // as JSON tokens). We forward `text_delta` directly
+            // and accumulate `input_json_delta` for the
+            // content_block_stop emission. Thinking deltas are
+            // dropped — they're for the model's benefit, not the
+            // chat panel. Anthropic guarantees thinking blocks
+            // arrive before user-visible blocks.
             final delta = obj['delta'] as Map<String, dynamic>? ?? {};
             final deltaType = delta['type'] as String? ?? '';
             if (deltaType == 'text_delta' || deltaType.isEmpty) {
               final text = delta['text'] as String? ?? '';
               if (text.isNotEmpty) yield text;
+            } else if (deltaType == 'input_json_delta') {
+              final idx = (obj['index'] as int?) ?? -1;
+              final partial = delta['partial_json'] as String? ?? '';
+              blockToolInput[idx]?.write(partial);
             }
           } else if (type == 'message_delta') {
             // Final-message envelope. `delta.stop_reason` is one of

@@ -1525,129 +1525,118 @@ class _FileToolCardState extends State<_FileToolCard> {
       _scrollBodyToBottomSoon();
     }
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: MouseRegion(
-        cursor: cardClickable ? SystemMouseCursors.click : SystemMouseCursors.basic,
-        onEnter: (_) => setState(() => _hover = true),
-        onExit: (_) => setState(() => _hover = false),
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: cardClickable ? onTap : null,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 100),
-            padding: const EdgeInsets.fromLTRB(10, 8, 12, 8),
-            decoration: BoxDecoration(
-              color: _hover ? DuckColors.bgRaised : DuckColors.bgDeeper,
-              borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-              border: Border.all(
-                color: _hover
-                    ? DuckColors.accentCyan.withValues(alpha: 0.4)
-                    : DuckColors.glassSeam,
-                width: 0.5,
+    // 2026-05 visual de-clutter pass: was a bordered card with
+    // bgDeeper background, ~36px tall when stacked filename + dir.
+    // For a turn that reads 8 files this stacked into a wall of
+    // chrome that drowned the assistant's prose. Slim treatment
+    // matches `_InspectionBadge` and `_ThinkingBlock`: borderless
+    // single-line row, transparent bg, hover lift to bgRaisedHi,
+    // path rendered inline as full relative path (no dir/filename
+    // split). Click semantics preserved: openable rows open the
+    // file in the editor, body-shaped pending rows toggle the
+    // streaming `_LiveBodyPanel`. The action label colour + the
+    // pending-dot / error tint carry status. Status badge dropped
+    // — its info now lives in the action text ("Read failed" /
+    // "Edited") and the accent colour.
+    final isError = !s.pending && !s.ok;
+    return MouseRegion(
+      cursor: cardClickable ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: cardClickable ? onTap : null,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AnimatedContainer(
+              duration: DuckMotion.fast,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+              decoration: BoxDecoration(
+                color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
+                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
               ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  children: [
-                    Icon(icon, size: 14, color: DuckColors.fgMuted),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: LayoutBuilder(
-                        builder: (context, constraints) {
-                          final stackBadge = constraints.maxWidth < 120;
-                          final title = Text(
-                            filename,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontFamily: DuckTheme.monoFont,
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w600,
-                              color: DuckColors.fgPrimary,
-                            ),
-                          );
-                          final badge = _ToolStatusBadge(
-                            label: action,
-                            accent: accent,
-                            pending: s.pending,
-                          );
-                          return Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (stackBadge) ...[
-                                title,
-                                const SizedBox(height: 3),
-                                badge,
-                              ] else
-                                Row(
-                                  children: [
-                                    Expanded(child: title),
-                                    const SizedBox(width: 8),
-                                    badge,
-                                  ],
-                                ),
-                              if (dir.isNotEmpty && dir != '.') ...[
-                                const SizedBox(height: 2),
-                                Text(
-                                  dir,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontFamily: DuckTheme.monoFont,
-                                    fontSize: 10.5,
-                                    color: DuckColors.fgFaint,
-                                    height: 1.2,
-                                  ),
-                                ),
-                              ],
-                            ],
-                          );
-                        },
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (s.pending)
+                    const _PendingDot()
+                  else
+                    Icon(icon, size: 11, color: accent),
+                  const SizedBox(width: 6),
+                  Text(
+                    action,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: isError ? FontWeight.w600 : FontWeight.w500,
+                      color: accent,
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      // Show the full relative path inline. The
+                      // older split-into-filename-and-dir layout
+                      // wasted vertical space and forced two lines
+                      // for any file outside the workspace root.
+                      // Full path also matches what the
+                      // `_InspectionBadge` renders so the two
+                      // surfaces read consistently.
+                      dir.isNotEmpty && dir != '.'
+                          ? '$dir/$filename'
+                          : filename,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      softWrap: false,
+                      style: TextStyle(
+                        fontFamily: DuckTheme.monoFont,
+                        fontSize: 11,
+                        color: isError
+                            ? DuckColors.stateError
+                            : DuckColors.fgMuted,
                       ),
                     ),
-                    if (hasLiveBody)
-                      Padding(
-                        padding: const EdgeInsets.only(left: 6),
-                        child: AnimatedRotation(
-                          turns: _bodyExpanded ? 0.5 : 0.0,
-                          duration: const Duration(milliseconds: 140),
-                          child: const Icon(
-                            Icons.expand_more,
-                            size: 16,
-                            color: DuckColors.accentCyan,
-                          ),
-                        ),
-                      )
-                    else if (openable)
-                      AnimatedOpacity(
-                        duration: const Duration(milliseconds: 120),
-                        opacity: _hover ? 1.0 : 0.0,
-                        child: const Padding(
-                          padding: EdgeInsets.only(left: 6),
-                          child: Icon(
-                            Icons.open_in_new,
-                            size: 12,
-                            color: DuckColors.accentCyan,
-                          ),
+                  ),
+                  if (hasLiveBody)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 6),
+                      child: AnimatedRotation(
+                        turns: _bodyExpanded ? 0.5 : 0.0,
+                        duration: DuckMotion.fast,
+                        child: const Icon(
+                          Icons.expand_more,
+                          size: 14,
+                          color: DuckColors.accentCyan,
                         ),
                       ),
-                  ],
-                ),
-                if (hasLiveBody && _bodyExpanded) ...[
-                  const SizedBox(height: 8),
-                  _LiveBodyPanel(
-                    body: body,
-                    scrollController: _bodyScroll,
-                  ),
+                    )
+                  else if (openable)
+                    AnimatedOpacity(
+                      duration: DuckMotion.fast,
+                      opacity: _hover ? 1.0 : 0.0,
+                      child: const Padding(
+                        padding: EdgeInsets.only(left: 6),
+                        child: Icon(
+                          Icons.open_in_new,
+                          size: 11,
+                          color: DuckColors.accentCyan,
+                        ),
+                      ),
+                    ),
                 ],
-              ],
+              ),
             ),
-          ),
+            if (hasLiveBody && _bodyExpanded)
+              Padding(
+                padding: const EdgeInsets.only(top: 4, left: 6, bottom: 2),
+                child: _LiveBodyPanel(
+                  body: body,
+                  scrollController: _bodyScroll,
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -1865,86 +1854,91 @@ class _ToolStatusBadgeState extends State<_ToolStatusBadge>
 /// same action, [parseChatSegments] collapses them into a
 /// [ToolGroupSegment] and renders the [ToolGroupView] header
 /// instead, so a long search-spam turn doesn't blow up the column.
-class _InspectionBadge extends StatelessWidget {
+class _InspectionBadge extends StatefulWidget {
   final ToolSegment segment;
   const _InspectionBadge({required this.segment});
 
   @override
+  State<_InspectionBadge> createState() => _InspectionBadgeState();
+}
+
+class _InspectionBadgeState extends State<_InspectionBadge> {
+  bool _hover = false;
+
+  @override
   Widget build(BuildContext context) {
+    final segment = widget.segment;
+    // 2026-05 visual de-clutter pass: was a bordered pill with
+    // letter-spaced UPPERCASE action label. Eight of those in one turn
+    // made the chat read as wall-of-chips and drowned the prose. New
+    // form is a borderless, single-line activity row mirroring the
+    // queued-prompts strip's `_QueuedPromptRow` grammar — small icon,
+    // lowercase action, mono-styled arg, hover lift on
+    // `bgRaisedHi`. Status (pending / failed) reads on the accent
+    // color of the action label so failures stay scannable.
+    //
+    // Rendered inside the assistant bubble's Column, full-width
+    // constraint. The arg is `Flexible` with ellipsis so a long
+    // SEARCH_TEXT query truncates instead of overflowing.
     final accent = segment.pending
         ? DuckColors.accentCyan
         : segment.ok
         ? DuckColors.fgSubtle
         : DuckColors.stateError;
-    // The badge is rendered inside the agent message bubble's Column,
-    // which gives it the full bubble width as its max constraint.
-    // We use `Align` so the pill shrinks to its content when there's
-    // room — but the inner `firstArg` text is `Flexible` with
-    // ellipsis, so a long argument string (e.g. a SEARCH_TEXT query
-    // that's a sentence) gets truncated to fit the available bubble
-    // width instead of overflowing horizontally. Without the
-    // Flexible wrapper, the Row's `mainAxisSize: min` would let the
-    // inner ConstrainedBox claim its full 200px regardless of
-    // parent — visible as Flutter's yellow-and-black overflow chevron
-    // when the chat panel is narrower than ~300px.
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Align(
-        alignment: AlignmentDirectional.centerStart,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-          decoration: BoxDecoration(
-            color: DuckColors.bgChip,
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(
-              color: segment.pending
-                  ? DuckColors.accentCyan.withValues(alpha: 0.45)
-                  : DuckColors.glassSeam,
-              width: 0.5,
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (segment.pending)
-                const _PendingDot()
-              else
-                Icon(
-                  _iconForInspection(segment.toolId),
-                  size: 11,
-                  color: accent,
-                ),
-              const SizedBox(width: 5),
-              Text(
-                _actionLabel(segment),
-                style: TextStyle(
-                  fontSize: 10.5,
-                  fontWeight: FontWeight.w600,
-                  color: accent,
-                  letterSpacing: 0.3,
-                ),
+    final isError = !segment.pending && !segment.ok;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: AnimatedContainer(
+        duration: DuckMotion.fast,
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        decoration: BoxDecoration(
+          color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
+          borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (segment.pending)
+              const _PendingDot()
+            else
+              Icon(
+                _iconForInspection(segment.toolId),
+                size: 11,
+                color: accent,
               ),
-              if (segment.firstArg.isNotEmpty) ...[
-                const SizedBox(width: 6),
-                Flexible(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 200),
-                    child: Text(
-                      segment.firstArg,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      softWrap: false,
-                      style: const TextStyle(
-                        fontFamily: DuckTheme.monoFont,
-                        fontSize: 10.5,
-                        color: DuckColors.fgMuted,
-                      ),
+            const SizedBox(width: 6),
+            Text(
+              _actionLabel(segment),
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: isError ? FontWeight.w600 : FontWeight.w500,
+                color: accent,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+            if (segment.firstArg.isNotEmpty) ...[
+              const SizedBox(width: 6),
+              Flexible(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 240),
+                  child: Text(
+                    segment.firstArg,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    softWrap: false,
+                    style: TextStyle(
+                      fontFamily: DuckTheme.monoFont,
+                      fontSize: 11,
+                      color: isError
+                          ? DuckColors.stateError
+                          : DuckColors.fgMuted,
                     ),
                   ),
                 ),
-              ],
+              ),
             ],
-          ),
+          ],
         ),
       ),
     );

@@ -1,6 +1,8 @@
 import 'ollama_service.dart' show CancellationToken;
 import 'timeline_recorder.dart';
 import 'tool_registry.dart';
+import 'tools/tool_match_adapter.dart';
+import 'tools/tool_schemas.dart';
 
 /// `(tool id, first regex capture group)` for one tool invocation. The
 /// chat controller uses this to build a per-turn entry in the
@@ -124,6 +126,92 @@ class ToolExecutor {
                .where((t) => t.defaultEnabled)
                .map((t) => t.id)
                .toSet();
+
+  /// Dispatch a single native tool call (provider emitted a
+  /// structured `tool_use` / `function_call` block instead of a
+  /// `<<<TOOL>>>` text grammar).
+  ///
+  /// Translates the parsed JSON args back into the [Match] shape
+  /// that existing tool bodies expect, dispatches through
+  /// [AgentTool.execute], and returns a [ToolPassResult] in the
+  /// same shape as [run] so the chat controller's iteration loop
+  /// can consume both paths uniformly.
+  ///
+  /// Why route through a synthesized Match rather than a parallel
+  /// `executeFromArgs(Map)` on each tool: roughly 25 tool bodies
+  /// would each need a duplicate JSON-aware adapter inside them,
+  /// for zero behavioural difference. The bridge through
+  /// [SyntheticMatch] preserves tool implementations as the
+  /// single source of truth and keeps the diff for native-tools
+  /// support contained to the executor + provider services.
+  Future<ToolPassResult> runNativeToolCall({
+    required String toolId,
+    required Map<String, dynamic> args,
+  }) async {
+    if (!enabledTools.contains(toolId)) {
+      // The model called a tool the user has disabled. Surface a
+      // failure feedback line — the controller's loop can decide
+      // whether to nudge the model or surface a chat warning.
+      return ToolPassResult(
+        '',
+        true,
+        '[FAILED] $toolId: tool is disabled in this workspace.\n'
+        '! action required: re-prompt without this tool, or enable '
+        'it in Settings → Tools.\n',
+      );
+    }
+    final tool = ToolRegistry.byId(toolId);
+    final schema = ToolSchemas.byId(toolId);
+    if (tool == null || schema == null) {
+      return ToolPassResult(
+        '',
+        true,
+        '[FAILED] $toolId: unknown tool. Native tool dispatch could '
+        'not find a registered implementation.\n',
+      );
+    }
+    final match = ToolSchemas.matchFor(schema, args);
+    final inv = ToolInvocation(
+      match: match,
+      workspaceDir: workspaceDir,
+      approver: (label, detail) => approver(tool.id, label, detail),
+      allowWritesOutsideWorkspace: allowWritesOutsideWorkspace,
+      onOutput: onToolOutput,
+      cancelToken: cancelToken,
+      agentTerminalLauncher: agentTerminalLauncher,
+      webSearch: webSearch,
+      webFetch: webFetch,
+    );
+    // Recorder pre/post — same contract as the text-grammar path.
+    // The recorder's by-tool snapshotting reads from `inv.match.group(N)`
+    // which the synthetic match provides.
+    await recorder?.beforeTool(tool, match);
+    final result = await tool.execute(inv);
+    await recorder?.afterTool(tool, match, result);
+    final isFailure = _looksLikeFailure(result);
+    final feedbackBuf = StringBuffer();
+    if (isFailure) {
+      feedbackBuf.writeln('[FAILED] $result');
+      feedbackBuf.writeln(
+        '! action required: the tool above did NOT execute. Either '
+        'fix the call (re-read the file with read_file:start_line/end_line '
+        'so your search matches exactly) or tell the user why this '
+        "can't be done.",
+      );
+    } else {
+      feedbackBuf.writeln(result);
+    }
+    final firstArg =
+        match.groupCount >= 1 ? (match.group(1) ?? '') : '';
+    final friendly = _friendlyReplacement(tool, match, result);
+    final fired = <FiredTool>[FiredTool(id: tool.id, firstArg: firstArg)];
+    return ToolPassResult(
+      friendly,
+      true,
+      feedbackBuf.toString(),
+      firedTools: fired,
+    );
+  }
 
   Future<ToolPassResult> run(String response) async {
     // **Normalize** the LLM output before regex matching to absorb

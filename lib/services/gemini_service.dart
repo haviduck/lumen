@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
+import 'tools/native_tool_format.dart';
 
 /// Detect image MIME type from base64 data by inspecting magic bytes.
 String _detectMediaType(String base64Data) {
@@ -329,6 +330,7 @@ class GeminiService {
     // forever waiting on a connection that's already dead.
     Duration idleTimeout = const Duration(minutes: 3),
     ReasoningEffort? effort,
+    Set<String>? nativeToolIds,
   }) async* {
     if (token?.isCancelled == true) return;
     if (apiKey.isEmpty) {
@@ -349,9 +351,50 @@ class GeminiService {
           systemInstruction = m['content'] as String;
           continue;
         }
+
+        // Native tool-result reply. Gemini encodes this as a `user`
+        // turn with a `function_response` part referencing the
+        // tool name (Gemini doesn't carry tool_use_id; the name +
+        // history order is the linkage).
+        if (role == 'tool') {
+          contents.add({
+            'role': 'user',
+            'parts': [
+              {
+                'function_response': {
+                  // We don't have a separate tool name on the wire
+                  // here, so reuse `tool_use_id` which the
+                  // controller stamps with the tool id — matches
+                  // what Gemini wants.
+                  'name': (m['tool_use_id'] as String?) ?? '',
+                  'response': {
+                    'content': (m['content'] as String?) ?? '',
+                  },
+                },
+              },
+            ],
+          });
+          continue;
+        }
+
         final parts = <Map<String, dynamic>>[];
         final content = m['content'] as String? ?? '';
         if (content.isNotEmpty) parts.add({'text': content});
+
+        // Native tool_use carried on an assistant turn. Gemini's
+        // `function_call` part lives alongside the prose part(s).
+        final toolUse = m['tool_use'];
+        if (role == 'assistant' && toolUse is Map<String, dynamic>) {
+          final args =
+              (toolUse['arguments'] as Map?)?.cast<String, dynamic>() ?? {};
+          parts.add({
+            'function_call': {
+              'name': (toolUse['name'] as String?) ?? '',
+              'args': args,
+            },
+          });
+        }
+
         final images = m['images'] as List<dynamic>? ?? [];
         for (final img in images) {
           parts.add({
@@ -397,6 +440,17 @@ class GeminiService {
       }
       _applyReasoningEffort(body, effort, model);
 
+      if (nativeToolIds != null && nativeToolIds.isNotEmpty) {
+        body['tools'] = [NativeToolDefinitions.forGemini(nativeToolIds)];
+        // Gemini's tool_config: `mode: AUTO` lets the model pick
+        // when to call. `ANY` would force a tool every turn — bad
+        // for agentic loops where the model needs to be free to
+        // produce a final summary.
+        body['tool_config'] = {
+          'function_calling_config': {'mode': 'AUTO'},
+        };
+      }
+
       final url =
           '$baseUrl/v1beta/models/$model:streamGenerateContent?alt=sse&key=$apiKey';
       final req = http.Request('POST', Uri.parse(url))
@@ -433,6 +487,29 @@ class GeminiService {
           for (final p in parts) {
             final t = p['text'] as String?;
             if (t != null && t.isNotEmpty) yield t;
+            // Native tool_use — Gemini emits `function_call` parts
+            // inline alongside text. Surface as a NativeToolUseMarker
+            // so the controller dispatches through the executor.
+            // Gemini doesn't carry a stable tool_use_id; we synthesize
+            // one from the call name + index for the tool_result
+            // round-trip linkage. (Gemini's API matches by call name
+            // + history order, so any unique id works as long as we
+            // round-trip it ourselves consistently.)
+            final fc = p['function_call'];
+            if (fc is Map) {
+              final name = (fc['name'] as String?) ?? '';
+              final rawArgs = fc['args'];
+              final args = rawArgs is Map
+                  ? rawArgs.cast<String, dynamic>()
+                  : <String, dynamic>{};
+              if (name.isNotEmpty) {
+                final id =
+                    'gemini-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+                yield NativeToolUseMarker.build(
+                  id: id, name: name, arguments: args,
+                );
+              }
+            }
           }
           // Truncation marker — `finishReason: MAX_TOKENS` means the
           // model hit `maxOutputTokens` (we send 16384) before its

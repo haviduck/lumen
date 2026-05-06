@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'tools/native_tool_format.dart';
+
 /// Talks to Ollama. Supports cancellation via `CancellationToken` so the
 /// "Stop Generation" button can interrupt in-flight requests.
 class CancellationToken {
@@ -329,6 +331,7 @@ class OllamaService {
     String? keepAlive = defaultKeepAlive,
     Map<String, dynamic>? options,
     bool forceCloud = false,
+    Set<String>? nativeToolIds,
   }) async* {
     if (token?.isCancelled == true) return;
     final client = http.Client();
@@ -336,13 +339,37 @@ class OllamaService {
     bool timedOut = false;
     try {
       final route = _resolveChatRoute(model, forceCloud: forceCloud);
+      final translated = _translateMessagesForOllama(messages);
       final payload = <String, dynamic>{
         'model': route.model,
-        'messages': messages,
+        'messages': translated,
         'stream': true,
       };
       if (keepAlive != null) payload['keep_alive'] = keepAlive;
       if (options != null && options.isNotEmpty) payload['options'] = options;
+      if (nativeToolIds != null && nativeToolIds.isNotEmpty) {
+        // Ollama tool-calling docs
+        // (https://docs.ollama.com/capabilities/tool-calling) put
+        // the `tools` array at the top level of /api/chat with the
+        // OpenAI-style `[{type: 'function', function: {name,
+        // description, parameters}}]` shape. Tool_calls in the
+        // RESPONSE arrive across streaming chunks (per the
+        // "Tool calling with streaming" section) — must be
+        // accumulated, not just read from the final frame.
+        payload['tools'] = NativeToolDefinitions.forOpenAi(nativeToolIds);
+        // We deliberately do NOT send `think: true`. Per
+        // https://docs.ollama.com/capabilities/thinking:
+        //   "Thinking is enabled by default in the CLI and API
+        //    for supported models."
+        // So a redundant `true` is wasted noise. Worse, GPT-OSS
+        // *ignores* boolean `think` and expects string levels
+        // (`"low"` / `"medium"` / `"high"`). If we ever want to
+        // tune reasoning intensity per model, the right place is
+        // a small switch on `model` that maps `ReasoningEffort`
+        // → `"low|medium|high"` for the GPT-OSS family and omits
+        // the field for everyone else (since the default is
+        // correct).
+      }
       final body = jsonEncode(payload);
       final req = http.Request('POST', Uri.parse('${route.host}/api/chat'))
         ..headers.addAll(route.headers)
@@ -397,6 +424,16 @@ class OllamaService {
       // doesn't leak. `</think>` is 8 bytes — that's the max we
       // ever need.
       const inlineMinHold = 8;
+      // **Tool-call accumulator.** Per the Ollama tool-calling docs
+      // (https://docs.ollama.com/capabilities/tool-calling) tool_calls
+      // are streamed across chunks — the docs' Python example
+      // explicitly does `tool_calls.extend(chunk.message.tool_calls)`
+      // on every chunk and then processes once at the end. Lumen's
+      // single-tool-per-iter discipline emits a NativeToolUseMarker
+      // for the FIRST tool_call we see and returns early — the
+      // controller breaks on the marker. `seenToolCalls` flags this
+      // so the done-frame fallback below doesn't emit twice.
+      bool seenToolCalls = false;
       await for (final line in lineStream) {
         if (token?.isCancelled == true) return;
         if (line.isEmpty) continue;
@@ -405,6 +442,58 @@ class OllamaService {
           final msg = obj['message'] as Map<String, dynamic>?;
           final thinking = msg?['thinking'] as String?;
           final content = msg?['content'] as String?;
+          final perChunkToolCalls = msg?['tool_calls'];
+
+          // Emit native tool_calls as they arrive — NOT just on the
+          // done frame. (See accumulator comment above for the
+          // 2026-05 bug-fix history.) Single-tool-per-iter: the
+          // first tool_call closes our stream cleanly, mirroring
+          // the controller's text-grammar `cutOnFirstTool` boundary.
+          if (!seenToolCalls &&
+              perChunkToolCalls is List &&
+              perChunkToolCalls.isNotEmpty) {
+            seenToolCalls = true;
+            final tc = perChunkToolCalls.first as Map<String, dynamic>;
+            final fn = tc['function'] as Map<String, dynamic>? ?? const {};
+            final name = (fn['name'] as String?) ?? '';
+            final rawArgs = fn['arguments'];
+            Map<String, dynamic> args;
+            if (rawArgs is Map) {
+              args = rawArgs.cast<String, dynamic>();
+            } else if (rawArgs is String) {
+              try {
+                args = (jsonDecode(rawArgs) as Map).cast<String, dynamic>();
+              } catch (_) {
+                args = <String, dynamic>{};
+              }
+            } else {
+              args = <String, dynamic>{};
+            }
+            // Close any open thinking phase so the controller's
+            // marker state machine doesn't leave the live message
+            // stuck in "thinking…" while we ship the tool call.
+            if (inThinking) {
+              inThinking = false;
+              yield thinkEndMarker;
+            }
+            if (inlineInThink) {
+              inlineInThink = false;
+              yield thinkEndMarker;
+            }
+            if (name.isNotEmpty) {
+              yield NativeToolUseMarker.build(
+                id: 'ollama-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}',
+                name: name,
+                arguments: args,
+              );
+              // Return early: the controller's break-on-marker has
+              // already fired, the model has nothing useful to add
+              // before the tool_result round-trips. Closing our
+              // stream here releases the upstream HTTP connection
+              // promptly instead of letting it drain.
+              return;
+            }
+          }
 
           // Phase: thinking tokens arriving.
           if (thinking != null && thinking.isNotEmpty) {
@@ -507,6 +596,48 @@ class OllamaService {
             if (inThinking) {
               inThinking = false;
               yield thinkEndMarker;
+            }
+            // Done-frame tool_calls fallback. The mid-stream
+            // accumulator above is the primary path (per the docs,
+            // tool_calls are streamed). Some Ollama versions /
+            // models still consolidate them onto the done frame —
+            // we honour that path too, but ONLY when we haven't
+            // already emitted from a mid-stream chunk. Without the
+            // `!seenToolCalls` guard we'd emit the same call twice.
+            final finalMsg = msg ?? obj['message'] as Map<String, dynamic>?;
+            final toolCalls = finalMsg?['tool_calls'];
+            if (!seenToolCalls && toolCalls is List && toolCalls.isNotEmpty) {
+              final tc = toolCalls.first as Map<String, dynamic>;
+              final fn = tc['function'] as Map<String, dynamic>? ?? const {};
+              final name = (fn['name'] as String?) ?? '';
+              final rawArgs = fn['arguments'];
+              Map<String, dynamic> args;
+              if (rawArgs is Map) {
+                args = rawArgs.cast<String, dynamic>();
+              } else if (rawArgs is String) {
+                // Some Ollama models return arguments as a JSON
+                // string even though the docs say object. Tolerate
+                // both shapes.
+                try {
+                  args = (jsonDecode(rawArgs) as Map).cast<String, dynamic>();
+                } catch (e) {
+                  debugPrint(
+                    'Ollama tool_calls arg parse failed: $e ($rawArgs)',
+                  );
+                  args = <String, dynamic>{};
+                }
+              } else {
+                args = <String, dynamic>{};
+              }
+              final providedId = tc['id'];
+              final id = (providedId is String && providedId.isNotEmpty)
+                  ? providedId
+                  : 'ollama-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}';
+              if (name.isNotEmpty) {
+                yield NativeToolUseMarker.build(
+                  id: id, name: name, arguments: args,
+                );
+              }
             }
             // Final frame carries timing metrics + done_reason.
             // Surface a hidden marker when the model hit its output
@@ -622,6 +753,163 @@ class OllamaService {
       debugPrint('Error fetching Ollama Cloud models: $e');
       return const <String>[];
     }
+  }
+
+  /// Translate the controller's neutral message shape into Ollama's
+  /// wire format. Per the Ollama tool-calling docs
+  /// (https://docs.ollama.com/capabilities/tool-calling):
+  ///
+  ///   - **Assistant turn with native tool_use** carries
+  ///     `tool_calls: [{type: 'function', function: {index, name,
+  ///     arguments}}]` where `arguments` is a Map, not a JSON-encoded
+  ///     string (OpenAI uses encoded; Ollama uses raw). No outer
+  ///     `id` field — Ollama matches replies by tool **name**, not
+  ///     by a call-site id.
+  ///   - **Tool result reply** uses `role: 'tool'` with the
+  ///     literal field `tool_name: <function name>` (NOT
+  ///     `tool_call_id`). The 2026-05 first-cut implementation
+  ///     used `tool_call_id` after copying OpenAI's shape; that
+  ///     broke the link Ollama needs between calls and replies,
+  ///     manifesting as "model thought, kept calling tools we
+  ///     never saw, looped".
+  ///   - Non-native messages pass through with classic
+  ///     `{role, content, images?}` shape.
+  ///
+  /// Pure transformation; doesn't mutate the input list.
+  List<Map<String, dynamic>> _translateMessagesForOllama(
+    List<Map<String, dynamic>> messages,
+  ) {
+    return [
+      for (final m in messages) _translateOneOllamaMessage(m),
+    ];
+  }
+
+  Map<String, dynamic> _translateOneOllamaMessage(Map<String, dynamic> m) {
+    final role = m['role'] as String? ?? 'user';
+    if (role == 'tool') {
+      return {
+        'role': 'tool',
+        // Ollama links replies to calls by function name. The
+        // controller stamps `tool_name` on every tool reply (along
+        // with `tool_use_id` for OpenAI/Anthropic compatibility).
+        // Falls back to `tool_use_id` for very old chat history
+        // recorded before the field existed — better wrong-ish
+        // than empty.
+        'tool_name': (m['tool_name'] as String?) ??
+            (m['tool_use_id'] as String?) ??
+            '',
+        'content': (m['content'] as String?) ?? '',
+      };
+    }
+    final out = <String, dynamic>{
+      'role': role,
+      'content': (m['content'] as String?) ?? '',
+    };
+    final images = m['images'];
+    if (images is List && images.isNotEmpty) {
+      out['images'] = images;
+    }
+    final toolUse = m['tool_use'];
+    if (role == 'assistant' && toolUse is Map<String, dynamic>) {
+      final args =
+          (toolUse['arguments'] as Map?)?.cast<String, dynamic>() ?? {};
+      out['tool_calls'] = <Map<String, dynamic>>[
+        {
+          'type': 'function',
+          'function': {
+            'index': 0,
+            'name': (toolUse['name'] as String?) ?? '',
+            'arguments': args,
+          },
+        },
+      ];
+    }
+    return out;
+  }
+
+  /// Per-model capability cache. `/api/show` exposes the
+  /// `capabilities` array (e.g. `["completion", "tools", "vision"]`)
+  /// for installed local models AND for cloud models when authed.
+  /// We hit the endpoint once per (host, model) tuple and remember
+  /// the answer for the lifetime of the [OllamaService] instance —
+  /// capabilities don't change between pulls and re-querying every
+  /// turn would add 50–150 ms of latency before the prompt-cache
+  /// warm path even starts.
+  ///
+  /// Cache key folds in the route (`local|cloud`) because the same
+  /// model name can resolve to different daemons (a `qwen3:8b`
+  /// pulled locally vs. the cloud catalogue entry of the same name)
+  /// and we want each route's capability sniffed independently.
+  final Map<String, Set<String>> _capabilityCache = <String, Set<String>>{};
+
+  /// Returns the model's capability set per `/api/show`, or an
+  /// empty set on any failure (unreachable / non-200 / malformed /
+  /// missing key for cloud). Capabilities of interest are
+  /// `tools` (native function calling), `vision` (multimodal),
+  /// `embedding`, `completion`, `thinking`. Callers should treat
+  /// "not found" as "no, the model doesn't have it" — we don't
+  /// want to gamble on a yes when the daemon couldn't tell us.
+  ///
+  /// [forceCloud] mirrors the `generateChatStream` flag — needed
+  /// because some `qwen3-coder:480b`-style names are reachable
+  /// via both routes and we want each cached separately.
+  Future<Set<String>> getModelCapabilities(
+    String rawModel, {
+    bool forceCloud = false,
+  }) async {
+    final route = _resolveChatRoute(rawModel, forceCloud: forceCloud);
+    final cacheKey = '${route.host}|${route.model}';
+    final hit = _capabilityCache[cacheKey];
+    if (hit != null) return hit;
+    try {
+      final res = await http
+          .post(
+            Uri.parse('${route.host}/api/show'),
+            headers: route.headers,
+            body: jsonEncode({'model': route.model}),
+          )
+          .timeout(const Duration(seconds: 6));
+      if (res.statusCode != 200) {
+        debugPrint(
+          'Ollama /api/show ${route.model} returned ${res.statusCode}',
+        );
+        final empty = <String>{};
+        _capabilityCache[cacheKey] = empty;
+        return empty;
+      }
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      final caps = (data['capabilities'] as List?)
+              ?.whereType<String>()
+              .toSet() ??
+          <String>{};
+      _capabilityCache[cacheKey] = caps;
+      return caps;
+    } catch (e) {
+      debugPrint('Ollama getModelCapabilities ${route.model} failed: $e');
+      final empty = <String>{};
+      _capabilityCache[cacheKey] = empty;
+      return empty;
+    }
+  }
+
+  /// Convenience: does this model support native tool calling?
+  /// Equivalent to `(await getModelCapabilities(model)).contains('tools')`.
+  /// Used by `ChatController._shouldUseNativeTools` to gate the
+  /// native-tools strategy on Ollama-routed models.
+  Future<bool> modelSupportsTools(
+    String rawModel, {
+    bool forceCloud = false,
+  }) async {
+    final caps = await getModelCapabilities(rawModel, forceCloud: forceCloud);
+    return caps.contains('tools');
+  }
+
+  /// Drop the capability cache. Wired to provider-settings save and
+  /// model-list refresh in `ChatController` so a user pulling a new
+  /// model OR rotating the cloud API key sees fresh capability info
+  /// without restarting Lumen.
+  void clearCapabilityCache() {
+    _capabilityCache.clear();
   }
 
   /// Lightweight "is the cloud key valid?" probe. GETs

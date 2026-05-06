@@ -66,7 +66,13 @@ typedef WebSearchFn =
 typedef WebFetchFn = Future<Map<String, dynamic>> Function(String url);
 
 class ToolInvocation {
-  final RegExpMatch match;
+  /// Regex-style match-shaped accessor for the tool's arguments.
+  /// In text-grammar mode this is a real [RegExpMatch]; in
+  /// native-tools mode it's a `SyntheticMatch` produced by
+  /// [ToolSchemas.matchFor]. Tool bodies only call `group(N)` /
+  /// `groupCount` / `[]`, all of which are on the [Match]
+  /// interface — both backings work transparently.
+  final Match match;
   final String? workspaceDir;
   final Future<bool> Function(String label, String detail) approver;
   final bool allowWritesOutsideWorkspace;
@@ -3554,7 +3560,7 @@ class ToolRegistry {
     );
   }
 
-  static String _substituteGroups(String segment, RegExpMatch m) {
+  static String _substituteGroups(String segment, Match m) {
     return segment.replaceAllMapped(RegExp(r'\$(\d+)'), (g) {
       final i = int.parse(g.group(1)!);
       if (i < 0 || i > m.groupCount) return g.group(0)!;

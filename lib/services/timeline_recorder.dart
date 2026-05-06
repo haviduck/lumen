@@ -70,7 +70,7 @@ class TimelineRecorder {
   /// `agentTool` origin from the captured entry. Reservations are
   /// released in `afterTool`'s `finally` so an exception in the tool
   /// body or our recordWrite doesn't permanently lock the path.
-  Future<void> beforeTool(AgentTool tool, RegExpMatch match) async {
+  Future<void> beforeTool(AgentTool tool, Match match) async {
     if (!timeline.isReady) return;
     if (!isCapturedTool(tool.id)) return;
     final ws = workspaceDir;
@@ -111,7 +111,7 @@ class TimelineRecorder {
   /// user as a tool error.
   Future<void> afterTool(
     AgentTool tool,
-    RegExpMatch match,
+    Match match,
     String result,
   ) async {
     if (!timeline.isReady) return;
@@ -180,7 +180,7 @@ class TimelineRecorder {
   /// changes.
   _TargetPaths _resolveTargets(
     String toolId,
-    RegExpMatch match,
+    Match match,
     String workspaceDir,
   ) {
     String? rel;
