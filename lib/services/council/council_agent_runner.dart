@@ -95,19 +95,22 @@ class CouncilAgentRunner {
           final parsed = NativeToolUseMarker.tryParse(rawChunk);
           if (parsed != null) {
             final before = rawChunk.substring(0, parsed.markerStart);
-            if (before.isNotEmpty) {
-              visible.write(before);
-              transcript.write(before);
-              onChunk(before);
+            final cleanBefore = _cleanVisibleChunk(before);
+            if (cleanBefore.isNotEmpty) {
+              visible.write(cleanBefore);
+              transcript.write(cleanBefore);
+              onChunk(cleanBefore);
             }
             pendingTool = parsed;
             break;
           }
         }
 
-        visible.write(rawChunk);
-        transcript.write(rawChunk);
-        onChunk(rawChunk);
+        final cleanChunk = _cleanVisibleChunk(rawChunk);
+        if (cleanChunk.isEmpty) continue;
+        visible.write(cleanChunk);
+        transcript.write(cleanChunk);
+        onChunk(cleanChunk);
       }
 
       final visibleText = visible.toString();
@@ -157,6 +160,26 @@ class CouncilAgentRunner {
     }
 
     return CouncilRunResult(content: transcript.toString());
+  }
+
+  String _cleanVisibleChunk(String chunk) {
+    return chunk
+        .replaceAll(
+          RegExp(r'<!--\s*LUMEN_THINK_START\s*-->', caseSensitive: false),
+          '',
+        )
+        .replaceAll(
+          RegExp(r'<!--\s*LUMEN_THINK_END\s*-->', caseSensitive: false),
+          '',
+        )
+        .replaceAll(
+          RegExp(r'<!--\s*lumen_think_start\s*-->', caseSensitive: false),
+          '',
+        )
+        .replaceAll(
+          RegExp(r'<!--\s*lumen_think_end\s*-->', caseSensitive: false),
+          '',
+        );
   }
 
   Future<CouncilToolResult> _runLumenTool(CouncilToolCall call) async {

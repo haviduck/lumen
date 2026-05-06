@@ -35,9 +35,16 @@ Your job is to break the user's brief into focused tasks, dispatch those tasks t
 
 Hard protocol rules:
 - Use `$dispatchToolId` to assign work. Do not merely describe a dispatch in prose.
-- Use `parallel: true` when independent tasks can run together.
-- Keep inter-agent conversation legible: summarize what you learned before dispatching the next phase.
+- Exploit parallelism aggressively: in the first planning wave, dispatch every independent research/review/test/design workstream with `parallel: true` instead of waiting for one agent to finish.
+- Prefer 2-4 parallel tasks per wave when the work can be split safely. Reserve sequential dispatch only for work that truly depends on a prior result.
+- Make agents collaborate. When one agent needs another perspective, instruct that agent to call `$askPoolToolId`; when you receive those results, dispatch follow-up synthesis or verification work to the most relevant agents.
+- Encourage agent-to-agent checks: security should challenge architecture, tests should challenge implementation, reviewer should challenge assumptions, researcher should feed facts into everyone else.
+- Treat agreement as suspicious. The Council is useful only when agents actively challenge each other's evidence, scope, assumptions, and proposed fixes.
+- Ask for objections, not validation. A good pool question says "what is wrong or missing here?" rather than "does this look good?"
+- Do not produce the final report until at least one explicit collaboration has happened through `$askPoolToolId`, unless the task is trivially single-agent. If no agent asked the pool, dispatch a short challenge/review task asking one agent to consult the pool.
+- Keep inter-agent conversation legible: summarize what the pool learned before dispatching the next phase.
 - Use `$askUserToolId` only when the council is blocked by missing intent, credentials, permissions, or risk acceptance.
+- Before finishing, synthesize what each agent contributed, unresolved risks, and what changed because agents talked to each other.
 - Finish by calling `$reportToolId` with the final markdown. Do not finish in plain prose.
 
 Council agents:
@@ -61,6 +68,8 @@ ${roleInstruction(agent)}
 
 Council rules:
 - Stay inside your assigned role and current task.
+- For any non-trivial task, ask the Council pool exactly one useful question before your final answer. Use `$askPoolToolId` to ask for a challenge, missing risk, validation idea, or specialist perspective.
+- Phrase that pool question adversarially: ask others to find the weakest assumption, missing evidence, failure mode, or counterexample in your current conclusion.
 - Share uncertainty through `$askPoolToolId` when another agent may know the answer.
 - Use `$askUserToolId` only when human input is necessary.
 - Return concrete findings, risks, and next-step recommendations to the orchestrator.
@@ -92,6 +101,39 @@ Keep the reply concise and actionable.
 
 Original user brief:
 ${config.brief}
+''';
+  }
+
+  static String finalEvaluatorSystemPrompt({
+    required CouncilConfig config,
+    required String draftReport,
+  }) {
+    final agents = config.agents
+        .map(
+          (a) =>
+              '## ${a.name}\nRole: ${roleInstruction(a)}\nTask: ${a.currentTask}\nTranscript:\n${a.transcript}',
+        )
+        .join('\n\n');
+    return '''
+You are the final evaluator of Lumen's Council.
+
+Your job is to enter at the end, challenge the Council's work, identify weak evidence, resolve contradictions, and produce the report the user should actually see.
+
+Evaluation rules:
+- Do not rubber-stamp the Council.
+- Call out unsupported claims, missing validation, weak security reasoning, and untested assumptions.
+- Preserve useful findings from every agent.
+- If the task involved security testing or pentesting, structure the result around scope, attack path, evidence, impact, and remediation.
+- Return one complete markdown report. No JSON. No hidden markers.
+
+Original user brief:
+${config.brief}
+
+Council draft report:
+$draftReport
+
+Agent work:
+$agents
 ''';
   }
 

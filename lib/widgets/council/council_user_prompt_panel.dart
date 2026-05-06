@@ -50,10 +50,10 @@ class _CouncilUserPromptPanelState extends State<CouncilUserPromptPanel> {
               ],
             ),
             borderRadius: BorderRadius.circular(DuckTheme.radiusL),
-            border: Border.all(color: DuckColors.accentDuck, width: 1.2),
+            border: Border.all(color: DuckColors.accentPurple, width: 1.2),
             boxShadow: [
               BoxShadow(
-                color: DuckColors.accentDuck.withValues(alpha: 0.26),
+                color: DuckColors.accentPurple.withValues(alpha: 0.24),
                 blurRadius: 34,
                 spreadRadius: 1,
               ),
@@ -71,7 +71,12 @@ class _CouncilUserPromptPanelState extends State<CouncilUserPromptPanel> {
                     height: 30,
                     decoration: const BoxDecoration(
                       shape: BoxShape.circle,
-                      gradient: DuckColors.duckGradient,
+                      gradient: LinearGradient(
+                        colors: [
+                          DuckColors.accentCyan,
+                          DuckColors.accentPurple,
+                        ],
+                      ),
                     ),
                     child: const Icon(
                       Icons.record_voice_over_outlined,

@@ -44,6 +44,7 @@ class CouncilController extends ChangeNotifier {
       <String, Completer<String>>{};
   int _activeDispatches = 0;
   int _questionSeq = 0;
+  bool _collaborationNudgeUsed = false;
 
   Future<void> startCouncil(CouncilConfig config, String workspacePath) async {
     await abort();
@@ -62,8 +63,9 @@ class CouncilController extends ChangeNotifier {
   Future<List<CouncilAgent>> proposeAgentsForBrief({
     required String brief,
     required CouncilAgent orchestrator,
-    int count = 4,
+    int? count,
   }) async {
+    final targetCount = count ?? _targetAgentCountForBrief(brief);
     final fallback = _fallbackAgentsForBrief(brief, orchestrator.model, count);
     if (brief.trim().isEmpty || orchestrator.model.trim().isEmpty) {
       return fallback;
@@ -79,16 +81,30 @@ Return ONLY JSON. No markdown. Shape:
     {
       "name": "short distinctive name",
       "role": "pentester|reviewer|researcher|architect|tester|writer|custom",
-      "customRole": "only when role is custom"
+      "customRole": "deep specialist remit; required when role is custom",
+      "mission": "what this agent must uncover or improve",
+      "rationale": "why this role is needed for this brief"
     }
   ]
 }
 
 Rules:
-- Create $count agents.
-- Pick complementary roles for the user's brief.
+- Choose the team size yourself between 3 and 8 agents. For ambitious product/platform prompts, prefer 6-8.
+- For this brief, aim for about $targetCount agents unless you can justify fewer.
+- Pick sharp, complementary specialist roles. Avoid generic "Architect / Reviewer / Tester" only.
+- Prefer custom roles when built-in labels are too blunt.
+- Each agent must have a distinct mission and must be capable of pushing back on at least one other agent.
 - Include a pentester only when security, threat modeling, auth, secrets, or pentesting is relevant.
 - Include a tester whenever implementation or debugging is likely.
+- If the user asks to make an IDE, app, product, workflow, or agentic system exceptional, include:
+  - product/UX strategy,
+  - agent orchestration/context/tools,
+  - codebase cartography,
+  - interaction design,
+  - reliability/testing,
+  - performance/platform,
+  - security/safety if tools or code execution are involved,
+  - a skeptical evaluator or adversarial reviewer.
 - Names should be short and useful in a visual dashboard.
 
 User brief:
@@ -135,6 +151,7 @@ $brief
     _dispatches.clear();
     _userQuestions.clear();
     _activeDispatches = 0;
+    _collaborationNudgeUsed = false;
     notifyListeners();
   }
 
@@ -194,56 +211,193 @@ $brief
     final json =
         jsonDecode(raw.substring(start, end + 1)) as Map<String, dynamic>;
     final agents = (json['agents'] as List?) ?? const [];
-    return agents.whereType<Map>().take(6).toList().asMap().entries.map((
+    return agents.whereType<Map>().take(8).toList().asMap().entries.map((
       entry,
     ) {
       final data = entry.value.cast<String, dynamic>();
       final role = _roleFromName(data['role'] as String?) ?? RolePreset.custom;
+      final customRole = data['customRole'] as String? ?? '';
+      final mission = data['mission'] as String? ?? '';
+      final rationale = data['rationale'] as String? ?? '';
       return CouncilAgent(
         id: 'agent_${entry.key}',
         name: (data['name'] as String?)?.trim().isNotEmpty == true
             ? (data['name'] as String).trim()
             : 'Agent ${entry.key + 1}',
         role: role,
-        customRole: data['customRole'] as String? ?? '',
+        customRole: _joinRoleParts(customRole, mission, rationale),
         model: model,
         enabledTools: _defaultCouncilTools,
       );
     }).toList();
   }
 
+  String _joinRoleParts(String customRole, String mission, String rationale) {
+    final parts = [
+      if (customRole.trim().isNotEmpty) customRole.trim(),
+      if (mission.trim().isNotEmpty) 'Mission: ${mission.trim()}',
+      if (rationale.trim().isNotEmpty) 'Why here: ${rationale.trim()}',
+    ];
+    return parts.join('\n');
+  }
+
   List<CouncilAgent> _fallbackAgentsForBrief(
     String brief,
     String model,
-    int count,
+    int? count,
   ) {
     final b = brief.toLowerCase();
-    final roles = <RolePreset>[
-      if (b.contains('security') ||
-          b.contains('pentest') ||
-          b.contains('auth') ||
-          b.contains('secret'))
-        RolePreset.pentester,
-      RolePreset.architect,
-      RolePreset.reviewer,
-      RolePreset.tester,
-      if (b.contains('research') || b.contains('compare'))
-        RolePreset.researcher,
-      if (b.contains('doc') || b.contains('report')) RolePreset.writer,
-    ];
-    while (roles.length < count) {
-      roles.add(RolePreset.researcher);
-    }
-    return roles.take(count).toList().asMap().entries.map((entry) {
-      final role = entry.value;
+    final targetCount = count ?? _targetAgentCountForBrief(brief);
+    final ambitiousIde =
+        (b.contains('ide') || b.contains('agentic') || b.contains('cursor')) &&
+        (b.contains('masterpiece') ||
+            b.contains('above') ||
+            b.contains('impactful') ||
+            b.contains('complete') ||
+            b.contains('unfinished'));
+    final specs = ambitiousIde
+        ? <({String name, RolePreset role, String customRole})>[
+            (
+              name: S.councilFallbackProductOps,
+              role: RolePreset.custom,
+              customRole: S.councilFallbackProductOpsRole,
+            ),
+            (
+              name: S.councilFallbackAgentCore,
+              role: RolePreset.custom,
+              customRole: S.councilFallbackAgentCoreRole,
+            ),
+            (
+              name: S.councilFallbackCodeCarto,
+              role: RolePreset.researcher,
+              customRole: S.councilFallbackCodeCartoRole,
+            ),
+            (
+              name: S.councilFallbackFlowDesign,
+              role: RolePreset.custom,
+              customRole: S.councilFallbackFlowDesignRole,
+            ),
+            (
+              name: S.councilFallbackReliability,
+              role: RolePreset.tester,
+              customRole: S.councilFallbackReliabilityRole,
+            ),
+            (
+              name: S.councilFallbackPlatform,
+              role: RolePreset.custom,
+              customRole: S.councilFallbackPlatformRole,
+            ),
+            (
+              name: S.councilFallbackSafety,
+              role: RolePreset.pentester,
+              customRole: S.councilFallbackSafetyRole,
+            ),
+            (
+              name: S.councilFallbackSkeptic,
+              role: RolePreset.reviewer,
+              customRole: S.councilFallbackSkepticRole,
+            ),
+          ]
+        : _defaultFallbackSpecs(b);
+    return specs.take(targetCount).toList().asMap().entries.map((entry) {
+      final spec = entry.value;
       return CouncilAgent(
         id: 'agent_${entry.key}',
-        name: _roleName(role),
-        role: role,
+        name: spec.name,
+        role: spec.role,
+        customRole: spec.customRole,
         model: model,
         enabledTools: _defaultCouncilTools,
       );
     }).toList();
+  }
+
+  int _targetAgentCountForBrief(String brief) {
+    final b = brief.toLowerCase();
+    var score = 0;
+    for (final word in [
+      'masterpiece',
+      'above cursor',
+      'agentic',
+      'ide',
+      'complete',
+      'unfinished',
+      'many agents',
+      'work together',
+      'impactful',
+      'platform',
+      'security',
+      'pentest',
+      'huge',
+    ]) {
+      if (b.contains(word)) score++;
+    }
+    if (score >= 5) return 8;
+    if (score >= 3) return 6;
+    if (score >= 1) return 5;
+    return 4;
+  }
+
+  List<({String name, RolePreset role, String customRole})>
+  _defaultFallbackSpecs(String briefLower) {
+    return [
+      if (briefLower.contains('security') ||
+          briefLower.contains('pentest') ||
+          briefLower.contains('auth') ||
+          briefLower.contains('secret'))
+        (
+          name: _roleName(RolePreset.pentester),
+          role: RolePreset.pentester,
+          customRole: '',
+        ),
+      (
+        name: _roleName(RolePreset.architect),
+        role: RolePreset.architect,
+        customRole: '',
+      ),
+      (
+        name: _roleName(RolePreset.reviewer),
+        role: RolePreset.reviewer,
+        customRole: '',
+      ),
+      (
+        name: _roleName(RolePreset.tester),
+        role: RolePreset.tester,
+        customRole: '',
+      ),
+      (
+        name: _roleName(RolePreset.researcher),
+        role: RolePreset.researcher,
+        customRole: '',
+      ),
+      (
+        name: S.councilFallbackSkeptic,
+        role: RolePreset.reviewer,
+        customRole: S.councilFallbackSkepticRole,
+      ),
+      (
+        name: S.councilFallbackPlatform,
+        role: RolePreset.custom,
+        customRole: S.councilFallbackPlatformRole,
+      ),
+      if (briefLower.contains('doc') || briefLower.contains('report'))
+        (
+          name: _roleName(RolePreset.writer),
+          role: RolePreset.writer,
+          customRole: '',
+        ),
+    ];
+  }
+
+  CouncilAgent _defaultFinalEvaluator(String model) {
+    return CouncilAgent(
+      id: 'final_evaluator',
+      name: S.councilFinalEvaluator,
+      role: RolePreset.reviewer,
+      customRole: S.councilFinalEvaluatorRole,
+      model: model,
+      enabledTools: _defaultCouncilTools,
+    );
   }
 
   Future<CouncilToolResult> _handleOrchestratorTool(
@@ -255,6 +409,13 @@ $brief
       case CouncilProtocol.askUserToolId:
         return _askUser(_session!.config.orchestrator.id, call);
       case CouncilProtocol.reportToolId:
+        if (!_hasPoolCollaboration() && !_collaborationNudgeUsed) {
+          _collaborationNudgeUsed = true;
+          return const CouncilToolResult(
+            feedback:
+                'Before the final report, force one Council collaboration round. Dispatch a short follow-up task to an appropriate agent and explicitly require them to call council_ask_pool for challenge/validation.',
+          );
+        }
         final markdown = call.arguments['markdown'] as String? ?? '';
         await _finishWithReport(markdown);
         return const CouncilToolResult(
@@ -324,12 +485,16 @@ $brief
     if (parallel) {
       _dispatches.add(future);
       unawaited(future);
-      return CouncilToolResult(feedback: 'Started ${agent.name} on: $task');
+      return CouncilToolResult(
+        feedback:
+            'Started ${agent.name} on: $task\n\nContinue coordinating the Council. If this work may benefit from another role, dispatch a companion task or have the agent use council_ask_pool before final synthesis.',
+      );
     }
 
     await future;
     return CouncilToolResult(
-      feedback: '${agent.name} finished.\n\n${agent.transcript}',
+      feedback:
+          '${agent.name} finished this task.\n\n${agent.transcript}\n\nBefore final report, consider whether another agent should challenge or verify these findings through a pool question or follow-up dispatch.',
     );
   }
 
@@ -369,10 +534,29 @@ $brief
       onCouncilTool: (call) => _handleAgentTool(agent, call),
     );
     _runners.add(runner);
+    final taskPoolCountBefore = _poolQuestionCountFrom(agent.id);
     final result = await runner.run();
     if (result.cancelled) return;
-    agent.status = CouncilAgentStatus.done;
+    final taskPoolCountAfter = _poolQuestionCountFrom(agent.id);
+    if (taskPoolCountAfter == taskPoolCountBefore &&
+        session.config.agents.length > 1) {
+      final pushback = await _askPool(
+        agent,
+        CouncilToolCall(
+          id: 'auto_pushback_${++_questionSeq}',
+          name: CouncilProtocol.askPoolToolId,
+          arguments: {
+            'question': S.councilAutoPushbackQuestion(agent.name, task),
+          },
+        ),
+      );
+      agent.transcript +=
+          '\n\n${S.councilPushbackHeader}:\n${pushback.feedback.trim()}\n';
+    }
     _event('agent_done', fromAgentId: agent.id, message: agent.transcript);
+    agent
+      ..status = CouncilAgentStatus.idle
+      ..currentTask = '';
     notifyListeners();
     await _persist();
   }
@@ -401,6 +585,7 @@ $brief
 
     for (final agent in session.config.agents) {
       if (agent.id == asker.id) continue;
+      final previousStatus = agent.status;
       agent.status = CouncilAgentStatus.replying;
       notifyListeners();
       final replyRunner = CouncilAgentRunner(
@@ -423,7 +608,7 @@ $brief
       entry.replies.add(
         CouncilPoolReply(fromAgentId: agent.id, answer: answer),
       );
-      agent.status = CouncilAgentStatus.idle;
+      agent.status = previousStatus;
       _event(
         'pool_reply',
         fromAgentId: agent.id,
@@ -479,9 +664,10 @@ $brief
     session.status = CouncilStatus.synthesizing;
     notifyListeners();
     await Future.wait(_dispatches);
-    final report = markdown.trim().isEmpty
+    final draftReport = markdown.trim().isEmpty
         ? '# Council Report\n\nNo final report was produced.'
         : markdown.trim();
+    final report = await _runFinalEvaluator(draftReport);
     final path = await persistence.writeReport(
       workspacePath: workspace,
       session: session,
@@ -493,9 +679,79 @@ $brief
       ..status = CouncilStatus.done
       ..finishedAt = DateTime.now();
     session.config.orchestrator.status = CouncilAgentStatus.done;
+    for (final agent in session.config.agents) {
+      if (agent.status != CouncilAgentStatus.error) {
+        agent.status = CouncilAgentStatus.done;
+      }
+    }
     _event('reported', message: path);
     notifyListeners();
     await _persist();
+  }
+
+  bool _hasPoolCollaboration() {
+    return _session?.events.any(
+          (e) => e.type == 'asked_pool' || e.type == 'pool_reply',
+        ) ??
+        false;
+  }
+
+  int _poolQuestionCountFrom(String agentId) {
+    return _session?.events
+            .where((e) => e.type == 'asked_pool' && e.fromAgentId == agentId)
+            .length ??
+        0;
+  }
+
+  Future<String> _runFinalEvaluator(String draftReport) async {
+    final session = _session;
+    final workspace = _workspacePath;
+    if (session == null || workspace == null) return draftReport;
+    var evaluator = session.config.finalEvaluator;
+    if (evaluator.model.trim().isEmpty) {
+      evaluator = _defaultFinalEvaluator(session.config.orchestrator.model);
+    }
+    evaluator
+      ..status = CouncilAgentStatus.working
+      ..currentTask = S.councilFinalEvaluatorTask;
+    _event(
+      'evaluator_started',
+      toAgentId: evaluator.id,
+      message: evaluator.currentTask,
+    );
+    notifyListeners();
+
+    final runner = CouncilAgentRunner(
+      agent: evaluator,
+      anthropic: anthropic,
+      copilot: copilot,
+      toolExecutor: _toolExecutor(evaluator, workspace),
+      systemPrompt: CouncilProtocol.finalEvaluatorSystemPrompt(
+        config: session.config,
+        draftReport: draftReport,
+      ),
+      userPrompt: 'Evaluate the Council now and produce the final report.',
+      nativeToolIds: evaluator.enabledTools,
+      onChunk: (chunk) => _appendTranscript(evaluator, chunk),
+      onCouncilTool: (_) async => const CouncilToolResult(
+        feedback: 'The final evaluator should produce prose only.',
+      ),
+    );
+    _runners.add(runner);
+    final result = await runner.run(maxIterations: 4);
+    if (result.cancelled || evaluator.transcript.trim().isEmpty) {
+      evaluator.status = CouncilAgentStatus.error;
+      _event('evaluator_done', fromAgentId: evaluator.id, message: draftReport);
+      return draftReport;
+    }
+    evaluator.status = CouncilAgentStatus.done;
+    _event(
+      'evaluator_done',
+      fromAgentId: evaluator.id,
+      message: evaluator.transcript,
+    );
+    notifyListeners();
+    return evaluator.transcript.trim();
   }
 
   ToolExecutor _toolExecutor(CouncilAgent agent, String workspace) {
@@ -510,9 +766,18 @@ $brief
   }
 
   void _appendTranscript(CouncilAgent agent, String chunk) {
-    agent.transcript += chunk;
-    _event('agent_chunk', fromAgentId: agent.id, message: chunk);
+    final clean = _cleanTranscriptChunk(chunk);
+    if (clean.isEmpty) return;
+    agent.transcript += clean;
+    _event('agent_chunk', fromAgentId: agent.id, message: clean);
     notifyListeners();
+  }
+
+  String _cleanTranscriptChunk(String chunk) {
+    return chunk.replaceAll(
+      RegExp(r'<!--\s*LUMEN_THINK_(START|END)\s*-->', caseSensitive: false),
+      '',
+    );
   }
 
   void _event(

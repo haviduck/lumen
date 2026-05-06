@@ -45,7 +45,9 @@ class CouncilAgentSector extends StatelessWidget {
         borderRadius: BorderRadius.circular(DuckTheme.radiusL),
         border: Border.all(
           color: active
-              ? (isOrchestrator ? DuckColors.accentDuck : DuckColors.accentCyan)
+              ? (isOrchestrator
+                    ? DuckColors.accentPurple
+                    : DuckColors.accentCyan)
               : DuckColors.glassSeam,
           width: active ? 1.6 : 0.7,
         ),
@@ -54,7 +56,7 @@ class CouncilAgentSector extends StatelessWidget {
                 BoxShadow(
                   color:
                       (isOrchestrator
-                              ? DuckColors.accentDuck
+                              ? DuckColors.accentPurple
                               : DuckColors.accentCyan)
                           .withValues(alpha: 0.22),
                   blurRadius: 28,
@@ -77,7 +79,7 @@ class CouncilAgentSector extends StatelessWidget {
                   shape: BoxShape.circle,
                   color:
                       (isOrchestrator
-                              ? DuckColors.accentDuck
+                              ? DuckColors.accentPurple
                               : DuckColors.accentCyan)
                           .withValues(alpha: 0.08),
                 ),
@@ -94,7 +96,7 @@ class CouncilAgentSector extends StatelessWidget {
                 borderRadius: BorderRadius.circular(999),
                 color: active
                     ? (isOrchestrator
-                          ? DuckColors.accentDuck
+                          ? DuckColors.accentPurple
                           : DuckColors.accentCyan)
                     : DuckColors.border,
               ),
@@ -111,7 +113,12 @@ class CouncilAgentSector extends StatelessWidget {
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       gradient: isOrchestrator
-                          ? DuckColors.duckGradient
+                          ? const LinearGradient(
+                              colors: [
+                                DuckColors.accentCyan,
+                                DuckColors.accentPurple,
+                              ],
+                            )
                           : const LinearGradient(
                               colors: [
                                 DuckColors.accentCyan,
@@ -123,7 +130,7 @@ class CouncilAgentSector extends StatelessWidget {
                               BoxShadow(
                                 color:
                                     (isOrchestrator
-                                            ? DuckColors.accentDuck
+                                            ? DuckColors.accentPurple
                                             : DuckColors.accentCyan)
                                         .withValues(alpha: 0.35),
                                 blurRadius: 18,
@@ -190,34 +197,12 @@ class CouncilAgentSector extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               Expanded(
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(9),
-                  decoration: BoxDecoration(
-                    color: DuckColors.bgDeepest.withValues(alpha: 0.58),
-                    borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-                    border: Border.all(
-                      color: active
-                          ? DuckColors.borderStrong
-                          : DuckColors.border,
-                      width: 0.5,
-                    ),
-                  ),
-                  child: SingleChildScrollView(
-                    reverse: true,
-                    child: Text(
-                      agent.transcript.trim().isEmpty
-                          ? S.councilNoTranscript
-                          : agent.transcript.trim(),
-                      style: TextStyle(
-                        color: agent.transcript.trim().isEmpty
-                            ? DuckColors.fgSubtle
-                            : DuckColors.fgSecondary,
-                        fontSize: 11,
-                        height: 1.35,
-                      ),
-                    ),
-                  ),
+                child: _TranscriptWell(
+                  transcript: agent.transcript,
+                  active: active,
+                  accent: isOrchestrator
+                      ? DuckColors.accentPurple
+                      : DuckColors.accentCyan,
                 ),
               ),
             ],
@@ -237,6 +222,146 @@ class CouncilAgentSector extends StatelessWidget {
       RolePreset.writer => Icons.edit_note_outlined,
       RolePreset.custom => Icons.person_outline,
     };
+  }
+}
+
+class _TranscriptWell extends StatelessWidget {
+  final String transcript;
+  final bool active;
+  final Color accent;
+
+  const _TranscriptWell({
+    required this.transcript,
+    required this.active,
+    required this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final text = transcript.trim();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: DuckColors.bgDeepest.withValues(alpha: 0.42),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        border: Border.all(
+          color: active ? accent.withValues(alpha: 0.35) : DuckColors.border,
+          width: 0.5,
+        ),
+      ),
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    accent.withValues(alpha: active ? 0.08 : 0.03),
+                    Colors.transparent,
+                    DuckColors.bgDeepest.withValues(alpha: 0.16),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          if (active) Positioned.fill(child: _WorkingField(accent: accent)),
+          SingleChildScrollView(
+            reverse: true,
+            child: Text(
+              text.isEmpty ? S.councilNoTranscript : text,
+              style: TextStyle(
+                color: text.isEmpty
+                    ? DuckColors.fgSubtle.withValues(alpha: 0.62)
+                    : DuckColors.fgSecondary.withValues(alpha: 0.42),
+                fontSize: 11,
+                height: 1.35,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WorkingField extends StatefulWidget {
+  final Color accent;
+
+  const _WorkingField({required this.accent});
+
+  @override
+  State<_WorkingField> createState() => _WorkingFieldState();
+}
+
+class _WorkingFieldState extends State<_WorkingField>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return CustomPaint(
+          painter: _WorkingFieldPainter(
+            t: _controller.value,
+            accent: widget.accent,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _WorkingFieldPainter extends CustomPainter {
+  final double t;
+  final Color accent;
+
+  _WorkingFieldPainter({required this.t, required this.accent});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1
+      ..strokeCap = StrokeCap.round;
+    for (var i = 0; i < 5; i++) {
+      final y = size.height * (0.2 + i * 0.14);
+      final start = (t * size.width * 1.4 + i * 37) % (size.width + 42) - 42;
+      paint.color = accent.withValues(alpha: 0.08 + i * 0.018);
+      canvas.drawLine(Offset(start, y), Offset(start + 34 + i * 6, y), paint);
+    }
+
+    final dotPaint = Paint()..color = accent.withValues(alpha: 0.16);
+    for (var i = 0; i < 9; i++) {
+      final x = (size.width * ((t + i * 0.137) % 1.0));
+      final y = size.height * (0.18 + ((i * 37) % 68) / 100);
+      canvas.drawCircle(Offset(x, y), 1.4, dotPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _WorkingFieldPainter oldDelegate) {
+    return oldDelegate.t != t || oldDelegate.accent != accent;
   }
 }
 

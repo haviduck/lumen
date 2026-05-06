@@ -2070,12 +2070,55 @@ class S {
   static const String councilReportReady = 'Report ready';
   static const String councilOpenReport = 'Open report';
   static const String councilAskPoolHeader = 'Council pool';
+  static const String councilBlackboardTitle = 'Blackboard';
+  static const String councilBlackboardEmpty =
+      'Tasks appear here as the orchestrator dispatches work.';
+  static const String councilBlackboardReportTitle = 'Final report';
+  static const String councilBlackboardReportBody =
+      'The Council has finished. Review the report before leaving the theater.';
   static const String councilAskUserHeader = 'Council needs you';
   static const String councilUserAnswerHint = 'Type your answer...';
   static const String councilSubmitAnswer = 'Send answer';
   static const String councilNoPoolQuestions = 'No pool questions yet.';
   static const String councilNoTranscript = 'Waiting for first signal...';
   static const String councilOrchestrator = 'Orchestrator';
+  static const String councilFinalEvaluator = 'Final evaluator';
+  static const String councilFinalEvaluatorTask =
+      'Evaluate Council work and produce final report';
+  static const String councilFinalEvaluatorRole =
+      'Independent evaluator. Challenge the council, validate evidence, and produce the final report.';
+  static const String councilPushbackHeader = 'Council pushback';
+  static String councilAutoPushbackQuestion(String agentName, String task) =>
+      '$agentName just completed this task: "$task". Push back hard: what is weak, missing, risky, unproven, or contradicted? Give concrete objections and one way to validate them.';
+  static const String councilFallbackProductOps = 'ProductOps';
+  static const String councilFallbackAgentCore = 'AgentCore';
+  static const String councilFallbackCodeCarto = 'CodeCarto';
+  static const String councilFallbackFlowDesign = 'FlowDesign';
+  static const String councilFallbackReliability = 'Reliability';
+  static const String councilFallbackPlatform = 'Platform';
+  static const String councilFallbackSafety = 'Safety';
+  static const String councilFallbackSkeptic = 'Skeptic';
+  static const String councilFallbackProductOpsRole =
+      'Product/UX strategist. Define what would make the IDE meaningfully better than existing agentic IDEs, and reject feature bloat.';
+  static const String councilFallbackAgentCoreRole =
+      'Agent systems architect. Design orchestration, context flow, tool use, memory, safety loops, and model handoffs.';
+  static const String councilFallbackCodeCartoRole =
+      'Codebase cartographer. Map the app, identify unfinished surfaces, architectural weak points, and hidden constraints.';
+  static const String councilFallbackFlowDesignRole =
+      'Interaction designer. Make complex agent workflows feel simple, legible, and powerful without overwhelming the user.';
+  static const String councilFallbackReliabilityRole =
+      'Reliability and regression engineer. Find brittle state, async races, missing tests, and flows likely to break under real use.';
+  static const String councilFallbackPlatformRole =
+      'Performance/platform engineer. Review Flutter desktop responsiveness, process handling, streaming, and resource use.';
+  static const String councilFallbackSafetyRole =
+      'Security and tool-safety reviewer. Challenge workspace writes, command execution, approvals, secrets, and abuse paths.';
+  static const String councilFallbackSkepticRole =
+      'Adversarial evaluator. Push back on hype, force evidence, and identify what still is not good enough.';
+  static const String councilSecurityGoalMap = 'Map surface';
+  static const String councilSecurityGoalEntry = 'Find entry';
+  static const String councilSecurityGoalExploit = 'Validate impact';
+  static const String councilSecurityGoalEvidence = 'Gather evidence';
+  static const String councilSecurityGoalRemediate = 'Report fixes';
   static const String councilStatusIdle = 'idle';
   static const String councilStatusDispatching = 'dispatching';
   static const String councilStatusWorking = 'working';

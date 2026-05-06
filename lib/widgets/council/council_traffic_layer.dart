@@ -81,21 +81,32 @@ class _CouncilTrafficPainter extends CustomPainter {
       canvas.drawLine(center, p, line);
     }
 
+    final collaborationLine = Paint()
+      ..color = DuckColors.accentPurple.withValues(alpha: 0.24)
+      ..strokeWidth = 1.2
+      ..strokeCap = StrokeCap.round;
+    for (final event in events.where((e) => e.type == 'pool_reply').take(24)) {
+      final from = points[event.fromAgentId];
+      final to = points[event.toAgentId];
+      if (from == null || to == null || from == to) continue;
+      canvas.drawLine(from, to, collaborationLine);
+    }
+
     final now = DateTime.now();
     for (final event in events.reversed.take(20)) {
       final age = now.difference(event.createdAt).inMilliseconds;
-      if (age > 5200) continue;
+      if (age > 2800) continue;
       final from = points[event.fromAgentId] ?? center;
       final to = points[event.toAgentId] ?? center;
       if (from == to) continue;
-      final t = (age / 5200).clamp(0.0, 1.0);
+      final t = (age / 2800).clamp(0.0, 1.0);
       final dot = Offset.lerp(from, to, t)!;
       canvas.drawLine(from, to, glowLine);
       canvas.drawLine(from, to, activeLine);
       canvas.drawCircle(
         dot,
         4.5 + (1 - t) * 3,
-        Paint()..color = DuckColors.accentDuck.withValues(alpha: 1 - t * 0.55),
+        Paint()..color = DuckColors.accentMint.withValues(alpha: 1 - t * 0.55),
       );
       canvas.drawCircle(
         dot,
@@ -103,7 +114,7 @@ class _CouncilTrafficPainter extends CustomPainter {
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1
-          ..color = DuckColors.accentDuck.withValues(alpha: 0.2),
+          ..color = DuckColors.accentPurple.withValues(alpha: 0.22),
       );
     }
   }

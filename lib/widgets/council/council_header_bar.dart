@@ -43,10 +43,12 @@ class CouncilHeaderBar extends StatelessWidget {
             height: 34,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              gradient: DuckColors.duckGradient,
+              gradient: const LinearGradient(
+                colors: [DuckColors.accentCyan, DuckColors.accentPurple],
+              ),
               boxShadow: [
                 BoxShadow(
-                  color: DuckColors.accentDuck.withValues(alpha: 0.24),
+                  color: DuckColors.accentPurple.withValues(alpha: 0.24),
                   blurRadius: 18,
                 ),
               ],

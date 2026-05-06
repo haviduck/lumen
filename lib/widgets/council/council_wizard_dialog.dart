@@ -242,6 +242,20 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
       title: _title.text.trim().isEmpty ? S.councilTitle : _title.text.trim(),
       brief: _brief.text.trim(),
       orchestrator: _orchestrator.toAgent('orchestrator'),
+      finalEvaluator: CouncilAgent(
+        id: 'final_evaluator',
+        name: S.councilFinalEvaluator,
+        role: RolePreset.reviewer,
+        customRole: S.councilFinalEvaluatorRole,
+        model: _orchestrator.model ?? '',
+        enabledTools: const {
+          'read_file',
+          'search_text',
+          'glob',
+          'web_search',
+          'web_fetch',
+        },
+      ),
       agents: [
         for (var i = 0; i < _agents.length; i++) _agents[i].toAgent('agent_$i'),
       ],
@@ -273,7 +287,7 @@ class _Header extends StatelessWidget {
       ),
       child: const Row(
         children: [
-          Icon(Icons.hub_outlined, color: DuckColors.accentDuck),
+          Icon(Icons.hub_outlined, color: DuckColors.accentPurple),
           SizedBox(width: 10),
           Text(
             S.councilWizardTitle,
@@ -300,13 +314,18 @@ class _GateBanner extends StatelessWidget {
       margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: DuckColors.stateWarn.withValues(alpha: 0.1),
+        color: DuckColors.accentPurple.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        border: Border.all(color: DuckColors.stateWarn.withValues(alpha: 0.6)),
+        border: Border.all(
+          color: DuckColors.accentPurple.withValues(alpha: 0.45),
+        ),
       ),
       child: Row(
         children: [
-          const Icon(Icons.warning_amber_outlined, color: DuckColors.stateWarn),
+          const Icon(
+            Icons.warning_amber_outlined,
+            color: DuckColors.accentPurple,
+          ),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -398,18 +417,18 @@ class _BriefStep extends StatelessWidget {
           decoration: BoxDecoration(
             gradient: LinearGradient(
               colors: [
-                DuckColors.accentDuck.withValues(alpha: 0.10),
+                DuckColors.accentPurple.withValues(alpha: 0.10),
                 DuckColors.accentCyan.withValues(alpha: 0.06),
               ],
             ),
             borderRadius: BorderRadius.circular(DuckTheme.radiusM),
             border: Border.all(
-              color: DuckColors.accentDuck.withValues(alpha: 0.26),
+              color: DuckColors.accentPurple.withValues(alpha: 0.26),
             ),
           ),
           child: Row(
             children: [
-              const Icon(Icons.auto_awesome, color: DuckColors.accentDuck),
+              const Icon(Icons.auto_awesome, color: DuckColors.accentPurple),
               const SizedBox(width: 10),
               const Expanded(
                 child: Column(

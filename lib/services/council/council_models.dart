@@ -1,3 +1,5 @@
+import '../../l10n/strings.dart';
+
 enum CouncilStatus {
   idle,
   dispatching,
@@ -123,6 +125,7 @@ class CouncilConfig {
   final String brief;
   final CouncilAgent orchestrator;
   final List<CouncilAgent> agents;
+  final CouncilAgent finalEvaluator;
   final DateTime createdAt;
 
   CouncilConfig({
@@ -131,11 +134,20 @@ class CouncilConfig {
     required this.brief,
     required this.orchestrator,
     required List<CouncilAgent> agents,
+    CouncilAgent? finalEvaluator,
     DateTime? createdAt,
   }) : agents = List.unmodifiable(agents),
+       finalEvaluator =
+           finalEvaluator ??
+           CouncilAgent(
+             id: 'final_evaluator',
+             name: S.councilFinalEvaluator,
+             role: RolePreset.reviewer,
+             model: orchestrator.model,
+           ),
        createdAt = createdAt ?? DateTime.now();
 
-  List<CouncilAgent> get allAgents => [orchestrator, ...agents];
+  List<CouncilAgent> get allAgents => [orchestrator, ...agents, finalEvaluator];
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -143,6 +155,7 @@ class CouncilConfig {
     'brief': brief,
     'orchestrator': orchestrator.toJson(),
     'agents': agents.map((a) => a.toJson()).toList(),
+    'finalEvaluator': finalEvaluator.toJson(),
     'createdAt': createdAt.toIso8601String(),
   };
 
@@ -159,6 +172,11 @@ class CouncilConfig {
           .whereType<Map>()
           .map((a) => CouncilAgent.fromJson(a.cast<String, dynamic>()))
           .toList(),
+      finalEvaluator: json['finalEvaluator'] is Map
+          ? CouncilAgent.fromJson(
+              (json['finalEvaluator'] as Map).cast<String, dynamic>(),
+            )
+          : null,
       createdAt:
           DateTime.tryParse(json['createdAt'] as String? ?? '') ??
           DateTime.now(),
@@ -269,6 +287,7 @@ class CouncilSession {
 
   CouncilAgent? agentById(String id) {
     if (config.orchestrator.id == id) return config.orchestrator;
+    if (config.finalEvaluator.id == id) return config.finalEvaluator;
     for (final agent in config.agents) {
       if (agent.id == id) return agent;
     }
