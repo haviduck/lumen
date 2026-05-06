@@ -88,7 +88,7 @@ class _CouncilTrafficPainter extends CustomPainter {
       final from = points[event.fromAgentId] ?? center;
       final to = points[event.toAgentId] ?? center;
       if (from == to) continue;
-      final t = ((age / 5200) + pulse * 0.18).clamp(0.0, 1.0);
+      final t = (age / 5200).clamp(0.0, 1.0);
       final dot = Offset.lerp(from, to, t)!;
       canvas.drawLine(from, to, glowLine);
       canvas.drawLine(from, to, activeLine);
@@ -99,7 +99,7 @@ class _CouncilTrafficPainter extends CustomPainter {
       );
       canvas.drawCircle(
         dot,
-        13 + math.sin(pulse * math.pi * 2) * 3,
+        13 + math.sin(pulse * math.pi * 2) * 1.2,
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1

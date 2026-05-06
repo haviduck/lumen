@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
+import '../l10n/strings.dart';
 import '../services/anthropic_service.dart';
 import '../services/copilot_service.dart';
 import '../services/council/council_agent_runner.dart';
@@ -55,6 +57,57 @@ class CouncilController extends ChangeNotifier {
     notifyListeners();
     await _persist();
     unawaited(_runOrchestrator());
+  }
+
+  Future<List<CouncilAgent>> proposeAgentsForBrief({
+    required String brief,
+    required CouncilAgent orchestrator,
+    int count = 4,
+  }) async {
+    final fallback = _fallbackAgentsForBrief(brief, orchestrator.model, count);
+    if (brief.trim().isEmpty || orchestrator.model.trim().isEmpty) {
+      return fallback;
+    }
+
+    final prompt =
+        '''
+You are designing a compact expert council for a software/technical task.
+
+Return ONLY JSON. No markdown. Shape:
+{
+  "agents": [
+    {
+      "name": "short distinctive name",
+      "role": "pentester|reviewer|researcher|architect|tester|writer|custom",
+      "customRole": "only when role is custom"
+    }
+  ]
+}
+
+Rules:
+- Create $count agents.
+- Pick complementary roles for the user's brief.
+- Include a pentester only when security, threat modeling, auth, secrets, or pentesting is relevant.
+- Include a tester whenever implementation or debugging is likely.
+- Names should be short and useful in a visual dashboard.
+
+User brief:
+$brief
+''';
+
+    try {
+      final messages = [
+        {'role': 'user', 'content': prompt},
+      ];
+      final split = _splitModel(orchestrator.model);
+      final raw = split.provider == 'claude'
+          ? await anthropic.generateChat(messages, model: split.rawModel)
+          : await copilot.generateChat(messages, model: split.rawModel);
+      final parsed = _parseProposedAgents(raw, orchestrator.model);
+      return parsed.length >= 2 ? parsed : fallback;
+    } catch (_) {
+      return fallback;
+    }
   }
 
   void showTheater() {
@@ -123,6 +176,74 @@ class CouncilController extends ChangeNotifier {
     if (!result.cancelled && session.status != CouncilStatus.done) {
       await _finishWithReport(result.content);
     }
+  }
+
+  ({String provider, String rawModel}) _splitModel(String model) {
+    final idx = model.indexOf(':');
+    if (idx < 0) return (provider: model, rawModel: model);
+    return (
+      provider: model.substring(0, idx),
+      rawModel: model.substring(idx + 1),
+    );
+  }
+
+  List<CouncilAgent> _parseProposedAgents(String raw, String model) {
+    final start = raw.indexOf('{');
+    final end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) return const <CouncilAgent>[];
+    final json =
+        jsonDecode(raw.substring(start, end + 1)) as Map<String, dynamic>;
+    final agents = (json['agents'] as List?) ?? const [];
+    return agents.whereType<Map>().take(6).toList().asMap().entries.map((
+      entry,
+    ) {
+      final data = entry.value.cast<String, dynamic>();
+      final role = _roleFromName(data['role'] as String?) ?? RolePreset.custom;
+      return CouncilAgent(
+        id: 'agent_${entry.key}',
+        name: (data['name'] as String?)?.trim().isNotEmpty == true
+            ? (data['name'] as String).trim()
+            : 'Agent ${entry.key + 1}',
+        role: role,
+        customRole: data['customRole'] as String? ?? '',
+        model: model,
+        enabledTools: _defaultCouncilTools,
+      );
+    }).toList();
+  }
+
+  List<CouncilAgent> _fallbackAgentsForBrief(
+    String brief,
+    String model,
+    int count,
+  ) {
+    final b = brief.toLowerCase();
+    final roles = <RolePreset>[
+      if (b.contains('security') ||
+          b.contains('pentest') ||
+          b.contains('auth') ||
+          b.contains('secret'))
+        RolePreset.pentester,
+      RolePreset.architect,
+      RolePreset.reviewer,
+      RolePreset.tester,
+      if (b.contains('research') || b.contains('compare'))
+        RolePreset.researcher,
+      if (b.contains('doc') || b.contains('report')) RolePreset.writer,
+    ];
+    while (roles.length < count) {
+      roles.add(RolePreset.researcher);
+    }
+    return roles.take(count).toList().asMap().entries.map((entry) {
+      final role = entry.value;
+      return CouncilAgent(
+        id: 'agent_${entry.key}',
+        name: _roleName(role),
+        role: role,
+        model: model,
+        enabledTools: _defaultCouncilTools,
+      );
+    }).toList();
   }
 
   Future<CouncilToolResult> _handleOrchestratorTool(
@@ -417,4 +538,32 @@ class CouncilController extends ChangeNotifier {
     if (session == null) return;
     await persistence.saveSession(session);
   }
+}
+
+const Set<String> _defaultCouncilTools = {
+  'read_file',
+  'search_text',
+  'glob',
+  'web_search',
+  'web_fetch',
+};
+
+RolePreset? _roleFromName(String? name) {
+  if (name == null) return null;
+  for (final role in RolePreset.values) {
+    if (role.name == name) return role;
+  }
+  return null;
+}
+
+String _roleName(RolePreset role) {
+  return switch (role) {
+    RolePreset.pentester => S.councilRolePentester,
+    RolePreset.reviewer => S.councilRoleReviewer,
+    RolePreset.researcher => S.councilRoleResearcher,
+    RolePreset.architect => S.councilRoleArchitect,
+    RolePreset.tester => S.councilRoleTester,
+    RolePreset.writer => S.councilRoleWriter,
+    RolePreset.custom => S.councilRoleCustom,
+  };
 }

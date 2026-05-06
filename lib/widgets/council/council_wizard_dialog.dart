@@ -13,6 +13,7 @@ import '../../theme/app_theme.dart';
 Future<void> showCouncilWizard(BuildContext context) {
   return showDialog<void>(
     context: context,
+    barrierDismissible: false,
     builder: (_) => const CouncilWizardDialog(),
   );
 }
@@ -29,6 +30,7 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
   final TextEditingController _brief = TextEditingController();
   int _step = 0;
   bool _loadedLastConfig = false;
+  bool _lazyGenerating = false;
   late List<_DraftAgent> _agents;
   late _DraftAgent _orchestrator;
 
@@ -122,7 +124,8 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
         constraints: const BoxConstraints(maxWidth: 820, maxHeight: 720),
         child: Column(
           children: [
-            _Header(step: _step),
+            const _Header(),
+            const _InfoBanner(message: S.councilModalProtected),
             if (models.isEmpty)
               const _GateBanner(message: S.councilModelGateBanner),
             Expanded(
@@ -135,7 +138,14 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
                   Step(
                     title: const Text(S.councilWizardStepBrief),
                     isActive: _step == 0,
-                    content: _BriefStep(title: _title, brief: _brief),
+                    content: _BriefStep(
+                      title: _title,
+                      brief: _brief,
+                      canGenerate:
+                          models.isNotEmpty && _brief.text.trim().isNotEmpty,
+                      isGenerating: _lazyGenerating,
+                      onGenerate: () => _generateLazyRoster(models),
+                    ),
                   ),
                   Step(
                     title: const Text(S.councilWizardStepAgents),
@@ -173,7 +183,8 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
               canStart:
                   models.isNotEmpty &&
                   _brief.text.trim().isNotEmpty &&
-                  _agents.length >= 2,
+                  _agents.length >= 2 &&
+                  !_lazyGenerating,
               onBack: _step == 0 ? null : () => setState(() => _step--),
               onNext: _step == 3 ? null : () => setState(() => _step++),
               onStart: () => _start(appState),
@@ -182,6 +193,39 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
         ),
       ),
     );
+  }
+
+  Future<void> _generateLazyRoster(List<String> models) async {
+    if (_lazyGenerating || models.isEmpty || _brief.text.trim().isEmpty) {
+      return;
+    }
+    _orchestrator.model ??= models.first;
+    setState(() => _lazyGenerating = true);
+    final appState = context.read<AppState>();
+    try {
+      final proposed = await appState.council.proposeAgentsForBrief(
+        brief: _brief.text.trim(),
+        orchestrator: _orchestrator.toAgent('orchestrator'),
+      );
+      if (!mounted) return;
+      setState(() {
+        for (final agent in _agents) {
+          agent.dispose();
+        }
+        _agents = proposed.map(_DraftAgent.fromAgent).toList();
+        _step = 1;
+      });
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(const SnackBar(content: Text(S.councilLazyModeDone)));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(const SnackBar(content: Text(S.councilLazyModeFailed)));
+    } finally {
+      if (mounted) setState(() => _lazyGenerating = false);
+    }
   }
 
   bool _isCouncilModel(String model) {
@@ -218,9 +262,7 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
 }
 
 class _Header extends StatelessWidget {
-  final int step;
-
-  const _Header({required this.step});
+  const _Header();
 
   @override
   Widget build(BuildContext context) {
@@ -278,11 +320,57 @@ class _GateBanner extends StatelessWidget {
   }
 }
 
+class _InfoBanner extends StatelessWidget {
+  final String message;
+
+  const _InfoBanner({required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: DuckColors.accentCyan.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        border: Border.all(
+          color: DuckColors.accentCyan.withValues(alpha: 0.24),
+        ),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.lock_outline,
+            size: 14,
+            color: DuckColors.accentCyan,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(color: DuckColors.fgMuted, fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _BriefStep extends StatelessWidget {
   final TextEditingController title;
   final TextEditingController brief;
+  final bool canGenerate;
+  final bool isGenerating;
+  final VoidCallback onGenerate;
 
-  const _BriefStep({required this.title, required this.brief});
+  const _BriefStep({
+    required this.title,
+    required this.brief,
+    required this.canGenerate,
+    required this.isGenerating,
+    required this.onGenerate,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -302,6 +390,64 @@ class _BriefStep extends StatelessWidget {
           decoration: _inputDecoration(
             S.councilBriefLabel,
             hint: S.councilBriefHint,
+          ),
+        ),
+        const SizedBox(height: 14),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                DuckColors.accentDuck.withValues(alpha: 0.10),
+                DuckColors.accentCyan.withValues(alpha: 0.06),
+              ],
+            ),
+            borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+            border: Border.all(
+              color: DuckColors.accentDuck.withValues(alpha: 0.26),
+            ),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.auto_awesome, color: DuckColors.accentDuck),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      S.councilLazyModeTitle,
+                      style: TextStyle(
+                        color: DuckColors.fgPrimary,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 12,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      S.councilLazyModeBody,
+                      style: TextStyle(color: DuckColors.fgMuted, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              ElevatedButton.icon(
+                onPressed: canGenerate && !isGenerating ? onGenerate : null,
+                icon: isGenerating
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.hub_outlined, size: 15),
+                label: Text(
+                  isGenerating
+                      ? S.councilLazyModeWorking
+                      : S.councilLazyModeGenerate,
+                ),
+              ),
+            ],
           ),
         ),
       ],
@@ -569,6 +715,13 @@ class _DraftAgent {
     );
     agent.customRole.text = json['customRole'] as String? ?? '';
     agent.model = json['model'] as String?;
+    return agent;
+  }
+
+  factory _DraftAgent.fromAgent(CouncilAgent source) {
+    final agent = _DraftAgent(name: source.name, role: source.role);
+    agent.customRole.text = source.customRole;
+    agent.model = source.model;
     return agent;
   }
 

@@ -2040,6 +2040,17 @@ class S {
   static const String councilWizardStepAgents = 'Agents';
   static const String councilWizardStepOrchestrator = 'Orchestrator';
   static const String councilWizardStepReview = 'Review';
+  static const String councilLazyModeTitle = 'Lazy mode';
+  static const String councilLazyModeBody =
+      'Let the orchestrator design the council from your brief.';
+  static const String councilLazyModeGenerate = 'Have orchestrator build team';
+  static const String councilLazyModeWorking =
+      'Orchestrator is designing the council...';
+  static const String councilLazyModeDone = 'Council roster generated.';
+  static const String councilLazyModeFailed =
+      'Could not generate a roster, so Lumen used a sensible default team.';
+  static const String councilModalProtected =
+      'Use Cancel when you want to close this setup.';
   static const String councilBriefLabel = 'What should the Council solve?';
   static const String councilBriefHint =
       'Describe the problem, goal, constraints, and what done looks like.';

@@ -30,7 +30,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
     super.initState();
     _pulse = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 4200),
+      duration: const Duration(milliseconds: 9000),
     )..repeat();
   }
 
@@ -145,12 +145,9 @@ class _CouncilStage extends StatelessWidget {
                   top: center.dy - cardH / 2,
                   width: cardW,
                   height: cardH,
-                  child: Transform.scale(
-                    scale: 1 + math.sin(pulse.value * math.pi * 2) * 0.006,
-                    child: CouncilAgentSector(
-                      agent: session.config.orchestrator,
-                      isOrchestrator: true,
-                    ),
+                  child: CouncilAgentSector(
+                    agent: session.config.orchestrator,
+                    isOrchestrator: true,
                   ),
                 ),
                 for (var i = 0; i < agents.length; i++)
@@ -163,7 +160,6 @@ class _CouncilStage extends StatelessWidget {
                     height: cardH,
                     agent: agents[i],
                     bounds: size,
-                    pulse: pulse.value,
                   ),
               ],
             );
@@ -182,13 +178,11 @@ class _CouncilStage extends StatelessWidget {
     required double height,
     required CouncilAgent agent,
     required Size bounds,
-    required double pulse,
   }) {
     final angle = -math.pi / 2 + (math.pi * 2 * index / count);
-    final drift = math.sin((pulse * math.pi * 2) + index) * 4;
     final raw = Offset(
-      center.dx + math.cos(angle) * (radius + drift),
-      center.dy + math.sin(angle) * (radius + drift),
+      center.dx + math.cos(angle) * radius,
+      center.dy + math.sin(angle) * radius,
     );
     final left = (raw.dx - width / 2).clamp(10.0, bounds.width - width - 10);
     final top = (raw.dy - height / 2).clamp(10.0, bounds.height - height - 10);
@@ -232,7 +226,8 @@ class _CouncilAtmospherePainter extends CustomPainter {
       ..strokeWidth = 1.6
       ..color = DuckColors.accentCyan.withValues(alpha: 0.16);
     for (var i = 0; i < 4; i++) {
-      final r = radius * (0.45 + i * 0.23) + pulse * 8;
+      final breathe = math.sin((pulse * math.pi * 2) + i * 0.7) * 2.5;
+      final r = radius * (0.45 + i * 0.23) + breathe;
       canvas.drawCircle(center, r, i == 2 ? activeRingPaint : ringPaint);
     }
 
@@ -248,7 +243,7 @@ class _CouncilAtmospherePainter extends CustomPainter {
       canvas.drawCircle(p, 3.5, nodePaint);
       canvas.drawCircle(
         p,
-        11 + math.sin((pulse * math.pi * 2) + i) * 2,
+        11 + math.sin((pulse * math.pi * 2) + i) * 0.8,
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 0.8
@@ -260,7 +255,7 @@ class _CouncilAtmospherePainter extends CustomPainter {
       ..strokeWidth = 0.7
       ..color = DuckColors.accentMint.withValues(alpha: 0.055);
     final step = 42.0;
-    final offset = pulse * step;
+    final offset = pulse * step * 0.45;
     for (var x = -step + offset; x < size.width; x += step) {
       canvas.drawLine(
         Offset(x, 0),
