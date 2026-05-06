@@ -10,6 +10,7 @@ import '../services/auto_backup_scheduler.dart';
 import '../services/backup_service.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/copilot_service.dart';
+import '../services/council/council_persistence_service.dart';
 import '../services/file_kind.dart';
 import '../services/gemini_service.dart';
 import '../services/gitnexus_service.dart';
@@ -28,6 +29,7 @@ import '../services/timeline_service.dart';
 import '../services/workspace_service.dart';
 import '../services/workspace_skills_service.dart';
 import 'chat_controller.dart';
+import 'council_controller.dart';
 import 'ssh_controller.dart';
 
 enum DuckViewMode { normal, zen, sideEye }
@@ -82,6 +84,8 @@ class AppState extends ChangeNotifier {
   final WorkspaceService _workspaceService = WorkspaceService();
   final PreferencesService prefs = PreferencesService();
   final ChatPersistenceService _persistence = ChatPersistenceService();
+  final CouncilPersistenceService _councilPersistence =
+      CouncilPersistenceService();
   final RulesService rules = RulesService();
   final IdeActions ideActions = IdeActions();
   // Tracks PIDs that Lumen explicitly spawned (terminal PTYs, agent
@@ -147,6 +151,7 @@ class AppState extends ChangeNotifier {
   late final RecentEditsTracker recentEdits = RecentEditsTracker(prefs);
 
   late final ChatController chat;
+  late final CouncilController council;
   late final AutoBackupScheduler autoBackup;
 
   // Optional reference to the workspace-wide [SshController]. Wired
@@ -436,6 +441,15 @@ class AppState extends ChangeNotifier {
       skills: workspaceSkills,
       agentTerminals: agentTerminals,
     );
+    council = CouncilController(
+      anthropic: _anthropicService,
+      copilot: _copilotService,
+      persistence: _councilPersistence,
+      isToolAutoApproved: (toolId, detail) {
+        return chat.autoApprove || chat.autoApprovedTools.contains(toolId);
+      },
+    );
+    council.addListener(notifyListeners);
     autoBackup = AutoBackupScheduler(
       backups: backups,
       prefs: prefs,
@@ -499,6 +513,7 @@ class AppState extends ChangeNotifier {
     _fsRefreshDebounce?.cancel();
     autoBackup.dispose();
     timeline.dispose();
+    council.removeListener(notifyListeners);
     gitnexus.removeListener(_onGitnexusChanged);
     gitnexus.dispose();
     unawaited(_copilotService.dispose());

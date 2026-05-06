@@ -25,6 +25,7 @@ import 'widgets/ai_chat/ai_chat.dart';
 import 'widgets/app_close_guard.dart';
 import 'widgets/common/ambient_background.dart';
 import 'widgets/common/duck_glass.dart';
+import 'widgets/council/council_theater.dart';
 import 'widgets/common/fast_popup_menu.dart';
 import 'widgets/editor/editor.dart';
 import 'widgets/file_explorer/file_explorer.dart';
@@ -95,34 +96,36 @@ class _SshAppStateBridgeState extends State<_SshAppStateBridge> {
         final appState = context.read<AppState>();
         appState.bindSsh(
           ssh,
-          conflictResolver: ({
-            required RemoteFileOrigin origin,
-            required int? currentSize,
-            required int? currentMtime,
-          }) async {
-            // The dialog needs a context with a Navigator above it.
-            // Walking up to `Overlay` keeps the dialog above the IDE
-            // shell even when a save is triggered from a deeply
-            // nested widget tree.
-            return showSshRemoteConflictDialog(
-              context,
-              origin: origin,
-              currentSize: currentSize,
-              currentMtime: currentMtime,
-            );
-          },
-          grabConflictResolver: ({
-            required String existingLocalPath,
-            required String remotePath,
-            required String hostLabel,
-          }) async {
-            return showSshGrabConflictDialog(
-              context,
-              existingLocalPath: existingLocalPath,
-              remotePath: remotePath,
-              hostLabel: hostLabel,
-            );
-          },
+          conflictResolver:
+              ({
+                required RemoteFileOrigin origin,
+                required int? currentSize,
+                required int? currentMtime,
+              }) async {
+                // The dialog needs a context with a Navigator above it.
+                // Walking up to `Overlay` keeps the dialog above the IDE
+                // shell even when a save is triggered from a deeply
+                // nested widget tree.
+                return showSshRemoteConflictDialog(
+                  context,
+                  origin: origin,
+                  currentSize: currentSize,
+                  currentMtime: currentMtime,
+                );
+              },
+          grabConflictResolver:
+              ({
+                required String existingLocalPath,
+                required String remotePath,
+                required String hostLabel,
+              }) async {
+                return showSshGrabConflictDialog(
+                  context,
+                  existingLocalPath: existingLocalPath,
+                  remotePath: remotePath,
+                  hostLabel: hostLabel,
+                );
+              },
         );
         // Subscribe to the `lumen-edit` stream once. Each event
         // means a remote shell helper just emitted an OSC 1337
@@ -183,9 +186,7 @@ class _SshAppStateBridgeState extends State<_SshAppStateBridge> {
             if (!overlayContext.mounted) return;
             showDuckToast(
               overlayContext,
-              isRemoteFileTooLarge(e)
-                  ? S.sshGrabTooLarge
-                  : '${S.error}: $e',
+              isRemoteFileTooLarge(e) ? S.sshGrabTooLarge : '${S.error}: $e',
             );
           }
         });
@@ -289,6 +290,7 @@ class _IdeShell extends StatelessWidget {
                     child: _LayoutForMode(
                       mode: state.viewMode,
                       chatHidden: state.chatHidden,
+                      councilVisible: state.council.theaterVisible,
                     ),
                   ),
                   const _StatusBar(),
@@ -380,9 +382,11 @@ class _LayoutForMode extends StatefulWidget {
   // *is* the chat-only layout so toggling chat-hidden there would
   // produce an empty workspace.
   final bool chatHidden;
+  final bool councilVisible;
   const _LayoutForMode({
     required this.mode,
     required this.chatHidden,
+    required this.councilVisible,
   });
 
   @override
@@ -433,7 +437,8 @@ class _LayoutForModeState extends State<_LayoutForMode> {
     // specifically: any attempt to swap the areas list on an
     // existing controller is silently ignored.)
     if (oldWidget.mode != widget.mode ||
-        oldWidget.chatHidden != widget.chatHidden) {
+        oldWidget.chatHidden != widget.chatHidden ||
+        oldWidget.councilVisible != widget.councilVisible) {
       _rebuildControllers();
     }
   }
@@ -442,10 +447,12 @@ class _LayoutForModeState extends State<_LayoutForMode> {
     switch (widget.mode) {
       case DuckViewMode.normal:
         _centerVertical = MultiSplitViewController(
-          areas: [
-            Area(flex: 0.72, builder: (c, a) => const Editor()),
-            Area(flex: 0.28, builder: (c, a) => const TerminalPane()),
-          ],
+          areas: widget.councilVisible
+              ? [Area(flex: 1, builder: (c, a) => const CouncilTheater())]
+              : [
+                  Area(flex: 0.72, builder: (c, a) => const Editor()),
+                  Area(flex: 0.28, builder: (c, a) => const TerminalPane()),
+                ],
         );
         _rootAxis = Axis.horizontal;
         // Layout from L→R is: [Explorer] [Editor+Terminal] [Chat?]
@@ -537,7 +544,8 @@ class _LayoutForModeState extends State<_LayoutForMode> {
     bool highlighted,
     MultiSplitViewThemeData themeData,
   ) {
-    final isChatDivider = widget.mode == DuckViewMode.normal &&
+    final isChatDivider =
+        widget.mode == DuckViewMode.normal &&
         !widget.chatHidden &&
         index == _chatDividerIndex;
     return Stack(

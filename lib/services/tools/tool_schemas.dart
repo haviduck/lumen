@@ -74,12 +74,18 @@ const _objectSchema = 'object';
 const _stringSchema = 'string';
 const _intSchema = 'integer';
 
-Map<String, dynamic> _strProp(String desc) =>
-    <String, dynamic>{'type': _stringSchema, 'description': desc};
-Map<String, dynamic> _intProp(String desc) =>
-    <String, dynamic>{'type': _intSchema, 'description': desc};
-Map<String, dynamic> _boolProp(String desc) =>
-    <String, dynamic>{'type': 'boolean', 'description': desc};
+Map<String, dynamic> _strProp(String desc) => <String, dynamic>{
+  'type': _stringSchema,
+  'description': desc,
+};
+Map<String, dynamic> _intProp(String desc) => <String, dynamic>{
+  'type': _intSchema,
+  'description': desc,
+};
+Map<String, dynamic> _boolProp(String desc) => <String, dynamic>{
+  'type': 'boolean',
+  'description': desc,
+};
 
 /// All canonical Lumen tool schemas. Descriptions are tuned for
 /// native tool-calling — short, positive, no scolding. The
@@ -103,7 +109,8 @@ class ToolSchemas {
           'path': _strProp('Workspace-relative path of the new file.'),
           'content': _strProp('Full file contents as a single string.'),
           'overwrite': _boolProp(
-              'Optional. When true, replaces an existing file. Default false.'),
+            'Optional. When true, replaces an existing file. Default false.',
+          ),
         },
         'required': ['path', 'content'],
       },
@@ -134,8 +141,9 @@ class ToolSchemas {
         'properties': {
           'path': _strProp('Workspace-relative path of the file to edit.'),
           'search': _strProp(
-              'The exact text to find. Must match the file byte-for-byte and '
-              'occur exactly once.'),
+            'The exact text to find. Must match the file byte-for-byte and '
+            'occur exactly once.',
+          ),
           'replace': _strProp('The replacement text.'),
         },
         'required': ['path', 'search', 'replace'],
@@ -224,7 +232,8 @@ class ToolSchemas {
           'start_line': _intProp('First line to replace (1-based, inclusive).'),
           'end_line': _intProp('Last line to replace (1-based, inclusive).'),
           'content': _strProp(
-              'New content for that range. Newlines preserved literally.'),
+            'New content for that range. Newlines preserved literally.',
+          ),
         },
         'required': ['path', 'start_line', 'end_line', 'content'],
       },
@@ -308,9 +317,7 @@ class ToolSchemas {
           'Requires user approval.',
       inputSchema: {
         'type': _objectSchema,
-        'properties': {
-          'path': _strProp('Workspace-relative path to delete.'),
-        },
+        'properties': {'path': _strProp('Workspace-relative path to delete.')},
         'required': ['path'],
       },
       toGroups: (args) => [(args['path'] as String?) ?? ''],
@@ -330,9 +337,11 @@ class ToolSchemas {
         'properties': {
           'path': _strProp('Workspace-relative file path.'),
           'start_line': _intProp(
-              'Optional 1-based start line. Inclusive. Omit for whole-file read.'),
+            'Optional 1-based start line. Inclusive. Omit for whole-file read.',
+          ),
           'end_line': _intProp(
-              'Optional 1-based end line. Inclusive. Omit for whole-file read.'),
+            'Optional 1-based end line. Inclusive. Omit for whole-file read.',
+          ),
         },
         'required': ['path'],
       },
@@ -364,7 +373,8 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'path': _strProp(
-              'Workspace-relative directory path. "." or empty = workspace root.'),
+            'Workspace-relative directory path. "." or empty = workspace root.',
+          ),
         },
         'required': ['path'],
       },
@@ -381,7 +391,8 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'path': _strProp(
-              'Workspace-relative starting directory. "." for workspace root.'),
+            'Workspace-relative starting directory. "." for workspace root.',
+          ),
         },
         'required': ['path'],
       },
@@ -398,14 +409,16 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'query': _strProp(
-              'Text or pattern to find. Treated as a literal substring '
-              'unless regex=true.'),
-          'regex':
-              _boolProp('Optional. When true, treat query as a regex.'),
+            'Text or pattern to find. Treated as a literal substring '
+            'unless regex=true.',
+          ),
+          'regex': _boolProp('Optional. When true, treat query as a regex.'),
           'glob': _strProp(
-              'Optional file glob to limit the search (e.g. "lib/**/*.dart").'),
+            'Optional file glob to limit the search (e.g. "lib/**/*.dart").',
+          ),
           'context': _intProp(
-              'Optional number of context lines to show around each match.'),
+            'Optional number of context lines to show around each match.',
+          ),
         },
         'required': ['query'],
       },
@@ -488,7 +501,8 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'revision': _strProp(
-              'Optional. "staged" for --cached, or a git revision spec.'),
+            'Optional. "staged" for --cached, or a git revision spec.',
+          ),
         },
         'required': <String>[],
       },
@@ -510,7 +524,8 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'path': _strProp(
-              'Optional file or directory path to scope the log to.'),
+            'Optional file or directory path to scope the log to.',
+          ),
           'n': _intProp('Optional commit count cap. Default 20.'),
         },
         'required': <String>[],
@@ -540,10 +555,12 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'path': _strProp('Workspace-relative file path.'),
-          'start_line':
-              _intProp('Optional first line to blame (1-based, inclusive).'),
-          'end_line':
-              _intProp('Optional last line to blame (1-based, inclusive).'),
+          'start_line': _intProp(
+            'Optional first line to blame (1-based, inclusive).',
+          ),
+          'end_line': _intProp(
+            'Optional last line to blame (1-based, inclusive).',
+          ),
         },
         'required': ['path'],
       },
@@ -579,8 +596,9 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'url': _strProp(
-              'URL, host:port, or bare port number (e.g. 3000, '
-              'localhost:5173, https://example.com).'),
+            'URL, host:port, or bare port number (e.g. 3000, '
+            'localhost:5173, https://example.com).',
+          ),
         },
         'required': ['url'],
       },
@@ -598,8 +616,9 @@ class ToolSchemas {
         'type': _objectSchema,
         'properties': {
           'command': _strProp(
-              'The exact command line to run (no shell function-style '
-              'wrapping, just the bare command as you would type it).'),
+            'The exact command line to run (no shell function-style '
+            'wrapping, just the bare command as you would type it).',
+          ),
         },
         'required': ['command'],
       },
@@ -634,7 +653,8 @@ class ToolSchemas {
         'properties': {
           'query': _strProp('Search query.'),
           'max_results': _intProp(
-              'Optional result count cap (1..10, default 5).'),
+            'Optional result count cap (1..10, default 5).',
+          ),
         },
         'required': ['query'],
       },
@@ -667,11 +687,77 @@ class ToolSchemas {
       toGroups: (args) => [(args['url'] as String?) ?? ''],
       toRawText: (args) => '<<<WEB_FETCH: ${args['url'] ?? ''}>>>',
     ),
+    ToolSchema(
+      id: 'council_dispatch',
+      name: 'COUNCIL_DISPATCH',
+      description:
+          'Assign a task to a named Council agent. Use parallel=true for independent work.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'agentId': _strProp('Target Council agent id.'),
+          'task': _strProp('Specific task for that agent.'),
+          'parallel': _boolProp('Whether the task can run concurrently.'),
+        },
+        'required': ['agentId', 'task'],
+      },
+      toGroups: (args) => [
+        (args['agentId'] as String?) ?? '',
+        (args['task'] as String?) ?? '',
+        '${args['parallel'] == true}',
+      ],
+      toRawText: (args) =>
+          '<<<COUNCIL_DISPATCH: ${args['agentId'] ?? ''}>>>\n'
+          '${args['task'] ?? ''}\n<<<END_COUNCIL>>>',
+    ),
+    ToolSchema(
+      id: 'council_ask_pool',
+      name: 'COUNCIL_ASK_POOL',
+      description:
+          'Ask sibling Council agents a concise question and receive their replies.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'question': _strProp('Question for the other Council agents.'),
+        },
+        'required': ['question'],
+      },
+      toGroups: (args) => [(args['question'] as String?) ?? ''],
+      toRawText: (args) => '<<<COUNCIL_ASK_POOL: ${args['question'] ?? ''}>>>',
+    ),
+    ToolSchema(
+      id: 'council_ask_user',
+      name: 'COUNCIL_ASK_USER',
+      description:
+          'Ask the user for missing information needed to continue the Council session.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'question': _strProp('Question to present to the user.'),
+        },
+        'required': ['question'],
+      },
+      toGroups: (args) => [(args['question'] as String?) ?? ''],
+      toRawText: (args) => '<<<COUNCIL_ASK_USER: ${args['question'] ?? ''}>>>',
+    ),
+    ToolSchema(
+      id: 'council_report',
+      name: 'COUNCIL_REPORT',
+      description: 'Finalize the Council session with a markdown report.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'markdown': _strProp('Final markdown report for the user.'),
+        },
+        'required': ['markdown'],
+      },
+      toGroups: (args) => [(args['markdown'] as String?) ?? ''],
+      toRawText: (args) =>
+          '<<<COUNCIL_REPORT>>>\n${args['markdown'] ?? ''}\n<<<END_COUNCIL>>>',
+    ),
   ];
 
-  static final Map<String, ToolSchema> _byId = {
-    for (final s in all) s.id: s,
-  };
+  static final Map<String, ToolSchema> _byId = {for (final s in all) s.id: s};
 
   static ToolSchema? byId(String id) => _byId[id];
 

@@ -1,6 +1,7 @@
 import 'ollama_service.dart' show CancellationToken;
 import 'timeline_recorder.dart';
 import 'tool_registry.dart';
+import 'council/council_tool_lock.dart';
 import 'tools/tool_match_adapter.dart';
 import 'tools/tool_schemas.dart';
 
@@ -42,6 +43,7 @@ class ToolPassResult {
 class ToolExecutor {
   String? workspaceDir;
   Set<String> enabledTools;
+  CouncilToolLock? councilToolLock;
 
   /// Approver receives the tool id alongside label + detail so the
   /// approval surface can register a per-tool blanket "Always allow"
@@ -113,6 +115,7 @@ class ToolExecutor {
     required this.workspaceDir,
     required this.approver,
     Set<String>? enabledTools,
+    this.councilToolLock,
     this.onToolOutput,
     this.recorder,
     this.allowWritesOutsideWorkspace = false,
@@ -156,8 +159,8 @@ class ToolExecutor {
         '',
         true,
         '[FAILED] $toolId: tool is disabled in this workspace.\n'
-        '! action required: re-prompt without this tool, or enable '
-        'it in Settings → Tools.\n',
+            '! action required: re-prompt without this tool, or enable '
+            'it in Settings → Tools.\n',
       );
     }
     final tool = ToolRegistry.byId(toolId);
@@ -167,7 +170,7 @@ class ToolExecutor {
         '',
         true,
         '[FAILED] $toolId: unknown tool. Native tool dispatch could '
-        'not find a registered implementation.\n',
+            'not find a registered implementation.\n',
       );
     }
     final match = ToolSchemas.matchFor(schema, args);
@@ -185,9 +188,7 @@ class ToolExecutor {
     // Recorder pre/post — same contract as the text-grammar path.
     // The recorder's by-tool snapshotting reads from `inv.match.group(N)`
     // which the synthetic match provides.
-    await recorder?.beforeTool(tool, match);
-    final result = await tool.execute(inv);
-    await recorder?.afterTool(tool, match, result);
+    final result = await _executeTool(tool, match, inv);
     final isFailure = _looksLikeFailure(result);
     final feedbackBuf = StringBuffer();
     if (isFailure) {
@@ -201,8 +202,7 @@ class ToolExecutor {
     } else {
       feedbackBuf.writeln(result);
     }
-    final firstArg =
-        match.groupCount >= 1 ? (match.group(1) ?? '') : '';
+    final firstArg = match.groupCount >= 1 ? (match.group(1) ?? '') : '';
     final friendly = _friendlyReplacement(tool, match, result);
     final fired = <FiredTool>[FiredTool(id: tool.id, firstArg: firstArg)];
     return ToolPassResult(
@@ -264,8 +264,7 @@ class ToolExecutor {
         // when it doesn't, we ensure one exists so the post-snapshot
         // has something to diff against. Errors are swallowed by the
         // recorder; capture failures must never break tool dispatch.
-        await recorder?.beforeTool(tool, raw);
-        final result = await tool.execute(inv);
+        final result = await _executeTool(tool, raw, inv);
         // Make failures impossible to gloss over. We've observed
         // models (Gemma cloud especially) reading a tool_result that
         // says `EDIT_FILE foo.scss: Error: SEARCH block not found`
@@ -292,8 +291,6 @@ class ToolExecutor {
         // i.e. (sessionId, turnId, messageId) — so the future
         // "click chat message → revert" feature has every agent-
         // origin entry already grouped per turn.
-        await recorder?.afterTool(tool, raw, result);
-
         final firstArg = (raw.groupCount >= 1 ? raw.group(1) : '') ?? '';
         fired.add(FiredTool(id: tool.id, firstArg: firstArg));
 
@@ -331,6 +328,17 @@ class ToolExecutor {
       feedback.toString(),
       firedTools: fired,
     );
+  }
+
+  Future<String> _executeTool(AgentTool tool, Match match, ToolInvocation inv) {
+    Future<String> run() async {
+      await recorder?.beforeTool(tool, match);
+      final result = await tool.execute(inv);
+      await recorder?.afterTool(tool, match, result);
+      return result;
+    }
+
+    return councilToolLock?.run(tool.id, run) ?? run();
   }
 
   static String? _toolIdForName(String toolName) {

@@ -2025,4 +2025,66 @@ class S {
       'Files opened over SSH are downloaded to a local cache. Save = SFTP upload back.';
   static const String settingsSshMirrorClear = 'Clear mirror cache';
   static const String settingsSshMirrorClearedFmt = 'Cleared mirror cache';
+
+  // Council
+  static const String councilTitle = 'The Council';
+  static const String councilConvene = 'Convene Council';
+  static const String councilSlashDescription =
+      'Open the Council multi-agent wizard.';
+  static const String councilNoWorkspace =
+      'Open a workspace before convening the Council.';
+  static const String councilModelGateBanner =
+      'Council requires a Claude or Copilot Claude model.';
+  static const String councilWizardTitle = 'Convene the Council';
+  static const String councilWizardStepBrief = 'Brief';
+  static const String councilWizardStepAgents = 'Agents';
+  static const String councilWizardStepOrchestrator = 'Orchestrator';
+  static const String councilWizardStepReview = 'Review';
+  static const String councilBriefLabel = 'What should the Council solve?';
+  static const String councilBriefHint =
+      'Describe the problem, goal, constraints, and what done looks like.';
+  static const String councilSessionTitleLabel = 'Council title';
+  static const String councilAgentNameLabel = 'Agent name';
+  static const String councilAgentRoleLabel = 'Role';
+  static const String councilAgentModelLabel = 'Model';
+  static const String councilCustomRoleLabel = 'Custom role';
+  static const String councilAddAgent = 'Add agent';
+  static const String councilRemoveAgent = 'Remove agent';
+  static const String councilStart = 'Send them in';
+  static const String councilBack = 'Back';
+  static const String councilNext = 'Next';
+  static const String councilAbort = 'Abort Council';
+  static const String councilBackToEditor = 'Back to editor';
+  static const String councilShowTheater = 'Show Council';
+  static const String councilReportReady = 'Report ready';
+  static const String councilOpenReport = 'Open report';
+  static const String councilAskPoolHeader = 'Council pool';
+  static const String councilAskUserHeader = 'Council needs you';
+  static const String councilUserAnswerHint = 'Type your answer...';
+  static const String councilSubmitAnswer = 'Send answer';
+  static const String councilNoPoolQuestions = 'No pool questions yet.';
+  static const String councilNoTranscript = 'Waiting for first signal...';
+  static const String councilOrchestrator = 'Orchestrator';
+  static const String councilStatusIdle = 'idle';
+  static const String councilStatusDispatching = 'dispatching';
+  static const String councilStatusWorking = 'working';
+  static const String councilStatusAwaitingUser = 'awaiting user';
+  static const String councilStatusAwaitingPool = 'awaiting pool';
+  static const String councilStatusSynthesizing = 'synthesizing';
+  static const String councilStatusDone = 'done';
+  static const String councilStatusAborted = 'aborted';
+  static const String councilStatusError = 'error';
+  static const String councilAgentStatusQueued = 'queued';
+  static const String councilAgentStatusAskingPool = 'asking pool';
+  static const String councilAgentStatusReplying = 'replying';
+  static String councilReportSavedAt(String path) => 'Report saved at $path';
+  static String councilAgentSectorTitle(String name, String role) =>
+      '$name · $role';
+  static const String councilRolePentester = 'Pentester';
+  static const String councilRoleReviewer = 'Reviewer';
+  static const String councilRoleResearcher = 'Researcher';
+  static const String councilRoleArchitect = 'Architect';
+  static const String councilRoleTester = 'Tester';
+  static const String councilRoleWriter = 'Writer';
+  static const String councilRoleCustom = 'Custom';
 }

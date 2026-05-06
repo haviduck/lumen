@@ -151,6 +151,7 @@ class PreferencesService {
   // tools capability — this flag only forces text grammar when the
   // native path WOULD have been chosen.
   static const String _kForceTextGrammarTools = 'chat.tools.forceTextGrammar';
+  static const String _kCouncilLastConfig = 'council.lastConfig';
   // List of tool ids the user has clicked "Always allow" on. Each
   // entry bypasses the approval card per-tool — distinct from the
   // global `agent.autoApproveCommands` flag, which is a master
@@ -360,6 +361,11 @@ class PreferencesService {
       (await _p).getBool(_kForceTextGrammarTools) ?? false;
   Future<void> setForceTextGrammarTools(bool v) async =>
       (await _p).setBool(_kForceTextGrammarTools, v);
+
+  Future<String> getCouncilLastConfigJson() async =>
+      (await _p).getString(_kCouncilLastConfig) ?? '';
+  Future<void> setCouncilLastConfigJson(String v) async =>
+      (await _p).setString(_kCouncilLastConfig, v);
 
   Future<String> getEditorTheme() async {
     final p = await _p;
