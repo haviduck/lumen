@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 import 'package:re_editor/re_editor.dart';
 import 'package:multi_split_view/multi_split_view.dart';
 import 'package:provider/provider.dart';
@@ -7,10 +10,15 @@ import 'package:provider/provider.dart';
 import 'l10n/strings.dart';
 import 'providers/app_state.dart';
 import 'providers/media_controller.dart';
+import 'providers/ssh_controller.dart';
 import 'services/ide_actions.dart';
 import 'services/language_detector.dart';
 import 'services/recent_edits_tracker.dart';
+import 'services/ssh/ssh_remote_file_service.dart';
 import 'services/window_chrome.dart';
+import 'widgets/common/duck_toast.dart';
+import 'widgets/ssh/ssh_grab_conflict_dialog.dart';
+import 'widgets/ssh/ssh_remote_conflict_dialog.dart';
 import 'theme/app_colors.dart';
 import 'theme/app_theme.dart';
 import 'widgets/ai_chat/ai_chat.dart';
@@ -23,6 +31,7 @@ import 'widgets/file_explorer/file_explorer.dart';
 import 'widgets/lock_screen.dart';
 import 'widgets/menu_bar.dart';
 import 'widgets/overlays/overlay_host.dart';
+import 'widgets/side_panes_column.dart';
 import 'widgets/terminal/terminal_pane.dart';
 import 'widgets/welcome_screen.dart';
 
@@ -45,10 +54,154 @@ Future<void> main() async {
         // and we need a single shared `WebviewController` so the
         // video doesn't reload on every placement swap.
         ChangeNotifierProvider(create: (_) => MediaController()),
+        // SshController is also root-level, parallel to
+        // MediaController. Owns all live SSH sessions + the host
+        // vault. `init()` is async (loads SharedPreferences for the
+        // host list); we kick it off here and the `_SshAppStateBridge`
+        // widget below waits for `ready` before binding to AppState.
+        ChangeNotifierProvider(create: (_) => SshController()..init()),
       ],
-      child: const LumenApp(),
+      child: const _SshAppStateBridge(child: LumenApp()),
     ),
   );
+}
+
+/// One-shot bridge that wires the [SshController] into [AppState] as
+/// soon as the controller's vault has finished loading. Lives between
+/// the providers and the rest of the tree so the binding happens
+/// exactly once on cold start, with the [BuildContext] of a top-level
+/// widget so the conflict-resolver dialog can attach to the root
+/// Navigator. Never rebuilds after the binding settles.
+class _SshAppStateBridge extends StatefulWidget {
+  final Widget child;
+  const _SshAppStateBridge({required this.child});
+
+  @override
+  State<_SshAppStateBridge> createState() => _SshAppStateBridgeState();
+}
+
+class _SshAppStateBridgeState extends State<_SshAppStateBridge> {
+  bool _bound = false;
+  StreamSubscription<SshLumenEditRequest>? _lumenEditSub;
+  StreamSubscription<SshLumenGrabRequest>? _lumenGrabSub;
+
+  @override
+  Widget build(BuildContext context) {
+    final ssh = context.watch<SshController>();
+    if (!_bound && ssh.ready) {
+      // Bind on the next frame — `bindSsh` calls into AppState which
+      // can `notifyListeners`; doing it inside `build` is illegal.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final appState = context.read<AppState>();
+        appState.bindSsh(
+          ssh,
+          conflictResolver: ({
+            required RemoteFileOrigin origin,
+            required int? currentSize,
+            required int? currentMtime,
+          }) async {
+            // The dialog needs a context with a Navigator above it.
+            // Walking up to `Overlay` keeps the dialog above the IDE
+            // shell even when a save is triggered from a deeply
+            // nested widget tree.
+            return showSshRemoteConflictDialog(
+              context,
+              origin: origin,
+              currentSize: currentSize,
+              currentMtime: currentMtime,
+            );
+          },
+          grabConflictResolver: ({
+            required String existingLocalPath,
+            required String remotePath,
+            required String hostLabel,
+          }) async {
+            return showSshGrabConflictDialog(
+              context,
+              existingLocalPath: existingLocalPath,
+              remotePath: remotePath,
+              hostLabel: hostLabel,
+            );
+          },
+        );
+        // Subscribe to the `lumen-edit` stream once. Each event
+        // means a remote shell helper just emitted an OSC 1337
+        // `LumenEdit=<path>` payload; we open the file via the
+        // standard remote-mirror path. Idempotent re-opens for the
+        // same path are fine — `AppState.openRemoteFile` ends up
+        // calling `openFile` which de-dupes by path.
+        //
+        // Toast on failure uses the bridge's own context post-await.
+        // We use `context.mounted` (BuildContext extension) rather
+        // than the State's `mounted` getter so the analyzer can
+        // statically link the guard to this exact context — that's
+        // what makes `use_build_context_synchronously` shut up. The
+        // bridge mounts once near the root and lives for the app's
+        // lifetime, so this is essentially a permanent listener;
+        // the `mounted` guard is defence in depth.
+        final overlayContext = context;
+        _lumenEditSub = ssh.onLumenEditRequest.listen((req) async {
+          try {
+            await appState.openRemoteFile(
+              hostId: req.hostId,
+              remotePath: req.remotePath,
+            );
+          } catch (e) {
+            if (!overlayContext.mounted) return;
+            showDuckToast(
+              overlayContext,
+              isRemoteFileTooLarge(e)
+                  ? S.sshRemoteFileTooLarge
+                  : '${S.error}: $e',
+            );
+          }
+        });
+        // Mirror subscription for `lumen-grab`. Same context capture
+        // + post-await `mounted` pattern as the edit listener — see
+        // the comment above for why `context.mounted` is the only
+        // form of guard the analyzer accepts here. On success we
+        // toast with the resolved local filename so the user knows
+        // exactly where the file landed (especially relevant when
+        // "Keep both" produced a `(N)` suffix they didn't pick).
+        _lumenGrabSub = ssh.onLumenGrabRequest.listen((req) async {
+          try {
+            final localPath = await appState.grabRemoteFile(
+              hostId: req.hostId,
+              remotePath: req.remotePath,
+            );
+            if (!overlayContext.mounted) return;
+            if (localPath == null) {
+              // User picked "Cancel" in the conflict dialog — silent
+              // is fine, no toast clutter for an explicit no-op.
+              return;
+            }
+            showDuckToast(
+              overlayContext,
+              S.sshGrabSuccessFmt(p.basename(localPath)),
+            );
+          } catch (e) {
+            if (!overlayContext.mounted) return;
+            showDuckToast(
+              overlayContext,
+              isRemoteFileTooLarge(e)
+                  ? S.sshGrabTooLarge
+                  : '${S.error}: $e',
+            );
+          }
+        });
+        setState(() => _bound = true);
+      });
+    }
+    return widget.child;
+  }
+
+  @override
+  void dispose() {
+    _lumenEditSub?.cancel();
+    _lumenGrabSub?.cancel();
+    super.dispose();
+  }
 }
 
 class LumenApp extends StatelessWidget {
@@ -111,6 +264,15 @@ class _IdeShell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
+    // Watch SSH + Media so the side-panes column is mounted /
+    // unmounted as soon as either controller flips. The visibility
+    // flag is passed to `_LayoutForMode` which rebuilds its root
+    // `MultiSplitViewController` whenever it changes (the
+    // multi_split_view 3.6.1 `initialAreas` landmine — see the
+    // class doc on `_LayoutForModeState`).
+    final ssh = context.watch<SshController>();
+    final media = context.watch<MediaController>();
+    final showSidePanes = SidePanesColumn.shouldMount(ssh: ssh, media: media);
     return _GlobalShortcuts(
       child: OverlayHost(
         child: Scaffold(
@@ -129,6 +291,7 @@ class _IdeShell extends StatelessWidget {
                     child: _LayoutForMode(
                       mode: state.viewMode,
                       chatHidden: state.chatHidden,
+                      showSidePanes: showSidePanes,
                     ),
                   ),
                   const _StatusBar(),
@@ -220,7 +383,17 @@ class _LayoutForMode extends StatefulWidget {
   // *is* the chat-only layout so toggling chat-hidden there would
   // produce an empty workspace.
   final bool chatHidden;
-  const _LayoutForMode({required this.mode, required this.chatHidden});
+  // v1.4: full-height column hosting SSH / Teams / Watch-media
+  // sits between the (Editor + Terminal) column and the chat
+  // sidebar. We mount the Area only when something is live so an
+  // empty strip never claims width. `_IdeShell` computes this
+  // from `SidePanesColumn.shouldMount(ssh, media)`.
+  final bool showSidePanes;
+  const _LayoutForMode({
+    required this.mode,
+    required this.chatHidden,
+    required this.showSidePanes,
+  });
 
   @override
   State<_LayoutForMode> createState() => _LayoutForModeState();
@@ -230,10 +403,29 @@ class _LayoutForModeState extends State<_LayoutForMode> {
   static const double _chatOptimalWidth = 340;
   static const double _chatMinWidth = 260;
   static const double _chatSnapThreshold = 24;
+  static const double _sidePanesOptimalWidth = 380;
+  static const double _sidePanesMinWidth = 260;
+  // Floor on the (Editor + Terminal) workbench column. Without
+  // this, the side-panes divider could be dragged so far left
+  // that the editor disappears entirely with no way to recover
+  // (the divider becomes invisible too once its handle has zero
+  // width to live on). 480 px is enough to comfortably show a
+  // code line at 96-char width plus the editor gutter, and still
+  // leaves the user a usable column on a 1080p secondary monitor.
+  static const double _workbenchMinWidth = 480;
 
   MultiSplitViewController? _root;
   MultiSplitViewController? _centerVertical;
   Axis _rootAxis = Axis.horizontal;
+
+  // Indices in the root area list — used by the divider chrome
+  // helpers (`_snapChatSidebarIfNearOptimal`, the bullet handle
+  // on the chat divider). Both used to be hard-coded to the
+  // chat-divider position; now that the side-panes Area can sit
+  // between center and chat, we record where each lives at
+  // rebuild time and consult these fields instead.
+  int _chatAreaIndex = -1;
+  int _chatDividerIndex = -1;
 
   @override
   void initState() {
@@ -244,13 +436,17 @@ class _LayoutForModeState extends State<_LayoutForMode> {
   @override
   void didUpdateWidget(covariant _LayoutForMode oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // Rebuild whenever the mode OR the chat-hidden flag changes —
-    // both feed into which `Area`s the root `MultiSplitView` ends
-    // up holding, and `MultiSplitViewController.areas` can't be
-    // mutated after construction without surprises, so a fresh
-    // controller is the cleanest path.
+    // Rebuild whenever the mode, the chat-hidden flag, OR the
+    // side-panes-visible flag changes — all three feed into which
+    // `Area`s the root `MultiSplitView` ends up holding, and
+    // `MultiSplitViewController.areas` can't be mutated after
+    // construction without surprises, so a fresh controller is
+    // the cleanest path. (multi_split_view 3.6.1 specifically: any
+    // attempt to swap the areas list on an existing controller is
+    // silently ignored.)
     if (oldWidget.mode != widget.mode ||
-        oldWidget.chatHidden != widget.chatHidden) {
+        oldWidget.chatHidden != widget.chatHidden ||
+        oldWidget.showSidePanes != widget.showSidePanes) {
       _rebuildControllers();
     }
   }
@@ -265,31 +461,56 @@ class _LayoutForModeState extends State<_LayoutForMode> {
           ],
         );
         _rootAxis = Axis.horizontal;
-        _root = MultiSplitViewController(
-          areas: [
-            Area(size: 240, min: 220, builder: (c, a) => const FileExplorer()),
-            Area(
-              flex: 1,
-              builder: (c, a) => MultiSplitView(
-                axis: Axis.vertical,
-                controller: _centerVertical!,
-              ),
+        // Build root areas in order; track chat-area-index for
+        // the divider helpers as we go. Layout from L→R is:
+        //   [Explorer] [Editor+Terminal] [SidePanes?] [Chat?]
+        final areas = <Area>[
+          Area(size: 240, min: 220, builder: (c, a) => const FileExplorer()),
+          Area(
+            flex: 1,
+            // `min:` floors the editor column so dragging the
+            // side-panes divider left can't make the editor
+            // vanish (the previous bug — divider was draggable
+            // all the way to the file explorer's right edge).
+            min: _workbenchMinWidth,
+            builder: (c, a) => MultiSplitView(
+              axis: Axis.vertical,
+              controller: _centerVertical!,
             ),
-            // Chat sidebar — omitted entirely when `chatHidden` is
-            // true so the editor + terminal column expands to fill
-            // the freed width. Toggle lives in the menu bar.
-            if (!widget.chatHidden)
-              Area(
-                size: _chatOptimalWidth,
-                min: _chatMinWidth,
-                builder: (c, a) => const AiChat(),
-              ),
-          ],
-        );
+          ),
+        ];
+        if (widget.showSidePanes) {
+          areas.add(
+            Area(
+              size: _sidePanesOptimalWidth,
+              min: _sidePanesMinWidth,
+              builder: (c, a) => const SidePanesColumn(),
+            ),
+          );
+        }
+        if (!widget.chatHidden) {
+          _chatAreaIndex = areas.length;
+          // Divider N sits BETWEEN areas N and N+1; the chat
+          // divider is the one immediately before the chat area.
+          _chatDividerIndex = areas.length - 1;
+          areas.add(
+            Area(
+              size: _chatOptimalWidth,
+              min: _chatMinWidth,
+              builder: (c, a) => const AiChat(),
+            ),
+          );
+        } else {
+          _chatAreaIndex = -1;
+          _chatDividerIndex = -1;
+        }
+        _root = MultiSplitViewController(areas: areas);
         break;
       case DuckViewMode.zen:
         _centerVertical = MultiSplitViewController(areas: const []);
         _rootAxis = Axis.horizontal;
+        _chatAreaIndex = -1;
+        _chatDividerIndex = -1;
         _root = MultiSplitViewController(
           areas: [Area(flex: 1, builder: (c, a) => const Editor())],
         );
@@ -297,6 +518,8 @@ class _LayoutForModeState extends State<_LayoutForMode> {
       case DuckViewMode.sideEye:
         _centerVertical = MultiSplitViewController(areas: const []);
         _rootAxis = Axis.horizontal;
+        _chatAreaIndex = -1;
+        _chatDividerIndex = -1;
         _root = MultiSplitViewController(
           areas: [Area(flex: 1, builder: (c, a) => const AiChat())],
         );
@@ -306,10 +529,15 @@ class _LayoutForModeState extends State<_LayoutForMode> {
 
   void _snapChatSidebarIfNearOptimal(int dividerIndex) {
     if (widget.mode != DuckViewMode.normal || widget.chatHidden) return;
-    // Root layout in normal mode is: explorer | workbench | chat.
-    // Divider 1 is the workbench/chat divider.
-    if (dividerIndex != 1 || _root == null || _root!.areasCount < 3) return;
-    final chatArea = _root!.getArea(2);
+    // Chat divider position varies depending on whether the
+    // SidePanes Area is mounted:
+    //   - chat-only: dividers go [0]=explorer/workbench [1]=workbench/chat
+    //   - chat + side-panes: [0]=explorer/workbench [1]=workbench/sidePanes [2]=sidePanes/chat
+    // `_chatDividerIndex` is recorded by `_rebuildControllers`.
+    if (_chatDividerIndex < 0 || dividerIndex != _chatDividerIndex) return;
+    if (_root == null || _chatAreaIndex < 0) return;
+    if (_root!.areasCount <= _chatAreaIndex) return;
+    final chatArea = _root!.getArea(_chatAreaIndex);
     final current = chatArea.size;
     if (current == null) return;
     if ((current - _chatOptimalWidth).abs() <= _chatSnapThreshold) {
@@ -325,8 +553,9 @@ class _LayoutForModeState extends State<_LayoutForMode> {
     bool highlighted,
     MultiSplitViewThemeData themeData,
   ) {
-    final isChatDivider =
-        widget.mode == DuckViewMode.normal && !widget.chatHidden && index == 1;
+    final isChatDivider = widget.mode == DuckViewMode.normal &&
+        !widget.chatHidden &&
+        index == _chatDividerIndex;
     return Stack(
       clipBehavior: Clip.none,
       children: [

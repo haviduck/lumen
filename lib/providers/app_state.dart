@@ -20,12 +20,14 @@ import '../services/preferences_service.dart';
 import '../services/recent_edits_tracker.dart';
 import '../services/remote/lumen_server.dart';
 import '../services/rules_service.dart';
+import '../services/ssh/ssh_remote_file_service.dart';
 import '../services/syncthing_service.dart';
 import '../services/timeline_models.dart';
 import '../services/timeline_service.dart';
 import '../services/workspace_service.dart';
 import '../services/workspace_skills_service.dart';
 import 'chat_controller.dart';
+import 'ssh_controller.dart';
 
 enum DuckViewMode { normal, zen, sideEye }
 
@@ -143,6 +145,52 @@ class AppState extends ChangeNotifier {
 
   late final ChatController chat;
   late final AutoBackupScheduler autoBackup;
+
+  // Optional reference to the workspace-wide [SshController]. Wired
+  // by `main.dart` after both providers exist via [bindSsh] so the
+  // save path can route remote-mirror buffers through SFTP and the
+  // editor tab strip can render `host:path` suffixes. Null until
+  // bound — every code path here treats it as opt-in (no SSH ⇒ no
+  // remote-aware behaviour, just normal local saves).
+  SshController? _ssh;
+  SshController? get ssh => _ssh;
+
+  /// Caller-provided closure that prompts the user when a remote save
+  /// would overwrite changes the remote made since download. Set by
+  /// main.dart so any save path (Ctrl+S, menu, save-all) uses the
+  /// same UX without each call site reimplementing the prompt.
+  /// Default: "cancel on conflict" — safer than silent overwrite.
+  SshConflictResolver _sshConflictResolver = ({
+    required RemoteFileOrigin origin,
+    required int? currentSize,
+    required int? currentMtime,
+  }) async => false;
+
+  /// Caller-provided closure that prompts the user when a `lumen-grab`
+  /// download is about to overwrite an existing file in the project.
+  /// Set by main.dart for the same reason as [_sshConflictResolver].
+  /// Default: "cancel on collision" — safer than silent overwrite,
+  /// and the user can always re-run the grab after deleting / moving
+  /// the existing file.
+  SshGrabConflictResolver _sshGrabConflictResolver = ({
+    required String existingLocalPath,
+    required String remotePath,
+    required String hostLabel,
+  }) async => SshGrabConflictDecision.cancel;
+
+  void bindSsh(
+    SshController controller, {
+    SshConflictResolver? conflictResolver,
+    SshGrabConflictResolver? grabConflictResolver,
+  }) {
+    _ssh = controller;
+    if (conflictResolver != null) {
+      _sshConflictResolver = conflictResolver;
+    }
+    if (grabConflictResolver != null) {
+      _sshGrabConflictResolver = grabConflictResolver;
+    }
+  }
 
   // Workspace
   String? _currentDirectory;
@@ -346,6 +394,23 @@ class AppState extends ChangeNotifier {
   bool get gitnexusEnabled => _gitnexusEnabled;
   bool get gitnexusAutoWiki => _gitnexusAutoWiki;
   String get gitnexusWikiModel => _gitnexusWikiModel;
+
+  // Per-workspace one-shot for the empty-editor duck mischief gag.
+  // Pre-loaded by `setDirectory` so the `_DuckMischief` widget can
+  // read it synchronously on mount and decide whether to play the
+  // full animation or skip straight to the static "quip + button"
+  // layout. See `PreferencesService._kDuckMischiefPlayed` for the
+  // full rationale.
+  bool _duckMischiefPlayed = false;
+  bool get duckMischiefPlayedForCurrentProject => _duckMischiefPlayed;
+  // Dev affordance — bumped by `replayDuckMischief()` so the
+  // `_DuckMischief` widget keyed off this value tears down and
+  // re-mounts, which is the only way to get the gag to play
+  // again from the same empty-editor surface (otherwise the
+  // controller has already finished and `initState` is the only
+  // entry point that reads the played-flag).
+  int _duckMischiefReplayTick = 0;
+  int get duckMischiefReplayTick => _duckMischiefReplayTick;
 
   AppState() {
     chat = ChatController(
@@ -822,6 +887,11 @@ class AppState extends ChangeNotifier {
     _fileContents.remove(file.path);
     _savedFileContents.remove(file.path);
     _fileLanguageOverrides.remove(file.path);
+    // Drop the remote-mirror provenance entry too. The on-disk
+    // mirror file itself stays — re-opening the same remote path
+    // re-downloads (cheap on small files) but spares us cache-eviction
+    // bookkeeping. `clearCache` from Settings is the heavy hammer.
+    _ssh?.remoteFiles.forget(file.path);
     if (_activeFile?.path == file.path) {
       _activeFile = _openFiles.isNotEmpty ? _openFiles.last : null;
     }
@@ -891,29 +961,217 @@ class AppState extends ChangeNotifier {
       (f) => f?.path == path,
       orElse: () => null,
     );
-    if (file != null) {
-      try {
-        await file.writeAsString(_fileContents[path]!);
-        _savedFileContents[path] = _fileContents[path]!;
-        // Capture the manual save in the revision timeline. Awaited
-        // (cheap: just a hash + maybe blob write + journal append)
-        // so the timeline rail repaint observed via `notifyListeners`
-        // sees the new entry on the same frame as the "Saved" badge.
-        await timeline.recordWrite(
-          path,
-          origin: TimelineOrigin.userSave,
-          note: 'Manual save',
-        );
-        // The user just made a deliberate "this is mine now" gesture —
-        // drop the recent-agent-edit highlights for this file so they
-        // don't paint forever even though the user has clearly taken
-        // ownership. Matches the design contract: "save = clear".
-        recentEdits.invalidate(path);
-        notifyListeners();
-      } catch (e) {
-        debugPrint('Error saving file: $e');
+    if (file == null) return;
+
+    final pendingContent = _fileContents[path];
+    if (pendingContent == null) return;
+
+    // SSH remote-mirror buffers ride a separate save path: SFTP
+    // upload + conflict-detect + snapshot refresh. The local cache
+    // file under `<appSupport>/lumen/ssh-mirror/...` is updated by
+    // the service itself once the upload succeeds — we still call
+    // the local writeAsString below as a defence-in-depth so the
+    // local cache is in sync even if the service somehow skipped
+    // its own write. No timeline entry for remote-mirror saves
+    // (the timeline is workspace-scoped and these files live
+    // outside the workspace).
+    final remoteService = _ssh?.remoteFiles;
+    if (remoteService != null && remoteService.isRemoteMirror(path)) {
+      final result = await remoteService.saveIfRemote(
+        localPath: path,
+        content: pendingContent,
+        resolveConflict: _sshConflictResolver,
+      );
+      if (result == null) {
+        // The service decided this isn't a mirror after all (race
+        // with `forget` from a tab close). Fall through to the
+        // local-only write.
+      } else {
+        switch (result.outcome) {
+          case SshSaveOutcome.succeeded:
+            _savedFileContents[path] = pendingContent;
+            try {
+              await file.writeAsString(pendingContent);
+            } catch (_) {}
+            recentEdits.invalidate(path);
+            notifyListeners();
+            return;
+          case SshSaveOutcome.cancelled:
+            // User explicitly chose not to overwrite. Don't mark the
+            // buffer clean; the dirty dot stays so the user knows
+            // the local has unsaved changes.
+            return;
+          case SshSaveOutcome.failed:
+            debugPrint('SSH save failed: ${result.errorMessage}');
+            return;
+        }
       }
     }
+
+    try {
+      await file.writeAsString(pendingContent);
+      _savedFileContents[path] = pendingContent;
+      // Capture the manual save in the revision timeline. Awaited
+      // (cheap: just a hash + maybe blob write + journal append)
+      // so the timeline rail repaint observed via `notifyListeners`
+      // sees the new entry on the same frame as the "Saved" badge.
+      await timeline.recordWrite(
+        path,
+        origin: TimelineOrigin.userSave,
+        note: 'Manual save',
+      );
+      // The user just made a deliberate "this is mine now" gesture —
+      // drop the recent-agent-edit highlights for this file so they
+      // don't paint forever even though the user has clearly taken
+      // ownership. Matches the design contract: "save = clear".
+      recentEdits.invalidate(path);
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error saving file: $e');
+    }
+  }
+
+  /// Open a remote file via the bound [SshController]'s
+  /// [SshRemoteFileService]. Downloads to the local mirror cache,
+  /// adds the mirror file to [openFiles], and focuses it.
+  ///
+  /// Throws when no SSH controller is bound, when no live connection
+  /// exists for [hostId], or when the SFTP open / download fails.
+  /// Caller (the activity-bar / Remote pane) is responsible for
+  /// turning those throws into user-facing toasts.
+  Future<void> openRemoteFile({
+    required String hostId,
+    required String remotePath,
+  }) async {
+    final controller = _ssh;
+    if (controller == null) {
+      throw StateError('SSH controller not bound');
+    }
+    final session = controller.findSessionForHost(hostId);
+    final conn = session?.connection;
+    if (conn == null) {
+      throw StateError('No active SSH connection for host $hostId');
+    }
+    final mirror = await controller.remoteFiles.open(
+      conn: conn,
+      remotePath: remotePath,
+    );
+    // Open the mirror through the regular file path; the timeline
+    // does NOT baseline remote-mirror files (their absolute path
+    // sits outside the workspace, so timeline.ensureBaseline would
+    // be a no-op anyway, but spelling it out keeps reviewer
+    // intent unambiguous).
+    await openFile(mirror);
+  }
+
+  /// Download a remote file into the open workspace via SFTP. The
+  /// counterpart to [openRemoteFile] (which opens a *mirrored* file
+  /// for save-back) — `grabRemoteFile` is a one-shot copy with no
+  /// save-back channel, no in-memory mirror tracking. Triggered by
+  /// the bundled `lumen-grab <file>` shell helper (the bridge in
+  /// main.dart subscribes to [SshController.onLumenGrabRequest]).
+  ///
+  /// Conflict resolution: if a file already exists at the resolved
+  /// local path, the bound [_sshGrabConflictResolver] decides what
+  /// to do (replace / keep-both with `(1)` suffix / cancel). The
+  /// resolver is set in [bindSsh] and shows the prompt UI; this
+  /// method only consumes its decision.
+  ///
+  /// On success: refreshes the file explorer so the new file shows
+  /// up in the tree, returns the absolute local path. On `cancel`:
+  /// returns null. Throws on hard failures (no project open, no
+  /// connection, SFTP error, file too large).
+  Future<String?> grabRemoteFile({
+    required String hostId,
+    required String remotePath,
+  }) async {
+    final controller = _ssh;
+    if (controller == null) {
+      throw StateError('SSH controller not bound');
+    }
+    final session = controller.findSessionForHost(hostId);
+    final conn = session?.connection;
+    if (conn == null) {
+      throw StateError('No active SSH connection for host $hostId');
+    }
+    final root = _currentDirectory;
+    if (root == null || root.isEmpty) {
+      throw StateError('No workspace open — cannot grab into project');
+    }
+
+    // Refuse oversized files for the same reason `openRemoteFile`
+    // does (avoid a 500 MB log accidentally hanging the IDE on a
+    // single SFTP call). Same threshold; if grab needs to scale up
+    // later we can split the cap.
+    final sftp = await conn.sftp();
+    final attrs = await sftp.stat(remotePath);
+    final size = attrs.size;
+    if (size != null && size > kSshRemoteFileMaxBytes) {
+      raiseRemoteFileTooLarge(size);
+    }
+
+    final basename = p.basename(remotePath);
+    if (basename.isEmpty || basename == '/' || basename == '.') {
+      throw StateError('Invalid remote path: $remotePath');
+    }
+    final candidate = p.join(root, basename);
+
+    var finalPath = candidate;
+    if (await File(candidate).exists()) {
+      final decision = await _sshGrabConflictResolver(
+        existingLocalPath: candidate,
+        remotePath: remotePath,
+        hostLabel: session?.host.displayName ?? hostId,
+      );
+      switch (decision) {
+        case SshGrabConflictDecision.cancel:
+          return null;
+        case SshGrabConflictDecision.replace:
+          // Land on the same path; SFTP open with truncate below.
+          finalPath = candidate;
+        case SshGrabConflictDecision.keepBoth:
+          finalPath = await _firstAvailableSibling(candidate);
+      }
+    }
+
+    // Stream-download. Same `closeDestination: true` contract as
+    // `openRemoteFile`: dartssh2 flushes + closes the IOSink on the
+    // success and throw paths.
+    final localFile = File(finalPath);
+    await localFile.parent.create(recursive: true);
+    final sink = localFile.openWrite();
+    try {
+      await sftp.download(remotePath, sink, closeDestination: true);
+    } catch (_) {
+      try {
+        await sink.close();
+      } catch (_) {}
+      rethrow;
+    }
+
+    refreshDirectory();
+    return finalPath;
+  }
+
+  /// Resolves a non-colliding path next to [originalPath] by
+  /// appending ` (N)` before the extension, with N incrementing
+  /// until we find a free slot. Mirrors macOS Finder's "Keep Both"
+  /// suffix style — `report.txt` → `report (1).txt`,
+  /// `report (1).txt` already in use → `report (2).txt`, …
+  /// Caps at 999 to avoid an infinite loop on a degenerate dir.
+  Future<String> _firstAvailableSibling(String originalPath) async {
+    final dir = p.dirname(originalPath);
+    final ext = p.extension(originalPath);
+    final stem = p.basenameWithoutExtension(originalPath);
+    for (var i = 1; i <= 999; i++) {
+      final next = p.join(dir, '$stem ($i)$ext');
+      if (!await File(next).exists()) {
+        return next;
+      }
+    }
+    throw StateError(
+      'Too many sibling collisions for $originalPath',
+    );
   }
 
   Future<String> restoreTimelineChangesForMessage(
@@ -1090,6 +1348,11 @@ class AppState extends ChangeNotifier {
     _savedFileContents.clear();
     _fileLanguageOverrides.clear();
     _activeFile = null;
+    // Pre-load the per-workspace duck mischief flag so `_DuckMischief`
+    // (which mounts as soon as the editor area renders with no open
+    // files) can read it synchronously without flashing the static
+    // "quip + button" layout before the animation kicks in.
+    _duckMischiefPlayed = await prefs.getDuckMischiefPlayedForWorkspace(path);
     _restartFileWatcher(path);
     // Mount the per-workspace revision timeline. Bind is awaited so
     // any subsequent file open / save lands in the right journal,
@@ -1285,6 +1548,35 @@ class AppState extends ChangeNotifier {
     await _loadRecentProjects();
   }
 
+  /// Called once by `_DuckMischief` after the empty-editor mascot gag
+  /// finishes its in-flight performance for the current workspace. Flips
+  /// the in-memory cache AND persists the per-workspace pref so the
+  /// next time this project is opened (now or after an app restart) the
+  /// gag is skipped and the static "quip + button" layout is shown
+  /// directly. Intentionally does NOT `notifyListeners` — the widget
+  /// already knows the gag is finishing and a notify here would just
+  /// trigger an extra rebuild for no visible change.
+  Future<void> markDuckMischiefPlayedForCurrentProject() async {
+    if (_duckMischiefPlayed) return;
+    _duckMischiefPlayed = true;
+    await prefs.setDuckMischiefPlayedForWorkspace(_currentDirectory, true);
+  }
+
+  /// Dev / debugging affordance. Clears the per-workspace played flag
+  /// AND bumps `duckMischiefReplayTick` so the `_DuckMischief` widget
+  /// (keyed off that tick) tears down and re-mounts. If the empty
+  /// editor surface is currently visible, the gag plays immediately;
+  /// if files are open, it plays the next time the user lands on the
+  /// empty editor. Wired into the Command Palette as `dev.replayDuck`
+  /// — not exposed via the menu bar because it's an animation-replay,
+  /// not a user-facing feature.
+  Future<void> replayDuckMischief() async {
+    _duckMischiefPlayed = false;
+    _duckMischiefReplayTick++;
+    await prefs.setDuckMischiefPlayedForWorkspace(_currentDirectory, false);
+    notifyListeners();
+  }
+
   Future<void> closeWorkspace() async {
     _currentDirectory = null;
     _openFiles.clear();
@@ -1292,6 +1584,10 @@ class AppState extends ChangeNotifier {
     _savedFileContents.clear();
     _fileLanguageOverrides.clear();
     _activeFile = null;
+    // No workspace = no duck gag (the welcome screen takes over). Reset
+    // to the default so a stale `true` from the previous project doesn't
+    // bleed into the next setDirectory call before its preload runs.
+    _duckMischiefPlayed = false;
     _restartFileWatcher(null); // tear down the recursive watcher
     await timeline.bindToWorkspace(null);
     recentEdits.bindWorkspace(null);

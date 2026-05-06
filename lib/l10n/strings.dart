@@ -197,10 +197,13 @@ class S {
   static const String providerErrorHideDetails = 'Hide details';
   static const String providerErrorOpenSettings = 'Open settings';
 
-  // Stall warning shown above the input strip when a generation has
-  // been silent (no chunks) for ~30s.
-  static String chatStallWarning(int seconds) =>
-      'No tokens for ${seconds}s — the model may be stuck. Use Stop and try the prompt again if it doesn\'t recover.';
+  // Stall warning shown as a quiet footer below the streaming
+  // assistant bubble when a generation has been silent (no chunks)
+  // for ~30s. The verbose "model may be stuck" copy was retired
+  // when the strip moved out of the above-input dock — the new
+  // shape is a discrete timer + Stop chip that lets the timer's
+  // location (under the live message) carry the meaning.
+  static String chatStallSilence(int seconds) => '${seconds}s silence';
   static const String chatStallStop = 'Stop';
 
   // Per-turn timing footer rendered at the bottom of finished
@@ -665,6 +668,23 @@ class S {
 
   // Editor
   static const String editorNoFileOpen = 'No file open';
+  // Empty-editor mascot gag (see _DuckMischief in widgets/editor/editor.dart).
+  // The stage starts empty (just the always-shown `editorEmptyAnatidaephobia`
+  // flavor line — the definition of the fear that, somewhere, a duck is
+  // watching you), then the duck waddles in, slaps the Create New File
+  // button into existence at center, pauses to declare
+  // `editorEmptyDuckRebellion` in a comic speech bubble, and exits left.
+  // The slapped button stays put after — the duck literally placed it.
+  static const String editorEmptyAnatidaephobia =
+      'Anatidaephobia — the irrational fear that somewhere, a duck is watching you.';
+  static const String editorEmptyCreateNewFile = 'Create New File';
+  static const String editorEmptyDuckRebellion = 'I AM THE REBELLION';
+  // Dev-only Command Palette entry — bumps a replay tick on AppState
+  // so `_DuckMischief` (keyed off it) tears down and re-mounts. Lets
+  // us iterate on the gag without resetting prefs by hand. Category
+  // and title kept short because the palette truncates aggressively.
+  static const String paletteDevReplayDuck = 'Replay duck mischief';
+  static const String paletteCategoryDev = 'Dev';
   static const String editorSaved = 'Saved';
   static const String editorUnsaved = 'Unsaved changes';
   static const String editorLanguage = 'Language';
@@ -861,9 +881,12 @@ class S {
   static const String mediaPlacementChat = 'In chat';
   static const String mediaPlacementChatDesc =
       'Top of chat panel. Scales 16:9 with chat width.';
-  static const String mediaPlacementEditor = 'Split editor';
+  static const String mediaPlacementEditor = 'Side column';
   static const String mediaPlacementEditorDesc =
-      'Right of the editor area as a draggable split pane.';
+      'Stacked alongside SSH and Teams in the right-of-editor column.';
+  // Retained for ABI safety. v1.4 lifted SSH / Teams / Watch into a
+  // shared full-height side column so Teams no longer evicts watch-
+  // media to chat. The string is no longer surfaced anywhere.
   static const String mediaTeamsForcesChat =
       'Teams is already using the editor split, so this media will open in the chat panel.';
 
@@ -1586,4 +1609,270 @@ class S {
   static const String settingsRemoteAccessRevokeAll = 'Revoke all';
   static const String settingsRemoteAccessLastSeen = 'Last seen';
   static const String settingsRemoteAccessNever = 'never';
+
+  // ── SSH integration ──────────────────────────────────────────
+  // Vaulted hosts, terminal sessions over dartssh2, drag-drop SFTP,
+  // edit-remote-on-save. See lib/services/ssh/ + lib/widgets/ssh/.
+  static const String sshActivityTooltip = 'SSH hosts';
+  static const String sshNoHosts = 'No SSH hosts yet';
+  static const String sshManageHosts = 'Manage hosts...';
+  static const String sshAddHost = 'Add host';
+  static const String sshEditHost = 'Edit host';
+  static const String sshDeleteHost = 'Delete host';
+  static const String sshConnect = 'Connect';
+  static const String sshDisconnect = 'Disconnect';
+  static const String sshConnecting = 'Connecting...';
+  static const String sshConnected = 'Connected';
+  static const String sshConnectionFailed = 'Connection failed';
+  static const String sshDisconnected = 'Disconnected';
+  static const String sshAuthFailed = 'Authentication failed';
+  static const String sshHostKeyChanged = 'Host key changed';
+  static const String sshHostKeyChangedBody =
+      'The remote host\'s key has changed since you last connected. This '
+      'could mean the server was reinstalled, or your traffic is being '
+      'intercepted. Verify with the host operator before trusting.';
+  static const String sshHostKeyTrustNew = 'Trust new key';
+  static const String sshHostKeyAbort = 'Disconnect';
+  static const String sshHostKeyFirstTrust =
+      'First-time connection. Trust this host\'s key fingerprint?';
+  static const String sshTrust = 'Trust';
+  static const String sshFingerprintLabel = 'Fingerprint';
+
+  // Vault dialog
+  static const String sshVaultTitle = 'SSH Hosts';
+  static const String sshVaultEmpty =
+      'Add a host to start. Lumen stores keys encrypted via your OS keystore.';
+  static const String sshVaultImportConfig = 'Import from ~/.ssh/config';
+  static const String sshVaultImportConfigDone = 'Imported {N} hosts';
+  static String sshVaultImportConfigDoneFmt(int n) => 'Imported $n hosts';
+  static const String sshVaultImportConfigNone = 'No hosts found in ~/.ssh/config';
+  static const String sshVaultImportConfigFailed = 'Failed to read ~/.ssh/config';
+
+  // Host editor dialog
+  static const String sshHostFieldLabel = 'Label';
+  static const String sshHostFieldHost = 'Host';
+  static const String sshHostFieldPort = 'Port';
+  static const String sshHostFieldUser = 'User';
+  static const String sshHostFieldAuthMethod = 'Authentication';
+  static const String sshHostAuthPassword = 'Password';
+  static const String sshHostAuthKeyFile = 'Key file';
+  static const String sshHostAuthAgent = 'OS SSH agent';
+  static const String sshHostFieldPassword = 'Password';
+  static const String sshHostFieldKeyFile = 'Private key file';
+  static const String sshHostFieldKeyFilePick = 'Pick key file...';
+  static const String sshHostFieldPassphrase = 'Passphrase (optional)';
+  static const String sshHostFieldRemember = 'Remember in vault';
+  static const String sshHostTestConnection = 'Test connection';
+  static const String sshHostTestSucceeded = 'Connected successfully';
+  static const String sshHostTestFailed = 'Test failed';
+  static const String sshHostSave = 'Save host';
+  static const String sshHostNameRequired = 'Label is required';
+  static const String sshHostHostRequired = 'Host is required';
+  static const String sshHostUserRequired = 'User is required';
+  static const String sshHostKeyMissing = 'Key file does not exist';
+  static const String sshHostDeleteConfirm =
+      'Delete this host? Any open sessions will be disconnected.';
+
+  // Remote pane (right-of-editor split)
+  static const String sshPaneTitle = 'REMOTE';
+  static const String sshPaneNoSessions = 'No active SSH sessions';
+  static const String sshPaneNewSession = 'New session';
+  static const String sshPaneCloseSession = 'Close session';
+  static const String sshPaneReconnect = 'Reconnect';
+  static const String sshPanePopOut = 'Move to terminal pane';
+  // Removed in v1.4.1 — the underlying ANSI sequences were no-ops
+  // on our xterm build, so the button mislead users. Kept as a
+  // const for ABI safety in case any test references it.
+  static const String sshPaneClearScreen = 'Clear screen';
+  static const String sshPaneClosePane = 'Close all SSH sessions';
+  static const String sshPaneClosePaneConfirmTitle = 'Close SSH pane?';
+  static const String sshPaneClosePaneConfirmBody =
+      'This will disconnect all active SSH sessions and hide the pane.';
+  static const String sshPaneDropHint = 'Drop to upload to {host}';
+  static String sshPaneDropHintFmt(String host) => 'Drop to upload to $host';
+
+  // Drag-drop upload dialog
+  static const String sshUploadTitle = 'Upload to host';
+  static const String sshUploadDestination = 'Destination directory';
+  static const String sshUploadDestinationHint = '/home/user/';
+  static const String sshUploadOverwrite = 'Overwrite existing files';
+  static const String sshUploadStart = 'Upload';
+  static const String sshUploadInFlight = 'Uploading...';
+  static const String sshUploadDone = 'Upload complete';
+  static const String sshUploadFailed = 'Upload failed';
+  static const String sshUploadDirsUnsupported =
+      "Folders can't be uploaded yet — drop individual files instead.";
+  /// Header above the upload-dialog file list. Plural-aware via the
+  /// `n == 1 ? 'file' : 'files'` branch — Dart i18n in this codebase
+  /// is intl-by-hand; nothing fancier.
+  static String sshUploadHeaderFmt(int n, String size) =>
+      '${n == 1 ? '1 file' : '$n files'}  ·  $size';
+  static String sshUploadGroupFolderFmt(int files, String size) =>
+      '${files == 1 ? '1 file' : '$files files'}  ·  $size';
+  /// Sub-line under the header when symlinks / unreadable entries
+  /// were skipped during the walk. We only render this when at
+  /// least one of the counts is non-zero.
+  static String sshUploadSkippedFmt(int symlinks, int unreadable) {
+    final bits = <String>[];
+    if (symlinks > 0) bits.add('$symlinks symlink${symlinks == 1 ? '' : 's'}');
+    if (unreadable > 0) bits.add('$unreadable unreadable');
+    return 'Skipped: ${bits.join(', ')}';
+  }
+  /// Used when the walk produced ZERO uploadable items — distinct
+  /// from the generic "upload failed" so the user knows they didn't
+  /// actually drop anything we could read.
+  static String sshUploadSkippedAllFmt(int symlinks, int unreadable) {
+    return "Nothing to upload — ${sshUploadSkippedFmt(symlinks, unreadable).toLowerCase()}";
+  }
+  static String sshUploadDoneWithSkipsFmt(int uploaded, int skipped) =>
+      'Uploaded $uploaded · skipped $skipped (already exist)';
+  static String sshUploadAggregateProgressFmt(int done, int total) =>
+      '$done / $total files';
+  static String sshUploadProgressFmt(String name, int sent, int total) =>
+      '$name  ·  ${(sent / 1024).toStringAsFixed(1)} KB / ${(total / 1024).toStringAsFixed(1)} KB';
+
+  // Remote-edit (open / save)
+  static const String sshOpenRemoteFile = 'Open remote file...';
+  static const String sshOpenRemoteFilePathHint = '/etc/hosts';
+  // Remote file browser dialog
+  static String sshRemoteBrowserTitleFmt(String host) =>
+      'Browse $host';
+  static const String sshRemoteBrowserUp = 'Go up one level';
+  static const String sshRemoteBrowserHome = 'Home';
+  static const String sshRemoteBrowserRefresh = 'Refresh';
+  static const String sshRemoteBrowserShowHidden = 'Show hidden files';
+  static const String sshRemoteBrowserHideHidden = 'Hide hidden files';
+  static const String sshRemoteBrowserEmpty = 'Empty directory';
+  static const String sshRemoteBrowserTypePath = 'Type path...';
+  static const String go = 'Go';
+
+  // Shell helpers (lumen-edit + OSC 7)
+  static const String sshShellHelpersTitle = 'SSH shell helpers';
+  static const String sshShellHelpersTooltip = 'Install shell helpers...';
+  static const String sshShellHelpersLumenEditTitle =
+      'lumen-edit  ·  open remote files in the editor';
+  static const String sshShellHelpersLumenEditBlurb =
+      'Adds a shell function so `lumen-edit <file>` opens that remote file '
+      'in this Lumen editor. Save in the editor → SFTP-uploaded back.';
+  static const String sshShellHelpersLumenGrabTitle =
+      'lumen-grab  ·  download a remote file into the workspace';
+  static const String sshShellHelpersLumenGrabBlurb =
+      'Adds a shell function so `lumen-grab <file>` copies that remote file '
+      'into your open Lumen workspace. Use for build artefacts, generated '
+      "files, logs — anything you want pulled down without leaving the shell.";
+
+  // lumen-grab UX (toasts + conflict dialog)
+  static const String sshGrabConflictTitle =
+      'Local file already exists';
+  static const String sshGrabConflictBody =
+      'A file with the same name already exists in your project. What '
+      "should we do with the file you're grabbing?";
+  static const String sshGrabConflictRemote = 'Remote';
+  static const String sshGrabConflictExisting = 'Existing';
+  static String sshGrabConflictExistingMetaFmt(String size, String mtime) =>
+      'Existing file: $size, last modified $mtime';
+  static String sshGrabConflictKeepBothPreviewFmt(String suggested) =>
+      '"Keep both" will save the new file as: $suggested';
+  static const String sshGrabConflictReplace = 'Replace';
+  static const String sshGrabConflictKeepBoth = 'Keep both';
+  static String sshGrabSuccessFmt(String name) => 'Grabbed: $name';
+  static const String sshGrabTooLarge =
+      'File is too large to grab into the workspace (>5 MB). Use scp / sftp '
+      'directly for files this size.';
+  static const String sshShellHelpersOsc7Title =
+      'PROMPT_COMMAND  ·  report cwd to Lumen';
+  static const String sshShellHelpersOsc7Blurb =
+      "Without this, dropping files into the SSH pane uploads to \$HOME by "
+      "default. With this, drops go to wherever you're currently `cd`'d.";
+  static const String sshShellHelpersCopyAll = 'Copy all';
+  static const String sshShellHelpersInstallSession =
+      'Install for this session';
+  static const String sshShellHelpersInstalled =
+      'Helper installed in this session';
+  static const String sshShellHelpersCopied = 'Copied to clipboard';
+  static const String sshShellHelpersPersistHint =
+      'Tip: paste these into ~/.bashrc or ~/.zshrc to make them stick across '
+      'sessions. The "Install for this session" button only sets them up '
+      'in the current shell.';
+  static const String sshRemoteFileTooLarge =
+      'File is too large to open in the editor (>5 MB). Use the terminal to inspect.';
+  static const String sshRemoteFileBinary =
+      'File looks binary. Open as text anyway?';
+  static const String sshRemoteFileSaved = 'Saved to remote';
+  static const String sshRemoteFileSaveFailed = 'Save to remote failed';
+  static const String sshRemoteFileConflictTitle = 'Remote changed since you opened it';
+  static const String sshRemoteFileConflictBody =
+      'The file on the remote has been modified since you opened it. '
+      'Saving now will overwrite those changes.';
+  static const String sshRemoteFileConflictOverwrite = 'Overwrite remote';
+  static const String sshRemoteFileConflictCancel = 'Keep both — cancel save';
+  static const String sshRemoteFileTabSuffixFmt = ' — {host}:{path}';
+  static String sshRemoteFileTabSuffix(String host, String path) =>
+      '  $host:$path';
+  static const String sshRemoteFileSyntaxOnlyHint =
+      'Remote file — syntax only, no IntelliSense';
+
+  // Remote file browser — right-click context menu actions.
+  // Plain verbs: "Open" navigates into a folder or opens a file in
+  // the editor; "Download" copies the entry into the project (the
+  // download dialog handles destination and conflict resolution).
+  static const String sshContextMenuOpen = 'Open';
+  static const String sshContextMenuOpenInEditor = 'Open in editor';
+  static const String sshContextMenuDownload = 'Download';
+  static const String sshContextMenuDownloadFolder = 'Download folder';
+
+  // SSH download dialog (right-click → Download). Defaults to
+  // <projectRoot>/ssh_sync/<basename> so the user never silently
+  // shadows a real project file with a remote pull.
+  static const String sshDownloadDialogTitleFile = 'Download remote file';
+  static const String sshDownloadDialogTitleFolder = 'Download remote folder';
+  static String sshDownloadDialogSubtitleFmt(
+    String hostLabel,
+    String remotePath,
+  ) => 'From $hostLabel:$remotePath';
+  static const String sshDownloadDestinationLabel = 'Save to';
+  static const String sshDownloadDestinationHint =
+      "Defaults to ssh_sync/ inside the project so you don't accidentally "
+      'overwrite real files.';
+  static const String sshDownloadBrowse = 'Browse…';
+  static const String sshDownloadConfirm = 'Download';
+  static const String sshDownloadInProgress = 'Downloading…';
+  static String sshDownloadProgressFilesFmt(int done, int total) =>
+      '$done / $total files';
+  static String sshDownloadCompleteFmt(String name) => 'Downloaded: $name';
+  static String sshDownloadFailedFmt(String reason) =>
+      'Download failed: $reason';
+  static const String sshDownloadFolderEmpty =
+      'Folder is empty — nothing to download.';
+  static const String sshDownloadNoWorkspace =
+      'Open a project first — downloads land in the workspace.';
+  static const String sshDownloadConflictTitle = 'Destination already exists';
+  static const String sshDownloadConflictBodyFile =
+      'A file with the same name already exists at the destination. '
+      'What should we do with the file you are downloading?';
+  static const String sshDownloadConflictBodyFolder =
+      'A folder with the same name already exists at the destination. '
+      "Replacing wipes the existing folder before the download starts.";
+  static const String sshDownloadConflictReplace = 'Replace';
+  static const String sshDownloadConflictKeepBoth = 'Keep both';
+  static String sshDownloadConflictKeepBothPreviewFmt(String suggested) =>
+      '"Keep both" will save as: $suggested';
+
+  // Settings → SSH
+  static const String settingsCatSsh = 'SSH';
+  static const String settingsSshTitle = 'SSH integration';
+  static const String settingsSshSubtitle =
+      'Manage vaulted hosts and remote-mirror cache.';
+  static const String settingsSshOpenVault = 'Open vault';
+  static const String settingsSshUseAgent = 'Allow OS SSH agent auth';
+  static const String settingsSshUseAgentHint =
+      'When enabled, hosts can authenticate via your system SSH agent (ssh-add\'d keys) instead of a key in the vault.';
+  static const String settingsSshKeepAlive = 'Keepalive (seconds)';
+  static const String settingsSshKeepAliveHint =
+      'Send a keepalive ping at this interval. 0 disables keepalive.';
+  static const String settingsSshMirrorCacheTitle = 'Remote-mirror cache';
+  static const String settingsSshMirrorCacheHint =
+      'Files opened over SSH are downloaded to a local cache. Save = SFTP upload back.';
+  static const String settingsSshMirrorClear = 'Clear mirror cache';
+  static const String settingsSshMirrorClearedFmt = 'Cleared mirror cache';
 }

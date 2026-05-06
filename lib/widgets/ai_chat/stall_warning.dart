@@ -7,22 +7,27 @@ import '../../providers/chat_controller.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 
-/// Above-input strip that surfaces "the model is silent" once the
-/// streaming chunks have stopped landing for a while.
+/// Quiet footer rendered directly below the streaming assistant
+/// bubble that surfaces "the model is silent" once the streaming
+/// chunks have stopped landing for a while.
 ///
 /// Uses **inter-chunk silence** as the stall metric, NOT total
 /// elapsed time. A reasoning model can legitimately think for
 /// minutes; what matters is whether tokens are still arriving. The
 /// chat controller updates `_lastChunkAt` on every chunk; this
 /// widget polls `controller.silenceDuration` once per second and
-/// renders a warning above the input strip when silence crosses
-/// [warnAfter].
+/// renders the timer + Stop chip when silence crosses [warnAfter].
 ///
 /// The warning is *advisory* — it doesn't auto-stop generation. The
 /// 3-minute hard idle timeout in the streaming services takes care
 /// of genuinely dead connections. This is the early heads-up so the
 /// user can decide to Stop and retry rather than wait the full 3
 /// minutes.
+///
+/// Visual treatment is intentionally muted (no panel band, no left
+/// stripe, mono-ish small text) so it reads as a footer of the
+/// streaming bubble above it — same calm-pass spirit as the
+/// queued-prompts strip and approval card reshapes.
 class StallWarningStrip extends StatefulWidget {
   final ChatController controller;
 
@@ -97,64 +102,55 @@ class _StallWarningStripState extends State<StallWarningStrip> {
       return const SizedBox.shrink();
     }
     final seconds = silence.inSeconds;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-      decoration: const BoxDecoration(
-        color: DuckColors.bgDeeper,
-        border: Border(
-          top: BorderSide(color: DuckColors.glassSeam, width: 0.5),
-          left: BorderSide(color: DuckColors.stateWarn, width: 2),
-        ),
-      ),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8, left: 14),
       child: Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
           const Icon(
             Icons.hourglass_top_outlined,
-            size: 13,
+            size: 12,
             color: DuckColors.stateWarn,
           ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              S.chatStallWarning(seconds),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                fontSize: 11,
-                color: DuckColors.fgMuted,
-                height: 1.35,
-              ),
+          const SizedBox(width: 6),
+          Text(
+            S.chatStallSilence(seconds),
+            style: const TextStyle(
+              fontSize: 11,
+              color: DuckColors.fgMuted,
             ),
           ),
-          const SizedBox(width: 6),
+          const SizedBox(width: 12),
           MouseRegion(
             cursor: SystemMouseCursors.click,
             child: InkWell(
               onTap: widget.controller.cancelGeneration,
               borderRadius: BorderRadius.circular(DuckTheme.radiusS),
               child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
-                  color: DuckColors.stateError.withValues(alpha: 0.14),
+                  color: DuckColors.stateError.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                  border: Border.all(
+                    color: DuckColors.stateError.withValues(alpha: 0.3),
+                    width: 0.5,
+                  ),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     const Icon(
-                      Icons.stop_circle,
-                      size: 12,
+                      Icons.stop,
+                      size: 10,
                       color: DuckColors.stateError,
                     ),
                     const SizedBox(width: 4),
                     Text(
                       S.chatStallStop,
                       style: const TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
                         color: DuckColors.stateError,
-                        letterSpacing: 0.2,
                       ),
                     ),
                   ],

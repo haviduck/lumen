@@ -170,7 +170,12 @@ class MediaController extends ChangeNotifier {
     } catch (_) {}
   }
 
-  bool get watchMediaForcedToChat => hasTeams;
+  /// Historical hold-over from v1.0–v1.3 when Teams and watch-media
+  /// fought for a single editor-right-slot. v1.4's side-panes
+  /// column lets them coexist, so this is now permanently `false`
+  /// — kept for ABI safety in case any chrome control lazily
+  /// references it; remove once we're sure nothing reads it.
+  bool get watchMediaForcedToChat => false;
 
   /// Extract the YouTube video id from a watch / share / shorts URL.
   /// Returns null when the URL is not a recognisable YouTube link.
@@ -207,15 +212,14 @@ class MediaController extends ChangeNotifier {
   /// then strips YouTube's masthead / sidebar / comments via injected
   /// CSS.
   Future<void> play(String url) async {
-    // Teams owns the editor-side webview slot. If it is active, normal
-    // watch-media must render in chat so both surfaces can coexist.
-    if (hasTeams && _placement != MediaPlacement.chat) {
-      _placement = MediaPlacement.chat;
-      try {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(_placementKey, 'chat');
-      } catch (_) {}
-    }
+    // v1.4 layout note: previously, if Teams was already active we
+    // forced watch-media's placement to `chat` because the editor
+    // right-slot could only host one webview at a time (Teams or
+    // watch, never both). v1.4 lifted SSH/Teams/Watch into a
+    // dedicated full-height side column (`SidePanesColumn`) that
+    // stacks all three vertically, so the lock-out is gone — Teams
+    // and YouTube can coexist in the side column. Placement is
+    // now strictly user-controlled via `setPlacement`.
 
     final ytId = extractYoutubeId(url);
     final isTwitch = ytId == null && url.contains('twitch.tv/');
@@ -334,15 +338,11 @@ class MediaController extends ChangeNotifier {
       } catch (_) {}
       await teamsWebview.loadUrl(url);
       _teamsUrl = url;
-      // While Teams is docked in the editor split, normal watch-media belongs
-      // in chat. This is the core coexistence rule the UI relies on.
-      if (_placement != MediaPlacement.chat) {
-        _placement = MediaPlacement.chat;
-        try {
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setString(_placementKey, 'chat');
-        } catch (_) {}
-      }
+      // v1.4: previously this method also flipped watch-media
+      // placement to `chat` so Teams could own the lone editor
+      // right-slot. The new `SidePanesColumn` stacks SSH / Teams /
+      // Watch vertically with no exclusivity, so we no longer
+      // touch placement here. See the matching note in `play()`.
       notifyListeners();
     } catch (e) {
       debugPrint('MediaController.playTeams failed: $e');

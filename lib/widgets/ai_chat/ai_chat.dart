@@ -498,11 +498,6 @@ class _AiChatState extends State<AiChat> {
                           padding: EdgeInsets.symmetric(horizontal: 16.0),
                           child: LinearProgressIndicator(minHeight: 2),
                         ),
-                      // Stall warning — surfaces once the model
-                      // has been silent for ~30s. Internal 1Hz
-                      // ticker; widget short-circuits to
-                      // SizedBox.shrink when below threshold.
-                      StallWarningStrip(controller: chat),
                       // Empty-response strip — surfaces after a
                       // turn ends with no visible content / tools
                       // / errors. Distinct from the stall strip
@@ -660,6 +655,34 @@ class _AiChatState extends State<AiChat> {
                 : null;
           }
 
+          // Streaming-only Column wrap: attaches the muted stall
+          // footer beneath the live assistant bubble. Skipping the
+          // wrap on non-streaming last messages avoids stranding an
+          // empty `SizedBox.shrink()` inside an extra Column on
+          // every finished turn (the strip short-circuits when
+          // silenceDuration is null, which is the case whenever
+          // !isGenerating).
+          if (isStreaming) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                MessageBubble(
+                  message: m,
+                  isUser: m.role == 'user',
+                  isStreaming: isStreaming,
+                  restoreChangeCount: restoreCount,
+                  restoreScope: scope,
+                  restoreFollowupMessages: followupCount,
+                  onRestore: onRestore,
+                  onEdit: m.role == 'user'
+                      ? () => _editMessageDialog(chat, index)
+                      : null,
+                  onDelete: () => chat.deleteMessage(index),
+                ),
+                StallWarningStrip(controller: chat),
+              ],
+            );
+          }
           return MessageBubble(
             message: m,
             isUser: m.role == 'user',

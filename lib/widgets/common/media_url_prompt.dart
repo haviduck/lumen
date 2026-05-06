@@ -54,10 +54,11 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
     final url = _ctrl.text.trim();
     if (url.isEmpty) return;
     final media = context.read<MediaController>();
-    if (media.hasTeams) {
-      await media.setPlacement(MediaPlacement.chat);
-    }
-    if (!mounted) return;
+    // v1.4: previously forced placement to chat when Teams was
+    // active because the editor right-slot could only host one
+    // webview. The new `SidePanesColumn` stacks SSH / Teams /
+    // Watch vertically with no exclusivity, so we leave the user's
+    // chosen placement alone here.
     Navigator.of(context).pop();
     await media.play(url);
   }
@@ -127,10 +128,15 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
               _UrlField(controller: _ctrl, focus: _focus, onSubmit: _submit),
               const SizedBox(height: 14),
               Consumer<MediaController>(
+                // v1.4: dropped the `_TeamsActiveNotice` short-
+                // circuit. Pre-v1.4, when Teams was active we'd
+                // hide the placement chooser and tell the user
+                // "this will open in chat" — because the editor
+                // right-slot was a single-webview surface. The
+                // side-panes column hosts SSH / Teams / Watch
+                // simultaneously now, so the chooser stays live
+                // regardless of Teams' state.
                 builder: (context, media, _) {
-                  if (media.hasTeams) {
-                    return const _TeamsActiveNotice();
-                  }
                   return const Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -292,38 +298,6 @@ class _PlacementChips extends StatelessWidget {
             description: S.mediaPlacementEditorDesc,
             selected: media.placement == MediaPlacement.editor,
             onTap: () => media.setPlacement(MediaPlacement.editor),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _TeamsActiveNotice extends StatelessWidget {
-  const _TeamsActiveNotice();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: DuckColors.bgChip,
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        border: Border.all(color: DuckColors.glassSeam, width: 0.5),
-      ),
-      child: const Row(
-        children: [
-          Icon(Icons.groups_outlined, size: 14, color: DuckColors.accentCyan),
-          SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              S.mediaTeamsForcesChat,
-              style: TextStyle(
-                fontSize: 11.5,
-                color: DuckColors.fgMuted,
-                height: 1.35,
-              ),
-            ),
           ),
         ],
       ),

@@ -162,6 +162,17 @@ class PreferencesService {
   static const String _kGitNexusAutoWiki = 'gitnexus.autoWiki';
   static const String _kGitNexusWikiModel = 'gitnexus.wikiModel';
 
+  // Per-workspace one-shot flag: has the empty-editor duck mischief gag
+  // played for this project yet? On the first visit it plays in full
+  // (smaller duck waddles in along the bottom, jumps to "throw" the
+  // Create New File button into existence, exits left). On subsequent
+  // visits the empty-editor surface skips the animation and just shows
+  // the Create New File button under the quip — no waiting, no mascot
+  // doing his thing every time you close the last open tab. Stored
+  // per-workspace via the existing `_wsKey` hash so two unrelated
+  // projects don't share the flag.
+  static const String _kDuckMischiefPlayed = 'editor.duckMischief.played';
+
   Future<SharedPreferences> get _p => SharedPreferences.getInstance();
 
   Future<String> getProvider() async =>
@@ -472,6 +483,16 @@ class PreferencesService {
   Future<void> setCurrentSessionIdForWorkspace(String? path, String v) async {
     await (await _p).setString('$_kCurrentSessionId.${_wsKey(path)}', v);
   }
+
+  /// Per-workspace one-shot flag. `false` (or never set) means the duck
+  /// mischief gag has NOT yet played for this project — the empty-editor
+  /// surface should run the full animation. `true` means subsequent
+  /// visits should skip straight to the static "quip + button" layout.
+  /// See `_kDuckMischiefPlayed` for the full rationale.
+  Future<bool> getDuckMischiefPlayedForWorkspace(String? path) async =>
+      (await _p).getBool('$_kDuckMischiefPlayed.${_wsKey(path)}') ?? false;
+  Future<void> setDuckMischiefPlayedForWorkspace(String? path, bool v) async =>
+      (await _p).setBool('$_kDuckMischiefPlayed.${_wsKey(path)}', v);
 
   Future<String?> getTerminalShellId() async =>
       (await _p).getString(_kTerminalShell);

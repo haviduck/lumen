@@ -7,17 +7,14 @@ import 'package:flutter/material.dart';
 import 'package:re_editor/re_editor.dart';
 import 'package:multi_split_view/multi_split_view.dart';
 import 'package:provider/provider.dart';
-import 'package:webview_windows/webview_windows.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
-import '../../providers/media_controller.dart';
 import '../../services/file_kind.dart';
 import '../../services/language_detector.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/fast_popup_menu.dart';
-import '../common/media_pane_chrome.dart';
 import '../menu_bar.dart';
 import '../process_manager/process_manager_view.dart';
 import '../settings_view.dart';
@@ -305,64 +302,18 @@ class _EditorState extends State<Editor> {
 
   @override
   Widget build(BuildContext context) {
-    // Outer scaffold only needs to know whether to wrap the editor in a
-    // Teams/YouTube split. Anything that depends on AppState moves into
-    // method tear-offs (`_buildIdeBodyArea`, `_buildPaneArea0/1`,
-    // `_buildMediaArea`) so the *closures* stored inside `Area`
-    // objects don't capture stale values.
-    //
-    // Why: `multi_split_view` 3.6.1 only consumes `initialAreas` once
-    // (in `initState`); on every parent rebuild `didUpdateWidget`
-    // hands the existing `Area` list back to a freshly-constructed
-    // `MultiSplitViewController`. So a closure like
-    // `(_, _) => editorBody` captured the empty-state `editorBody`
-    // from the very first frame and never updated when the user
-    // clicked a file in the explorer. Tear-offs of instance methods
-    // stay bound to `this` (a stable reference); invoking the stored
-    // builder dispatches to the current method body, which reads
-    // fresh state via `context.watch<AppState>()`.
-    return Consumer<MediaController>(
-      builder: (context, media, _) {
-        final showMediaInEditor =
-            media.hasTeams ||
-            (media.hasMedia && media.placement == MediaPlacement.editor);
-        if (!showMediaInEditor) {
-          // No Teams / no docked watch-media — render the editor body
-          // directly. Pulling AppState happens inside `_buildIdeBody`.
-          return _buildIdeBody(context);
-        }
-        return MultiSplitViewTheme(
-          data: MultiSplitViewThemeData(
-            dividerThickness: 1,
-            dividerHandleBuffer: 8,
-            dividerPainter: DividerPainters.background(
-              color: DuckColors.glassSeam,
-              highlightedColor: DuckColors.accentCyan.withValues(alpha: 0.4),
-            ),
-          ),
-          child: MultiSplitView(
-            axis: Axis.horizontal,
-            initialAreas: [
-              Area(flex: 0.6, builder: _buildIdeBodyArea),
-              Area(flex: 0.4, builder: _buildMediaArea),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  /// Method-tear-off wrapper around [_buildIdeBody] used as a stable
-  /// `Area.builder`. See [build] for the captured-closure landmine
-  /// this defends against.
-  Widget _buildIdeBodyArea(BuildContext context, Area area) {
+    // v1.4: the editor is now JUST the IDE body (tab bar + editor
+    // pane(s)). Previously this build method also wrapped a
+    // horizontal `MultiSplitView` to host the SSH "Remote" pane
+    // and the Teams / Watch-media pane to the right. Both have
+    // been lifted up into the dedicated `SidePanesColumn` widget,
+    // which is a sibling of the (Editor + Terminal) column at the
+    // root layout level (`_LayoutForMode`). The lift gives the
+    // editor full vertical height regardless of how many side
+    // panes are open, and lets SSH / Teams / Watch-media stack
+    // vertically in their own resizable column instead of
+    // fighting for the editor's right slot.
     return _buildIdeBody(context);
-  }
-
-  Widget _buildMediaArea(BuildContext context, Area area) {
-    final media = context.watch<MediaController>();
-    final slot = media.hasTeams ? MediaSlot.teams : MediaSlot.watch;
-    return _EditorMediaPane(media: media, slot: slot);
   }
 
   /// The "IDE body" — tab bar + active pane(s). Reads `AppState`
@@ -393,7 +344,14 @@ class _EditorState extends State<Editor> {
         // flagged as confusing on the side-by-side
         // comparison. We diverge here on purpose.
         color: DuckColors.editorBg,
-        child: const Center(child: _DuckQuip()),
+        // Keyed off `duckMischiefReplayTick` so the dev-only
+        // `Replay duck mischief` palette command (which bumps the
+        // tick) forces a fresh mount and re-runs the gag from the
+        // top — without the key, the controller is already at 1.0
+        // and `initState` doesn't re-fire on a notify.
+        child: _DuckMischief(
+          key: ValueKey(appState.duckMischiefReplayTick),
+        ),
       );
     }
 
@@ -584,58 +542,14 @@ class _EditorState extends State<Editor> {
   }
 }
 
-/// Editor-placement media pane — header chrome + the shared
-/// `MediaController.webview`. Lives inside a `MultiSplitView` next
-/// to the editor body, so its width is whatever the user dragged
-/// the divider to.
+/// A single code editor pane (one tab's worth of `re_editor`).
 ///
-/// **Layout rules:**
-/// - For aspect-locked media (YouTube / Twitch) the webview is wrapped
-///   in `AspectRatio(16/9)` inside `Center`. The pane fills with black
-///   (`bgDeepest`) and the player letterboxes when the pane's aspect
-///   doesn't match 16:9. Without this, YouTube's player tries to
-///   fill an arbitrary-shaped pane and the actual video becomes
-///   tiny / cropped depending on the user's split ratio.
-/// - For arbitrary URLs (news, streams, anything embeddable) the
-///   webview just fills the pane — those pages flow freely and
-///   benefit from the full real estate. Use the chrome's zoom +/-
-///   to fit the page contents to the pane size.
-class _EditorMediaPane extends StatelessWidget {
-  final MediaController media;
-  final MediaSlot slot;
-  const _EditorMediaPane({required this.media, required this.slot});
-
-  @override
-  Widget build(BuildContext context) {
-    final permissionRequested = slot == MediaSlot.teams
-        ? MediaController.handleTeamsPermission
-        : null;
-    final body = media.isAspectLockedFor(slot)
-        ? Center(
-            child: AspectRatio(
-              aspectRatio: 16 / 9,
-              child: Webview(
-                media.webviewFor(slot),
-                permissionRequested: permissionRequested,
-              ),
-            ),
-          )
-        : Webview(
-            media.webviewFor(slot),
-            permissionRequested: permissionRequested,
-          );
-    return Container(
-      color: DuckColors.bgDeepest,
-      child: Column(
-        children: [
-          MediaPaneChrome(media: media, slot: slot),
-          Expanded(child: body),
-        ],
-      ),
-    );
-  }
-}
-
+/// `_EditorState` owns one or two of these depending on
+/// `_splitView`: pane 0 is always the primary, pane 1 only exists
+/// when the user has split. The pane handles its own
+/// `CodeLineEditingController` lifecycle — including registering
+/// with the IDE action bridge while focused so menu-bar
+/// undo/redo/find/copy/paste hit the right buffer.
 class _EditorPane extends StatefulWidget {
   final AppState appState;
   final String path;
@@ -1496,12 +1410,22 @@ class _EditorTabBar extends StatelessWidget {
                   final isSettings = AppState.isSettingsTab(file.path);
                   final isProcessMgr = AppState.isProcessManagerTab(file.path);
                   final isUntitled = AppState.isUntitledTab(file.path);
+                  // Remote-mirror tabs render as `<basename>  <host>:<path>`
+                  // so the user sees what they're editing AND where it
+                  // came from. The local mirror path under
+                  // `<appSupport>/lumen/ssh-mirror/...` is meaningless
+                  // to humans — surfacing the remote address instead
+                  // makes the tab self-documenting.
+                  final remoteOrigin =
+                      appState.ssh?.remoteFiles.originFor(file.path);
                   final fileName = isSettings
                       ? S.settingsTitle
                       : isProcessMgr
                       ? S.processManagerTitle
                       : isUntitled
                       ? 'Untitled-${file.path.replaceAll(AppState.untitledPrefix, '')}'
+                      : remoteOrigin != null
+                      ? '${remoteOrigin.remotePath.split('/').last}  ·  ${remoteOrigin.hostLabel}'
                       : file.path.split(Platform.pathSeparator).last;
                   final isActive = appState.activeFile?.path == file.path;
                   final isDirty = appState.isFileDirty(file.path);
@@ -1915,56 +1839,671 @@ class _ToolbarOverflow extends StatelessWidget {
   }
 }
 
-class _DuckQuip extends StatelessWidget {
-  const _DuckQuip();
+// ---------------------------------------------------------------------------
+// Empty-editor mischief: an always-shown anatidaephobia flavor line + a
+// one-shot Haviduck cameo, gated PER PROJECT.
+//
+// **First visit to a workspace** (`AppState.duckMischiefPlayedForCurrentProject`
+// is false): the stage starts EMPTY (no button), a smaller duck waddles in
+// along the bottom edge of the stage, pauses at the center, JUMPS straight
+// up — at the apex of the jump the Create New File button materializes
+// directly above him, as if hurled into place — lands, pivots, declares
+// "I AM THE REBELLION" in a comic speech bubble, then waddles back out
+// the left edge. The button he just threw stays put forever after — the
+// duck literally placed the empty state's only interactive affordance.
+// On gag completion `markDuckMischiefPlayedForCurrentProject` is called,
+// flipping the per-workspace pref so every subsequent visit to this
+// project skips straight to the static layout.
+//
+// **Subsequent visits** (pref is true): no animation, no stage. We render
+// the quip and the Create New File button stacked tightly, with a small
+// gap. Same compact button as the animated path, just sitting there.
+//
+// The flag is per-workspace (hashed via PreferencesService._wsKey) — open
+// project A, see the gag once, then open project B and see it again
+// because B has its own pref slot. Closing/reopening A skips it.
+//
+// The Haviduck.gif is right-facing natively, so:
+//   - walk-in (left → center): no flip
+//   - walk-out (center → off-screen left): horizontally flipped so the duck
+//     still faces its direction of travel.
+//
+// The `_shoutMs` phase between the flip and the walk-out is intentional —
+// the duck stops in place while the speech bubble fades in so the rebellion
+// line registers BEFORE the duck starts moving again.
+// ---------------------------------------------------------------------------
 
-  static final _rng = Random();
-  static const _quips = [
-    'A duck walked into a code review.\nNobody noticed until it shipped to prod.',
-    'Your posture right now would make\na chiropractor weep with joy... at the billing opportunity.',
-    'Fun fact: ducks have three eyelids.\nYou have zero excuses not to blink more.',
-    'That keyboard cost less than lunch.\nYour wrists can tell.',
-    'Somewhere, a fanny pack is waiting\nfor you to ironically bring it back.',
-    'Ducks sleep with one eye open.\nYou should too, during deployments.',
-    'Sit up straight.\nThis message will self-destruct... your back won\'t.',
-    'A group of ducks is called a raft.\nA group of developers is called a standup... allegedly.',
-    'Your mechanical keyboard doesn\'t\nmake you type better. It just makes everyone else type angrier.',
-    'Fanny packs: because cargo shorts\nweren\'t embarrassing enough.',
-    'Duck quacks don\'t echo.\nNeither does good code in a monolith.',
-    'You\'ve been sitting for how long?\nEven the office chair is concerned.',
-    'Pro tip: rubber duck debugging works\nbetter if you actually talk to it.',
-    'Your \'ergonomic\' setup is just\na laptop on a stack of old textbooks.',
-    'Ducks can fly at 50 mph.\nYour deploy pipeline wishes.',
-    'That energy drink won\'t fix your\narchitecture decisions.',
-    'Open a file already.\nThe duck is getting impatient.',
-    'A fanny pack has more storage\nthan your free-tier database.',
-    'Ducks have been around for 40 million years.\nYour node_modules folder just feels that old.',
-    'Your neck is at a 45-degree angle.\nThat\'s not a feature, it\'s a bug.',
-    'The \'D\' in IDE stands for duck.\nLook it up. Actually don\'t.',
-    'Somewhere a senior dev is refactoring\ncode you wrote at 3am. They\'re not happy.',
-    'Ducks molt all their flight feathers at once.\nKind of like your repo after a rebase gone wrong.',
-    'Your keyboard has more crumbs\nthan a bakery floor.',
-    'Fanny packs are just utility belts\nfor people who gave up.',
-    'A mallard\'s quack can express\nmore emotion than your commit messages.',
-    'Hydrate. Even ducks know this.\nThey literally live in water.',
-    'Your monitor brightness is set to\n\'surface of the sun\'. Your retinas filed a complaint.',
-    'Ducks have regional accents.\nYour code has regional disasters.',
-    'That cheap keyboard will outlive\nyour motivation. Open a file. Do something.',
-  ];
+class _DuckMischief extends StatefulWidget {
+  const _DuckMischief({super.key});
+
+  @override
+  State<_DuckMischief> createState() => _DuckMischiefState();
+}
+
+class _DuckMischiefState extends State<_DuckMischief>
+    with SingleTickerProviderStateMixin {
+  // Phase durations (ms). Sum = totalMs. Tweak any of these in isolation;
+  // the timing helper below uses cumulative boundaries derived from these.
+  static const int _initialMs = 2500; // calm: just flavor line, empty stage
+  static const int _walkInMs = 4500; // duck enters from left along the floor
+  static const int _jumpMs = 760; // vertical jump, button materializes at apex
+  static const int _settleMs = 500; // beat after the duck lands
+  static const int _flipMs = 220; // duck pivots to face left
+  static const int _shoutMs = 1000; // duck stationary, bubble fades in
+  static const int _walkOutMs = 4000; // duck waddles out (slow waddle)
+
+  static const int _totalMs = _initialMs +
+      _walkInMs +
+      _jumpMs +
+      _settleMs +
+      _flipMs +
+      _shoutMs +
+      _walkOutMs;
+
+  late final AnimationController _ctrl;
+  // Decided once on mount from `AppState.duckMischiefPlayedForCurrentProject`.
+  // Null only during the initial frame between `initState` and the first
+  // build, which never actually paints because we set it synchronously
+  // below.
+  bool _shouldAnimate = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: _totalMs),
+    );
+    // Sync read in initState — `Provider.of(listen: false)` (== context.read)
+    // is documented as safe here because `_DuckMischief` is always mounted
+    // below the AppState provider in the tree.
+    final state = context.read<AppState>();
+    _shouldAnimate = !state.duckMischiefPlayedForCurrentProject;
+    if (_shouldAnimate) {
+      _ctrl
+        ..addStatusListener(_onStatus)
+        ..forward();
+    }
+  }
+
+  void _onStatus(AnimationStatus status) {
+    if (status == AnimationStatus.completed) {
+      // Mark played AFTER the gag finishes so a user who closes/reopens
+      // the project mid-animation still gets to see it next time.
+      // Fire-and-forget — the pref write is one shared-prefs setter,
+      // failures are non-recoverable and not user-visible.
+      // ignore: discarded_futures
+      context.read<AppState>().markDuckMischiefPlayedForCurrentProject();
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _onNewFile() {
+    context.read<AppState>().openUntitledTab();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final quip = _quips[_rng.nextInt(_quips.length)];
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 48),
-      child: Text(
-        quip,
-        textAlign: TextAlign.center,
-        style: const TextStyle(
-          color: DuckColors.fgFaint,
-          fontSize: 13,
-          height: 1.6,
-          fontStyle: FontStyle.italic,
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Always-shown flavor line — the literal definition of what
+            // the duck gag below performs (when it performs at all).
+            const Text(
+              S.editorEmptyAnatidaephobia,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: DuckColors.fgFaint,
+                fontSize: 13,
+                height: 1.4,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+            // Tighter gap between quip and button than the original
+            // 28px — both the animated stage (where the button settles
+            // mid-stage) and the static layout (where the button sits
+            // immediately under the quip) read as one cohesive unit
+            // rather than a quip floating disconnected at the top.
+            const SizedBox(height: 14),
+            if (_shouldAnimate)
+              _DuckStage(ctrl: _ctrl, onNewFile: _onNewFile)
+            else
+              SizedBox(
+                width: _DuckStage.buttonW,
+                height: _DuckStage.buttonH,
+                child: _EmptyStateActionButton(
+                  icon: Icons.note_add_outlined,
+                  label: S.editorEmptyCreateNewFile,
+                  accent: DuckColors.accentDuck,
+                  onTap: _onNewFile,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Horizontal "stage" that hosts the eventual centered Create New File
+/// button (above) and the animated duck overlay (walking along the floor
+/// of the stage). Sized in pixels — large enough to give the duck room
+/// to enter / exit and to clear vertical space for the jump apex without
+/// overflowing into the file explorer or chat sidebars.
+class _DuckStage extends StatelessWidget {
+  const _DuckStage({
+    required this.ctrl,
+    required this.onNewFile,
+  });
+
+  final AnimationController ctrl;
+  final VoidCallback onNewFile;
+
+  // Public so the static (skip-mode) layout in `_DuckMischiefState.build`
+  // can mount a button with the exact same footprint as the animated one.
+  static const double buttonW = 200.0;
+  static const double buttonH = 46.0;
+
+  // Smaller duck sprite than the v1 gag (was 88) — the new walk-on-the-
+  // floor framing benefits from a less imposing mascot, and the button
+  // ends up at the duck's eye level rather than the duck eclipsing it.
+  static const double _duckSize = 56.0;
+  // Button row sits in the upper portion of the stage, bubble nestles
+  // between button and duck head, duck walks across the bottom.
+  static const double _stageH = 150.0;
+  // Vertical sin-arc apex of the jump — how high (in px) the duck rises
+  // above its resting baseline at jumpProgress == 0.5. Tall enough that
+  // the duck reaches the bottom edge of the (centered) button row.
+  // Public so `_MischiefTiming.jumpDy` can read it without a back-channel.
+  static const double jumpApexPx = 38.0;
+  // Pixels of clearance between the duck's feet and the bottom of the
+  // stage — keeps the sprite from kissing the editor background's
+  // bottom edge.
+  static const double _floorPad = 4.0;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: _stageH,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final stageW = constraints.maxWidth;
+          // Single button is centered, so the duck stops at the stage
+          // center too. Subtract half the sprite width so the duck's
+          // body is centered under the button.
+          final stopLeft = (stageW - _duckSize) / 2;
+          // Duck baseline (top of sprite when standing on the floor).
+          // The jump motion subtracts an extra `jumpDy` from this.
+          final duckBaselineTop = _stageH - _duckSize - _floorPad;
+
+          return AnimatedBuilder(
+            animation: ctrl,
+            builder: (context, _) {
+              final t = (ctrl.value * _DuckMischiefState._totalMs).round();
+              final timing = _MischiefTiming.at(t);
+              final duckLeft = timing.duckLeft(
+                stageW: stageW,
+                duckSize: _duckSize,
+                stopLeft: stopLeft,
+              );
+              return Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  // Create New File button — invisible until the duck
+                  // jumps and "throws" it into place at the jump apex.
+                  // Anchored to the upper portion of the stage (the duck
+                  // walks along the floor below it).
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    top: 4,
+                    height: buttonH,
+                    child: Center(
+                      child: SizedBox(
+                        width: buttonW,
+                        height: buttonH,
+                        child: Transform.scale(
+                          scale: timing.buttonScale,
+                          child: Opacity(
+                            opacity: timing.buttonOpacity,
+                            child: IgnorePointer(
+                              // Until the throw actually lands, the
+                              // button isn't real — don't accept clicks
+                              // on the invisible/animating ghost.
+                              ignoring: timing.buttonOpacity < 0.5,
+                              child: _EmptyStateActionButton(
+                                icon: Icons.note_add_outlined,
+                                label: S.editorEmptyCreateNewFile,
+                                accent: DuckColors.accentDuck,
+                                onTap: onNewFile,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // Duck — walks along the floor, jumps straight up at
+                  // center to throw the button into place, lands, exits.
+                  Positioned(
+                    left: duckLeft,
+                    // Subtract jumpDy so larger values raise the duck.
+                    top: duckBaselineTop - timing.jumpDy,
+                    width: _duckSize,
+                    height: _duckSize,
+                    child: Opacity(
+                      opacity: timing.duckOpacity,
+                      // Sprite is right-facing natively — flip on the
+                      // X axis when walking back to the left.
+                      child: Transform.flip(
+                        flipX: timing.duckFacingLeft,
+                        child: Image.asset(
+                          'assets/Haviduck.gif',
+                          fit: BoxFit.contain,
+                          gaplessPlayback: true,
+                          filterQuality: FilterQuality.none,
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // Speech bubble — only during the shout + walk-out,
+                  // anchored above the duck and following its X. Sits
+                  // in the gap between the (already-placed) button and
+                  // the duck's head, tail pointing down to the duck.
+                  if (timing.bubbleOpacity > 0.01)
+                    Positioned(
+                      left: duckLeft +
+                          _duckSize / 2 -
+                          _SpeechBubble.estimatedHalfWidth,
+                      top: duckBaselineTop - 48,
+                      child: Opacity(
+                        opacity: timing.bubbleOpacity,
+                        child: const _SpeechBubble(
+                          text: S.editorEmptyDuckRebellion,
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+
+}
+
+/// Pure timing helper. Given the elapsed time (ms since the controller
+/// started), it returns every animatable value the stage needs: duck X /
+/// facing direction / opacity, button materialization (scale / fade),
+/// duck jump dy, and speech-bubble fade.
+///
+/// All easing lives in this class so the build method stays declarative.
+class _MischiefTiming {
+  _MischiefTiming({
+    required this.duckPhase,
+    required this.duckProgress,
+    required this.duckFacingLeft,
+    required this.duckOpacity,
+    required this.jumpProgress,
+    required this.bubbleOpacity,
+  });
+
+  // Cumulative phase boundaries, derived from `_DuckMischiefState`.
+  // _b1: end of initial calm (empty stage).
+  // _b2: end of walk-in.
+  // _b3: end of jump (button is fully materialized at apex, duck is
+  //      back on the floor).
+  // _b4: end of post-landing settle (still facing right).
+  // _b5: end of pivot/flip (now facing left).
+  // _b6: end of stationary shout (bubble fully visible).
+  // _b7: end of walk-out (= total).
+  static const int _b1 = _DuckMischiefState._initialMs;
+  static const int _b2 = _b1 + _DuckMischiefState._walkInMs;
+  static const int _b3 = _b2 + _DuckMischiefState._jumpMs;
+  static const int _b4 = _b3 + _DuckMischiefState._settleMs;
+  static const int _b5 = _b4 + _DuckMischiefState._flipMs;
+  static const int _b6 = _b5 + _DuckMischiefState._shoutMs;
+  static const int _b7 = _b6 + _DuckMischiefState._walkOutMs;
+
+  final _DuckPhase duckPhase;
+  // Progress within the current duck phase (0..1).
+  final double duckProgress;
+  final bool duckFacingLeft;
+  final double duckOpacity;
+  // Jump progress (0..1). 0 before jump, 1 after the duck lands. The
+  // button materializes around p=0.45 (apex of the jump).
+  final double jumpProgress;
+  final double bubbleOpacity;
+
+  factory _MischiefTiming.at(int t) {
+    final _DuckPhase phase;
+    final double progress;
+    final bool facingLeft;
+    if (t < _b1) {
+      phase = _DuckPhase.idle;
+      progress = 0;
+      facingLeft = false;
+    } else if (t < _b2) {
+      phase = _DuckPhase.walkingIn;
+      progress = ((t - _b1) / _DuckMischiefState._walkInMs).clamp(0.0, 1.0);
+      facingLeft = false;
+    } else if (t < _b4) {
+      // Stationary at center across jump + settle (still facing right).
+      // The jump's vertical motion is applied separately via `jumpDy`
+      // so the duck appears to leap and land without changing phase.
+      phase = _DuckPhase.atButton;
+      progress = 0;
+      facingLeft = false;
+    } else if (t < _b6) {
+      // Pivot + stationary shout — duck holds position facing left so
+      // the speech bubble has time to register before the walk-out.
+      phase = _DuckPhase.atButton;
+      progress = 0;
+      facingLeft = true;
+    } else if (t < _b7) {
+      phase = _DuckPhase.walkingOut;
+      progress = ((t - _b6) / _DuckMischiefState._walkOutMs).clamp(0.0, 1.0);
+      facingLeft = true;
+    } else {
+      phase = _DuckPhase.gone;
+      progress = 1;
+      facingLeft = true;
+    }
+
+    // Jump progress: 0 before jump, 0..1 across jump window, 1 after.
+    final double jumpP;
+    if (t < _b2) {
+      jumpP = 0;
+    } else if (t < _b3) {
+      jumpP = ((t - _b2) / _DuckMischiefState._jumpMs).clamp(0.0, 1.0);
+    } else {
+      jumpP = 1;
+    }
+
+    // Speech bubble: fades in across the front ~45% of the stationary
+    // shout phase, holds full through the rest of the shout AND the
+    // entire walk-out, then fades out only as the duck nears the off-
+    // screen left edge. The duck and the bubble exit together so the
+    // "I AM THE REBELLION" line lands while the duck is still visible.
+    final double bubble;
+    if (t < _b5) {
+      bubble = 0;
+    } else if (t < _b6) {
+      final p = (t - _b5) / _DuckMischiefState._shoutMs;
+      bubble = (p / 0.45).clamp(0.0, 1.0);
+    } else if (t < _b7) {
+      final p = (t - _b6) / _DuckMischiefState._walkOutMs;
+      if (p < 0.8) {
+        bubble = 1;
+      } else {
+        bubble = (1.0 - (p - 0.8) / 0.2).clamp(0.0, 1.0);
+      }
+    } else {
+      bubble = 0;
+    }
+
+    return _MischiefTiming(
+      duckPhase: phase,
+      duckProgress: progress,
+      duckFacingLeft: facingLeft,
+      duckOpacity: phase == _DuckPhase.idle || phase == _DuckPhase.gone
+          ? 0.0
+          : 1.0,
+      jumpProgress: jumpP,
+      bubbleOpacity: bubble,
+    );
+  }
+
+  /// Computed duck X (top-left of the sprite) within the stage.
+  double duckLeft({
+    required double stageW,
+    required double duckSize,
+    required double stopLeft,
+  }) {
+    final offstageLeft = -duckSize - 24;
+    switch (duckPhase) {
+      case _DuckPhase.idle:
+      case _DuckPhase.gone:
+        return offstageLeft;
+      case _DuckPhase.walkingIn:
+        return _lerp(offstageLeft, stopLeft, _easeOut(duckProgress));
+      case _DuckPhase.atButton:
+        return stopLeft;
+      case _DuckPhase.walkingOut:
+        return _lerp(stopLeft, offstageLeft, _easeIn(duckProgress));
+    }
+  }
+
+  /// Vertical jump motion. Sin-arc peaks at p=0.5 (~+38px ABOVE the
+  /// resting baseline) and returns to 0 at p=1 — duck leaps straight
+  /// up to "throw" the button into place, then lands. Caller subtracts
+  /// this from the duck's resting `top` (positive jumpDy = higher on
+  /// screen). Zero outside the jump window.
+  double get jumpDy {
+    if (jumpProgress <= 0 || jumpProgress >= 1) return 0;
+    return _DuckStage.jumpApexPx * sin(pi * jumpProgress);
+  }
+
+  /// Button opacity. Hidden until the jump nears its apex (p≈0.45),
+  /// then fades up to 1.0 over the remainder of the jump window. After
+  /// the duck lands the button stays fully visible — the duck literally
+  /// threw it into place, so it doesn't disappear when the duck leaves.
+  double get buttonOpacity {
+    if (jumpProgress < 0.45) return 0;
+    if (jumpProgress < 1) {
+      return ((jumpProgress - 0.45) / 0.55).clamp(0.0, 1.0);
+    }
+    return 1;
+  }
+
+  /// Button scale. Pops in oversized at the jump apex, settles to 1.0
+  /// by the end of the jump window. Ease-out so the bounce feels like
+  /// it's losing energy rather than ramping linearly.
+  double get buttonScale {
+    if (jumpProgress < 0.45) return 1.4;
+    if (jumpProgress < 1) {
+      final p = (jumpProgress - 0.45) / 0.55;
+      return _lerp(1.4, 1.0, _easeOut(p));
+    }
+    return 1;
+  }
+}
+
+enum _DuckPhase { idle, walkingIn, atButton, walkingOut, gone }
+
+double _lerp(double a, double b, double t) => a + (b - a) * t;
+double _easeOut(double t) => 1 - (1 - t) * (1 - t);
+double _easeIn(double t) => t * t;
+
+/// Compact comic speech bubble with a tail pointing down toward the
+/// duck. Renders the rebellion line in a heavier, slightly tilted
+/// font so it reads as a shout. Uses chip-surface colors so it sits
+/// on top of the editor background without screaming.
+class _SpeechBubble extends StatelessWidget {
+  const _SpeechBubble({required this.text});
+
+  final String text;
+
+  // Rough width estimate used by the stage to horizontally center the
+  // bubble over the duck. Doesn't need to be exact — speech bubbles
+  // look fine slightly off-axis.
+  static const double estimatedHalfWidth = 86.0;
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: const _SpeechBubblePainter(),
+      child: Container(
+        constraints: const BoxConstraints(minWidth: 140, maxWidth: 220),
+        padding: const EdgeInsets.fromLTRB(14, 9, 14, 13),
+        child: Text(
+          text,
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            color: DuckColors.fgPrimary,
+            fontSize: 12,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.6,
+            height: 1.15,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SpeechBubblePainter extends CustomPainter {
+  const _SpeechBubblePainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const radius = 12.0;
+    const tailH = 8.0;
+    final body = Rect.fromLTWH(0, 0, size.width, size.height - tailH);
+    final rrect = RRect.fromRectAndRadius(body, const Radius.circular(radius));
+
+    final fill = Paint()
+      ..color = DuckColors.bgRaisedHi
+      ..style = PaintingStyle.fill;
+    final stroke = Paint()
+      ..color = DuckColors.borderStrong
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0;
+
+    canvas.drawRRect(rrect, fill);
+
+    // Triangle tail centered on the bubble, pointing down toward the
+    // duck below. Drawn before the stroke so the tail shares the body
+    // outline cleanly.
+    final tailMidX = size.width / 2;
+    final tail = Path()
+      ..moveTo(tailMidX - 9, body.bottom - 0.5)
+      ..lineTo(tailMidX, size.height)
+      ..lineTo(tailMidX + 9, body.bottom - 0.5)
+      ..close();
+    canvas.drawPath(tail, fill);
+
+    // Outline: bubble + tail as one continuous contour, with the small
+    // segment of the bubble bottom UNDER the tail not stroked so the
+    // tail appears to "merge" into the bubble.
+    final outline = Path()
+      // top-left arc start
+      ..moveTo(0, radius)
+      ..arcToPoint(const Offset(radius, 0), radius: const Radius.circular(radius))
+      ..lineTo(size.width - radius, 0)
+      ..arcToPoint(
+        Offset(size.width, radius),
+        radius: const Radius.circular(radius),
+      )
+      ..lineTo(size.width, body.bottom - radius)
+      ..arcToPoint(
+        Offset(size.width - radius, body.bottom),
+        radius: const Radius.circular(radius),
+      )
+      // right side of tail base
+      ..lineTo(tailMidX + 9, body.bottom)
+      // tail point
+      ..lineTo(tailMidX, size.height)
+      // back up to left side of tail base
+      ..lineTo(tailMidX - 9, body.bottom)
+      ..lineTo(radius, body.bottom)
+      ..arcToPoint(
+        Offset(0, body.bottom - radius),
+        radius: const Radius.circular(radius),
+      )
+      ..close();
+    canvas.drawPath(outline, stroke);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SpeechBubblePainter oldDelegate) => false;
+}
+
+/// Compact action button used in the empty editor state. Mirrors the
+/// welcome screen's `_Action` styling but renders inside a fixed-size
+/// slot so the stage layout (and the duck's stop position) can be
+/// computed deterministically.
+class _EmptyStateActionButton extends StatefulWidget {
+  const _EmptyStateActionButton({
+    required this.icon,
+    required this.label,
+    required this.accent,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color accent;
+  final VoidCallback onTap;
+
+  @override
+  State<_EmptyStateActionButton> createState() =>
+      _EmptyStateActionButtonState();
+}
+
+class _EmptyStateActionButtonState extends State<_EmptyStateActionButton> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = _hover ? DuckColors.bgRaisedHi : DuckColors.bgChip;
+    final border = _hover
+        ? widget.accent.withValues(alpha: 0.6)
+        : DuckColors.borderStrong;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: AnimatedContainer(
+        duration: DuckMotion.instant,
+        curve: DuckMotion.standard,
+        decoration: BoxDecoration(
+          color: bg,
+          border: Border.all(color: border, width: 1),
+          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: widget.onTap,
+            borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(widget.icon, color: widget.accent, size: 17),
+                  const SizedBox(width: 9),
+                  Flexible(
+                    child: Text(
+                      widget.label,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: DuckColors.fgPrimary,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ),
       ),
     );

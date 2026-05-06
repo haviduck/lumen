@@ -12,6 +12,7 @@ import 'package:provider/provider.dart';
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
 import '../../providers/media_controller.dart';
+import '../../providers/ssh_controller.dart';
 import '../../services/gitnexus_service.dart';
 import '../../services/gitignore_matcher.dart';
 import '../../services/timeline_models.dart';
@@ -23,6 +24,7 @@ import '../common/duck_toast.dart';
 import '../common/fast_popup_menu.dart';
 import '../common/media_url_prompt.dart';
 import '../menu_bar.dart';
+import '../ssh/ssh_session_picker.dart';
 import '../timeline/timeline_dialog.dart';
 import '../timeline/timeline_rail.dart';
 import 'file_icon_colors.dart';
@@ -1996,6 +1998,13 @@ class _ExplorerActivityBar extends StatelessWidget {
         tooltip: S.timelineMenuTooltip,
         onTap: onTimeline,
       ),
+      // SSH host fast-menu — sits next to GitNexus rather than
+      // replacing it (the user explicitly asked to keep both). Tap
+      // opens an anchored host-picker dropdown; a mint dot under
+      // the icon indicates at least one live session. The button
+      // shows the picker itself (NOT routed through `onSsh`) so
+      // the dropdown anchors to this specific tile's RenderBox.
+      const _SshActivityButton(),
       // Watch the master switch here at construction time so when the
       // user disables GitNexus we don't leave a dangling separator
       // hairline pointing at empty space (the row's seam-between-tiles
@@ -2036,6 +2045,49 @@ class _ActivityBarSeam extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(width: 0.5, height: 14, color: DuckColors.glassSeam);
+  }
+}
+
+/// Activity-bar tile for the SSH host picker. Wraps a
+/// `BrightIconButton` so the styling matches the surrounding tiles
+/// exactly, with a small mint dot in the bottom-right when at least
+/// one session is live — same affordance the GitNexus tile uses for
+/// its serve/mcp daemons. Watches `SshController.hasSessions` so the
+/// dot toggles without the parent having to rebuild.
+class _SshActivityButton extends StatelessWidget {
+  const _SshActivityButton();
+
+  @override
+  Widget build(BuildContext context) {
+    final hasLive =
+        context.select<SshController, bool>((s) => s.hasSessions);
+    // `context` here is bound to this widget's element (the Stack).
+    // The Stack's RenderBox sizes to its child (the BrightIconButton),
+    // so passing it as the picker's anchor positions the dropdown
+    // directly under the icon — not under the parent activity bar.
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        BrightIconButton(
+          icon: Icons.dns_outlined,
+          tooltip: S.sshActivityTooltip,
+          onTap: () => showSshSessionPicker(context),
+        ),
+        if (hasLive)
+          Positioned(
+            right: 4,
+            bottom: 3,
+            child: Container(
+              width: 6,
+              height: 6,
+              decoration: const BoxDecoration(
+                color: DuckColors.accentMint,
+                shape: BoxShape.circle,
+              ),
+            ),
+          ),
+      ],
+    );
   }
 }
 

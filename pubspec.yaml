@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.3+3
+version: 1.0.4+4
 
 environment:
   sdk: ^3.11.0
@@ -75,6 +75,18 @@ dependencies:
   # blank background) and the window grows to maximised when the
   # user opens a workspace. See lib/services/window_chrome.dart.
   window_manager: ^0.5.1
+  # Pure-Dart SSH/SFTP client. Powers the Remote pane (right-of-editor
+  # split) and the SSH session tabs. We pipe `SSHClient.shell()`
+  # streams straight into `xterm.Terminal` — no PTY in this path. SFTP
+  # is used for drag-drop upload from the file explorer and for the
+  # remote-mirror edit-on-save flow (download → open as local mirror
+  # → save = SFTP upload + conflict detect). See lib/services/ssh/.
+  dartssh2: ^2.17.1
+  # OS-keystore-backed encrypted storage for the SSH host vault
+  # (private keys, passphrases). DPAPI on Windows, Keychain on macOS,
+  # libsecret on Linux. The vault metadata (host, user, port, label)
+  # rides in shared_preferences as JSON; only the secrets ride here.
+  flutter_secure_storage: ^9.2.2
 
 dev_dependencies:
   flutter_test:
@@ -101,6 +113,11 @@ flutter:
   # To add assets to your application, add an assets section, like this:
   assets:
     - assets/images/lumen_logo.png
+    # Empty-editor mascot — used by the "duck steals the Open File button"
+    # gag in lib/widgets/editor/editor.dart::_DuckMischief. Right-facing
+    # walk cycle gif; we flip horizontally when the duck waddles back
+    # out of frame.
+    - assets/Haviduck.gif
     # uBlock Origin Lite (MV3) — bundled as a zip and unpacked at first
     # launch into %LOCALAPPDATA%/Lumen/extensions/ublock-lite/. Loaded
     # into the shared media WebView2 via `WebviewController.addBrowserExtension`.

@@ -105,6 +105,33 @@ Secrets and API keys should be configured locally through the app settings or en
 - `assets/` contains bundled application assets.
 - `windows/`, `linux/`, `macos/`, `android/`, and `ios/` contain Flutter platform scaffolding.
 
+## SSH and the AI Agent — what the agent CAN and CANNOT do
+
+Lumen ships an SSH integration (vaulted hosts, in-IDE Remote terminal pane, drag-drop SFTP upload, remote-edit-on-save). When you also use the agentic chat in Lumen, you may reasonably wonder how those two surfaces interact.
+
+**Today, by design, the agent has no direct access to the SSH layer.** The boundary is hard, not advisory:
+
+- The agent **cannot** read your vaulted host list, host fingerprints, passwords, key passphrases, or private key file paths. Secrets live in the OS keystore (`flutter_secure_storage` — DPAPI on Windows, Keychain on macOS, libsecret on Linux); host metadata lives in `SharedPreferences`. Neither store is exposed to any agent tool.
+- The agent **cannot** open, control, or read from a live SSH session. The connections are owned by `SshController` and surfaced only to the user-facing Remote pane widget tree; the tool registry has no entry that touches `SshClientService`.
+- The agent **cannot** SFTP files to a remote host, edit a remote-mirrored buffer, or trigger a host-key trust prompt. Remote-edit-on-save flows through the user's own Ctrl+S in the editor.
+- The agent **cannot** see that an SSH session exists at all — `SshController` is not registered with any tool descriptor. As far as the agent is concerned, there is no SSH layer.
+
+This is a security choice. SSH credentials and active connections give an attacker arbitrary remote command execution under your identity; routing an LLM near them — even with approval prompts — opens a class of "the model misread your intent and ran `rm -rf` on prod" failures that we don't think the convenience is worth right now.
+
+**Tools are being designed.** A scoped set of agent-facing capabilities is on the roadmap so the agent can do useful remote work without ever holding credentials or initiating a connection itself:
+
+- "Run command in the *currently active* SSH session" — gated by per-command approval (same `commandApprovalKey` model the local `RUN_CMD` tool already uses), session selected by the user in the Remote pane, never by the agent.
+- "Read remote file via the active session's SFTP channel" — read-only, size-capped, uses the user's already-authenticated connection.
+- "Write to a remote-mirror buffer the user has open" — equivalent to the agent editing a local file the user opened; goes through the same `EDIT_FILE` / `MULTI_EDIT` approval surface; the user's existing edit-on-save flow handles the remote upload.
+
+What is explicitly NOT on the roadmap:
+
+- Agent-initiated `connect` to a vaulted host without user action.
+- Agent access to passwords, passphrases, key files, or key material of any kind.
+- Agent ability to modify the vault (add / remove / re-key hosts).
+
+If you want to give the agent remote reach today, the supported pattern is: connect manually in the Remote pane, run the commands you want manually, copy outputs into chat as you would from any other terminal. The roadmap items above will narrow that gap incrementally — each one will land behind a tool toggle in Settings → Tools, default-off, with an approval card on first invocation. Track progress in the SSH section of `.agents/knowledgebase.md`.
+
 ## Notes
 
 This repository is private while Lumen is under active development. Some integrations require local services or API keys and will degrade gracefully when unavailable.
