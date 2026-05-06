@@ -432,8 +432,16 @@ class _SshDownloadDialogState extends State<_SshDownloadDialog> {
                 ),
               ),
               const SizedBox(height: 6),
+              // Row defaults to `crossAxisAlignment: center`. We
+              // do NOT use `stretch` here: this Row sits inside a
+              // Column with `mainAxisSize: MainAxisSize.min`, so
+              // Row.h is unbounded; stretch then propagates an
+              // infinite-height constraint to the children and
+              // the entire frame fails to lay out (the
+              // `BoxConstraints forces an infinite height`
+              // assert, plus a flood of mouse-tracker asserts as
+              // hover-over-broken-render-tree spirals).
               Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Expanded(
                     child: TextField(

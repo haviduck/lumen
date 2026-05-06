@@ -13,9 +13,9 @@
 migrate_working_dir/
 
 # Lumen local workspace data
-#.agents/
-#.lumen/
-#.claude/
+.agents/
+.lumen/
+.claude/
 .gitnexus/
 .stfolder/
 .stignore

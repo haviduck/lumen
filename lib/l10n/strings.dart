@@ -1746,7 +1746,19 @@ class S {
   static const String sshRemoteBrowserTypePath = 'Type path...';
   static const String go = 'Go';
 
-  // Shell helpers (lumen-edit + OSC 7)
+  // Shell helpers (lumen-edit + OSC 7) — manual install dialog.
+  //
+  // v1.4.2: the install dialog (`ssh_shell_helpers_dialog.dart`) and
+  // its activity-bar entry point were removed. Helpers are now
+  // auto-injected into every fresh SSH session by
+  // `SshController._runConnect` via
+  // `autoInstallShellHelpersOneLiner()` — see the rationale on that
+  // function for why we ship a compact one-liner instead of the
+  // full `allShellHelpers()` block.
+  //
+  // The constants below are kept for ABI safety in case any test /
+  // external skin still imports them; they no longer surface
+  // anywhere in the chrome.
   static const String sshShellHelpersTitle = 'SSH shell helpers';
   static const String sshShellHelpersTooltip = 'Install shell helpers...';
   static const String sshShellHelpersLumenEditTitle =

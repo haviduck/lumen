@@ -463,15 +463,25 @@ class _LayoutForModeState extends State<_LayoutForMode> {
         _rootAxis = Axis.horizontal;
         // Build root areas in order; track chat-area-index for
         // the divider helpers as we go. Layout from L→R is:
-        //   [Explorer] [Editor+Terminal] [SidePanes?] [Chat?]
+        //   [Explorer] [Editor+Terminal] [Chat?] [SidePanes?]
+        //
+        // Why chat sits BEFORE side-panes despite chat being the
+        // "right sidebar" mentally: chat is the user's active
+        // collaboration surface (typing, reading replies), so it
+        // earns the slot adjacent to the editor where focus
+        // already lives. Side-panes hold passive surfaces (Teams,
+        // YouTube, SSH sessions you're not currently typing in),
+        // so they get pushed to the very edge to stay out of the
+        // editor's peripheral vision.
         final areas = <Area>[
           Area(size: 240, min: 220, builder: (c, a) => const FileExplorer()),
           Area(
             flex: 1,
-            // `min:` floors the editor column so dragging the
-            // side-panes divider left can't make the editor
-            // vanish (the previous bug — divider was draggable
-            // all the way to the file explorer's right edge).
+            // `min:` floors the editor column so dragging either
+            // the chat divider or the side-panes divider left
+            // can't make the editor vanish (the previous bug —
+            // divider was draggable all the way to the file
+            // explorer's right edge).
             min: _workbenchMinWidth,
             builder: (c, a) => MultiSplitView(
               axis: Axis.vertical,
@@ -479,19 +489,14 @@ class _LayoutForModeState extends State<_LayoutForMode> {
             ),
           ),
         ];
-        if (widget.showSidePanes) {
-          areas.add(
-            Area(
-              size: _sidePanesOptimalWidth,
-              min: _sidePanesMinWidth,
-              builder: (c, a) => const SidePanesColumn(),
-            ),
-          );
-        }
         if (!widget.chatHidden) {
           _chatAreaIndex = areas.length;
           // Divider N sits BETWEEN areas N and N+1; the chat
           // divider is the one immediately before the chat area.
+          // With chat at index 2 (right of the workbench) the
+          // chat divider is always divider 1 — no longer
+          // dependent on whether side-panes are mounted, since
+          // chat now sits BEFORE side-panes.
           _chatDividerIndex = areas.length - 1;
           areas.add(
             Area(
@@ -503,6 +508,15 @@ class _LayoutForModeState extends State<_LayoutForMode> {
         } else {
           _chatAreaIndex = -1;
           _chatDividerIndex = -1;
+        }
+        if (widget.showSidePanes) {
+          areas.add(
+            Area(
+              size: _sidePanesOptimalWidth,
+              min: _sidePanesMinWidth,
+              builder: (c, a) => const SidePanesColumn(),
+            ),
+          );
         }
         _root = MultiSplitViewController(areas: areas);
         break;

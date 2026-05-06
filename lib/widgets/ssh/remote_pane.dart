@@ -14,7 +14,6 @@ import '../../theme/app_theme.dart';
 import '../common/duck_toast.dart';
 import 'ssh_remote_file_browser_dialog.dart';
 import 'ssh_session_picker.dart';
-import 'ssh_shell_helpers_dialog.dart';
 import 'ssh_upload_dialog.dart';
 
 /// "Remote" pane — sits in the editor right-slot's vertical split as
@@ -309,23 +308,14 @@ class _RemotePaneChrome extends StatelessWidget {
                 );
               },
             ),
-            // Shell helpers: prints the `lumen-edit` + OSC 7 snippets
-            // into a dialog with copy / install-for-this-session
-            // actions. Keeps the magic discoverable for users who
-            // didn't read the docs (i.e. everyone).
-            _ChromeIconButton(
-              icon: Icons.terminal_outlined,
-              tooltip: S.sshShellHelpersTooltip,
-              onTap: () {
-                final id = ssh.activeSessionId;
-                if (id == null) return;
-                showSshShellHelpersDialog(
-                  context,
-                  ssh: ssh,
-                  sessionId: id,
-                );
-              },
-            ),
+            // Shell helpers (`lumen-edit`, `lumen-grab`, OSC 7) are
+            // now auto-injected by `SshController._runConnect` ~250ms
+            // after each session connects, so the manual "install
+            // helpers" icon + dialog has been retired. See
+            // `autoInstallShellHelpersOneLiner` in
+            // `ssh_terminal_pre_processor.dart` for the snippet
+            // and the rationale (idempotent, bash/zsh-guarded,
+            // single-line to keep echo noise minimal).
             _ChromeIconButton(
               icon: Icons.refresh,
               tooltip: S.sshPaneReconnect,

@@ -329,12 +329,37 @@ class SshController extends ChangeNotifier {
       entry.state = SshSessionState.connected;
       notifyListeners();
 
-      // Optimistic feedback so the user sees something immediately
-      // on slow servers that buffer their banner. Cleared by the
-      // first real shell output.
-      // (Intentionally does not write to xterm — banner output will
-      // start landing within 100ms on healthy servers; emitting a
-      // synthetic line here would just clutter the buffer.)
+      // Auto-inject the shell helpers (`lumen-edit`, `lumen-grab`,
+      // OSC 7 cwd reporting) into the freshly opened session by
+      // SFTP-uploading a self-deleting script and sourcing it.
+      //
+      // Why upload + source instead of typing the body inline?
+      // dartssh2's shell channel runs in canonical mode — the
+      // remote shell echoes every byte we write. Typing the full
+      // installer body would dump 30+ lines of "you typed this"
+      // noise into the user's freshly opened terminal. Uploading
+      // the body to a file and sourcing it means the user only
+      // sees ONE short input line (`. /tmp/.lumen-helpers-…sh`)
+      // plus the duck banner the script prints on its way out.
+      // Banner / motd / first PS1 stay intact (the 250ms delay
+      // below lets them flush before our line lands).
+      //
+      // Why fire-and-forget (`unawaited`)?
+      // The `_runConnect` future completes once the connection is
+      // ready; callers (the activity-bar fast menu, `connectToHost`)
+      // shouldn't block on the cosmetic install. SFTP failure or a
+      // mid-paste channel close are caught + swallowed inside
+      // `_autoInstallShellHelpers`; the user just doesn't get
+      // helpers that session. No error spam.
+      unawaited(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        // Bail if the session was closed during the wait window.
+        if (entry.shell == null ||
+            entry.state != SshSessionState.connected) {
+          return;
+        }
+        await _autoInstallShellHelpers(entry, conn);
+      }());
     } catch (e) {
       entry.state = SshSessionState.failed;
       entry.failureMessage = _humanizeError(e);
@@ -448,6 +473,66 @@ class SshController extends ChangeNotifier {
       // Best-effort — if the shell channel went away mid-paste the
       // user will see the disconnect via the close-stream listener.
     }
+  }
+
+  /// SFTP-uploads the helper script body produced by
+  /// [autoInstallShellHelpersScript] to a per-session unique path
+  /// under `/tmp/`, then types `. <path>` into the interactive
+  /// shell. The script self-deletes as its last statement so we
+  /// don't leak files into `/tmp` even if the user disconnects
+  /// mid-session.
+  ///
+  /// Failure modes (all silent — no helpers, no error spam):
+  /// - SFTP subsystem unavailable on the server → `conn.sftp()`
+  ///   throws, caught and debug-logged.
+  /// - `/tmp` not writable / quota / readonly mount → `sftp.open`
+  ///   throws, caught.
+  /// - Channel closes between SFTP write and shell paste →
+  ///   `pasteIntoSession`'s own try/catch swallows. The temp file
+  ///   stays on disk in that edge case (won't self-delete because
+  ///   we never sourced it), but `/tmp` is conventionally cleared
+  ///   on reboot.
+  Future<void> _autoInstallShellHelpers(
+    SshSessionEntry entry,
+    SshConnection conn,
+  ) async {
+    // Random suffix so two Lumen sessions to the same host (or a
+    // reconnect arriving before /tmp is swept) can't collide on
+    // the helper script's path. microsecondsSinceEpoch in base36
+    // is 8–9 chars and unique per process tick.
+    final suffix = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    final remotePath = '/tmp/.lumen-helpers-$suffix.sh';
+
+    final body = autoInstallShellHelpersScript();
+    try {
+      final sftp = await conn.sftp();
+      final file = await sftp.open(
+        remotePath,
+        mode: SftpFileOpenMode.create |
+            SftpFileOpenMode.write |
+            SftpFileOpenMode.truncate,
+      );
+      try {
+        await file.writeBytes(Uint8List.fromList(utf8.encode(body)));
+      } finally {
+        await file.close();
+      }
+    } catch (e) {
+      // Most common cause is "no SFTP subsystem on this server"
+      // (rsync-only / locked-down hosts) or "/tmp is read-only"
+      // on hardened images. Either way the user gets a working
+      // shell sans helpers, which is strictly better than dumping
+      // 30 lines of installer noise into their terminal.
+      debugPrint('[ssh] auto-install helpers SFTP write failed: $e');
+      return;
+    }
+
+    // Bail if the session closed between SFTP write and now.
+    if (entry.shell == null ||
+        entry.state != SshSessionState.connected) {
+      return;
+    }
+    await pasteIntoSession(entry.id, '. $remotePath\n');
   }
 
   /// Find an existing session by host id (returns the first match).

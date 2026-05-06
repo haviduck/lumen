@@ -315,3 +315,84 @@ String allShellHelpers() {
 /// (e.g. an "Install for this session" button that types the helper
 /// into the active terminal). UTF-8.
 List<int> shellHelperBytes() => utf8.encode('${allShellHelpers()}\n');
+
+/// Self-deleting shell script body used by [SshController] to seed
+/// every fresh SSH session with the helpers.
+///
+/// **Delivery contract.** The controller SFTP-uploads this body to a
+/// per-session unique path (e.g. `/tmp/.lumen-helpers-<id>.sh`) and
+/// types `. <path>` into the interactive shell. The script's last
+/// statement `rm -f`s itself (the body is already parsed into the
+/// shell's read buffer by then, so deletion is safe). Net visible
+/// terminal traffic is one short `.` source line + a small duck
+/// banner — banner / motd / first PS1 are preserved.
+///
+/// **Why a sourced script and not an inline one-liner?**
+/// dartssh2's shell channel is in canonical mode, so the remote
+/// shell echoes every byte we write back through stdout. An inline
+/// 700-char installer dumps a multi-line wrapped blob into the
+/// user's terminal. A sourced script means the user only sees the
+/// `.` invocation line; the function definitions stay invisible
+/// because they live in the file we wrote, not in the input stream.
+/// The duck banner that prints from the script is intentional
+/// "hello, helpers loaded" feedback rather than syntax noise.
+///
+/// **Shell compatibility.** The functional body is guarded by
+/// `[ -n "$BASH_VERSION$ZSH_VERSION" ]`. fish / dash / csh / busybox
+/// don't enter the body but still run the banner + self-delete
+/// portion (banner uses POSIX `cat <<'…'`, self-delete uses POSIX
+/// `rm`). For exotic shells where `cat`/`rm` aren't on PATH the
+/// script just prints whatever errors the shell emits and the
+/// invocation line lands in the user's history — acceptable for
+/// the v1 audience (Linux/macOS).
+///
+/// **Idempotency on reconnect.** The bash branch wraps the
+/// `PROMPT_COMMAND` prepend in a `case` guard so re-sourcing
+/// doesn't pile up `_lumen_osc7;` chains. The zsh branch wraps the
+/// `precmd_functions+=(…)` in a parallel guard. Function
+/// definitions overwrite cleanly when re-defined.
+String autoInstallShellHelpersScript() {
+  // Dart raw triple-quote string (`r'''…'''`) preserves the
+  // backslashes (\033, \a, \$VAR) verbatim into the wire so the
+  // remote `printf` interprets them as ESC / BEL / shell var.
+  // No interpolation, no `\$` doubling — what you see is what the
+  // shell receives.
+  return r'''__lumen_self="${BASH_SOURCE:-$0}"
+if [ -n "$BASH_VERSION$ZSH_VERSION" ]; then
+  lumen-edit() {
+    if [ -z "$1" ]; then echo "usage: lumen-edit <file>" >&2; return 1; fi
+    local t="$1"
+    case "$t" in /*) ;; *) t="$PWD/$t" ;; esac
+    printf '\033]1337;LumenEdit=%s\a' "$t"
+  }
+  lumen-grab() {
+    if [ -z "$1" ]; then echo "usage: lumen-grab <file>" >&2; return 1; fi
+    local t="$1"
+    case "$t" in /*) ;; *) t="$PWD/$t" ;; esac
+    printf '\033]1337;LumenGrab=%s\a' "$t"
+  }
+  _lumen_osc7() { printf '\033]7;file://%s%s\a' "$HOSTNAME" "$PWD"; }
+  if [ -n "$BASH_VERSION" ]; then
+    case "$PROMPT_COMMAND" in
+      *_lumen_osc7*) ;;
+      *) PROMPT_COMMAND="_lumen_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+    esac
+  fi
+  if [ -n "$ZSH_VERSION" ]; then
+    case " ${precmd_functions[*]} " in
+      *" _lumen_osc7 "*) ;;
+      *) precmd_functions+=(_lumen_osc7) ;;
+    esac
+  fi
+fi
+
+cat <<'LUMEN_BANNER'
+   .--.   Lumen connected
+  ( oo )  helpers: lumen-edit · lumen-grab · OSC 7 cwd
+   '~~~'
+LUMEN_BANNER
+
+rm -f -- "$__lumen_self" 2>/dev/null
+unset __lumen_self
+''';
+}
