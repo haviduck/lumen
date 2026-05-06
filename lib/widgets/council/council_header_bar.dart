@@ -9,11 +9,13 @@ import '../../theme/app_theme.dart';
 class CouncilHeaderBar extends StatelessWidget {
   final CouncilController controller;
   final VoidCallback? onOpenReport;
+  final VoidCallback? onPingOrchestrator;
 
   const CouncilHeaderBar({
     super.key,
     required this.controller,
     this.onOpenReport,
+    this.onPingOrchestrator,
   });
 
   @override
@@ -86,6 +88,17 @@ class CouncilHeaderBar extends StatelessWidget {
               ],
             ),
           ),
+          if (controller.canPingOrchestrator && onPingOrchestrator != null)
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: _HeaderButton(
+                icon: Icons.send_outlined,
+                label: S.councilPingHeaderLabel,
+                tooltip: S.councilPingHeaderTooltip,
+                accent: true,
+                onTap: onPingOrchestrator,
+              ),
+            ),
           if (session?.reportPath.isNotEmpty == true)
             _HeaderButton(
               icon: Icons.description_outlined,
@@ -118,6 +131,7 @@ class CouncilHeaderBar extends StatelessWidget {
       CouncilStatus.awaitingUser => S.councilStatusAwaitingUser,
       CouncilStatus.awaitingPool => S.councilStatusAwaitingPool,
       CouncilStatus.synthesizing => S.councilStatusSynthesizing,
+      CouncilStatus.awaitingFollowup => S.councilStatusAwaitingUser,
       CouncilStatus.done => S.councilStatusDone,
       CouncilStatus.aborted => S.councilStatusAborted,
       CouncilStatus.error => S.councilStatusError,
@@ -130,35 +144,47 @@ class _HeaderButton extends StatelessWidget {
   final String label;
   final VoidCallback? onTap;
   final bool danger;
+  final bool accent;
+  final String? tooltip;
 
   const _HeaderButton({
     required this.icon,
     required this.label,
     this.onTap,
     this.danger = false,
+    this.accent = false,
+    this.tooltip,
   });
 
   @override
   Widget build(BuildContext context) {
-    final color = danger ? DuckColors.stateError : DuckColors.fgMuted;
+    final Color color;
+    final Color bgColor;
+    final Color borderColor;
+    if (danger) {
+      color = DuckColors.stateError;
+      bgColor = DuckColors.stateError.withValues(alpha: 0.08);
+      borderColor = DuckColors.stateError.withValues(alpha: 0.28);
+    } else if (accent) {
+      color = DuckColors.accentCyan;
+      bgColor = DuckColors.accentCyan.withValues(alpha: 0.10);
+      borderColor = DuckColors.accentCyan.withValues(alpha: 0.40);
+    } else {
+      color = DuckColors.fgMuted;
+      bgColor = DuckColors.bgChip.withValues(alpha: 0.72);
+      borderColor = DuckColors.border;
+    }
     return Tooltip(
-      message: label,
+      message: tooltip ?? label,
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(DuckTheme.radiusS),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
           decoration: BoxDecoration(
-            color: danger
-                ? DuckColors.stateError.withValues(alpha: 0.08)
-                : DuckColors.bgChip.withValues(alpha: 0.72),
+            color: bgColor,
             borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-            border: Border.all(
-              color: danger
-                  ? DuckColors.stateError.withValues(alpha: 0.28)
-                  : DuckColors.border,
-              width: 0.6,
-            ),
+            border: Border.all(color: borderColor, width: 0.6),
           ),
           child: Row(
             children: [

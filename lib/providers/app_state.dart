@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -447,6 +448,26 @@ class AppState extends ChangeNotifier {
       persistence: _councilPersistence,
       isToolAutoApproved: (toolId, detail) {
         return chat.autoApprove || chat.autoApprovedTools.contains(toolId);
+      },
+      // Success-only: clear ONLY the wizard `brief` field from the cached
+      // last-config so the next time the user opens the council wizard,
+      // the prompt textbar starts empty. Preserve title/agents/orchestrator
+      // model picks — those are sticky UX the user did not ask to wipe.
+      // Never called on abort/error → a failed run keeps the brief so
+      // the user can retry without retyping. Surgical key rewrite, not
+      // a `remove()`.
+      onReportPersisted: () async {
+        try {
+          final raw = await prefs.getCouncilLastConfigJson();
+          if (raw.trim().isEmpty) return;
+          final json = jsonDecode(raw);
+          if (json is! Map) return;
+          final map = Map<String, dynamic>.from(json);
+          map['brief'] = '';
+          await prefs.setCouncilLastConfigJson(jsonEncode(map));
+        } catch (_) {
+          // best-effort; controller already swallows failures
+        }
       },
     );
     council.addListener(notifyListeners);

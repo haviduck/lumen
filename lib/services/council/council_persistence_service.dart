@@ -1,27 +1,77 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'council_models.dart';
 
-class CouncilPersistenceService {
-  Directory? _root;
+/// One report on disk: the markdown file and (optionally) its JSON sidecar.
+///
+/// Sidecar parsing is deliberately tolerant — a missing or corrupt `.json`
+/// must never blank the browser dialog. Per-file failures are isolated and
+/// surfaced via [sidecarOk].
+class CouncilReportEntry {
+  final String markdownPath;
+  final String? sidecarPath;
+  final String title;
+  final String summary;
+  final List<String> agentRoster;
+  final DateTime savedAt;
+  final String runId;
+  final int sizeBytes;
+  final bool sidecarOk;
 
-  Future<Directory> _ensureRoot() async {
-    if (_root != null) return _root!;
+  const CouncilReportEntry({
+    required this.markdownPath,
+    required this.sidecarPath,
+    required this.title,
+    required this.summary,
+    required this.agentRoster,
+    required this.savedAt,
+    required this.runId,
+    required this.sizeBytes,
+    required this.sidecarOk,
+  });
+
+  String get fileName => p.basename(markdownPath);
+}
+
+/// Persistence + retrieval for council artifacts.
+///
+/// Two stores:
+///  - **Sessions** (state snapshots) live under
+///    `<applicationSupport>/chat_sessions/councils/<id>.json` (unchanged).
+///  - **Reports** (the artifact users keep) live under
+///    `<applicationDocuments>/Lumen/CouncilReports/`. Each run produces a
+///    `<utc-iso-ms>-<slug>-<rand4>.md` plus a sibling `.json` sidecar.
+///
+/// Filename grammar resists same-second collisions (ms precision + 4-hex
+/// suffix), empty slugs from non-ASCII titles (slug fallback), Windows
+/// MAX_PATH (slug capped at 60 chars), and Windows reserved names. Writes
+/// are atomic via `*.tmp` + `rename`, with a startup sweep that removes
+/// stale tmp files left by a crash mid-run.
+class CouncilPersistenceService {
+  Directory? _sessionRoot;
+  Directory? _reportRoot;
+  bool _sweptStaleTmp = false;
+  static final _rand = math.Random.secure();
+
+  // ---------- Session snapshots (unchanged behaviour) ----------
+
+  Future<Directory> _ensureSessionRoot() async {
+    if (_sessionRoot != null) return _sessionRoot!;
     final base = await getApplicationSupportDirectory();
     final dir = Directory(p.join(base.path, 'chat_sessions', 'councils'));
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    _root = dir;
+    if (!await dir.exists()) await dir.create(recursive: true);
+    _sessionRoot = dir;
     return dir;
   }
 
   Future<void> saveSession(CouncilSession session) async {
-    final root = await _ensureRoot();
+    final root = await _ensureSessionRoot();
     final file = File(p.join(root.path, '${session.config.id}.json'));
     await file.writeAsString(
       const JsonEncoder.withIndent('  ').convert(session.toJson()),
@@ -29,47 +79,340 @@ class CouncilPersistenceService {
   }
 
   Future<CouncilSession?> loadSession(String id) async {
-    final root = await _ensureRoot();
+    final root = await _ensureSessionRoot();
     final file = File(p.join(root.path, '$id.json'));
     if (!await file.exists()) return null;
     final raw = await file.readAsString();
     return CouncilSession.fromJson(jsonDecode(raw) as Map<String, dynamic>);
   }
 
+  // ---------- Report library (browseable artifacts) ----------
+
+  /// Where reports live on disk. Surfaced so the menu / viewer can show it.
+  Future<Directory> reportsDirectory() async => _ensureReportRoot();
+
+  Future<Directory> _ensureReportRoot() async {
+    if (_reportRoot != null) return _reportRoot!;
+    final base = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(base.path, 'Lumen', 'CouncilReports'));
+    if (!await dir.exists()) await dir.create(recursive: true);
+    _reportRoot = dir;
+    if (!_sweptStaleTmp) {
+      _sweptStaleTmp = true;
+      // Fire-and-forget; never let a sweep failure break a save.
+      unawaited(_sweepStaleTmp(dir));
+    }
+    return dir;
+  }
+
+  Future<void> _sweepStaleTmp(Directory dir) async {
+    try {
+      final cutoff = DateTime.now().subtract(const Duration(minutes: 1));
+      await for (final entity in dir.list()) {
+        if (entity is! File) continue;
+        if (!entity.path.endsWith('.tmp')) continue;
+        try {
+          final stat = await entity.stat();
+          if (stat.modified.isBefore(cutoff)) {
+            await entity.delete();
+          }
+        } catch (_) {
+          // File-locked or vanished — skip.
+        }
+      }
+    } catch (_) {
+      // Directory listing error is non-fatal; reports still save.
+    }
+  }
+
+  /// Persist a council run as a `.md` + `.json` pair. Returns the absolute
+  /// markdown path. Safe to call concurrently.
   Future<String> writeReport({
-    required String workspacePath,
     required CouncilSession session,
     required String markdown,
+    String? workspacePath,
+    String? summary,
   }) async {
-    final dir = Directory(p.join(workspacePath, '.lumen', 'council'));
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    final stamp = _stamp(DateTime.now());
-    final slug = _slug(
-      session.config.title.isEmpty
-          ? session.config.brief
-          : session.config.title,
+    final root = await _ensureReportRoot();
+    final now = DateTime.now().toUtc();
+    final stamp = _stamp(now);
+    final titleSrc = session.config.title.trim().isNotEmpty
+        ? session.config.title
+        : session.config.brief;
+    final slug = _slug(titleSrc);
+    final rand = _rand4();
+    final base = '$stamp-$slug-$rand';
+    final mdPath = p.join(root.path, '$base.md');
+    final jsonPath = p.join(root.path, '$base.json');
+
+    final sidecar = <String, dynamic>{
+      'schema': 1,
+      'runId': session.runId,
+      'title': titleSrc,
+      'brief': session.config.brief,
+      'summary': summary ?? _deriveSummary(markdown),
+      'savedAt': now.toIso8601String(),
+      'startedAt': session.startedAt.toUtc().toIso8601String(),
+      'roundIndex': session.roundIndex,
+      'agentRoster': [
+        for (final a in session.config.allAgents)
+          {'id': a.id, 'name': a.name, 'role': a.role, 'model': a.model},
+      ],
+      'markdownFile': p.basename(mdPath),
+    };
+
+    // Write sidecar first, then markdown. A present `.md` therefore implies
+    // a sidecar already landed (or its absence means we know to fall back).
+    await _atomicWriteBytes(
+      jsonPath,
+      utf8.encode(const JsonEncoder.withIndent('  ').convert(sidecar)),
     );
-    final path = p.join(dir.path, '$stamp-$slug.md');
-    final file = File(path);
-    await file.writeAsString(markdown);
-    return path;
+    await _atomicWriteBytes(mdPath, utf8.encode(markdown));
+
+    // Best-effort workspace mirror — preserves the prior behaviour where
+    // reports also lived under `<workspace>/.lumen/council/`. If it fails,
+    // the canonical artifact in the global library is still safe.
+    if (workspacePath != null && workspacePath.isNotEmpty) {
+      try {
+        final mirrorDir = Directory(
+          p.join(workspacePath, '.lumen', 'council'),
+        );
+        if (!await mirrorDir.exists()) {
+          await mirrorDir.create(recursive: true);
+        }
+        await File(
+          p.join(mirrorDir.path, '$base.md'),
+        ).writeAsBytes(utf8.encode(markdown));
+      } catch (_) {
+        // Mirror is optional. Don't surface — the global save succeeded.
+      }
+    }
+
+    return mdPath;
   }
 
-  static String _stamp(DateTime dt) {
-    String two(int n) => n.toString().padLeft(2, '0');
-    return '${dt.year}-${two(dt.month)}-${two(dt.day)}-'
-        '${two(dt.hour)}${two(dt.minute)}';
+  /// Atomic-ish write: bytes → `*.tmp` → `rename`. Retries on Windows file
+  /// locks (e.g. user has the file open in Word/VSCode and is forcing an
+  /// overwrite, which shouldn't happen for fresh stamps but does for
+  /// near-collisions).
+  Future<void> _atomicWriteBytes(String finalPath, List<int> bytes) async {
+    final tmp = File('$finalPath.tmp');
+    await tmp.writeAsBytes(bytes, flush: true);
+    var attempt = 0;
+    while (true) {
+      try {
+        await tmp.rename(finalPath);
+        return;
+      } on FileSystemException catch (_) {
+        attempt++;
+        if (attempt >= 3) {
+          // Last-ditch fallback: copy + delete — works even when a strict
+          // rename can't overwrite. If the destination is locked, append
+          // a numeric suffix so we never silently drop the report.
+          try {
+            await tmp.copy(finalPath);
+            await tmp.delete();
+            return;
+          } catch (_) {
+            final alt = _withSuffix(finalPath, '.${_rand4()}');
+            await tmp.copy(alt);
+            try {
+              await tmp.delete();
+            } catch (_) {}
+            return;
+          }
+        }
+        await Future<void>.delayed(Duration(milliseconds: 100 * attempt));
+      }
+    }
   }
+
+  /// Browseable list, newest first. Tolerates corrupt sidecars.
+  Future<List<CouncilReportEntry>> listReports() async {
+    final root = await _ensureReportRoot();
+    final entries = <CouncilReportEntry>[];
+    await for (final entity in root.list()) {
+      if (entity is! File) continue;
+      final path = entity.path;
+      if (!path.endsWith('.md')) continue;
+      if (path.endsWith('.md.tmp')) continue;
+      try {
+        entries.add(await _parseEntry(entity));
+      } catch (_) {
+        // Single bad file can't take the whole list down.
+      }
+    }
+    entries.sort((a, b) => b.savedAt.compareTo(a.savedAt));
+    return entries;
+  }
+
+  Future<CouncilReportEntry> _parseEntry(File md) async {
+    final stat = await md.stat();
+    final base = p.basenameWithoutExtension(md.path);
+    final sidecar = File(p.join(p.dirname(md.path), '$base.json'));
+    var sidecarOk = false;
+    String title = base;
+    String summary = '';
+    List<String> roster = const [];
+    String runId = '';
+    DateTime savedAt = stat.modified;
+    if (await sidecar.exists()) {
+      try {
+        final raw = await sidecar.readAsString();
+        final json = jsonDecode(raw) as Map<String, dynamic>;
+        title = (json['title'] as String?)?.trim().isNotEmpty == true
+            ? (json['title'] as String).trim()
+            : base;
+        summary = (json['summary'] as String?)?.trim() ?? '';
+        runId = (json['runId'] as String?) ?? '';
+        savedAt =
+            DateTime.tryParse((json['savedAt'] as String?) ?? '')?.toLocal() ??
+                stat.modified;
+        final r = json['agentRoster'];
+        if (r is List) {
+          roster = [
+            for (final a in r)
+              if (a is Map && a['name'] is String) a['name'] as String,
+          ];
+        }
+        sidecarOk = true;
+      } catch (_) {
+        // fall through to filename-derived metadata
+      }
+    }
+    if (summary.isEmpty) {
+      summary = await _firstHeadingOrLine(md);
+    }
+    return CouncilReportEntry(
+      markdownPath: md.path,
+      sidecarPath: sidecarOk ? sidecar.path : null,
+      title: title,
+      summary: summary,
+      agentRoster: roster,
+      savedAt: savedAt,
+      runId: runId,
+      sizeBytes: stat.size,
+      sidecarOk: sidecarOk,
+    );
+  }
+
+  Future<String> _firstHeadingOrLine(File md) async {
+    try {
+      final raw = await md.readAsString();
+      for (final line in raw.split('\n')) {
+        final t = line.trim();
+        if (t.isEmpty) continue;
+        return t.replaceFirst(RegExp(r'^#+\s*'), '');
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /// Read the markdown body. Returns empty string if the file is gone.
+  Future<String> readMarkdown(String path) async {
+    final f = File(path);
+    if (!await f.exists()) return '';
+    return f.readAsString();
+  }
+
+  /// Delete a report (markdown + sidecar). Errors are swallowed and a
+  /// boolean returned so the UI can show a non-fatal toast.
+  Future<bool> deleteReport(CouncilReportEntry entry) async {
+    var ok = true;
+    try {
+      final f = File(entry.markdownPath);
+      if (await f.exists()) await f.delete();
+    } catch (_) {
+      ok = false;
+    }
+    final sidecar = entry.sidecarPath ??
+        p.join(
+          p.dirname(entry.markdownPath),
+          '${p.basenameWithoutExtension(entry.markdownPath)}.json',
+        );
+    try {
+      final f = File(sidecar);
+      if (await f.exists()) await f.delete();
+    } catch (_) {
+      // Sidecar delete failure is non-fatal.
+    }
+    return ok;
+  }
+
+  /// Open the OS file manager with [path] selected.
+  Future<void> revealInOs(String path) async {
+    if (Platform.isWindows) {
+      await Process.start('explorer.exe', ['/select,', path]);
+    } else if (Platform.isMacOS) {
+      await Process.start('open', ['-R', path]);
+    } else {
+      await Process.start('xdg-open', [p.dirname(path)]);
+    }
+  }
+
+  // ---------- Filename helpers ----------
+
+  static String _stamp(DateTime utc) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    String three(int n) => n.toString().padLeft(3, '0');
+    return '${utc.year}${two(utc.month)}${two(utc.day)}T'
+        '${two(utc.hour)}${two(utc.minute)}${two(utc.second)}'
+        '${three(utc.millisecond)}Z';
+  }
+
+  static String _rand4() {
+    const hex = '0123456789abcdef';
+    final buf = StringBuffer();
+    for (var i = 0; i < 4; i++) {
+      buf.write(hex[_rand.nextInt(16)]);
+    }
+    return buf.toString();
+  }
+
+  static const Set<String> _winReserved = {
+    'con', 'prn', 'aux', 'nul',
+    'com1', 'com2', 'com3', 'com4', 'com5',
+    'com6', 'com7', 'com8', 'com9',
+    'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5',
+    'lpt6', 'lpt7', 'lpt8', 'lpt9',
+  };
 
   static String _slug(String input) {
-    final lowered = input.toLowerCase();
-    final cleaned = lowered
+    final cleaned = input
+        .toLowerCase()
         .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
         .replaceAll(RegExp(r'-+'), '-')
         .replaceAll(RegExp(r'^-|-$'), '');
-    if (cleaned.isEmpty) return 'council-report';
-    return cleaned.length <= 48 ? cleaned : cleaned.substring(0, 48);
+    if (cleaned.isEmpty || _winReserved.contains(cleaned)) return 'council';
+    return cleaned.length <= 60 ? cleaned : cleaned.substring(0, 60);
+  }
+
+  static String _deriveSummary(String markdown) {
+    // First non-empty, non-heading line — capped.
+    for (final raw in markdown.split('\n')) {
+      final line = raw.trim();
+      if (line.isEmpty) continue;
+      if (line.startsWith('#')) continue;
+      if (line.startsWith('```')) continue;
+      return line.length > 220 ? '${line.substring(0, 217)}…' : line;
+    }
+    // Fall back to the first heading.
+    for (final raw in markdown.split('\n')) {
+      final line = raw.trim();
+      if (line.startsWith('#')) {
+        final stripped = line.replaceFirst(RegExp(r'^#+\s*'), '');
+        return stripped.length > 220
+            ? '${stripped.substring(0, 217)}…'
+            : stripped;
+      }
+    }
+    return '';
+  }
+
+  static String _withSuffix(String path, String suffix) {
+    final ext = p.extension(path);
+    final base = p.basenameWithoutExtension(path);
+    final dir = p.dirname(path);
+    return p.join(dir, '$base$suffix$ext');
   }
 }

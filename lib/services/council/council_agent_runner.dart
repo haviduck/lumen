@@ -65,6 +65,33 @@ class CouncilAgentRunner {
   final CouncilToolCallback onCouncilTool;
   final CancellationToken token = CancellationToken();
 
+  /// Mid-session messages from the human to splice into the agent's
+  /// message list at the next iteration boundary. Used by the orchestrator
+  /// "ping" UX so the user can change directives without aborting the run.
+  ///
+  /// Each entry pairs the trimmed text with an optional list of base64
+  /// JPEG images sourced from the clipboard / file picker. The images
+  /// are emitted on the message map under the `images` key so the wire
+  /// shape matches `ChatController` exactly — Anthropic / Gemini /
+  /// Ollama services convert it to their respective vision blocks.
+  /// (Copilot / GitHub Models currently silently drop the images key,
+  /// which is a separate provider-side fix.)
+  final List<({String text, List<String> images})> _pendingUserNotes =
+      <({String text, List<String> images})>[];
+
+  /// Queue a human note to inject before the next iteration. Empty
+  /// notes with no attachments are ignored; an image-only note (no
+  /// text) is allowed and forwarded to the model as a user turn whose
+  /// content is a short stub plus the image attachments.
+  void addUserNote(String note, {List<String> images = const []}) {
+    final trimmed = note.trim();
+    if (trimmed.isEmpty && images.isEmpty) return;
+    _pendingUserNotes.add((
+      text: trimmed,
+      images: List<String>.unmodifiable(images),
+    ));
+  }
+
   Future<CouncilRunResult> run({int maxIterations = 12}) async {
     final messages = <Map<String, dynamic>>[
       {'role': 'system', 'content': systemPrompt},
@@ -78,6 +105,28 @@ class CouncilAgentRunner {
           content: transcript.toString(),
           cancelled: true,
         );
+      }
+
+      // Drain any user notes the human pushed mid-session before the
+      // next stream call, so the agent sees them as a fresh user turn
+      // and can rewire the plan / re-dispatch agents accordingly.
+      while (_pendingUserNotes.isNotEmpty) {
+        final note = _pendingUserNotes.removeAt(0);
+        final body = note.text.isEmpty
+            ? '(image-only attachment from the human user)'
+            : note.text;
+        final entry = <String, dynamic>{
+          'role': 'user',
+          'content':
+              'USER NOTE (mid-session injection from the human user). '
+              'Bake this into the plan. If it changes any other agent\'s '
+              'directives, update them via the council_dispatch tool with '
+              'revised tasks instead of ignoring them:\n\n$body',
+        };
+        if (note.images.isNotEmpty) {
+          entry['images'] = note.images;
+        }
+        messages.add(entry);
       }
 
       final visible = StringBuffer();

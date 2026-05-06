@@ -20,36 +20,39 @@ class CouncilBlackboard extends StatelessWidget {
     final tasks = _tasks();
     return Container(
       margin: const EdgeInsets.fromLTRB(8, 14, 14, 14),
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFF10151C), Color(0xFF171D26), Color(0xFF0D1117)],
-        ),
+        // Flat raised surface — token-bound, no hardcoded hex gradient.
+        // The previous implementation hardcoded three hex stops and added
+        // a mint glow shadow which read as "cartoonish" against the rest
+        // of the modal. Now: bgRaised fill, hairline glassSeam border,
+        // soft drop-shadow for depth only.
+        color: DuckColors.bgRaised,
         borderRadius: BorderRadius.circular(DuckTheme.radiusL),
-        border: Border.all(color: DuckColors.borderStrong, width: 0.8),
-        boxShadow: [
-          BoxShadow(
-            color: DuckColors.accentMint.withValues(alpha: 0.08),
-            blurRadius: 28,
-          ),
-          ...DuckTheme.shadowSoft,
-        ],
+        border: Border.all(color: DuckColors.glassSeam, width: 0.6),
+        boxShadow: DuckTheme.shadowSoft,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
+          Row(
             children: [
-              Icon(Icons.fact_check_outlined, color: DuckColors.accentMint),
-              SizedBox(width: 8),
-              Text(
+              // 2px hairline rail in front of the title — replaces the
+              // mint Icon block. Same visual language as the agent
+              // monogram tile rail and the speech bubble eyebrow rule.
+              Container(
+                width: 2,
+                height: 14,
+                color: DuckColors.accentMint.withValues(alpha: 0.85),
+              ),
+              const SizedBox(width: 10),
+              const Text(
                 S.councilBlackboardTitle,
                 style: TextStyle(
                   color: DuckColors.fgPrimary,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 0.5,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.2,
                 ),
               ),
             ],

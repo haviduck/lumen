@@ -7,9 +7,147 @@ enum CouncilStatus {
   awaitingUser,
   awaitingPool,
   synthesizing,
+  awaitingFollowup,
   done,
   aborted,
   error,
+}
+
+/// Canonical names for every event the Council emits on its lifecycle bus.
+/// Stagecraft (visual layer) and persistence subscribe to these. Adding new
+/// event types here is the only sanctioned way to introduce new visual
+/// signals — never invent a string at the call-site.
+class CouncilEventType {
+  CouncilEventType._();
+
+  // Session
+  static const sessionStarted = 'session_started';
+  static const aborted = 'aborted';
+  static const councilRoundCompleted = 'council_round_completed';
+  static const awaitingUserFollowup = 'awaiting_user_followup';
+  static const councilClosed = 'council_closed';
+  static const roundTwoStarted = 'round_two_started';
+
+  // Agent lifecycle
+  static const agentArrived = 'agent_arrived';
+  static const agentThinkingStarted = 'agent_thinking_started';
+  static const agentThinkingEnded = 'agent_thinking_ended';
+  static const agentDone = 'agent_done';
+  static const agentError = 'agent_error';
+
+  // Communication
+  static const messageSent = 'message_sent';
+  static const linkStarted = 'link_started';
+  static const linkEnded = 'link_ended';
+  static const reviewerFollowup = 'reviewer_followup';
+
+  // Legacy (kept for blackboard / traffic widgets that already filter on them)
+  static const dispatched = 'dispatched';
+  static const agentStarted = 'agent_started';
+  static const askedPool = 'asked_pool';
+  static const poolReply = 'pool_reply';
+  static const askedUser = 'asked_user';
+  static const userReply = 'user_reply';
+  static const userPingedOrchestrator = 'user_pinged_orchestrator';
+  static const reported = 'reported';
+  static const evaluatorStarted = 'evaluator_started';
+  static const evaluatorDone = 'evaluator_done';
+  static const agentChunk = 'agent_chunk';
+}
+
+/// Kind of a `message_sent` event. Drives speech-bubble styling.
+class CouncilMessageKind {
+  CouncilMessageKind._();
+  static const dispatch = 'dispatch';
+  static const reply = 'reply';
+  static const askPool = 'ask_pool';
+  static const poolReply = 'pool_reply';
+  static const askUser = 'ask_user';
+  static const userReply = 'user_reply';
+  static const review = 'review';
+  static const followup = 'followup';
+}
+
+/// A single weakness raised by the final evaluator. Stable IDs let round-two
+/// briefs cite "address W2, W4" instead of paraphrasing prose.
+class CouncilWeakness {
+  final String id;
+  final String severity;
+  final String area;
+  final String description;
+
+  const CouncilWeakness({
+    required this.id,
+    required this.severity,
+    required this.area,
+    required this.description,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'severity': severity,
+    'area': area,
+    'description': description,
+  };
+
+  static CouncilWeakness fromJson(Map<String, dynamic> json) => CouncilWeakness(
+    id: json['id'] as String? ?? '',
+    severity: json['severity'] as String? ?? 'minor',
+    area: json['area'] as String? ?? '',
+    description: json['description'] as String? ?? '',
+  );
+}
+
+/// Structured payload of `reviewer_followup`. Carries everything the
+/// orchestrator + briefer need to re-brief a coherent round two without
+/// re-parsing prose.
+class ReviewerFollowup {
+  final int roundIndex;
+  final String summary;
+  final List<CouncilWeakness> weaknesses;
+  final Map<String, List<String>> perAgentTasks;
+  final bool suggestedRoundTwo;
+  final String rebriefAddendum;
+
+  const ReviewerFollowup({
+    required this.roundIndex,
+    required this.summary,
+    required this.weaknesses,
+    required this.perAgentTasks,
+    required this.suggestedRoundTwo,
+    required this.rebriefAddendum,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'roundIndex': roundIndex,
+    'summary': summary,
+    'weaknesses': weaknesses.map((w) => w.toJson()).toList(),
+    'perAgentTasks': perAgentTasks,
+    'suggestedRoundTwo': suggestedRoundTwo,
+    'rebriefAddendum': rebriefAddendum,
+  };
+
+  static ReviewerFollowup fromJson(Map<String, dynamic> json) {
+    final tasksRaw = (json['perAgentTasks'] as Map?)?.cast<String, dynamic>() ??
+        const <String, dynamic>{};
+    final tasks = <String, List<String>>{};
+    tasksRaw.forEach((k, v) {
+      if (v is List) {
+        tasks[k] = v.whereType<String>().toList();
+      }
+    });
+    return ReviewerFollowup(
+      roundIndex: (json['roundIndex'] as num?)?.toInt() ?? 0,
+      summary: json['summary'] as String? ?? '',
+      weaknesses: ((json['weaknesses'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((m) => CouncilWeakness.fromJson(m.cast<String, dynamic>()))
+          .toList(),
+      perAgentTasks: tasks,
+      suggestedRoundTwo: json['suggestedRoundTwo'] == true,
+      rebriefAddendum: json['rebriefAddendum'] as String? ?? '',
+    );
+  }
 }
 
 enum CouncilAgentStatus {
@@ -262,26 +400,34 @@ class CouncilPoolReply {
 
 class CouncilSession {
   final CouncilConfig config;
+  final String runId;
   CouncilStatus status;
+  int roundIndex;
   final DateTime startedAt;
   DateTime? finishedAt;
   String reportMarkdown;
   String reportPath;
+  ReviewerFollowup? reviewerFollowup;
   final List<CouncilEvent> events;
   final List<CouncilQuestion> poolQuestions;
   CouncilQuestion? pendingUserQuestion;
 
   CouncilSession({
     required this.config,
+    String? runId,
     this.status = CouncilStatus.idle,
+    this.roundIndex = 0,
     DateTime? startedAt,
     this.finishedAt,
     this.reportMarkdown = '',
     this.reportPath = '',
+    this.reviewerFollowup,
     List<CouncilEvent>? events,
     List<CouncilQuestion>? poolQuestions,
     this.pendingUserQuestion,
-  }) : startedAt = startedAt ?? DateTime.now(),
+  }) : runId = runId ??
+            '${config.id}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
+       startedAt = startedAt ?? DateTime.now(),
        events = List<CouncilEvent>.from(events ?? const []),
        poolQuestions = List<CouncilQuestion>.from(poolQuestions ?? const []);
 
@@ -296,11 +442,14 @@ class CouncilSession {
 
   Map<String, dynamic> toJson() => {
     'config': config.toJson(),
+    'runId': runId,
     'status': status.name,
+    'roundIndex': roundIndex,
     'startedAt': startedAt.toIso8601String(),
     'finishedAt': finishedAt?.toIso8601String(),
     'reportMarkdown': reportMarkdown,
     'reportPath': reportPath,
+    'reviewerFollowup': reviewerFollowup?.toJson(),
     'events': events.map((e) => e.toJson()).toList(),
     'poolQuestions': poolQuestions.map((q) => q.toJson()).toList(),
     'pendingUserQuestion': pendingUserQuestion?.toJson(),
@@ -312,6 +461,13 @@ class CouncilSession {
         (json['config'] as Map?)?.cast<String, dynamic>() ??
             const <String, dynamic>{},
       ),
+      runId: json['runId'] as String?,
+      roundIndex: (json['roundIndex'] as num?)?.toInt() ?? 0,
+      reviewerFollowup: json['reviewerFollowup'] is Map
+          ? ReviewerFollowup.fromJson(
+              (json['reviewerFollowup'] as Map).cast<String, dynamic>(),
+            )
+          : null,
       status:
           _enumByName(CouncilStatus.values, json['status'] as String?) ??
           CouncilStatus.idle,

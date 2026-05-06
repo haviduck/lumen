@@ -2069,6 +2069,29 @@ class S {
   static const String councilShowTheater = 'Show Council';
   static const String councilReportReady = 'Report ready';
   static const String councilOpenReport = 'Open report';
+  static const String councilReportsMenuItem = 'Council Reports…';
+  static const String councilReportsBrowserTitle = 'Council Reports';
+  static const String councilReportsBrowserEmpty =
+      'No council reports yet.\n'
+      'Convene the council and the artifact will land here.';
+  static const String councilReportsRefresh = 'Refresh';
+  static const String councilReportsRevealFolder = 'Open reports folder';
+  static const String councilReportRevealInFolder = 'Reveal in folder';
+  static const String councilReportCopyPath = 'Copy path';
+  static const String councilReportExport = 'Export';
+  static const String councilReportPathCopied = 'Report path copied.';
+  static const String councilReportTruncated =
+      'Large report — showing the first 256 KB. Open the file for the full text.';
+  static const String councilReportMermaidLabel = 'MERMAID DIAGRAM';
+  static const String councilReportMermaidCopy = 'Copy diagram source';
+  static const String councilReportMermaidCopied =
+      'Mermaid source copied — paste into mermaid.live.';
+  static const String councilReportEmpty = 'Empty report.';
+  static const String councilReportDiagramUnsupported =
+      'This Mermaid kind is not rendered inline. Source shown below.';
+  static const String councilReportDeleteTitle = 'Delete report?';
+  static const String councilReportDeleteFailed =
+      'Could not delete the report (file may be open).';
   static const String councilAskPoolHeader = 'Council pool';
   static const String councilBlackboardTitle = 'Blackboard';
   static const String councilBlackboardEmpty =
@@ -2082,6 +2105,43 @@ class S {
   static const String councilNoPoolQuestions = 'No pool questions yet.';
   static const String councilNoTranscript = 'Waiting for first signal...';
   static const String councilOrchestrator = 'Orchestrator';
+  // Live orchestrator ping composer.
+  static const String councilPingOrchestratorTitle = 'Ping the orchestrator';
+  static const String councilPingOrchestratorBody =
+      'Add a note the orchestrator should bake into the plan. Use this to '
+      'change directives, course-correct, or add new constraints. The '
+      'orchestrator will pick this up at its next iteration and may '
+      're-dispatch agents accordingly.';
+  static const String councilPingOrchestratorHint =
+      'e.g. tighten scope to the wizard UX only, drop the security pass...';
+  static const String councilPingOrchestratorSend = 'Send to orchestrator';
+  static const String councilPingOrchestratorSent =
+      'Note sent to orchestrator.';
+  static const String councilPingOrchestratorUnavailable =
+      'The orchestrator is not running right now.';
+  static const String councilPingOrchestratorVisionWarn =
+      'Heads-up: the orchestrator model may not support image inputs. '
+      'Attachments will still be sent but agents on text-only providers '
+      'may ignore them.';
+  static const String councilPingHeaderLabel = 'Ping';
+  static const String councilPingHeaderTooltip =
+      'Send the orchestrator a mid-session note (resurrects it if quiet)';
+  static const String councilOrchestratorKickHeader =
+      'You are continuing a previously-started Council session. The user '
+      'has sent a follow-up note that you must address. Treat the note as '
+      'a directive, not a suggestion.';
+  static const String councilOrchestratorKickStatusHeading =
+      '=== Status digest ===';
+  static const String councilOrchestratorKickPoolHeading =
+      '=== Pool exchanges ===';
+  static const String councilOrchestratorKickNoteHeading =
+      '=== User\'s note ===';
+  static const String councilOrchestratorKickInstructions =
+      '=== What to do ===\n'
+      'Decide based on the note: continue waiting (call no tool, just '
+      'restate where things stand), dispatch follow-ups, ask the user '
+      'with council_ask_user, or call council_report. Do not silently '
+      'ignore the note.';
   static const String councilFinalEvaluator = 'Final evaluator';
   static const String councilFinalEvaluatorTask =
       'Evaluate Council work and produce final report';

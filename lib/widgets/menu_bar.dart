@@ -14,6 +14,7 @@ import 'common/bright_icon_button.dart';
 import 'common/duck_glass.dart';
 import 'common/duck_toast.dart';
 import 'common/media_url_prompt.dart';
+import 'council/council_reports_browser.dart';
 import 'gitnexus_dialog.dart';
 import 'llm_providers_setup_dialog.dart';
 import 'lock_screen.dart';
@@ -234,6 +235,8 @@ class DuckMenuBar extends StatelessWidget {
                       S.manualSkillTitle,
                       enabled: state.currentDirectory != null,
                     ),
+                    _menuDivider,
+                    _item(context, 'councilReports', S.councilReportsMenuItem),
                     _menuDivider,
                     _item(context, 'autoApprove', S.menuToggleAutoApprove),
                     _menuDivider,
@@ -641,6 +644,10 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
     case 'createSkill':
       if (!context.mounted) return;
       await showManualSkillDialog(context);
+      break;
+    case 'councilReports':
+      if (!context.mounted) return;
+      await showCouncilReportsBrowser(context);
       break;
     case 'autoApprove':
       await state.chat.setAutoApprove(!state.chat.autoApprove);

@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
+import '../../providers/council_controller.dart';
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
@@ -248,13 +249,7 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
         role: RolePreset.reviewer,
         customRole: S.councilFinalEvaluatorRole,
         model: _orchestrator.model ?? '',
-        enabledTools: const {
-          'read_file',
-          'search_text',
-          'glob',
-          'web_search',
-          'web_fetch',
-        },
+        enabledTools: kCouncilDefaultTools,
       ),
       agents: [
         for (var i = 0; i < _agents.length; i++) _agents[i].toAgent('agent_$i'),
@@ -758,13 +753,7 @@ class _DraftAgent {
       role: role,
       customRole: customRole.text.trim(),
       model: model ?? '',
-      enabledTools: const {
-        'read_file',
-        'search_text',
-        'glob',
-        'web_search',
-        'web_fetch',
-      },
+      enabledTools: kCouncilDefaultTools,
     );
   }
 

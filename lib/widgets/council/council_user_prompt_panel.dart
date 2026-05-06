@@ -5,6 +5,7 @@ import '../../providers/council_controller.dart';
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import 'council_paste_field.dart';
 
 class CouncilUserPromptPanel extends StatefulWidget {
   final CouncilController controller;
@@ -22,11 +23,20 @@ class CouncilUserPromptPanel extends StatefulWidget {
 
 class _CouncilUserPromptPanelState extends State<CouncilUserPromptPanel> {
   final TextEditingController _answer = TextEditingController();
+  final CouncilPasteAttachments _attachments = CouncilPasteAttachments();
 
   @override
   void dispose() {
     _answer.dispose();
+    _attachments.dispose();
     super.dispose();
+  }
+
+  void _submit() {
+    final text = _answer.text.trim();
+    final imgs = _attachments.takeAll();
+    if (text.isEmpty && imgs.isEmpty) return;
+    widget.controller.answerPendingUserQuestion(text, images: imgs);
   }
 
   @override
@@ -105,35 +115,19 @@ class _CouncilUserPromptPanelState extends State<CouncilUserPromptPanel> {
                 ),
               ),
               const SizedBox(height: 10),
-              TextField(
+              CouncilComposerField(
                 controller: _answer,
+                attachments: _attachments,
                 minLines: 3,
                 maxLines: 6,
-                style: const TextStyle(color: DuckColors.fgPrimary),
-                decoration: InputDecoration(
-                  hintText: S.councilUserAnswerHint,
-                  hintStyle: const TextStyle(color: DuckColors.fgMuted),
-                  filled: true,
-                  fillColor: DuckColors.bgDeeper,
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-                    borderSide: const BorderSide(color: DuckColors.border),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-                    borderSide: const BorderSide(color: DuckColors.border),
-                  ),
-                ),
+                hintText: S.councilUserAnswerHint,
+                onSubmit: _submit,
               ),
               const SizedBox(height: 10),
               Align(
                 alignment: Alignment.centerRight,
                 child: ElevatedButton.icon(
-                  onPressed: () {
-                    final text = _answer.text.trim();
-                    if (text.isEmpty) return;
-                    widget.controller.answerPendingUserQuestion(text);
-                  },
+                  onPressed: _submit,
                   icon: const Icon(Icons.send, size: 15),
                   label: const Text(S.councilSubmitAnswer),
                 ),
