@@ -8,14 +8,13 @@ import 'package:path/path.dart' as p;
 import '../services/agent_terminal_bridge.dart';
 import '../services/anthropic_service.dart';
 import '../services/auto_backup_scheduler.dart';
+import '../services/kb_service.dart';
 import '../services/backup_service.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/copilot_service.dart';
 import '../services/council/council_persistence_service.dart';
 import '../services/file_kind.dart';
 import '../services/gemini_service.dart';
-import '../services/gitnexus_service.dart';
-import '../services/github_models_service.dart';
 import '../services/ide_actions.dart';
 import '../services/lumen_process_tracker.dart';
 import '../services/ollama_service.dart';
@@ -24,7 +23,6 @@ import '../services/recent_edits_tracker.dart';
 import '../services/remote/lumen_server.dart';
 import '../services/rules_service.dart';
 import '../services/ssh/ssh_remote_file_service.dart';
-import '../services/syncthing_service.dart';
 import '../services/timeline_models.dart';
 import '../services/timeline_service.dart';
 import '../services/workspace_service.dart';
@@ -95,15 +93,25 @@ class AppState extends ChangeNotifier {
   final OllamaService _ollamaService = OllamaService();
   final GeminiService _geminiService = GeminiService();
   final AnthropicService _anthropicService = AnthropicService();
-  final GitHubModelsService _githubModelsService = GitHubModelsService();
   final CopilotService _copilotService = CopilotService();
   // Public read-only handles so features outside the chat flow can
   // reach the configured clients without re-deriving from prefs.
   OllamaService get ollamaService => _ollamaService;
   GeminiService get geminiService => _geminiService;
   AnthropicService get anthropicService => _anthropicService;
-  GitHubModelsService get githubModelsService => _githubModelsService;
   CopilotService get copilotService => _copilotService;
+
+  // Cached Copilot auth probe result. Populated lazily by
+  // [refreshCopilotAuthState] and consumed by the onboarding dialog.
+  CopilotAuthState? _copilotAuthState;
+  CopilotAuthState? get copilotAuthState => _copilotAuthState;
+
+  Future<CopilotAuthState> refreshCopilotAuthState() async {
+    final s = await _copilotService.probeAuthState();
+    _copilotAuthState = s;
+    notifyListeners();
+    return s;
+  }
   final WorkspaceService _workspaceService = WorkspaceService();
   final PreferencesService prefs = PreferencesService();
   final ChatPersistenceService _persistence = ChatPersistenceService();
@@ -130,8 +138,6 @@ class AppState extends ChangeNotifier {
     processes: lumenProcesses,
   );
   final BackupService backups = BackupService();
-  final SyncthingService syncthing = SyncthingService();
-  final GitNexusService gitnexus = GitNexusService();
   final WorkspaceSkillsService workspaceSkills = WorkspaceSkillsService();
   // Optional embedded HTTP server used by the Remote Access feature
   // (paired phones / tablets connect over LAN / Tailscale). Off by
@@ -298,8 +304,6 @@ class AppState extends ChangeNotifier {
   String _ollamaApiKey = '';
   String _geminiApiKey = '';
   String _anthropicApiKey = '';
-  String _githubModelsApiKey = '';
-  String _githubModelsOrganization = '';
   String _copilotApiKey = '';
   bool _copilotUseLoggedInUser = true;
   String _openaiApiKey = '';
@@ -312,7 +316,7 @@ class AppState extends ChangeNotifier {
   bool _historySummaryEnabled = false;
   int _historySummaryMaxChars = 1200;
   int _historySummaryRefreshDelta = 10;
-  bool _knowledgebaseAutoSummarize = true;
+  bool _knowledgebaseAutoSummarize = false;
   int _knowledgebaseAutoSummarizeThresholdChars = 12000;
 
   // Editor settings
@@ -352,27 +356,6 @@ class AppState extends ChangeNotifier {
   String _settingsInitialCategory = 'general';
   int _settingsOpenRevision = 0;
 
-  // Syncthing cross-device sync — see `services/syncthing_service.dart`
-  // and `.agents/knowledgebase.md` § Syncthing for the full architecture.
-  bool _syncthingEnabled = false;
-  bool _syncthingAutoShare = true;
-  // Off by default. The blanket-`autoAcceptFolders=true` flow we used to
-  // run silently dropped folders into the receiver's Syncthing data
-  // directory because `defaults.folder.path` wasn't set there. The
-  // pending-folders panel is the safe replacement; this toggle exists
-  // only for power users who explicitly opt in.
-  bool _syncthingAutoAcceptRemote = false;
-  bool _syncthingIgnorePerms = true;
-  bool _syncthingWriteStignore = true;
-  String _syncthingVersioningPreset = 'staggered';
-  String _syncthingDefaultLandingPath = '~/Lumen-Sync';
-
-  // GitNexus integration master switch — see `_kGitNexusEnabled`
-  // doc in `PreferencesService` for the full off-state contract.
-  bool _gitnexusEnabled = true;
-  bool _gitnexusAutoWiki = false;
-  String _gitnexusWikiModel = '';
-
   String? get currentDirectory => _currentDirectory;
   List<File> get openFiles => _openFiles;
   File? get activeFile => _activeFile;
@@ -392,8 +375,6 @@ class AppState extends ChangeNotifier {
   String get ollamaApiKey => _ollamaApiKey;
   String get geminiApiKey => _geminiApiKey;
   String get anthropicApiKey => _anthropicApiKey;
-  String get githubModelsApiKey => _githubModelsApiKey;
-  String get githubModelsOrganization => _githubModelsOrganization;
   String get copilotApiKey => _copilotApiKey;
   bool get copilotUseLoggedInUser => _copilotUseLoggedInUser;
   String get openaiApiKey => _openaiApiKey;
@@ -406,6 +387,21 @@ class AppState extends ChangeNotifier {
   bool get knowledgebaseAutoSummarize => _knowledgebaseAutoSummarize;
   int get knowledgebaseAutoSummarizeThresholdChars =>
       _knowledgebaseAutoSummarizeThresholdChars;
+
+  /// Set when a KB write (in-app save OR agent-driven file-tool write
+  /// to `.agents/knowledgebase.md`) crosses the user-configured
+  /// threshold AND the auto-summarize flag is on. The KnowledgeBaseView
+  /// reads this on open and triggers `_summarize()` (which still shows
+  /// the confirm-replace dialog — never silent rewrites). Cleared by
+  /// [consumeKbAutoSummarizePending] once the view has acted on it.
+  bool get kbAutoSummarizePending => _kbAutoSummarizePending;
+  bool _kbAutoSummarizePending = false;
+  bool consumeKbAutoSummarizePending() {
+    if (!_kbAutoSummarizePending) return false;
+    _kbAutoSummarizePending = false;
+    notifyListeners();
+    return true;
+  }
   bool isProviderEnabled(String p) => _enabledProviders.contains(p);
 
   String get editorTheme => _editorTheme;
@@ -425,19 +421,7 @@ class AppState extends ChangeNotifier {
   String get settingsInitialCategory => _settingsInitialCategory;
   int get settingsOpenRevision => _settingsOpenRevision;
 
-  bool get syncthingEnabled => _syncthingEnabled;
-  bool get syncthingAutoShare => _syncthingAutoShare;
-  bool get syncthingAutoAcceptRemote => _syncthingAutoAcceptRemote;
-  bool get syncthingIgnorePerms => _syncthingIgnorePerms;
-  bool get syncthingWriteStignore => _syncthingWriteStignore;
-  String get syncthingVersioningPreset => _syncthingVersioningPreset;
-  String get syncthingDefaultLandingPath => _syncthingDefaultLandingPath;
-
-  bool get gitnexusEnabled => _gitnexusEnabled;
-  bool get gitnexusAutoWiki => _gitnexusAutoWiki;
-  String get gitnexusWikiModel => _gitnexusWikiModel;
-
-  // Per-workspace one-shot for the empty-editor duck mischief gag.
+  // Per-workspace one-shotfor the empty-editor duck mischief gag.
   // Pre-loaded by `setDirectory` so the `_DuckMischief` widget can
   // read it synchronously on mount and decide whether to play the
   // full animation or skip straight to the static "quip + button"
@@ -459,7 +443,6 @@ class AppState extends ChangeNotifier {
       ollama: _ollamaService,
       gemini: _geminiService,
       anthropic: _anthropicService,
-      github: _githubModelsService,
       copilot: _copilotService,
       persistence: _persistence,
       rules: rules,
@@ -505,34 +488,22 @@ class AppState extends ChangeNotifier {
       // between scheduler ticks, so we must not capture it at construction.
       workspacePathProvider: () async => _currentDirectory,
     );
-    // Bridge gitnexus notifications into AppState so widgets that
-    // read `state.gitnexus` via `Consumer<AppState>` rebuild when
-    // analyze finishes / serve toggles / mcp toggles. Without this
-    // the activity-bar icon and the GitNexus settings panel only
-    // refresh on whatever unrelated AppState change happens to fire
-    // next, which made "I clicked analyze and the icon didn't move"
-    // a real complaint.
-    gitnexus.addListener(_onGitnexusChanged);
+    KbService.writes.addListener(_onKbWrite);
     _bootstrap();
   }
 
-  void _onGitnexusChanged() {
-    // GitNexus produces high-frequency updates while streaming
-    // analyze stdout; bouncing every chunk through `notifyListeners`
-    // would rebuild every Consumer<AppState> listener (which is a
-    // lot). Cheap rate-limit: only forward when generating the
-    // forward at most every ~120ms. End states (process exit, status
-    // flip) come through naturally because the trailing call always
-    // fires after the timer elapses.
-    if (_gitnexusForwardScheduled) return;
-    _gitnexusForwardScheduled = true;
-    Future.delayed(const Duration(milliseconds: 120), () {
-      _gitnexusForwardScheduled = false;
-      notifyListeners();
-    });
+  void _onKbWrite() {
+    final ev = KbService.writes.value;
+    if (ev == null) return;
+    if (!_knowledgebaseAutoSummarize) return;
+    if (ev.workspacePath != _currentDirectory) return;
+    final threshold = _knowledgebaseAutoSummarizeThresholdChars;
+    if (threshold < 2000) return;
+    if (ev.length <= threshold) return;
+    if (_kbAutoSummarizePending) return;
+    _kbAutoSummarizePending = true;
+    notifyListeners();
   }
-
-  bool _gitnexusForwardScheduled = false;
 
   Future<void> _bootstrap() async {
     await _loadSettings();
@@ -562,8 +533,6 @@ class AppState extends ChangeNotifier {
     autoBackup.dispose();
     timeline.dispose();
     council.removeListener(notifyListeners);
-    gitnexus.removeListener(_onGitnexusChanged);
-    gitnexus.dispose();
     unawaited(_copilotService.dispose());
     remote.dispose();
     super.dispose();
@@ -575,8 +544,6 @@ class AppState extends ChangeNotifier {
     _ollamaApiKey = await prefs.getOllamaApiKey();
     _geminiApiKey = await prefs.getGeminiApiKey();
     _anthropicApiKey = await prefs.getAnthropicApiKey();
-    _githubModelsApiKey = await prefs.getGithubModelsApiKey();
-    _githubModelsOrganization = await prefs.getGithubModelsOrganization();
     _copilotApiKey = await prefs.getCopilotApiKey();
     _copilotUseLoggedInUser = await prefs.getCopilotUseLoggedInUser();
     _openaiApiKey = await prefs.getOpenaiApiKey();
@@ -593,24 +560,8 @@ class AppState extends ChangeNotifier {
     _ollamaService.apiKey = _ollamaApiKey;
     _geminiService.apiKey = _geminiApiKey;
     _anthropicService.apiKey = _anthropicApiKey;
-    _githubModelsService.apiKey = _githubModelsApiKey;
-    _githubModelsService.organization = _githubModelsOrganization;
     _copilotService.apiKey = _copilotApiKey;
     _copilotService.useLoggedInUser = _copilotUseLoggedInUser;
-    _githubModelsService.unavailableModels
-      ..clear()
-      ..addAll(await prefs.getGithubUnavailableModels());
-    _githubModelsService.onUnavailableModelDiscovered = (id) async {
-      // Persist immediately, then refresh the model picker so the dead
-      // model disappears without the user having to open Settings and
-      // hit Save. Fired during streaming, so we run async and don't
-      // block the error-rendering pipeline.
-      await prefs.setGithubUnavailableModels(
-        _githubModelsService.unavailableModels.toList(),
-      );
-      await chat.reloadModels(enabledProviders: _enabledProviders);
-      notifyListeners();
-    };
     _copilotService.unavailableModels
       ..clear()
       ..addAll(await prefs.getCopilotUnavailableModels());
@@ -637,29 +588,6 @@ class AppState extends ChangeNotifier {
         .getAgentAllowOutsideWorkspaceWrites();
     _autoVerifyAfterEdits = await prefs.getAgentAutoVerifyAfterEdits();
     _chatHidden = await prefs.getChatHidden();
-    _gitnexusEnabled = await prefs.getGitNexusEnabled();
-    _gitnexusAutoWiki = await prefs.getGitNexusAutoWiki();
-    _gitnexusWikiModel = await prefs.getGitNexusWikiModel();
-    gitnexus.setWikiPreferences(
-      autoWikiAfterAnalyze: _gitnexusAutoWiki,
-      model: _gitnexusWikiModel,
-    );
-    await gitnexus.setEnabled(_gitnexusEnabled);
-    _syncthingEnabled = await prefs.getSyncthingEnabled();
-    _syncthingAutoShare = await prefs.getSyncthingAutoShare();
-    _syncthingAutoAcceptRemote = await prefs.getSyncthingAutoAcceptRemote();
-    _syncthingIgnorePerms = await prefs.getSyncthingIgnorePerms();
-    _syncthingWriteStignore = await prefs.getSyncthingWriteStignore();
-    _syncthingVersioningPreset = await prefs.getSyncthingVersioningPreset();
-    _syncthingDefaultLandingPath = await prefs.getSyncthingDefaultLandingPath();
-    final stEndpoint = await prefs.getSyncthingEndpoint();
-    final stApiKey = await prefs.getSyncthingApiKey();
-    syncthing.configure(baseUrl: stEndpoint, apiKey: stApiKey);
-    // Push our safety defaults into the local Syncthing instance once
-    // it's reachable. Idempotent — re-runs are cheap.
-    if (_syncthingEnabled) {
-      unawaited(_syncthingApplySafetyDefaults());
-    }
     notifyListeners();
   }
 
@@ -703,8 +631,6 @@ class AppState extends ChangeNotifier {
     required String ollamaApiKey,
     required String geminiApiKey,
     required String anthropicApiKey,
-    required String githubModelsApiKey,
-    required String githubModelsOrganization,
     required String copilotApiKey,
     required bool copilotUseLoggedInUser,
     required String openaiApiKey,
@@ -714,8 +640,6 @@ class AppState extends ChangeNotifier {
     _ollamaApiKey = ollamaApiKey.trim();
     _geminiApiKey = geminiApiKey;
     _anthropicApiKey = anthropicApiKey;
-    _githubModelsApiKey = githubModelsApiKey;
-    _githubModelsOrganization = githubModelsOrganization.trim();
     _copilotApiKey = copilotApiKey.trim();
     _copilotUseLoggedInUser = copilotUseLoggedInUser;
     _openaiApiKey = openaiApiKey;
@@ -723,8 +647,6 @@ class AppState extends ChangeNotifier {
     _ollamaService.apiKey = _ollamaApiKey;
     _geminiService.apiKey = _geminiApiKey;
     _anthropicService.apiKey = _anthropicApiKey;
-    _githubModelsService.apiKey = _githubModelsApiKey;
-    _githubModelsService.organization = _githubModelsOrganization;
     _copilotService.apiKey = _copilotApiKey;
     _copilotService.useLoggedInUser = _copilotUseLoggedInUser;
     await prefs.setEnabledProviders(enabledProviders.toList());
@@ -732,8 +654,6 @@ class AppState extends ChangeNotifier {
     await prefs.setOllamaApiKey(_ollamaApiKey);
     await prefs.setGeminiApiKey(geminiApiKey);
     await prefs.setAnthropicApiKey(anthropicApiKey);
-    await prefs.setGithubModelsApiKey(githubModelsApiKey);
-    await prefs.setGithubModelsOrganization(_githubModelsOrganization);
     await prefs.setCopilotApiKey(_copilotApiKey);
     await prefs.setCopilotUseLoggedInUser(_copilotUseLoggedInUser);
     await prefs.setOpenaiApiKey(openaiApiKey);
@@ -798,17 +718,6 @@ class AppState extends ChangeNotifier {
     _activeFile = _openFiles.firstWhere(
       (f) => f.path == knowledgeBaseSentinel,
     );
-    notifyListeners();
-  }
-
-  /// Clears the locally-cached set of GitHub Models that previously
-  /// returned `400 unavailable_model`. Use this after GitHub rolls out
-  /// a model that was previously gated, so it reappears in the picker
-  /// on the next Save.
-  Future<void> resetGithubUnavailableModels() async {
-    _githubModelsService.unavailableModels.clear();
-    await prefs.setGithubUnavailableModels(const <String>[]);
-    await chat.reloadModels(enabledProviders: _enabledProviders);
     notifyListeners();
   }
 
@@ -1505,7 +1414,6 @@ class AppState extends ChangeNotifier {
     // initial prune sweep) happens off-thread inside the service.
     await timeline.bindToWorkspace(path);
     recentEdits.bindWorkspace(path);
-    await gitnexus.bindWorkspace(path);
     await _workspaceService.addRecentProject(path);
     await _loadRecentProjects();
     // Per-project chat tabs: persist the previous workspace's tab
@@ -1517,28 +1425,7 @@ class AppState extends ChangeNotifier {
     // settings-first opens don't go through that path).
     unawaited(workspaceSkills.reload(path));
     notifyListeners();
-    _syncthingAutoShareIfNeeded(path);
     return isNewProject;
-  }
-
-  /// Returns `true` if Syncthing is enabled, auto-share is OFF, and the
-  /// folder at [path] is not already registered — i.e. we should ask the
-  /// user if they want to share it.
-  Future<bool> shouldPromptSyncthingShare(String path) async {
-    if (!_syncthingEnabled || _syncthingAutoShare) return false;
-    try {
-      return !(await syncthing.isFolderRegistered(path));
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /// Manually trigger Syncthing sharing for a path (user accepted the prompt).
-  void syncthingShareManually(String path) {
-    final prev = _syncthingAutoShare;
-    _syncthingAutoShare = true; // temporarily enable so the helper runs
-    _syncthingAutoShareIfNeeded(path);
-    _syncthingAutoShare = prev; // restore
   }
 
   /// Refreshes the file explorer without nuking open files.
@@ -1736,7 +1623,6 @@ class AppState extends ChangeNotifier {
     _restartFileWatcher(null); // tear down the recursive watcher
     await timeline.bindToWorkspace(null);
     recentEdits.bindWorkspace(null);
-    await gitnexus.bindWorkspace(null);
     // Swap chat tabs back to the no-workspace bucket — leaving a
     // project's tabs mounted while the workspace is closed would
     // make the chat panel show project-specific history on the
@@ -1761,318 +1647,4 @@ class AppState extends ChangeNotifier {
     chat.appendTerminalOutput(text, workspacePath: _currentDirectory);
   }
 
-  // --- GitNexus integration master switch ---
-
-  /// Persist and apply the GitNexus master toggle. When `enabled` is
-  /// false, [GitNexusService.setEnabled] tears down its probe loop
-  /// and stops any owned daemon (see service docs for what happens
-  /// to externally-owned orphans). Settings UI rebuilds via
-  /// `notifyListeners`; the activity-bar icon checks this flag and
-  /// hides itself when off.
-  Future<void> setGitNexusEnabled(bool enabled) async {
-    if (_gitnexusEnabled == enabled) return;
-    _gitnexusEnabled = enabled;
-    await prefs.setGitNexusEnabled(enabled);
-    await gitnexus.setEnabled(enabled);
-    notifyListeners();
-  }
-
-  Future<void> updateGitNexusWikiSettings({
-    required bool autoWiki,
-    required String wikiModel,
-  }) async {
-    final normalizedModel = wikiModel.trim();
-    _gitnexusAutoWiki = autoWiki;
-    _gitnexusWikiModel = normalizedModel;
-    await prefs.setGitNexusAutoWiki(autoWiki);
-    await prefs.setGitNexusWikiModel(normalizedModel);
-    gitnexus.setWikiPreferences(
-      autoWikiAfterAnalyze: autoWiki,
-      model: normalizedModel,
-    );
-    notifyListeners();
-  }
-
-  // --- Syncthing cross-device sync ---
-
-  /// Persist and apply Syncthing connection + safety settings in one shot.
-  Future<void> updateSyncthingSettings({
-    required bool enabled,
-    required String endpoint,
-    required String apiKey,
-    required bool autoShare,
-    bool? autoAcceptRemote,
-    bool? ignorePerms,
-    bool? writeStignore,
-    String? versioningPreset,
-    String? defaultLandingPath,
-  }) async {
-    _syncthingEnabled = enabled;
-    _syncthingAutoShare = autoShare;
-    if (autoAcceptRemote != null) _syncthingAutoAcceptRemote = autoAcceptRemote;
-    if (ignorePerms != null) _syncthingIgnorePerms = ignorePerms;
-    if (writeStignore != null) _syncthingWriteStignore = writeStignore;
-    if (versioningPreset != null) {
-      _syncthingVersioningPreset = versioningPreset;
-    }
-    if (defaultLandingPath != null) {
-      _syncthingDefaultLandingPath = defaultLandingPath;
-    }
-
-    syncthing.configure(baseUrl: endpoint, apiKey: apiKey);
-    await prefs.setSyncthingEnabled(enabled);
-    await prefs.setSyncthingEndpoint(endpoint);
-    await prefs.setSyncthingApiKey(apiKey);
-    await prefs.setSyncthingAutoShare(autoShare);
-    if (autoAcceptRemote != null) {
-      await prefs.setSyncthingAutoAcceptRemote(autoAcceptRemote);
-    }
-    if (ignorePerms != null) {
-      await prefs.setSyncthingIgnorePerms(ignorePerms);
-    }
-    if (writeStignore != null) {
-      await prefs.setSyncthingWriteStignore(writeStignore);
-    }
-    if (versioningPreset != null) {
-      await prefs.setSyncthingVersioningPreset(versioningPreset);
-    }
-    if (defaultLandingPath != null) {
-      await prefs.setSyncthingDefaultLandingPath(defaultLandingPath);
-    }
-
-    notifyListeners();
-
-    if (enabled) {
-      // Re-apply safety defaults whenever the user touches Settings,
-      // not just at boot. Fire-and-forget — the UI doesn't block.
-      unawaited(_syncthingApplySafetyDefaults());
-    }
-
-    // If the user just enabled Syncthing while a project is already open,
-    // auto-share it now rather than waiting for the next setDirectory call.
-    if (_currentDirectory != null) {
-      _syncthingAutoShareIfNeeded(_currentDirectory!);
-    }
-  }
-
-  /// Pushes Lumen's safety defaults into the local Syncthing instance:
-  ///
-  ///   1. `defaults.folder.path` ← user's [syncthingDefaultLandingPath]
-  ///      (default `~/Lumen-Sync`). Fixes the "auto-accepted folder
-  ///      lands inside Syncthing's data dir as a relative path" bug.
-  ///   2. `defaults/ignores` ← Lumen's `.stignore` template (one-shot,
-  ///      gated by [PreferencesService.getSyncthingDefaultIgnoresWritten]).
-  ///   3. `autoAcceptFolders` ← respects [syncthingAutoAcceptRemote]
-  ///      on every remote device. Default OFF — the pending-folders
-  ///      panel is the safe accept path.
-  ///
-  /// All three steps swallow errors; if Syncthing is unreachable
-  /// nothing happens and the UI doesn't surface a failure.
-  Future<void> _syncthingApplySafetyDefaults() async {
-    try {
-      // 1. Default folder path.
-      final landing = _syncthingDefaultLandingPath.trim();
-      if (landing.isNotEmpty) {
-        final current = await syncthing.getDefaultFolder();
-        final currentPath = (current?['path'] as String? ?? '').trim();
-        if (currentPath != landing) {
-          final ok = await syncthing.patchDefaultFolder({'path': landing});
-          debugPrint(
-            ok
-                ? '[Syncthing] defaults.folder.path → "$landing"'
-                : '[Syncthing] failed to patch defaults.folder.path',
-          );
-        }
-      }
-
-      // 2. Default ignores — one-shot.
-      final alreadyWritten = await prefs.getSyncthingDefaultIgnoresWritten();
-      if (!alreadyWritten) {
-        final ok = await syncthing.setDefaultIgnores(kLumenDefaultStignore);
-        if (ok) {
-          await prefs.setSyncthingDefaultIgnoresWritten(true);
-          debugPrint('[Syncthing] Seeded defaults/ignores');
-        }
-      }
-
-      // 3. Reconcile autoAcceptFolders on every remote device.
-      await _syncthingReconcileAutoAccept();
-    } catch (e) {
-      debugPrint('[Syncthing] safety defaults error: $e');
-    }
-  }
-
-  /// Fire-and-forget: if Syncthing is enabled + autoShare is on, ensure
-  /// the workspace is a shared folder with ALL devices attached and
-  /// configured according to the current safety defaults (ignorePerms,
-  /// versioning preset, .stignore template).
-  void _syncthingAutoShareIfNeeded(String path) {
-    if (!_syncthingEnabled || !_syncthingAutoShare) return;
-    () async {
-      try {
-        final id = SyncthingService.folderIdFromPath(path);
-        final label = path
-            .replaceAll('\\', '/')
-            .split('/')
-            .where((s) => s.isNotEmpty)
-            .last;
-
-        final versioning = SyncthingVersioningPresetX.fromKey(
-          _syncthingVersioningPreset,
-        ).toJson();
-
-        final already = await syncthing.isFolderRegistered(path);
-        if (already) {
-          final folderId = await syncthing.folderIdForPath(path);
-          if (folderId != null) {
-            // Reattach all devices and re-stamp our safety defaults so
-            // the user can flip preferences and have them propagate
-            // without manually editing each folder.
-            final devices = (await syncthing.listDevices())
-                .map((d) => {'deviceID': d['deviceID'] as String? ?? ''})
-                .where((d) => (d['deviceID'] ?? '').isNotEmpty)
-                .toList();
-            final patch = <String, dynamic>{
-              'devices': devices,
-              'ignorePerms': _syncthingIgnorePerms,
-              // ignore: use_null_aware_elements
-              if (versioning != null) 'versioning': versioning,
-            };
-            final ok = await syncthing.patchFolder(folderId, patch);
-            debugPrint(
-              ok
-                  ? '[Syncthing] Re-applied defaults to "$label"'
-                  : '[Syncthing] Failed to patch "$label"',
-            );
-            unawaited(_syncthingMaybeWriteStignore(folderId, path));
-          }
-        } else {
-          final ok = await syncthing.addFolder(
-            id: id,
-            path: path,
-            label: label,
-            ignorePerms: _syncthingIgnorePerms,
-            versioning: versioning,
-          );
-          debugPrint(
-            ok
-                ? '[Syncthing] Auto-shared folder "$label" (id=$id)'
-                : '[Syncthing] Failed to auto-share "$label"',
-          );
-          if (ok) {
-            unawaited(_syncthingMaybeWriteStignore(id, path));
-          }
-        }
-
-        await _syncthingReconcileAutoAccept();
-      } catch (e) {
-        debugPrint('[Syncthing] Auto-share error: $e');
-      }
-    }();
-  }
-
-  /// Drops the Lumen `.stignore` template into [folderId] iff the user
-  /// has opted into stignore seeding AND the folder doesn't already
-  /// have an ignore file (to avoid stomping user customisations).
-  Future<void> _syncthingMaybeWriteStignore(
-    String folderId,
-    String fsPath,
-  ) async {
-    if (!_syncthingWriteStignore) return;
-    try {
-      final existing = await syncthing.folderIgnores(folderId);
-      if (existing == null) return;
-      // Empty list means "no .stignore file" — fine to seed. A non-empty
-      // list means the user already has patterns; leave them alone.
-      if (existing.isNotEmpty) return;
-      final ok = await syncthing.setFolderIgnores(
-        folderId,
-        kLumenDefaultStignore,
-      );
-      debugPrint(
-        ok
-            ? '[Syncthing] Seeded .stignore in "$folderId"'
-            : '[Syncthing] Failed to seed .stignore in "$folderId"',
-      );
-    } catch (e) {
-      debugPrint('[Syncthing] _syncthingMaybeWriteStignore error: $e');
-    }
-  }
-
-  /// Sets `autoAcceptFolders` on every remote device to match
-  /// [syncthingAutoAcceptRemote]. Skips devices already in the desired
-  /// state. Default OFF — the pending-folders panel is the safe accept
-  /// path; we used to default this ON which caused folders to land in
-  /// Syncthing's data directory on the receiver.
-  Future<void> _syncthingReconcileAutoAccept() async {
-    try {
-      final status = await syncthing.systemStatus();
-      final localId = status?['myID'] as String?;
-      final devices = await syncthing.listDevices();
-      for (final d in devices) {
-        final did = d['deviceID'] as String? ?? '';
-        if (did.isEmpty || did == localId) continue;
-        final current = d['autoAcceptFolders'] == true;
-        if (current == _syncthingAutoAcceptRemote) continue;
-        await syncthing.enableAutoAccept(
-          did,
-          enabled: _syncthingAutoAcceptRemote,
-        );
-        debugPrint(
-          '[Syncthing] autoAcceptFolders=$_syncthingAutoAcceptRemote on $did',
-        );
-      }
-    } catch (e) {
-      debugPrint('[Syncthing] autoAccept reconcile error: $e');
-    }
-  }
-
-  /// Detects pairs of devices that are mutually flagged as introducer
-  /// (the "Remote is an introducer to us, and we are to them" warning).
-  /// Returns a list of remote `deviceID`s that we are introducer to AND
-  /// that are introducer to us — i.e., the ones the user should
-  /// down-flag on this side to break the loop.
-  ///
-  /// This is heuristic: Syncthing only exposes our own device entries
-  /// over REST, so we can read whether *we've* marked them as
-  /// introducer. The "they marked us as introducer" half comes from
-  /// the live warning log; for that we expose a one-shot fix that
-  /// just clears the flag on our side (always safe).
-  Future<List<String>> syncthingMutualIntroducerCandidates() async {
-    final out = <String>[];
-    try {
-      final devices = await syncthing.listDevices();
-      for (final d in devices) {
-        if (d['introducer'] == true) {
-          final did = d['deviceID'] as String? ?? '';
-          if (did.isNotEmpty) out.add(did);
-        }
-      }
-    } catch (e) {
-      debugPrint('[Syncthing] mutualIntroducer error: $e');
-    }
-    return out;
-  }
-
-  /// One-shot fix: clears `introducer` on every remote device on our
-  /// side. Safe under all circumstances — at worst, you lose the
-  /// auto-propagation of new device IDs from those introducers, which
-  /// you can re-enable per device later.
-  Future<int> syncthingClearAllIntroducers() async {
-    var fixed = 0;
-    try {
-      final devices = await syncthing.listDevices();
-      for (final d in devices) {
-        if (d['introducer'] != true) continue;
-        final did = d['deviceID'] as String? ?? '';
-        if (did.isEmpty) continue;
-        if (await syncthing.setIntroducer(did, enabled: false)) {
-          fixed++;
-        }
-      }
-    } catch (e) {
-      debugPrint('[Syncthing] clearAllIntroducers error: $e');
-    }
-    return fixed;
-  }
 }

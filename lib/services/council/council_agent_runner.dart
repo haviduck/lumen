@@ -257,6 +257,11 @@ class CouncilAgentRunner {
         nativeToolIds: nativeToolIds,
       );
     }
+    if (split.provider == 'github') {
+      return Stream<String>.value(
+        'GitHub Models was removed; please pick another model.',
+      );
+    }
     return Stream<String>.value(
       'Council requires a claude:* or copilot:* model.',
     );
@@ -270,4 +275,5 @@ class CouncilAgentRunner {
       rawModel: model.substring(idx + 1),
     );
   }
+
 }

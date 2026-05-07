@@ -113,7 +113,6 @@ class _SettingsDialogState extends State<SettingsDialog> {
                         S.providerOllama,
                         S.providerGemini,
                         S.providerClaude,
-                        S.providerGithub,
                         S.providerCopilot,
                         S.providerOpenAI,
                       ])
@@ -377,8 +376,6 @@ class _SettingsDialogState extends State<SettingsDialog> {
                     onPressed: () async {
                       final a = context.read<AppState>();
                       await a.updateProviderSettings(
-                        githubModelsApiKey: a.githubModelsApiKey,
-                        githubModelsOrganization: a.githubModelsOrganization,
                         copilotApiKey: a.copilotApiKey,
                         copilotUseLoggedInUser: a.copilotUseLoggedInUser,
                         enabledProviders: _enabledProviders,

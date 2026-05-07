@@ -171,6 +171,11 @@ $brief
         {'role': 'user', 'content': prompt},
       ];
       final split = _splitModel(orchestrator.model);
+      if (split.provider == 'github') {
+        throw StateError(
+          'GitHub Models was removed; please pick another model.',
+        );
+      }
       final raw = split.provider == 'claude'
           ? await anthropic.generateChat(messages, model: split.rawModel)
           : await copilot.generateChat(messages, model: split.rawModel);

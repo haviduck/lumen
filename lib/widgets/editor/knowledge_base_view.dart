@@ -88,6 +88,19 @@ class _KnowledgeBaseViewState extends State<KnowledgeBaseView> {
       _ctrl.text = body;
       _loading = false;
     });
+    // Auto-summarize trigger: if a previous KB write (in-app save or
+    // agent-driven `tool_registry` write) crossed the threshold and
+    // the user opted in, AppState flipped a pending flag. Consume it
+    // here and run `_summarize()` — the confirm dialog still gates
+    // the actual replace, so this is opt-in + still user-confirmed.
+    if (!mounted) return;
+    final appState = context.read<AppState>();
+    if (appState.consumeKbAutoSummarizePending()) {
+      // ignore: use_build_context_synchronously
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _summarize();
+      });
+    }
   }
 
   Future<void> _save() async {

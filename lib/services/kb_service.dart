@@ -75,6 +75,13 @@ class KbService extends ChangeNotifier {
   /// Writes [content] to the canonical KB file, creating parents as
   /// needed. Returns the resolved file path on success, null on
   /// failure (callers can surface a toast).
+  ///
+  /// On success, fires [writes] with the new byte-length so any
+  /// listening UI (e.g. KnowledgeBaseView, auto-summarize banner)
+  /// can react. This is the single chokepoint for in-app KB writes;
+  /// agent-driven writes that go through `tool_registry`'s generic
+  /// file tools should call [maybeNotifyExternalWrite] after their
+  /// `writeAsString`.
   static Future<String?> write(String workspacePath, String content) async {
     try {
       final f = await ensureFile(workspacePath);
@@ -82,10 +89,48 @@ class KbService extends ChangeNotifier {
         await f.parent.create(recursive: true);
       }
       await f.writeAsString(content);
+      _emit(workspacePath, content.length);
       return f.path;
     } catch (e) {
       debugPrint('KbService.write failed: $e');
       return null;
+    }
+  }
+
+  /// Broadcast notifier for KB-write events. Static so non-instance
+  /// callers (tool_registry, agent file tools) can publish without
+  /// a service handle. Listeners receive the latest event via
+  /// [ValueNotifier.value]; consumers that care about every write
+  /// (rather than the last one) should debounce on their side.
+  static final ValueNotifier<KbWriteEvent?> writes =
+      ValueNotifier<KbWriteEvent?>(null);
+
+  static void _emit(String workspacePath, int length) {
+    writes.value = KbWriteEvent(
+      workspacePath: workspacePath,
+      length: length,
+      at: DateTime.now(),
+    );
+  }
+
+  /// Hook for non-[write] writers (the agent's generic file tools in
+  /// `tool_registry.dart`). Call after any `writeAsString` whose
+  /// target *might* be the canonical KB path; this method is a no-op
+  /// when [filePath] does not resolve to it. Re-reads the file on
+  /// disk to get an authoritative byte-length (covers the append
+  /// case where the caller only knows the fragment it wrote).
+  static Future<void> maybeNotifyExternalWrite(
+    String workspacePath,
+    String filePath,
+  ) async {
+    try {
+      final canonical = pathFor(workspacePath);
+      if (!p.equals(p.normalize(filePath), canonical)) return;
+      final f = File(canonical);
+      final len = await f.exists() ? (await f.readAsString()).length : 0;
+      _emit(workspacePath, len);
+    } catch (e) {
+      debugPrint('KbService.maybeNotifyExternalWrite failed: $e');
     }
   }
 
@@ -140,4 +185,21 @@ HARD RULES:
       },
     ];
   }
+}
+
+/// Payload published on [KbService.writes] after every successful
+/// KB write (in-app via [KbService.write] or external via
+/// [KbService.maybeNotifyExternalWrite]). Carries enough context
+/// for a listener to make the auto-summarize decision without a
+/// follow-up disk read.
+@immutable
+class KbWriteEvent {
+  final String workspacePath;
+  final int length;
+  final DateTime at;
+  const KbWriteEvent({
+    required this.workspacePath,
+    required this.length,
+    required this.at,
+  });
 }

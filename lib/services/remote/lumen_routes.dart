@@ -425,6 +425,11 @@ Router buildLumenRouter(LumenRemoteDeps deps) {
         'hint': 'Body must include a non-empty `model` field.',
       });
     }
+    if (model.startsWith('github:')) {
+      return _badRequest('removed_provider', const {
+        'hint': 'GitHub Models was removed; pick another provider.',
+      });
+    }
     final chat = deps.chatController();
     if (!chat.availableModels.contains(model)) {
       // Reject unknown models loud — silently coercing to

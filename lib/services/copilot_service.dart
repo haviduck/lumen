@@ -466,4 +466,51 @@ class CopilotService {
     final fallback = firstMessage.trim().replaceAll(RegExp(r'\s+'), ' ');
     return fallback.length > 40 ? '${fallback.substring(0, 40)}...' : fallback;
   }
+
+  /// Probe the current Copilot CLI auth state. Used by the onboarding
+  /// dialog.
+  Future<CopilotAuthState> probeAuthState() async {
+    try {
+      final npm = await Process.run('npm', [
+        'root',
+        '-g',
+      ], runInShell: true);
+      bool installed = false;
+      if (npm.exitCode == 0) {
+        final root = (npm.stdout as String).trim();
+        if (root.isNotEmpty) {
+          final pkgDir = Directory(
+            '$root${Platform.pathSeparator}@github'
+            '${Platform.pathSeparator}copilot',
+          );
+          installed = await pkgDir.exists();
+        }
+      }
+      if (!installed) return CopilotAuthState.notInstalled;
+
+      final candidates = <String>[];
+      final home =
+          Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'];
+      if (home != null && home.isNotEmpty) {
+        candidates.add(
+          '$home${Platform.pathSeparator}.config'
+          '${Platform.pathSeparator}github-copilot',
+        );
+      }
+      final appdata = Platform.environment['APPDATA'];
+      if (appdata != null && appdata.isNotEmpty) {
+        candidates.add('$appdata${Platform.pathSeparator}github-copilot');
+      }
+      for (final c in candidates) {
+        if (await Directory(c).exists()) {
+          return CopilotAuthState.loggedIn;
+        }
+      }
+      return CopilotAuthState.notLoggedIn;
+    } catch (_) {
+      return CopilotAuthState.unavailable;
+    }
+  }
 }
+
+enum CopilotAuthState { notInstalled, notLoggedIn, loggedIn, unavailable }

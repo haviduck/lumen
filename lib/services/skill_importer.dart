@@ -164,13 +164,27 @@ class SkillImporter {
     );
     await dir.create(recursive: true);
     final outFile = File(p.join(dir.path, 'SKILL.md'));
-    final content = _stampImportedFrom(
+    final stamped = _stampImportedFrom(
       result.rawMarkdown,
       repoLabel: result.repoLabel,
       sourceUrl: result.sourceUrl,
     );
+    final content = _sanitisePua(stamped);
     await outFile.writeAsString(content);
     return outFile;
+  }
+
+  /// Strip Unicode Private Use Area glyphs (Nerd Font icon ranges and
+  /// the Supplementary PUA-A/B blocks) from imported markdown. These
+  /// codepoints render as boxes/garbage on machines without a patched
+  /// font and historically collided with the chat composer's segment
+  /// parser. Cheap regex scrub — preserves all real markdown.
+  static String _sanitisePua(String s) {
+    final pua = RegExp(
+      r'[\uE000-\uF8FF]|[\u{F0000}-\u{FFFFD}]|[\u{100000}-\u{10FFFD}]',
+      unicode: true,
+    );
+    return s.replaceAll(pua, '');
   }
 
   void dispose() => _client.close();

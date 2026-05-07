@@ -48,8 +48,6 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
   late final TextEditingController _ollamaApiKeyCtrl;
   late final TextEditingController _geminiCtrl;
   late final TextEditingController _claudeCtrl;
-  late final TextEditingController _githubCtrl;
-  late final TextEditingController _githubOrgCtrl;
   late final TextEditingController _copilotCtrl;
   late final TextEditingController _openaiCtrl;
   bool _copilotUseLoggedInUser = true;
@@ -65,10 +63,6 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
     _ollamaApiKeyCtrl = TextEditingController(text: state.ollamaApiKey);
     _geminiCtrl = TextEditingController(text: state.geminiApiKey);
     _claudeCtrl = TextEditingController(text: state.anthropicApiKey);
-    _githubCtrl = TextEditingController(text: state.githubModelsApiKey);
-    _githubOrgCtrl = TextEditingController(
-      text: state.githubModelsOrganization,
-    );
     _copilotCtrl = TextEditingController(text: state.copilotApiKey);
     _copilotUseLoggedInUser = state.copilotUseLoggedInUser;
     _openaiCtrl = TextEditingController(text: state.openaiApiKey);
@@ -80,8 +74,6 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
     _ollamaApiKeyCtrl.dispose();
     _geminiCtrl.dispose();
     _claudeCtrl.dispose();
-    _githubCtrl.dispose();
-    _githubOrgCtrl.dispose();
     _copilotCtrl.dispose();
     _openaiCtrl.dispose();
     super.dispose();
@@ -107,8 +99,6 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
       ollamaApiKey: _ollamaApiKeyCtrl.text.trim(),
       geminiApiKey: _geminiCtrl.text.trim(),
       anthropicApiKey: _claudeCtrl.text.trim(),
-      githubModelsApiKey: _githubCtrl.text.trim(),
-      githubModelsOrganization: _githubOrgCtrl.text.trim(),
       copilotApiKey: _copilotCtrl.text.trim(),
       copilotUseLoggedInUser: _copilotUseLoggedInUser,
       openaiApiKey: _openaiCtrl.text.trim(),
@@ -198,26 +188,6 @@ class _LlmProvidersSetupDialogState extends State<_LlmProvidersSetupDialog> {
                         enabled: _enabled.contains('Claude'),
                         onToggle: (v) => _toggle('Claude', v),
                         body: _ApiKeyField(controller: _claudeCtrl),
-                      ),
-                      _ProviderCard(
-                        id: 'GitHub Models',
-                        label: S.providerGithub,
-                        hint: S.llmProvidersGithubHint,
-                        enabled: _enabled.contains('GitHub Models'),
-                        onToggle: (v) => _toggle('GitHub Models', v),
-                        body: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            _ApiKeyField(controller: _githubCtrl),
-                            const SizedBox(height: 8),
-                            _LabeledField(
-                              label: S.settingsGithubOrgLabel,
-                              controller: _githubOrgCtrl,
-                              obscure: false,
-                              hintText: S.settingsGithubOrgHint,
-                            ),
-                          ],
-                        ),
                       ),
                       _ProviderCard(
                         id: 'GitHub Copilot',

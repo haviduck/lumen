@@ -71,10 +71,8 @@ class ModelCapabilities {
             // Bare `gemini-pro-vision` etc.
             lower.contains('vision');
 
-      case 'github':
       case 'copilot':
       case 'openai':
-        // OpenAI / GitHub Models: gpt-4o family, gpt-4-turbo with
         // vision, gpt-4.1, gpt-5 family, o1/o3/o4 reasoning models
         // (most are multimodal; o1-mini text-only is the exception).
         // GitHub Models prefixes with the publisher

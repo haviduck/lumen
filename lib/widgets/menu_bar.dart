@@ -15,7 +15,6 @@ import 'common/duck_glass.dart';
 import 'common/duck_toast.dart';
 import 'common/media_url_prompt.dart';
 import 'council/council_reports_browser.dart';
-import 'gitnexus_dialog.dart';
 import 'llm_providers_setup_dialog.dart';
 import 'lock_screen.dart';
 import 'manual_skill_dialog.dart';
@@ -746,12 +745,6 @@ Future<void> _runNewProjectWizardFromMenu(
   if (context.mounted) {
     await showSkillGeneratorDialog(context, workspacePath: path);
   }
-  if (context.mounted && state.gitnexusEnabled) {
-    await showGitNexusOnboardingDialog(context, workspacePath: path);
-  }
-  if (context.mounted) {
-    await _promptSyncthingIfNeeded(context, state, path);
-  }
 }
 
 /// First-run heuristic shared with `welcome_screen.dart`. True when
@@ -762,7 +755,6 @@ Future<void> _runNewProjectWizardFromMenu(
 Future<bool> _isLumenFirstRun(AppState state) async {
   final hasAnyKey = state.geminiApiKey.isNotEmpty ||
       state.anthropicApiKey.isNotEmpty ||
-      state.githubModelsApiKey.isNotEmpty ||
       state.openaiApiKey.isNotEmpty ||
       // Mirror the welcome-screen heuristic: an Ollama Cloud key
       // counts as "configured" so cloud-only users skip onboarding.
@@ -780,43 +772,6 @@ Future<void> _promptSyncthingIfNeeded(
   AppState state,
   String path,
 ) async {
-  final shouldPrompt = await state.shouldPromptSyncthingShare(path);
-  if (!shouldPrompt || !context.mounted) return;
-
-  final accepted = await showDialog<bool>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: DuckColors.bgRaised,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        side: const BorderSide(color: DuckColors.border, width: 0.5),
-      ),
-      title: const Text(
-        'Share with Syncthing?',
-        style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-      ),
-      content: const Text(
-        'Syncthing is connected but auto-share is off. '
-        'Would you like to share this project with all your devices?',
-        style: TextStyle(fontSize: 12.5, color: DuckColors.fgMuted),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, false),
-          child: const Text('No'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, true),
-          child: const Text('Share'),
-        ),
-      ],
-    ),
-  );
-
-  if (accepted == true) {
-    state.syncthingShareManually(path);
-    if (context.mounted) {
-      showDuckToast(context, 'Project shared with Syncthing devices.');
-    }
-  }
+  // Syncthing integration removed.
 }
+

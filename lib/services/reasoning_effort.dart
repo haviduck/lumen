@@ -86,10 +86,9 @@ class ReasoningEffortHelper {
       case 'gemini':
         // 2.5 family ships thinkingConfig. 2.0 doesn't.
         return lower.contains('2.5');
-      case 'github':
       case 'copilot':
       case 'openai':
-        // gpt-5 family + o-series accept reasoning_effort. Older
+        // gpt-5 family+ o-series accept reasoning_effort. Older
         // chat models (gpt-4o, gpt-4.1) don't. The provider id may
         // include a publisher prefix on GitHub Models
         // (`openai/gpt-5-mini`); we just substring-match.

@@ -3,7 +3,6 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'handoff_service.dart';
 import 'lumen_workspace_config.dart';
 
 /// Reads/writes `.lumen/rules.md` at both global and workspace scope.
@@ -111,12 +110,10 @@ to the workspace.
   static const String _canonicalKnowledgebasePath = '.agents/knowledgebase.md';
 
   /// Workspace stub for brand-new workspaces — same body as
-  /// [_workspaceDefaultStub] plus the chat-handoff receive rule and
-  /// the knowledgebase rule so the system works out of the box.
-  /// Existing workspaces get the handoff rule auto-appended on first
-  /// `/handoff` via [HandoffService.ensureRuleInstalled].
+  /// [_workspaceDefaultStub] plus the knowledgebase rule so the
+  /// system works out of the box.
   static String get workspaceDefaultStub =>
-      '$_workspaceDefaultStub\n${HandoffService.ruleBlock}\n\n$_knowledgebaseRuleBlock\n';
+      '$_workspaceDefaultStub\n$_knowledgebaseRuleBlock\n';
 
   /// Marker comment for the knowledgebase rule block. Used to detect
   /// whether the block is already present — idempotent append.

@@ -79,8 +79,6 @@ class _OllamaCloudKeyPromptDialogState
       ollamaApiKey: key,
       geminiApiKey: state.geminiApiKey,
       anthropicApiKey: state.anthropicApiKey,
-      githubModelsApiKey: state.githubModelsApiKey,
-      githubModelsOrganization: state.githubModelsOrganization,
       copilotApiKey: state.copilotApiKey,
       copilotUseLoggedInUser: state.copilotUseLoggedInUser,
       openaiApiKey: state.openaiApiKey,

@@ -137,7 +137,6 @@ class ModelTier {
         if (m.contains('flash-lite') || m.contains('nano')) return standard;
         if (m.contains('flash')) return pro; // 2.5 Flash handles all tools.
         return pro;
-      case 'github':
       case 'copilot':
         // OpenAI-shaped catalog. mini / nano → Standard, rest → Pro.
         if (m.contains('mini') || m.contains('nano')) return standard;

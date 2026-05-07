@@ -9,7 +9,6 @@ import '../l10n/strings.dart';
 import '../services/agent_terminal_bridge.dart';
 import '../services/anthropic_service.dart';
 import '../services/copilot_service.dart';
-import '../services/github_models_service.dart';
 import '../services/chat_chip.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/external_tool_loader.dart';
@@ -438,7 +437,6 @@ class ChatController extends ChangeNotifier {
   final OllamaService ollama;
   final GeminiService gemini;
   final AnthropicService anthropic;
-  final GitHubModelsService github;
   final CopilotService copilot;
   final ChatPersistenceService persistence;
   final RulesService rules;
@@ -482,7 +480,6 @@ class ChatController extends ChangeNotifier {
     required this.ollama,
     required this.gemini,
     required this.anthropic,
-    required this.github,
     required this.copilot,
     required this.persistence,
     required this.rules,
@@ -1080,12 +1077,6 @@ class ChatController extends ChangeNotifier {
         all.addAll(models.map((m) => 'claude:$m'));
       } catch (_) {}
     }
-    if (enabled.contains('GitHub Models')) {
-      try {
-        final models = await github.getModels();
-        all.addAll(models.map((m) => 'github:$m'));
-      } catch (_) {}
-    }
     if (enabled.contains('GitHub Copilot')) {
       try {
         final models = await copilot.getModels();
@@ -1123,9 +1114,6 @@ class ChatController extends ChangeNotifier {
     if (enabled.contains('Claude') && await anthropic.isReachable()) {
       return true;
     }
-    if (enabled.contains('GitHub Models') && await github.isReachable()) {
-      return true;
-    }
     if (enabled.contains('GitHub Copilot') && await copilot.isReachable()) {
       return true;
     }
@@ -1146,7 +1134,6 @@ class ChatController extends ChangeNotifier {
     final providerName = switch (provider) {
       'gemini' => 'Gemini',
       'claude' => 'Claude',
-      'github' => 'GitHub Models',
       'copilot' => 'GitHub Copilot',
       // Both `ollama` and `ollama-cloud` map to the same enabled-
       // provider toggle in Settings — the namespace split is for
@@ -1162,8 +1149,6 @@ class ChatController extends ChangeNotifier {
         return gemini.generateChat(messages, model: rawModel, token: token);
       case 'claude':
         return anthropic.generateChat(messages, model: rawModel, token: token);
-      case 'github':
-        return github.generateChat(messages, model: rawModel, token: token);
       case 'copilot':
         return copilot.generateChat(messages, model: rawModel, token: token);
       case 'ollama-cloud':
@@ -1305,7 +1290,6 @@ class ChatController extends ChangeNotifier {
   static String _prettyProviderLabel(String provider) => switch (provider) {
     'gemini' => 'Gemini',
     'claude' => 'Claude',
-    'github' => 'GitHub Models',
     'copilot' => 'GitHub Copilot',
     'ollama-cloud' => 'Ollama Cloud',
     _ => 'Ollama',
@@ -1336,8 +1320,6 @@ class ChatController extends ChangeNotifier {
       case 'claude':
         return true;
       case 'gemini':
-        return true;
-      case 'github':
         return true;
       case 'copilot':
         return true;
@@ -1374,7 +1356,6 @@ class ChatController extends ChangeNotifier {
     final providerName = switch (provider) {
       'gemini' => 'Gemini',
       'claude' => 'Claude',
-      'github' => 'GitHub Models',
       'copilot' => 'GitHub Copilot',
       // `ollama` and `ollama-cloud` are both gated by the single
       // 'Ollama' provider toggle — the namespace split is purely
@@ -1399,15 +1380,6 @@ class ChatController extends ChangeNotifier {
         return;
       case 'claude':
         yield* anthropic.generateChatStream(
-          messages,
-          model: rawModel,
-          token: token,
-          effort: effort,
-          nativeToolIds: nativeToolIds,
-        );
-        return;
-      case 'github':
-        yield* github.generateChatStream(
           messages,
           model: rawModel,
           token: token,
@@ -1461,8 +1433,6 @@ class ChatController extends ChangeNotifier {
         return gemini.summarizeTitle(firstMessage, model: rawModel);
       case 'claude':
         return anthropic.summarizeTitle(firstMessage, model: rawModel);
-      case 'github':
-        return github.summarizeTitle(firstMessage, model: rawModel);
       case 'copilot':
         return copilot.summarizeTitle(firstMessage, model: rawModel);
       case 'ollama-cloud':

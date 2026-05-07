@@ -18,9 +18,6 @@ class PreferencesService {
   static const String _kOllamaApiKey = 'ollama.apiKey';
   static const String _kGeminiApiKey = 'gemini.apiKey';
   static const String _kAnthropicApiKey = 'anthropic.apiKey';
-  static const String _kKbAutoSummarizeEnabled = 'kb.autoSummarize.enabled';
-  static const String _kKbAutoSummarizeThresholdChars =
-      'kb.autoSummarize.thresholdChars';
   static const String _kCopilotApiKey = 'copilot.apiKey';
   static const String _kCopilotUseLoggedInUser = 'copilot.useLoggedInUser';
   static const String _kCopilotUnavailableModels = 'copilot.unavailableModels';
@@ -82,30 +79,6 @@ class PreferencesService {
       'editor.themeMigratedToNord';
   static const String _kEditorThemeMigratedToLumenMidnight =
       'editor.themeMigratedToLumenMidnight';
-  static const String _kSyncthingEnabled = 'syncthing.enabled';
-  static const String _kSyncthingEndpoint = 'syncthing.endpoint';
-  static const String _kSyncthingApiKey = 'syncthing.apiKey';
-  static const String _kSyncthingAutoShare = 'syncthing.autoShareProjects';
-  // Per-receiver behaviour toggles. All default to safe values:
-  //   autoAcceptRemote = false  — no silent folder creation on this PC
-  //   ignorePerms      = true   — code projects on Windows hate +x diffs
-  //   versioningPreset = staggered — recommended retention for code
-  //   defaultLandingPath = ~/Lumen-Sync — base for any folders Syncthing
-  //     does end up auto-creating; explicitly override the upstream `~`
-  //     so files never land inside Syncthing's data directory.
-  //   defaultIgnoresWritten = false — one-shot guard so we only seed the
-  //     server-side default ignore patterns once per install.
-  //   writeStignore = true — drop the Lumen .stignore on first share
-  static const String _kSyncthingAutoAcceptRemote =
-      'syncthing.autoAcceptRemote';
-  static const String _kSyncthingIgnorePerms = 'syncthing.ignorePerms';
-  static const String _kSyncthingVersioningPreset =
-      'syncthing.versioningPreset';
-  static const String _kSyncthingDefaultLandingPath =
-      'syncthing.defaultLandingPath';
-  static const String _kSyncthingDefaultIgnoresWritten =
-      'syncthing.defaultIgnoresWritten';
-  static const String _kSyncthingWriteStignore = 'syncthing.writeStignore';
   // Remote Access — opt-in HTTP server that lets paired devices talk to
   // this Lumen instance over LAN / Tailscale. Off by default on every
   // install; enabling brings up `LumenServer` (see
@@ -178,9 +151,6 @@ class PreferencesService {
   // installed Node or never want the integration can turn it off and
   // forget about it.
   static const String _kGitNexusEnabled = 'gitnexus.enabled';
-  static const String _kGitNexusAutoWiki = 'gitnexus.autoWiki';
-  static const String _kGitNexusWikiModel = 'gitnexus.wikiModel';
-
   // Per-workspace one-shot flag: has the empty-editor duck mischief gag
   // played for this project yet? On the first visit it plays in full
   // (smaller duck waddles in along the bottom, jumps to "throw" the
@@ -199,10 +169,16 @@ class PreferencesService {
   Future<void> setProvider(String v) async =>
       (await _p).setString(_kProvider, v);
 
-  Future<List<String>> getEnabledProviders() async =>
-      (await _p).getStringList(_kEnabledProviders) ?? ['Ollama'];
+  Future<List<String>> getEnabledProviders() async {
+    final raw = (await _p).getStringList(_kEnabledProviders) ?? ['Ollama'];
+    // Migration shim: GitHub Models was removed.
+    return raw.where((p) => p != 'GitHub Models').toList();
+  }
   Future<void> setEnabledProviders(List<String> v) async =>
-      (await _p).setStringList(_kEnabledProviders, v);
+      (await _p).setStringList(
+        _kEnabledProviders,
+        v.where((p) => p != 'GitHub Models').toList(),
+      );
 
   Future<String> getEndpoint() async =>
       (await _p).getString(_kEndpoint) ?? 'http://localhost:11434';
@@ -304,7 +280,7 @@ class PreferencesService {
   /// knowledgebase when it grows past Knowledge Smith's threshold.
   /// Default ON — users opt out from the Knowledge Base settings tab.
   Future<bool> getKnowledgebaseAutoSummarize() async =>
-      (await _p).getBool(_kKnowledgebaseAutoSummarize) ?? true;
+      (await _p).getBool(_kKnowledgebaseAutoSummarize) ?? false;
   Future<void> setKnowledgebaseAutoSummarize(bool v) async =>
       (await _p).setBool(_kKnowledgebaseAutoSummarize, v);
 
@@ -455,10 +431,14 @@ class PreferencesService {
   /// Restore the previously-selected chat model. Returns empty when
   /// never set — caller should fall through to its own default
   /// (typically `_availableModels.first`).
-  Future<String> getSelectedModel() async =>
-      (await _p).getString(_kSelectedModel) ?? '';
+  Future<String> getSelectedModel() async {
+    final raw = (await _p).getString(_kSelectedModel) ?? '';
+    // Migration shim: GitHub Models was removed; null out legacy refs.
+    if (raw.startsWith('github:')) return '';
+    return raw;
+  }
   Future<void> setSelectedModel(String v) async =>
-      (await _p).setString(_kSelectedModel, v);
+      (await _p).setString(_kSelectedModel, v.startsWith('github:') ? '' : v);
 
   /// IDs of the chat sessions the user currently has open as tabs.
   /// Persisted via `setStringList` so order is preserved (browser-tab-style:
@@ -634,79 +614,6 @@ class PreferencesService {
       (await _p).getBool(_kGitNexusEnabled) ?? true;
   Future<void> setGitNexusEnabled(bool v) async =>
       (await _p).setBool(_kGitNexusEnabled, v);
-
-  Future<bool> getGitNexusAutoWiki() async =>
-      (await _p).getBool(_kGitNexusAutoWiki) ?? false;
-  Future<void> setGitNexusAutoWiki(bool v) async =>
-      (await _p).setBool(_kGitNexusAutoWiki, v);
-
-  Future<String> getGitNexusWikiModel() async =>
-      (await _p).getString(_kGitNexusWikiModel) ?? '';
-  Future<void> setGitNexusWikiModel(String v) async =>
-      (await _p).setString(_kGitNexusWikiModel, v.trim());
-
-  // --- Syncthing ---
-  Future<bool> getSyncthingEnabled() async =>
-      (await _p).getBool(_kSyncthingEnabled) ?? false;
-  Future<void> setSyncthingEnabled(bool v) async =>
-      (await _p).setBool(_kSyncthingEnabled, v);
-
-  Future<String> getSyncthingEndpoint() async =>
-      (await _p).getString(_kSyncthingEndpoint) ?? 'http://localhost:8384';
-  Future<void> setSyncthingEndpoint(String v) async =>
-      (await _p).setString(_kSyncthingEndpoint, v);
-
-  Future<String> getSyncthingApiKey() async =>
-      (await _p).getString(_kSyncthingApiKey) ?? '';
-  Future<void> setSyncthingApiKey(String v) async =>
-      (await _p).setString(_kSyncthingApiKey, v);
-
-  Future<bool> getSyncthingAutoShare() async =>
-      (await _p).getBool(_kSyncthingAutoShare) ?? true;
-  Future<void> setSyncthingAutoShare(bool v) async =>
-      (await _p).setBool(_kSyncthingAutoShare, v);
-
-  /// Whether Lumen should flip `autoAcceptFolders=true` on every remote
-  /// device. Off by default — explicit accept (via the pending-folders
-  /// panel) is the safe path.
-  Future<bool> getSyncthingAutoAcceptRemote() async =>
-      (await _p).getBool(_kSyncthingAutoAcceptRemote) ?? false;
-  Future<void> setSyncthingAutoAcceptRemote(bool v) async =>
-      (await _p).setBool(_kSyncthingAutoAcceptRemote, v);
-
-  Future<bool> getSyncthingIgnorePerms() async =>
-      (await _p).getBool(_kSyncthingIgnorePerms) ?? true;
-  Future<void> setSyncthingIgnorePerms(bool v) async =>
-      (await _p).setBool(_kSyncthingIgnorePerms, v);
-
-  /// One of: `none | trashcan | simple | staggered`. Default
-  /// `staggered` (recommended for code projects).
-  Future<String> getSyncthingVersioningPreset() async =>
-      (await _p).getString(_kSyncthingVersioningPreset) ?? 'staggered';
-  Future<void> setSyncthingVersioningPreset(String v) async =>
-      (await _p).setString(_kSyncthingVersioningPreset, v);
-
-  /// Base path for any folders Syncthing auto-accepts on this PC.
-  /// Defaults to `~/Lumen-Sync`. Pushed to Syncthing's
-  /// `defaults.folder.path` whenever the integration is enabled.
-  Future<String> getSyncthingDefaultLandingPath() async =>
-      (await _p).getString(_kSyncthingDefaultLandingPath) ?? '~/Lumen-Sync';
-  Future<void> setSyncthingDefaultLandingPath(String v) async =>
-      (await _p).setString(_kSyncthingDefaultLandingPath, v);
-
-  /// One-shot guard so the server-side `defaults/ignores` only get seeded
-  /// once. After the first push the user owns them in Syncthing's GUI.
-  Future<bool> getSyncthingDefaultIgnoresWritten() async =>
-      (await _p).getBool(_kSyncthingDefaultIgnoresWritten) ?? false;
-  Future<void> setSyncthingDefaultIgnoresWritten(bool v) async =>
-      (await _p).setBool(_kSyncthingDefaultIgnoresWritten, v);
-
-  /// Whether to drop the Lumen `.stignore` template into newly-shared
-  /// folders that don't already have one.
-  Future<bool> getSyncthingWriteStignore() async =>
-      (await _p).getBool(_kSyncthingWriteStignore) ?? true;
-  Future<void> setSyncthingWriteStignore(bool v) async =>
-      (await _p).setBool(_kSyncthingWriteStignore, v);
 
   // --- Remote Access (Lumen mobile companion) ---
   /// Master switch for the embedded HTTP server. Off by default —

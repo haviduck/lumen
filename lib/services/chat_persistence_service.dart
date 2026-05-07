@@ -107,21 +107,27 @@ class ChatSession {
       'historySummaryDropped': cachedHistorySummaryDroppedCount,
   };
 
-  factory ChatSession.fromJson(Map<String, dynamic> j) => ChatSession(
-    id: j['id'] as String,
-    title: (j['title'] ?? 'Untitled') as String,
-    createdAt: DateTime.parse(j['createdAt'] as String),
-    updatedAt: DateTime.parse(j['updatedAt'] as String),
-    workspacePath: j['workspacePath'] as String?,
-    model: j['model'] as String?,
-    reasoningEffort: reasoningEffortFromId(j['reasoningEffort'] as String?),
-    messages: ((j['messages'] as List?) ?? const [])
-        .map((e) => PersistedMessage.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    cachedHistorySummary: j['historySummary'] as String?,
-    cachedHistorySummaryDroppedCount: (j['historySummaryDropped'] as num?)
-        ?.toInt(),
-  );
+  factory ChatSession.fromJson(Map<String, dynamic> j) {
+    var rawModel = j['model'] as String?;
+    if (rawModel != null && rawModel.startsWith('github:')) {
+      rawModel = null;
+    }
+    return ChatSession(
+      id: j['id'] as String,
+      title: (j['title'] ?? 'Untitled') as String,
+      createdAt: DateTime.parse(j['createdAt'] as String),
+      updatedAt: DateTime.parse(j['updatedAt'] as String),
+      workspacePath: j['workspacePath'] as String?,
+      model: rawModel,
+      reasoningEffort: reasoningEffortFromId(j['reasoningEffort'] as String?),
+      messages: ((j['messages'] as List?) ?? const [])
+          .map((e) => PersistedMessage.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      cachedHistorySummary: j['historySummary'] as String?,
+      cachedHistorySummaryDroppedCount: (j['historySummaryDropped'] as num?)
+          ?.toInt(),
+    );
+  }
 }
 
 class PersistedMessage {

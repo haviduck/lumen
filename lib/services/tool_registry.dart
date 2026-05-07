@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'agent_terminal_bridge.dart';
+import 'kb_service.dart';
 import 'ollama_service.dart' show CancellationToken;
 import 'ripgrep_provisioner.dart';
 
@@ -582,6 +583,9 @@ class ToolRegistry {
           }
           await f.parent.create(recursive: true);
           await f.writeAsString(content);
+          await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           // Whole-file line range — `lines 1-N`. Useful for overwrite
           // (the chip jumps to top of the rewritten file); for fresh
           // files `1-N` is mostly cosmetic but keeps the chip
@@ -738,6 +742,9 @@ class ToolRegistry {
                 'and try again.';
           }
           await f.writeAsString(result);
+          await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           return 'EDIT_FILE $fileName: Success (1 replacement made, $lineHint)';
         } catch (e) {
           return 'EDIT_FILE $fileName: Error: $e';
@@ -858,6 +865,9 @@ class ToolRegistry {
                 'change content.';
           }
           await f.writeAsString(content);
+          await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           // Build the line hint. Single-edit case mirrors EDIT_FILE
           // ("lines 42"); multi-edit reports the first match line as
           // the click target (`lines 42`) and lists the rest in the
@@ -1028,6 +1038,9 @@ class ToolRegistry {
                 'again.';
           }
           await f.writeAsString(restored);
+          await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           final auditOld = _formatRangeAudit(
             startLine: start,
             content: removed,
@@ -1118,6 +1131,9 @@ class ToolRegistry {
             }
           }
           await f.writeAsString(toWrite, mode: FileMode.append);
+          await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           final appendedLines = '\n'.allMatches(content).length + 1;
           final firstNew = existingLines + 1;
           final lastNew = existingLines + appendedLines;

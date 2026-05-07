@@ -236,6 +236,9 @@ class CouncilAgent {
   };
 
   static CouncilAgent fromJson(Map<String, dynamic> json) {
+    var model = json['model'] as String? ?? '';
+    // Migration shim: GitHub Models was removed; null out legacy refs.
+    if (model.startsWith('github:')) model = '';
     return CouncilAgent(
       id: json['id'] as String? ?? '',
       name: json['name'] as String? ?? '',
@@ -243,7 +246,7 @@ class CouncilAgent {
           _enumByName(RolePreset.values, json['role'] as String?) ??
           RolePreset.custom,
       customRole: json['customRole'] as String? ?? '',
-      model: json['model'] as String? ?? '',
+      model: model,
       enabledTools: ((json['enabledTools'] as List?) ?? const [])
           .whereType<String>()
           .toSet(),

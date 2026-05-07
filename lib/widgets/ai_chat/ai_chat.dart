@@ -1665,7 +1665,6 @@ class _ModelSelectionPanelState extends State<_ModelSelectionPanel> {
       'ollama-cloud',
       'gemini',
       'claude',
-      'github',
       'copilot',
       'openai',
     ];
@@ -1929,7 +1928,6 @@ String _prettyProvider(String provider) {
     'ollama-cloud' => S.providerOllamaCloud,
     'gemini' => S.providerGemini,
     'claude' => S.providerClaude,
-    'github' => S.providerGithub,
     'copilot' => S.providerCopilot,
     'openai' => S.providerOpenAI,
     _ => provider,
