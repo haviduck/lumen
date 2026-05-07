@@ -8,8 +8,6 @@ import '../services/window_chrome.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import 'common/ambient_background.dart';
-import 'common/duck_toast.dart';
-import 'gitnexus_dialog.dart';
 import 'llm_providers_setup_dialog.dart';
 import 'ollama_cloud_key_prompt_dialog.dart';
 import 'ollama_setup_dialog.dart';
@@ -25,15 +23,12 @@ class WelcomeScreen extends StatelessWidget {
     final state = context.read<AppState>();
     final isNewProject = await state.setDirectory(dir);
     if (!navigator.mounted) return;
-    // First-time-opened folders go through the same wizard the
-    // "Create new project" flow uses — skills + GitNexus + Syncthing.
-    // Each step is skippable so the user can bail at any point.
-    // Already-known projects skip straight to the (idempotent)
-    // Syncthing prompt only.
+    // First-time-opened folders run the trimmed onboarding wizard
+    // (Ollama → cloud key → providers → skills). GitNexus and
+    // Syncthing wizard steps were retired — GitNexus stays available
+    // via the gitnexus tools/CLI, Syncthing via Settings → Sync.
     if (isNewProject) {
       await _runNewProjectWizard(navigator.context, state, dir);
-    } else if (navigator.mounted) {
-      await _promptSyncthingIfNeeded(navigator.context, state, dir);
     }
   }
 
@@ -59,20 +54,18 @@ class WelcomeScreen extends StatelessWidget {
   ///      Models, OpenAI) so the rest of the wizard (skill
   ///      generator) actually has an LLM to call.
   ///   4. **Skill generator** — asks an LLM to bootstrap
-  ///      `.lumen/tools/` and `.lumen/skills/` for this project.
-  ///      When an Ollama Cloud key is set (from any source — pasted
-  ///      in step 2, in step 3, or pre-existing) the generator
-  ///      forces a frontier cloud model regardless of the user's
-  ///      currently selected chat model. See `pickSkillModel` in
+  ///      `.agents/tools/` and `.agents/skills/` for this project.
+  ///      When an Ollama Cloud key is set the generator forces a
+  ///      frontier cloud model regardless of the user's currently
+  ///      selected chat model. See `pickSkillModel` in
   ///      `services/skill_model_picker.dart`.
-  ///   5. **GitNexus** — `npx gitnexus analyze` the workspace.
-  ///   6. **Syncthing** — share with already-paired devices.
   ///
   /// Steps 1, 2, and 3 only fire when `_isLumenFirstRun` returns
   /// true so repeat users (who already have at least one provider
-  /// working) don't get nagged on every new project. Steps 4-6
-  /// always offer — they're per-workspace concerns, not
-  /// per-installation ones.
+  /// working) don't get nagged on every new project. Step 4 always
+  /// offers — it's a per-workspace concern, not a per-installation
+  /// one. The previous GitNexus and Syncthing wizard steps were
+  /// removed; both features remain available outside the wizard.
   ///
   /// **Why a dedicated Ollama Cloud step instead of folding it into
   /// the LLM providers grid.** The full LLM providers dialog is a
@@ -108,12 +101,6 @@ class WelcomeScreen extends StatelessWidget {
     if (context.mounted) {
       await showSkillGeneratorDialog(context, workspacePath: path);
     }
-    if (context.mounted && state.gitnexusEnabled) {
-      await showGitNexusOnboardingDialog(context, workspacePath: path);
-    }
-    if (context.mounted) {
-      await _promptSyncthingIfNeeded(context, state, path);
-    }
   }
 
   /// Heuristic for "is this the user's first time using Lumen?". We
@@ -126,7 +113,6 @@ class WelcomeScreen extends StatelessWidget {
   Future<bool> _isLumenFirstRun(AppState state) async {
     final hasAnyKey = state.geminiApiKey.isNotEmpty ||
         state.anthropicApiKey.isNotEmpty ||
-        state.githubModelsApiKey.isNotEmpty ||
         state.openaiApiKey.isNotEmpty ||
         // An Ollama Cloud key is just as much "the user has configured
         // a provider" as any other key — treat it the same so cloud-
@@ -522,50 +508,5 @@ class _RecentRowState extends State<_RecentRow> {
   }
 }
 
-/// Shows a one-time prompt asking if the user wants to share this project
-/// with Syncthing. Only fires when Syncthing is enabled, auto-share is OFF,
-/// and the folder isn't already registered.
-Future<void> _promptSyncthingIfNeeded(
-  BuildContext context,
-  AppState state,
-  String path,
-) async {
-  final shouldPrompt = await state.shouldPromptSyncthingShare(path);
-  if (!shouldPrompt || !context.mounted) return;
-
-  final accepted = await showDialog<bool>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: DuckColors.bgRaised,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        side: const BorderSide(color: DuckColors.border, width: 0.5),
-      ),
-      title: const Text(
-        S.syncthingPromptTitle,
-        style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-      ),
-      content: const Text(
-        S.syncthingPromptBody,
-        style: TextStyle(fontSize: 12.5, color: DuckColors.fgMuted),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, false),
-          child: const Text(S.syncthingPromptCancel),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, true),
-          child: const Text(S.syncthingPromptShare),
-        ),
-      ],
-    ),
-  );
-
-  if (accepted == true) {
-    state.syncthingShareManually(path);
-    if (context.mounted) {
-      showDuckToast(context, S.syncthingSharedToast);
-    }
-  }
-}
+// `_promptSyncthingIfNeeded` was removed when the project wizard's
+// Syncthing step retired. Sharing is configured via Settings → Sync.

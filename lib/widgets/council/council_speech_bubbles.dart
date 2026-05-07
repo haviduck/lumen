@@ -90,11 +90,16 @@ class _Bubble {
 class CouncilSpeechBubblesLayer extends StatefulWidget {
   final CouncilSession session;
   final CouncilStageAnchors anchors;
+  /// When true, the final evaluator's output is being rendered on the
+  /// LeftBlackboard panel; suppress chunk + done bubbles for the
+  /// evaluator so it doesn't double-render in chat-style overlays.
+  final bool evaluatorOnBlackboard;
 
   const CouncilSpeechBubblesLayer({
     super.key,
     required this.session,
     required this.anchors,
+    this.evaluatorOnBlackboard = false,
   });
 
   @override
@@ -194,9 +199,15 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     }
   }
 
+  bool _isEvaluatorMuted(String agentId) {
+    if (!widget.evaluatorOnBlackboard) return false;
+    return agentId == widget.session.config.finalEvaluator.id;
+  }
+
   void _handleEvent(CouncilEvent e) {
     switch (e.type) {
       case CouncilEventType.agentChunk:
+        if (_isEvaluatorMuted(e.fromAgentId)) break;
         _accumulateChunk(e.fromAgentId, e.message);
         break;
       case CouncilEventType.askedPool:
@@ -237,6 +248,7 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
         break;
       case CouncilEventType.agentDone:
       case CouncilEventType.evaluatorDone:
+        if (_isEvaluatorMuted(e.fromAgentId)) break;
         _flushChunkBuffer(e.fromAgentId);
         if (!(_agentSawChunks[e.fromAgentId] ?? false) &&
             e.message.trim().isNotEmpty) {

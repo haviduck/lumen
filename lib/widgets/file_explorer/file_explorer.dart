@@ -13,7 +13,6 @@ import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
 import '../../providers/media_controller.dart';
 import '../../providers/ssh_controller.dart';
-import '../../services/gitnexus_service.dart';
 import '../../services/gitignore_matcher.dart';
 import '../../services/timeline_models.dart';
 import '../../theme/app_colors.dart';
@@ -1998,19 +1997,19 @@ class _ExplorerActivityBar extends StatelessWidget {
         tooltip: S.timelineMenuTooltip,
         onTap: onTimeline,
       ),
-      // SSH host fast-menu — sits next to GitNexus rather than
-      // replacing it (the user explicitly asked to keep both). Tap
-      // opens an anchored host-picker dropdown; a mint dot under
-      // the icon indicates at least one live session. The button
-      // shows the picker itself (NOT routed through `onSsh`) so
-      // the dropdown anchors to this specific tile's RenderBox.
+      // SSH host fast-menu. Tap opens an anchored host-picker
+      // dropdown; a mint dot under the icon indicates at least one
+      // live session. The button shows the picker itself (NOT routed
+      // through `onSsh`) so the dropdown anchors to this specific
+      // tile's RenderBox.
       const _SshActivityButton(),
-      // Watch the master switch here at construction time so when the
-      // user disables GitNexus we don't leave a dangling separator
-      // hairline pointing at empty space (the row's seam-between-tiles
-      // pattern doesn't know about a self-hidden tile).
-      if (context.select<AppState, bool>((s) => s.gitnexusEnabled))
-        const _GitNexusStatusButton(),
+      // Knowledge Base — opens the workspace knowledgebase as an
+      // editor tab (markdown editor + preview + "Summarize"). This
+      // slot used to host the GitNexus status icon; the user removed
+      // GitNexus from the surfaced integrations so the KB now owns
+      // the slot. Always-on (not gated): the KB exists for every
+      // workspace, even before the file is created.
+      const _KnowledgeBaseButton(),
     ];
 
     return Container(
@@ -2091,268 +2090,31 @@ class _SshActivityButton extends StatelessWidget {
   }
 }
 
-class _GitNexusStatusButton extends StatefulWidget {
-  const _GitNexusStatusButton();
-
-  @override
-  State<_GitNexusStatusButton> createState() => _GitNexusStatusButtonState();
-}
-
-class _GitNexusStatusButtonState extends State<_GitNexusStatusButton> {
-  final GlobalKey _key = GlobalKey();
-  bool _hover = false;
+/// Activity-bar tile for the workspace knowledgebase. Replaces the
+/// pre-1.0.8 GitNexus status icon — single tap opens the
+/// `KnowledgeBaseView` as an editor tab. Always visible (no master
+/// switch): every workspace has a knowledgebase, even before the
+/// markdown file is created.
+class _KnowledgeBaseButton extends StatelessWidget {
+  const _KnowledgeBaseButton();
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
-        // Master switch off → no GitNexus icon at all. We deliberately
-        // collapse the slot rather than render a "disabled" icon to
-        // honour the user's "I don't want to see this integration"
-        // intent. The activity-bar `Row` already handles missing
-        // tiles via its mainAxisAlignment.spaceEvenly layout, so
-        // shrinking to zero is safe.
-        if (!state.gitnexusEnabled) return const SizedBox.shrink();
-        final service = state.gitnexus;
-        final color = _statusColor(service.status, _hover);
-        // A running daemon (serve / mcp) deserves a distinct
-        // affordance from "indexed and idle". Each daemon's bottom-
-        // right dot is positioned independently so both can show at
-        // once when the user has both daemons up. Colour map:
-        //   - serve dot → mint  (HTTP server, "data flowing")
-        //   - mcp dot   → purple ("AI host integration")
-        final daemonDots = <Widget>[];
-        if (service.serveRunning) {
-          daemonDots.add(
-            const Positioned(
-              right: 4,
-              bottom: 3,
-              child: _DaemonDot(color: DuckColors.accentMint),
-            ),
-          );
-        }
-        if (service.mcpRunning) {
-          daemonDots.add(
-            const Positioned(
-              right: 4,
-              top: 3,
-              child: _DaemonDot(color: DuckColors.accentPurple),
-            ),
-          );
-        }
-        return Tooltip(
-          message: _tooltipFor(service),
-          child: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            onEnter: (_) => setState(() => _hover = true),
-            onExit: (_) => setState(() => _hover = false),
-            child: GestureDetector(
-              key: _key,
-              onTap: () => _showMenu(context, service),
-              child: AnimatedContainer(
-                duration: DuckMotion.fast,
-                curve: DuckMotion.standard,
-                margin: const EdgeInsets.symmetric(horizontal: 1),
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-                decoration: BoxDecoration(
-                  color: _hover
-                      ? DuckColors.bgRaisedHi.withValues(alpha: 0.62)
-                      : Colors.transparent,
-                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                ),
-                child: Stack(
-                  clipBehavior: Clip.none,
-                  alignment: Alignment.center,
-                  children: [
-                    // While the analyze indexer is running, render a
-                    // tiny progress ring instead of the static icon.
-                    // Same outer footprint so the activity-bar layout
-                    // doesn't shift mid-run.
-                    if (service.isRunning)
-                      const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 1.6,
-                          color: DuckColors.accentCyan,
-                        ),
-                      )
-                    else
-                      Icon(Icons.account_tree_outlined, size: 16, color: color),
-                    ...daemonDots,
-                  ],
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  /// Tooltip composes status + active daemons so a glance reveals
-  /// the full state without opening the menu. Adopted serve renders
-  /// with a "(shared)" suffix so the user knows it's machine-wide
-  /// without having to open Settings.
-  String _tooltipFor(GitNexusService service) {
-    final parts = <String>[S.gitnexusTitle, _statusLabel(service.status)];
-    if (service.serveRunning) {
-      parts.add(
-        service.serveAdopted
-            ? S.gitnexusServeRunningOnAdopted(service.servePort)
-            : S.gitnexusServeRunningOn(service.servePort),
-      );
-    }
-    if (service.mcpRunning) {
-      parts.add(S.gitnexusMcpRunningTooltip);
-    }
-    return parts.join(' · ');
-  }
-
-  Future<void> _showMenu(BuildContext context, GitNexusService service) async {
-    final box = _key.currentContext?.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
-    final pos = box.localToGlobal(
-      Offset(0, box.size.height),
-      ancestor: overlay,
-    );
-    final picked = await showFastMenu<String>(
-      context: context,
-      position: RelativeRect.fromLTRB(
-        pos.dx - 160,
-        pos.dy + 4,
-        overlay.size.width - pos.dx - box.size.width,
-        0,
-      ),
-      items: [
-        PopupMenuItem<String>(
-          enabled: false,
-          child: Text(
-            _statusLabel(service.status),
-            style: const TextStyle(fontSize: 11, color: DuckColors.fgMuted),
-          ),
-        ),
-        const PopupMenuDivider(),
-        if (service.isRunning)
-          const PopupMenuItem<String>(
-            value: 'stop',
-            child: Text(S.gitnexusStop),
-          )
-        else ...[
-          const PopupMenuItem<String>(
-            value: 'analyze',
-            child: Text(S.gitnexusAnalyzeNow),
-          ),
-          const PopupMenuItem<String>(
-            value: 'reanalyze',
-            child: Text(S.gitnexusReanalyze),
-          ),
-        ],
-        const PopupMenuDivider(),
-        // Toggle for the machine-wide serve daemon. When the running
-        // instance was started by another window (adopted), the
-        // label spells out that stopping it affects every Lumen
-        // window — no surprise side-effects from a one-click action.
-        // The mcp toggle intentionally lives only in Settings now:
-        // it's per-window stdio that almost no one needs because AI
-        // hosts spawn their own.
-        PopupMenuItem<String>(
-          value: 'toggle-serve',
-          child: Row(
-            children: [
-              const _DaemonDot(color: DuckColors.accentMint),
-              const SizedBox(width: 8),
-              Text(
-                !service.serveRunning
-                    ? S.gitnexusServeStart
-                    : service.serveAdopted
-                    ? S.gitnexusServeStopMachineWide
-                    : S.gitnexusServeStop,
-              ),
-            ],
-          ),
-        ),
-        const PopupMenuDivider(),
-        const PopupMenuItem<String>(
-          value: 'settings',
-          child: Text(S.gitnexusOpenSettings),
-        ),
-      ],
-    );
-    if (!context.mounted || picked == null) return;
-    switch (picked) {
-      case 'stop':
-        await service.stop();
-        break;
-      case 'analyze':
-        await service.analyze();
-        break;
-      case 'reanalyze':
-        await service.analyze(force: true);
-        break;
-      case 'toggle-serve':
-        await service.setServeRunning(!service.serveRunning);
-        break;
-      case 'settings':
-        context.read<AppState>().openSettingsTab(category: 'gitnexus');
-        break;
-    }
-  }
-
-  Color _statusColor(GitNexusStatus status, bool hover) {
-    // `running` used to share `stateWarn` (#EBCB8B) with `indexed`'s
-    // `accentDuck`, which is the same hex value — the user couldn't
-    // tell mid-run from idle-and-indexed at a glance. The active
-    // running state is now drawn as a `CircularProgressIndicator`
-    // upstream (so the colour here is unused on `running`, but kept
-    // for completeness in case the icon falls back). Indexed stays
-    // gold so the steady-state remains the brand colour the user
-    // recognises.
-    return switch (status) {
-      GitNexusStatus.indexed => DuckColors.accentDuck,
-      GitNexusStatus.running => DuckColors.accentCyan,
-      GitNexusStatus.failed => DuckColors.stateError,
-      GitNexusStatus.noNode => DuckColors.stateWarn,
-      GitNexusStatus.notIndexed =>
-        hover ? DuckColors.fgPrimary : DuckColors.fgMuted,
-      GitNexusStatus.noWorkspace =>
-        hover ? DuckColors.fgPrimary : DuckColors.fgMuted,
-    };
-  }
-
-  String _statusLabel(GitNexusStatus status) {
-    return switch (status) {
-      GitNexusStatus.noWorkspace => S.gitnexusStatusNoWorkspace,
-      GitNexusStatus.noNode => S.gitnexusStatusNoNode,
-      GitNexusStatus.notIndexed => S.gitnexusStatusNotIndexed,
-      GitNexusStatus.indexed => S.gitnexusStatusIndexed,
-      GitNexusStatus.running => S.gitnexusStatusRunning,
-      GitNexusStatus.failed => S.gitnexusStatusFailed,
-    };
-  }
-}
-
-/// Tiny circular pip rendered over the GitNexus icon to signal an
-/// active background daemon (serve / mcp). 6×6 with a 1px outline so
-/// it reads against either dark or hover-lifted chrome backgrounds.
-class _DaemonDot extends StatelessWidget {
-  final Color color;
-  const _DaemonDot({required this.color});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 6,
-      height: 6,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-        border: Border.all(color: DuckColors.bgDeeper, width: 1),
-      ),
+    return BrightIconButton(
+      icon: Icons.menu_book_outlined,
+      tooltip: 'Knowledgebase',
+      onTap: () => context.read<AppState>().openKnowledgeBaseTab(),
     );
   }
 }
+
+// Pre-1.0.8: a `_GitNexusStatusButton` and its `_DaemonDot` helper
+// lived in this slot. They were deleted when the GitNexus integration
+// was retired from the file-explorer activity bar — the slot now hosts
+// `_KnowledgeBaseButton` above. The deletion is local to this file;
+// `gitnexus_service.dart` itself is removed by Copilot Onboarder.
+
+
 
 /// Workspace-root header. The whole row is tappable — clicking toggles the
 /// tree collapse/expand exactly like a real folder row. New-file / new-folder

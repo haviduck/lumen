@@ -54,6 +54,11 @@ class AppState extends ChangeNotifier {
   /// open a code editor.
   static const String processManagerSentinel = '__process_manager__';
 
+  /// Sentinel file path for the Knowledge Base virtual tab. Routes
+  /// to `KnowledgeBaseView` (markdown editor + preview + summarize
+  /// header). Closed-set sentinel — exact-match only, never prefix.
+  static const String knowledgeBaseSentinel = '__knowledge_base__';
+
   /// Prefix for untitled (unsaved) tabs created with Ctrl+T.
   static const String untitledPrefix = '__untitled__';
 
@@ -63,6 +68,23 @@ class AppState extends ChangeNotifier {
   /// Returns `true` when the given path is the process manager sentinel.
   static bool isProcessManagerTab(String? path) =>
       path == processManagerSentinel;
+
+  /// Returns `true` when the given path is the knowledge base sentinel.
+  static bool isKnowledgeBaseTab(String? path) =>
+      path == knowledgeBaseSentinel;
+
+  /// All sentinel paths that should be excluded from real-file
+  /// behaviours (filesystem watching, dirty-on-disk diffs, line-ref
+  /// chips, accept/revoke decoration overlays). Closed enum — keep
+  /// in sync when adding a new sentinel.
+  static const Set<String> sentinelPaths = {
+    settingsSentinel,
+    processManagerSentinel,
+    knowledgeBaseSentinel,
+  };
+
+  static bool isSentinelPath(String? path) =>
+      path != null && sentinelPaths.contains(path);
 
   /// Returns `true` when the given path is an untitled (unsaved) tab.
   static bool isUntitledTab(String? path) =>
@@ -290,6 +312,8 @@ class AppState extends ChangeNotifier {
   bool _historySummaryEnabled = false;
   int _historySummaryMaxChars = 1200;
   int _historySummaryRefreshDelta = 10;
+  bool _knowledgebaseAutoSummarize = true;
+  int _knowledgebaseAutoSummarizeThresholdChars = 12000;
 
   // Editor settings
   // Default to `lumen-midnight` — bespoke theme tuned to the IDE chrome
@@ -379,6 +403,9 @@ class AppState extends ChangeNotifier {
   bool get historySummaryEnabled => _historySummaryEnabled;
   int get historySummaryMaxChars => _historySummaryMaxChars;
   int get historySummaryRefreshDelta => _historySummaryRefreshDelta;
+  bool get knowledgebaseAutoSummarize => _knowledgebaseAutoSummarize;
+  int get knowledgebaseAutoSummarizeThresholdChars =>
+      _knowledgebaseAutoSummarizeThresholdChars;
   bool isProviderEnabled(String p) => _enabledProviders.contains(p);
 
   String get editorTheme => _editorTheme;
@@ -559,6 +586,9 @@ class AppState extends ChangeNotifier {
     _historySummaryEnabled = await prefs.getHistorySummaryEnabled();
     _historySummaryMaxChars = await prefs.getHistorySummaryMaxChars();
     _historySummaryRefreshDelta = await prefs.getHistorySummaryRefreshDelta();
+    _knowledgebaseAutoSummarize = await prefs.getKnowledgebaseAutoSummarize();
+    _knowledgebaseAutoSummarizeThresholdChars =
+        await prefs.getKnowledgebaseAutoSummarizeThresholdChars();
     _ollamaService.baseUrl = _ollamaEndpoint;
     _ollamaService.apiKey = _ollamaApiKey;
     _geminiService.apiKey = _geminiApiKey;
@@ -739,6 +769,38 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setKnowledgebaseAutoSummarize(bool v) async {
+    _knowledgebaseAutoSummarize = v;
+    await prefs.setKnowledgebaseAutoSummarize(v);
+    notifyListeners();
+  }
+
+  Future<void> setKnowledgebaseAutoSummarizeThresholdChars(int v) async {
+    final safe = v < 2000 ? 12000 : v;
+    _knowledgebaseAutoSummarizeThresholdChars = safe;
+    await prefs.setKnowledgebaseAutoSummarizeThresholdChars(safe);
+    notifyListeners();
+  }
+
+  /// Opens the Knowledge Base viewer as a virtual editor tab. Same
+  /// sentinel pattern as `openSettingsTab` / `openProcessManagerTab`:
+  /// a fake `File` is materialised at [knowledgeBaseSentinel] so the
+  /// editor's tab strip has something to render, and the editor's
+  /// pane router swaps in `KnowledgeBaseView` when the active path
+  /// matches the sentinel. Re-opening focuses the existing tab.
+  void openKnowledgeBaseTab() {
+    final sentinel = File(knowledgeBaseSentinel);
+    if (!_openFiles.any((f) => f.path == knowledgeBaseSentinel)) {
+      _openFiles.add(sentinel);
+      _fileContents[knowledgeBaseSentinel] = '';
+      _savedFileContents[knowledgeBaseSentinel] = '';
+    }
+    _activeFile = _openFiles.firstWhere(
+      (f) => f.path == knowledgeBaseSentinel,
+    );
+    notifyListeners();
+  }
+
   /// Clears the locally-cached set of GitHub Models that previously
   /// returned `400 unavailable_model`. Use this after GitHub rolls out
   /// a model that was previously gated, so it reappears in the picker
@@ -878,16 +940,24 @@ class AppState extends ChangeNotifier {
   }
 
   /// Opens the settings view as a virtual tab in the editor area.
+  /// The Settings tab is always pinned to index 0 (leftmost) in the
+  /// tab strip — if it already exists somewhere else, it gets moved
+  /// back to the leftmost slot so the user always finds it where they
+  /// expect.
   void openSettingsTab({String category = 'general'}) {
     _settingsInitialCategory = category;
     _settingsOpenRevision++;
-    final sentinel = File(settingsSentinel);
-    if (!_openFiles.any((f) => f.path == settingsSentinel)) {
-      _openFiles.add(sentinel);
+    final existingIndex =
+        _openFiles.indexWhere((f) => f.path == settingsSentinel);
+    if (existingIndex < 0) {
+      _openFiles.insert(0, File(settingsSentinel));
       _fileContents[settingsSentinel] = '';
       _savedFileContents[settingsSentinel] = '';
+    } else if (existingIndex != 0) {
+      final f = _openFiles.removeAt(existingIndex);
+      _openFiles.insert(0, f);
     }
-    _activeFile = _openFiles.firstWhere((f) => f.path == settingsSentinel);
+    _activeFile = _openFiles.first;
     notifyListeners();
   }
 
@@ -980,6 +1050,14 @@ class AppState extends ChangeNotifier {
     if (oldIndex < 0 || oldIndex >= _openFiles.length) return;
     if (newIndex > oldIndex) newIndex -= 1;
     if (newIndex < 0 || newIndex >= _openFiles.length) return;
+    // Settings tab is pinned: it can never move out of slot 0, and
+    // nothing else can occupy slot 0 while it is present.
+    final hasSettings = _openFiles.isNotEmpty &&
+        _openFiles.first.path == settingsSentinel;
+    if (hasSettings) {
+      if (oldIndex == 0) return; // can't drag the settings tab
+      if (newIndex == 0) newIndex = 1; // bump anything else past it
+    }
     final f = _openFiles.removeAt(oldIndex);
     _openFiles.insert(newIndex, f);
     notifyListeners();

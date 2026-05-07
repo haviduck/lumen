@@ -18,10 +18,9 @@ class PreferencesService {
   static const String _kOllamaApiKey = 'ollama.apiKey';
   static const String _kGeminiApiKey = 'gemini.apiKey';
   static const String _kAnthropicApiKey = 'anthropic.apiKey';
-  static const String _kGithubModelsApiKey = 'githubModels.apiKey';
-  static const String _kGithubModelsOrg = 'githubModels.organization';
-  static const String _kGithubUnavailableModels =
-      'githubModels.unavailableModels';
+  static const String _kKbAutoSummarizeEnabled = 'kb.autoSummarize.enabled';
+  static const String _kKbAutoSummarizeThresholdChars =
+      'kb.autoSummarize.thresholdChars';
   static const String _kCopilotApiKey = 'copilot.apiKey';
   static const String _kCopilotUseLoggedInUser = 'copilot.useLoggedInUser';
   static const String _kCopilotUnavailableModels = 'copilot.unavailableModels';
@@ -66,6 +65,10 @@ class PreferencesService {
   static const String _kHistorySummaryMaxChars = 'chat.historySummary.maxChars';
   static const String _kHistorySummaryRefreshDelta =
       'chat.historySummary.refreshDelta';
+  static const String _kKnowledgebaseAutoSummarize =
+      'knowledgebase.autoSummarize';
+  static const String _kKnowledgebaseAutoSummarizeThresholdChars =
+      'knowledgebase.autoSummarize.thresholdChars';
   static const String _kTerminalShell = 'terminal.shell';
   static const String _kAutoBackupEnabled = 'autoBackup.enabled';
   static const String _kAutoBackupIntervalMinutes =
@@ -224,20 +227,6 @@ class PreferencesService {
   Future<void> setAnthropicApiKey(String v) async =>
       (await _p).setString(_kAnthropicApiKey, v);
 
-  Future<String> getGithubModelsApiKey() async =>
-      (await _p).getString(_kGithubModelsApiKey) ?? '';
-  Future<void> setGithubModelsApiKey(String v) async =>
-      (await _p).setString(_kGithubModelsApiKey, v);
-
-  Future<String> getGithubModelsOrganization() async =>
-      (await _p).getString(_kGithubModelsOrg) ?? '';
-  Future<void> setGithubModelsOrganization(String v) async =>
-      (await _p).setString(_kGithubModelsOrg, v.trim());
-
-  Future<List<String>> getGithubUnavailableModels() async =>
-      (await _p).getStringList(_kGithubUnavailableModels) ?? const <String>[];
-  Future<void> setGithubUnavailableModels(List<String> v) async =>
-      (await _p).setStringList(_kGithubUnavailableModels, v);
 
   Future<String> getCopilotApiKey() async =>
       (await _p).getString(_kCopilotApiKey) ?? '';
@@ -310,6 +299,32 @@ class PreferencesService {
       (await _p).getInt(_kHistorySummaryRefreshDelta) ?? 10;
   Future<void> setHistorySummaryRefreshDelta(int v) async =>
       (await _p).setInt(_kHistorySummaryRefreshDelta, v);
+
+  /// Whether the agent is allowed to auto-summarize the workspace
+  /// knowledgebase when it grows past Knowledge Smith's threshold.
+  /// Default ON — users opt out from the Knowledge Base settings tab.
+  Future<bool> getKnowledgebaseAutoSummarize() async =>
+      (await _p).getBool(_kKnowledgebaseAutoSummarize) ?? true;
+  Future<void> setKnowledgebaseAutoSummarize(bool v) async =>
+      (await _p).setBool(_kKnowledgebaseAutoSummarize, v);
+
+  /// Character-count threshold for auto-summarize. ~12k chars maps to
+  /// roughly 3000–3400 tokens with markdown-and-code density (4-3.5
+  /// chars/token), which is a sensible ceiling for KB content the
+  /// agent re-reads at the start of every chat. Floor of 2000 keeps a
+  /// pathological "0" or negative value from triggering an infinite
+  /// summarize loop. The UI can offer a slider; the floor is enforced
+  /// here so writers never have to.
+  Future<int> getKnowledgebaseAutoSummarizeThresholdChars() async {
+    final raw =
+        (await _p).getInt(_kKnowledgebaseAutoSummarizeThresholdChars) ?? 12000;
+    return raw < 2000 ? 12000 : raw;
+  }
+
+  Future<void> setKnowledgebaseAutoSummarizeThresholdChars(int v) async {
+    final safe = v < 2000 ? 12000 : v;
+    await (await _p).setInt(_kKnowledgebaseAutoSummarizeThresholdChars, safe);
+  }
 
   /// Skill ids the user has explicitly toggled on. `null` means
   /// "no preference yet — fall back to each skill's defaultEnabled".

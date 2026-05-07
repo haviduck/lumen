@@ -8,6 +8,7 @@ import '../../providers/app_state.dart';
 import '../../services/workspace_skills_service.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import 'skill_import_dialog.dart';
 
 /// Settings panel section that lists `WorkspaceSkill` entries
 /// loaded from `.lumen/skills/` and the global app-support skills
@@ -134,6 +135,27 @@ class _AgentSkillsListState extends State<AgentSkillsList> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                children: [
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: () => SkillImportDialog.show(context),
+                    icon: const Icon(Icons.cloud_download_outlined, size: 14),
+                    label: const Text('Import from GitHub'),
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      foregroundColor: DuckColors.accentMint,
+                      textStyle: const TextStyle(fontSize: 11.5),
+                    ),
+                  ),
+                ],
+              ),
+            ),
             for (final skill in skills)
               _SkillRow(
                 key: ValueKey(skill.id),
@@ -206,6 +228,10 @@ class _SkillRow extends StatelessWidget {
                           ? S.skillsScopeWorkspace
                           : S.skillsScopeGlobal,
                     ),
+                    if (skill.sourceRepo != null) ...[
+                      const SizedBox(width: 6),
+                      _ScopeChip(label: 'from ${skill.sourceRepo}'),
+                    ],
                   ],
                 ),
                 const SizedBox(height: 3),

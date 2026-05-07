@@ -10,6 +10,7 @@ import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
 import 'council_agent_sector.dart';
 import 'council_backdrop.dart';
+import 'council_blackboard.dart';
 import 'council_header_bar.dart';
 import 'council_orchestrator_ping_panel.dart';
 import 'council_report_viewer.dart';
@@ -165,44 +166,84 @@ class _CouncilTheaterState extends State<CouncilTheater>
     CouncilController controller,
     CouncilSession session,
   ) {
-    return Stack(
-      children: [
-        Positioned.fill(
-          child: _CouncilStage(
-            session: session,
-            pulse: _pulse,
-            anchors: _anchors,
-            canPingOrchestrator: controller.canPingOrchestrator,
-            onTapOrchestrator: controller.canPingOrchestrator
-                ? () => setState(() => _pingOpen = true)
-                : null,
-          ),
-        ),
-        Positioned.fill(
-          child: CouncilSpeechBubblesLayer(
-            session: session,
-            anchors: _anchors,
-          ),
-        ),
-        if (session.pendingUserQuestion != null)
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: DuckColors.bgDeepest.withValues(alpha: 0.38),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Blackboards mount only when the viewport has the width to spare.
+        // Below this threshold the orbital stage cannot survive 2× ~280px
+        // chrome stolen from its layout, so we fall back to bubbles-only
+        // and let the evaluator's verdict still surface in chat.
+        final bool wideEnough = constraints.maxWidth >= 1280;
+        final double panelW = wideEnough
+            ? constraints.maxWidth.clamp(1280.0, 1920.0) * 0.18
+            : 0;
+        final bool blackboardsMounted = wideEnough;
+        return Stack(
+          children: [
+            Positioned.fill(
+              left: panelW,
+              right: panelW,
+              child: _CouncilStage(
+                session: session,
+                pulse: _pulse,
+                anchors: _anchors,
+                canPingOrchestrator: controller.canPingOrchestrator,
+                evaluatorOnBlackboard: blackboardsMounted,
+                onTapOrchestrator: controller.canPingOrchestrator
+                    ? () => setState(() => _pingOpen = true)
+                    : null,
               ),
             ),
-          ),
-        if (session.pendingUserQuestion != null)
-          CouncilUserPromptPanel(
-            controller: controller,
-            question: session.pendingUserQuestion!,
-          ),
-        if (_pingOpen)
-          CouncilOrchestratorPingPanel(
-            controller: controller,
-            onClose: () => setState(() => _pingOpen = false),
-          ),
-      ],
+            Positioned.fill(
+              left: panelW,
+              right: panelW,
+              child: CouncilSpeechBubblesLayer(
+                session: session,
+                anchors: _anchors,
+                evaluatorOnBlackboard: blackboardsMounted,
+              ),
+            ),
+            if (blackboardsMounted)
+              Positioned(
+                left: 0,
+                top: 0,
+                bottom: 0,
+                width: panelW,
+                child: CouncilLeftBlackboard(session: session),
+              ),
+            if (blackboardsMounted)
+              Positioned(
+                right: 0,
+                top: 0,
+                bottom: 0,
+                width: panelW,
+                child: CouncilBlackboard(
+                  session: session,
+                  onOpenReport: session.reportPath.isNotEmpty
+                      ? () => setState(() => _reportOpen = true)
+                      : null,
+                ),
+              ),
+            if (session.pendingUserQuestion != null)
+              Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: DuckColors.bgDeepest.withValues(alpha: 0.38),
+                  ),
+                ),
+              ),
+            if (session.pendingUserQuestion != null)
+              CouncilUserPromptPanel(
+                controller: controller,
+                question: session.pendingUserQuestion!,
+              ),
+            if (_pingOpen)
+              CouncilOrchestratorPingPanel(
+                controller: controller,
+                onClose: () => setState(() => _pingOpen = false),
+              ),
+          ],
+        );
+      },
     );
   }
 }
@@ -212,6 +253,7 @@ class _CouncilStage extends StatelessWidget {
   final Animation<double> pulse;
   final CouncilStageAnchors anchors;
   final bool canPingOrchestrator;
+  final bool evaluatorOnBlackboard;
   final VoidCallback? onTapOrchestrator;
 
   const _CouncilStage({
@@ -219,6 +261,7 @@ class _CouncilStage extends StatelessWidget {
     required this.pulse,
     required this.anchors,
     required this.canPingOrchestrator,
+    required this.evaluatorOnBlackboard,
     required this.onTapOrchestrator,
   });
 
@@ -289,6 +332,9 @@ class _CouncilStage extends StatelessWidget {
                             events: session.events,
                             pulse: pulse,
                             anchors: anchors,
+                            mutedAgentIds: evaluatorOnBlackboard
+                                ? {session.config.finalEvaluator.id}
+                                : const <String>{},
                           ),
                         ),
                       ),
@@ -333,6 +379,12 @@ class _CouncilStage extends StatelessWidget {
 
   List<CouncilAgent> _visibleAgents(CouncilSession session) {
     final evaluator = session.config.finalEvaluator;
+    // When the left blackboard is mounted it owns the evaluator's surface;
+    // keeping the evaluator in the orbital ring would double-render its
+    // status + transcript (Skeptic flag, round-two ruling).
+    if (evaluatorOnBlackboard) {
+      return [...session.config.agents];
+    }
     final showEvaluator =
         session.status == CouncilStatus.synthesizing ||
         session.status == CouncilStatus.done ||

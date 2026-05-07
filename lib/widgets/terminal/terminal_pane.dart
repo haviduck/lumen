@@ -11,12 +11,14 @@ import 'package:xterm/xterm.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
+import '../../providers/chat_controller.dart';
 import '../../services/shell_discovery.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/fast_popup_menu.dart';
 import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
+import 'terminal_selection_tooltip.dart';
 import 'terminal_session.dart';
 
 /// Manages multiple terminal tabs, each backed by a `TerminalSession`.
@@ -879,7 +881,23 @@ class _TerminalPaneState extends State<TerminalPane> {
             ),
           ),
           Expanded(
-            child: _buildTerminalView(context, appState, session, focused),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: _buildTerminalView(context, appState, session, focused),
+                ),
+                Positioned(
+                  top: 4,
+                  right: 8,
+                  child: TerminalSelectionTooltip(
+                    session: session,
+                    onAddToChat: (chip) {
+                      context.read<ChatController>().addPendingChip(chip);
+                    },
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),

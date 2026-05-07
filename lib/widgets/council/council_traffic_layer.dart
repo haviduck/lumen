@@ -12,6 +12,7 @@ class CouncilTrafficLayer extends StatelessWidget {
   final List<CouncilEvent> events;
   final Animation<double> pulse;
   final CouncilStageAnchors anchors;
+  final Set<String> mutedAgentIds;
 
   const CouncilTrafficLayer({
     super.key,
@@ -20,6 +21,7 @@ class CouncilTrafficLayer extends StatelessWidget {
     required this.events,
     required this.pulse,
     required this.anchors,
+    this.mutedAgentIds = const <String>{},
   });
 
   @override
@@ -37,6 +39,7 @@ class CouncilTrafficLayer extends StatelessWidget {
                   : events,
               pulse: pulse.value,
               anchors: anchors,
+              mutedAgentIds: mutedAgentIds,
               repaint: pulse,
             ),
           );
@@ -52,6 +55,7 @@ class _CouncilTrafficPainter extends CustomPainter {
   final List<CouncilEvent> events;
   final double pulse;
   final CouncilStageAnchors anchors;
+  final Set<String> mutedAgentIds;
 
   _CouncilTrafficPainter({
     required this.agents,
@@ -59,6 +63,7 @@ class _CouncilTrafficPainter extends CustomPainter {
     required this.events,
     required this.pulse,
     required this.anchors,
+    required this.mutedAgentIds,
     required Listenable repaint,
   }) : super(repaint: repaint);
 
@@ -107,6 +112,10 @@ class _CouncilTrafficPainter extends CustomPainter {
       ..strokeWidth = 0.9
       ..strokeCap = StrokeCap.round;
     for (final event in events.where((e) => e.type == 'pool_reply').take(24)) {
+      if (mutedAgentIds.contains(event.fromAgentId) ||
+          mutedAgentIds.contains(event.toAgentId)) {
+        continue;
+      }
       final from = points[event.fromAgentId];
       final to = points[event.toAgentId];
       if (from == null || to == null || from == to) continue;
@@ -117,6 +126,15 @@ class _CouncilTrafficPainter extends CustomPainter {
     for (final event in events.reversed.take(28)) {
       final age = now.difference(event.createdAt).inMilliseconds;
       if (age > 2600) continue;
+      // Suppress evaluator-touching pulses when the evaluator lives on
+      // the blackboard; otherwise they'd silently fall back to orchPoint
+      // and either vanish (from==to guard) or render as phantom
+      // orchestrator→orchestrator self-loops. The blackboard's own
+      // status surface carries the "done" signal in that mode.
+      if (mutedAgentIds.contains(event.fromAgentId) ||
+          mutedAgentIds.contains(event.toAgentId)) {
+        continue;
+      }
       final fromPoint = points[event.fromAgentId];
       final toPoint = points[event.toAgentId];
       if (fromPoint == null && toPoint == null) continue;

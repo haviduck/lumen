@@ -83,16 +83,16 @@ practical, and specific to this project.
       '''<!-- LUMEN_KNOWLEDGEBASE_RULE -->
 ## Knowledgebase (cross-chat memory)
 
-A shared knowledgebase lives at `.lumen/knowledgebase.md`. It is the only
+A shared knowledgebase lives at `.agents/knowledgebase.md`. It is the only
 persistent memory between separate chat sessions in this workspace.
 
 **At the start of every chat:**
-- Read `.lumen/knowledgebase.md` if it exists. Use it as context for the
+- Read `.agents/knowledgebase.md` if it exists. Use it as context for the
   current session — it describes architecture, conventions, recent changes,
   and things that previous sessions learned the hard way.
 
 **After completing non-trivial work:**
-- Update `.lumen/knowledgebase.md` with anything a future chat session would
+- Update `.agents/knowledgebase.md` with anything a future chat session would
   benefit from knowing: new patterns introduced, architectural decisions made,
   pitfalls discovered, conventions established, or important file locations.
 - Keep it concise and scannable (bullets, short sections). Remove stale entries
@@ -103,6 +103,12 @@ persistent memory between separate chat sessions in this workspace.
 If the file does not exist yet, create it on your first meaningful contribution
 to the workspace.
 ''';
+
+  /// Pre-`.agents` path string. Used by [migrateLegacyKnowledgebasePath]
+  /// to rewrite stale rule text in workspaces that already have a
+  /// rules.md from before the move.
+  static const String _legacyKnowledgebasePath = '.lumen/knowledgebase.md';
+  static const String _canonicalKnowledgebasePath = '.agents/knowledgebase.md';
 
   /// Workspace stub for brand-new workspaces — same body as
   /// [_workspaceDefaultStub] plus the chat-handoff receive rule and
@@ -180,10 +186,43 @@ to the workspace.
       // Auto-install knowledgebase rule for existing workspaces that
       // predate the feature. Idempotent — no-ops if already present.
       await ensureKnowledgebaseRuleInstalled(workspacePath);
+      // Rewrite the legacy `.lumen/knowledgebase.md` path to
+      // `.agents/knowledgebase.md` in workspaces that were rule-installed
+      // before the storage move. Idempotent — only writes when stale
+      // text is found.
+      await migrateLegacyKnowledgebasePath(workspacePath);
       return await f.readAsString();
     } catch (e) {
       debugPrint('Failed to read workspace rules: $e');
       return '';
+    }
+  }
+
+  /// One-shot rewrite: replaces literal `.lumen/knowledgebase.md`
+  /// occurrences in a workspace's rules.md with `.agents/knowledgebase.md`.
+  /// Returns true on a meaningful rewrite. Skips silently when the
+  /// file doesn't exist or contains no legacy references.
+  static Future<bool> migrateLegacyKnowledgebasePath(
+      String workspacePath) async {
+    try {
+      final f = LumenWorkspaceConfig.rulesFile(workspacePath);
+      if (!await f.exists()) return false;
+      final text = await f.readAsString();
+      if (!text.contains(_legacyKnowledgebasePath)) return false;
+      final rewritten = text.replaceAll(
+        _legacyKnowledgebasePath,
+        _canonicalKnowledgebasePath,
+      );
+      if (rewritten == text) return false;
+      await f.writeAsString(rewritten);
+      debugPrint(
+        'RulesService: rewrote $_legacyKnowledgebasePath → '
+        '$_canonicalKnowledgebasePath in ${f.path}',
+      );
+      return true;
+    } catch (e) {
+      debugPrint('RulesService.migrateLegacyKnowledgebasePath: $e');
+      return false;
     }
   }
 

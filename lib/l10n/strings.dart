@@ -2097,6 +2097,10 @@ class S {
   static const String councilBlackboardEmpty =
       'Tasks appear here as the orchestrator dispatches work.';
   static const String councilBlackboardReportTitle = 'Final report';
+  static const String councilLeftBlackboardTitle = 'Evaluator';
+  static const String councilLeftBlackboardEmpty =
+      'Awaiting evaluation…';
+  static const String councilLeftBlackboardStreaming = 'Drafting verdict…';
   static const String councilBlackboardReportBody =
       'The Council has finished. Review the report before leaving the theater.';
   static const String councilAskUserHeader = 'Council needs you';

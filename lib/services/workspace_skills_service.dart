@@ -55,6 +55,13 @@ class WorkspaceSkill {
   /// Workspace-local skills win on id collisions.
   final bool isWorkspaceLocal;
 
+  /// When the skill was imported from a remote source (typically a
+  /// GitHub repo), this records the human-readable origin so the
+  /// listing UI can render an "imported from <repo>" badge. Set in
+  /// frontmatter as `source` or `imported_from`. `null` for
+  /// hand-authored or generated skills.
+  final String? sourceRepo;
+
   const WorkspaceSkill({
     required this.id,
     required this.name,
@@ -63,6 +70,7 @@ class WorkspaceSkill {
     required this.body,
     required this.filePath,
     required this.isWorkspaceLocal,
+    this.sourceRepo,
   });
 }
 
@@ -70,11 +78,15 @@ class WorkspaceSkill {
 /// and compiles the active set into a single text block ready to
 /// drop into the chat-agent system prompt.
 ///
-/// Two source roots, in priority order:
-///   1. `<workspace>/.lumen/skills/*.md` (workspace-local; wins on
-///      id collision)
-///   2. `<app-support>/.lumen/skills/*.md` (global, applies to
-///      every workspace)
+/// Three source roots, in priority order:
+///   1. `<workspace>/.agents/skills/*.md` (canonical workspace
+///      location; wins on id collision)
+///   2. `<workspace>/.lumen/skills/*.md` (legacy fallback — read
+///      until the on-launch migration copies the directory across,
+///      then this dir is empty and the fallback no-ops)
+///   3. `<app-support>/.agents/skills/*.md` then
+///      `<app-support>/.lumen/skills/*.md` (global, applies to every
+///      workspace; same legacy-fallback shape)
 ///
 /// Frontmatter parsing is intentionally minimal — a YAML-ish header
 /// delimited by `---` lines, with `key: value` rows. We don't pull
@@ -103,11 +115,16 @@ class WorkspaceSkillsService extends ChangeNotifier {
     _workspacePath = workspacePath;
     final out = <String, WorkspaceSkill>{};
 
-    // Global first; workspace-local overrides.
+    // Global first; workspace-local overrides. We read both `.agents/`
+    // (canonical) and `.lumen/` (legacy) at app-support level: legacy
+    // first, canonical wins on id collision.
     try {
-      final globalDir = await _globalSkillsDir();
-      final globalSkills = await _walkDir(globalDir, isWorkspaceLocal: false);
-      for (final s in globalSkills) {
+      final globalLegacy = await _globalLegacySkillsDir();
+      for (final s in await _walkDir(globalLegacy, isWorkspaceLocal: false)) {
+        out[s.id] = s;
+      }
+      final globalAgents = await _globalSkillsDir();
+      for (final s in await _walkDir(globalAgents, isWorkspaceLocal: false)) {
         out[s.id] = s;
       }
     } catch (e) {
@@ -115,10 +132,26 @@ class WorkspaceSkillsService extends ChangeNotifier {
     }
 
     if (workspacePath != null) {
+      // One-shot migration: copy legacy `.lumen/skills/*.md` to
+      // `.agents/skills/` if the canonical dir is missing-or-empty.
+      // Copy (not move) so a botched migration can't lose the user's
+      // skill files.
       try {
+        await migrateLegacySkillsIfNeeded(workspacePath);
+      } catch (e) {
+        debugPrint('SkillsService: migration failed: $e');
+      }
+
+      try {
+        // Read legacy first so the canonical dir wins on id clash —
+        // important when migration just copied files: same id, same
+        // content, but isWorkspaceLocal stays consistent.
+        final legacy = LumenWorkspaceConfig.legacySkillsDir(workspacePath);
+        for (final s in await _walkDir(legacy, isWorkspaceLocal: true)) {
+          out[s.id] = s;
+        }
         final wsDir = LumenWorkspaceConfig.skillsDir(workspacePath);
-        final wsSkills = await _walkDir(wsDir, isWorkspaceLocal: true);
-        for (final s in wsSkills) {
+        for (final s in await _walkDir(wsDir, isWorkspaceLocal: true)) {
           out[s.id] = s;
         }
       } catch (e) {
@@ -130,6 +163,60 @@ class WorkspaceSkillsService extends ChangeNotifier {
       ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     notifyListeners();
     return _all;
+  }
+
+  /// Idempotent migration from `.lumen/skills/` → `.agents/skills/`.
+  ///
+  /// Runs every reload but no-ops fast in the common case. Migrates
+  /// when both:
+  ///   - source `.lumen/skills/` exists and contains at least one file, and
+  ///   - target `.agents/skills/` is missing or empty.
+  ///
+  /// Copies each file individually (best-effort; per-file failures
+  /// are logged but don't abort the rest). Does NOT delete the legacy
+  /// directory — the loader's legacy fallback continues to read it
+  /// for one release, then a future cleanup step can remove it.
+  static Future<void> migrateLegacySkillsIfNeeded(String workspacePath) async {
+    final legacy = LumenWorkspaceConfig.legacySkillsDir(workspacePath);
+    if (!await legacy.exists()) return;
+    final canonical = LumenWorkspaceConfig.skillsDir(workspacePath);
+    if (await canonical.exists()) {
+      // Treat any pre-existing markdown in the canonical dir as
+      // "migration already done" — don't risk overwriting user edits.
+      final hasContent = await canonical
+          .list()
+          .where((e) => e is File && _isMarkdown(e.path))
+          .isEmpty
+          .then((empty) => !empty);
+      if (hasContent) return;
+    } else {
+      await canonical.create(recursive: true);
+    }
+    var legacyHasContent = false;
+    await for (final entity in legacy.list()) {
+      if (entity is! File) continue;
+      if (!_isMarkdown(entity.path)) continue;
+      legacyHasContent = true;
+      try {
+        final dest = File(p.join(canonical.path, p.basename(entity.path)));
+        if (!await dest.exists()) {
+          await entity.copy(dest.path);
+        }
+      } catch (e) {
+        debugPrint('SkillsService: failed to migrate ${entity.path}: $e');
+      }
+    }
+    if (legacyHasContent) {
+      debugPrint(
+        'SkillsService: migrated .lumen/skills → .agents/skills for '
+        '$workspacePath (legacy left in place as read-only fallback)',
+      );
+    }
+  }
+
+  static bool _isMarkdown(String path) {
+    final lower = path.toLowerCase();
+    return lower.endsWith('.md') || lower.endsWith('.markdown');
   }
 
   /// Build the system-prompt block for the currently-loaded skill
@@ -221,6 +308,7 @@ class WorkspaceSkillsService extends ChangeNotifier {
     String? id;
     String? name;
     String? trigger;
+    String? sourceRepo;
     bool defaultEnabled = true;
     String body = content;
 
@@ -245,6 +333,10 @@ class WorkspaceSkillsService extends ChangeNotifier {
             case 'when':
             case 'when_to_apply':
               trigger = value;
+            case 'source':
+            case 'source_repo':
+            case 'imported_from':
+              sourceRepo = value;
             case 'enabled':
             case 'default_enabled':
             case 'defaultenabled':
@@ -267,6 +359,7 @@ class WorkspaceSkillsService extends ChangeNotifier {
       body: body,
       filePath: path,
       isWorkspaceLocal: isWorkspaceLocal,
+      sourceRepo: (sourceRepo == null || sourceRepo.isEmpty) ? null : sourceRepo,
     );
   }
 
@@ -282,6 +375,11 @@ class WorkspaceSkillsService extends ChangeNotifier {
   }
 
   static Future<Directory> _globalSkillsDir() async {
+    final base = await getApplicationSupportDirectory();
+    return Directory(p.join(base.path, '.agents', 'skills'));
+  }
+
+  static Future<Directory> _globalLegacySkillsDir() async {
     final base = await getApplicationSupportDirectory();
     return Directory(p.join(base.path, '.lumen', 'skills'));
   }

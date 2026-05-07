@@ -33,10 +33,11 @@ import 'empty_response_strip.dart';
 import 'slash_commands/council_command.dart';
 import 'message_bubble.dart';
 import 'queued_prompts_strip.dart';
-import 'slash_commands/handoff_command.dart';
 import 'slash_commands/push_command.dart';
 import 'slash_commands/slash_command.dart';
 import 'slash_commands/slash_command_picker.dart';
+import 'chat_composer.dart';
+import 'chip_text_editing_controller.dart';
 import 'stall_warning.dart';
 
 class AiChat extends StatefulWidget {
@@ -72,7 +73,12 @@ class _ChatRewindData {
 }
 
 class _AiChatState extends State<AiChat> {
-  final TextEditingController _input = TextEditingController();
+  // Chip-capable composer controller. Replaces the plain
+  // `TextEditingController` so files / code-ranges / terminal
+  // selections render as inline pill widgets at the caret position
+  // (Cursor-style), not as a separate strip above the textarea.
+  // See `lib/widgets/ai_chat/chip_text_editing_controller.dart`.
+  final ChipTextEditingController _input = ChipTextEditingController();
   final ScrollController _scroll = ScrollController();
   final FocusNode _focus = FocusNode();
   final SlashCommandPickerController _slash = SlashCommandPickerController();
@@ -105,7 +111,6 @@ class _AiChatState extends State<AiChat> {
   void _registerSlashCommands() {
     SlashCommandRegistry.register(CouncilCommand());
     SlashCommandRegistry.register(CouncilCommand(alias: 'counsil'));
-    SlashCommandRegistry.register(HandoffCommand());
     SlashCommandRegistry.register(PushCommand());
   }
 
@@ -253,10 +258,23 @@ class _AiChatState extends State<AiChat> {
   void _consumeComposerInsertions() {
     final chat = _listenedChat;
     if (chat == null) return;
+    // Legacy plain-text composer insertions (slash command output,
+    // misc programmatic prepends). Kept so non-chip producers still
+    // work — but `addPendingReference` no longer pushes here; it
+    // routes through `addPendingChip` instead.
     final insertions = chat.consumePendingComposerInsertions();
-    if (insertions.isEmpty) return;
     for (final token in insertions) {
       _insertReferenceToken(token);
+    }
+    // Chip insertions: file/folder drops, terminal-selection tooltip,
+    // doc/KB drops. Each is appended to the composer's chip list and
+    // rendered as a pill above the plain TextField.
+    final chipInsertions = chat.consumePendingChipInsertions();
+    for (final chip in chipInsertions) {
+      _input.addChip(chip);
+    }
+    if (chipInsertions.isNotEmpty || insertions.isNotEmpty) {
+      _focus.requestFocus();
     }
   }
 
@@ -547,8 +565,13 @@ class _AiChatState extends State<AiChat> {
                       // the user has typed follow-ups while the
                       // current generation was still in flight.
                       QueuedPromptsStrip(controller: chat),
-                      if (chat.pendingImages.isNotEmpty ||
-                          chat.pendingReferences.isNotEmpty)
+                      // Pending file/folder/code/terminal references
+                      // now render as inline chips inside the
+                      // composer's `TextField` itself (chip schema:
+                      // `lib/services/chat_chip.dart`). The strip is
+                      // only used for image attachments these days —
+                      // images can't be inlined into a text run.
+                      if (chat.pendingImages.isNotEmpty)
                         _buildAttachmentStrip(chat),
                       _buildInput(appState, chat),
                     ],
@@ -903,7 +926,13 @@ class _AiChatState extends State<AiChat> {
   }
 
   Widget _buildAttachmentStrip(ChatController chat) {
-    final refs = chat.pendingReferences;
+    // Pending file/folder/code/terminal references render as inline
+    // chips inside the composer's `TextField` (chip schema lives in
+    // `lib/services/chat_chip.dart`). The strip is now image-only;
+    // we still consult `pendingReferences` only to show a count badge
+    // when chips have been mirrored from drag-drop, but the visual
+    // wrap of reference rows is gone — the chips ARE the UI.
+    final refs = const <ChatReference>[];
     final images = chat.pendingImages;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -991,7 +1020,7 @@ class _AiChatState extends State<AiChat> {
     void send() {
       final text = _input.text;
       // Slash-command path: intercept BEFORE the empty-input guard so
-      // a bare `/handoff` (with no other content) still runs even
+      // a bare slash command (with no other content) still runs even
       // when there are no pending refs/images. The picker may or may
       // not be open here — pressing Enter always tries to resolve a
       // slash if the input parses as one.
@@ -1139,6 +1168,10 @@ class _AiChatState extends State<AiChat> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            ChatComposerChipsStrip(
+              controller: _input,
+              dragHighlighted: _referenceDragOver,
+            ),
             Shortcuts(
               shortcuts: const <ShortcutActivator, Intent>{
                 SingleActivator(LogicalKeyboardKey.keyV, control: true):

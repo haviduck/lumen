@@ -26,6 +26,7 @@ import 'autocomplete_overlay.dart';
 import 'binary_preview.dart';
 import 'editor_themes.dart';
 import 'indent_guides.dart';
+import 'knowledge_base_view.dart';
 import 'markdown_preview.dart';
 import 'recent_edits_overlay.dart';
 import 'unsaved_changes_dialog.dart';
@@ -265,6 +266,22 @@ class _EditorState extends State<Editor> {
           appState.setActiveFile(file);
         },
         child: const ProcessManagerView(),
+      );
+    }
+    // Knowledge Base sentinel — markdown editor + preview + summarize
+    // header for the workspace `.agents/knowledgebase.md`. Same
+    // virtual-tab pattern as settings/process-manager: routed BEFORE
+    // any real-file branch so the literal `__knowledge_base__` path
+    // can never hit a code-editor mount.
+    if (AppState.isKnowledgeBaseTab(path)) {
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapDown: (_) {
+          setState(() => _focusedPane = paneIndex);
+          final file = appState.openFiles.firstWhere((f) => f.path == path);
+          appState.setActiveFile(file);
+        },
+        child: const KnowledgeBaseView(),
       );
     }
 
@@ -1441,13 +1458,11 @@ class _EditorTabBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // The seam between tabs and content is painted by inactive tabs
+    // themselves so the active tab can sit flush against the editor body
+    // (no orphan strip under the active tab).
     return Container(
-      decoration: const BoxDecoration(
-        color: DuckColors.bgDeeper,
-        border: Border(
-          bottom: BorderSide(color: DuckColors.glassSeam, width: 0.5),
-        ),
-      ),
+      decoration: const BoxDecoration(color: DuckColors.bgDeeper),
       child: SizedBox(
         height: DuckTheme.tabHeight + 4,
         child: Row(
@@ -1705,7 +1720,17 @@ class _EditorTabState extends State<_EditorTab> {
               duration: DuckMotion.fast,
               curve: DuckMotion.standard,
               padding: const EdgeInsets.symmetric(horizontal: 14),
-              decoration: BoxDecoration(color: tabColor),
+              decoration: BoxDecoration(
+                color: tabColor,
+                border: widget.isActive
+                    ? null
+                    : const Border(
+                        bottom: BorderSide(
+                          color: DuckColors.glassSeam,
+                          width: 0.5,
+                        ),
+                      ),
+              ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [

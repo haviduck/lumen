@@ -10,6 +10,7 @@ import '../services/agent_terminal_bridge.dart';
 import '../services/anthropic_service.dart';
 import '../services/copilot_service.dart';
 import '../services/github_models_service.dart';
+import '../services/chat_chip.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/external_tool_loader.dart';
 import '../services/gemini_service.dart';
@@ -824,6 +825,57 @@ class ChatController extends ChangeNotifier {
     final out = List<String>.from(_pendingComposerInsertions);
     _pendingComposerInsertions.clear();
     return out;
+  }
+
+  /// Chip-shaped composer insertions queued by:
+  ///  - drag-drop from the file explorer (file/folder chips),
+  ///  - the xterm "Add to chat" tooltip (terminal-selection chips),
+  ///  - future surfaces (knowledgebase docs, search hits).
+  ///
+  /// Drained by `_AiChatState._consumeComposerInsertions` which calls
+  /// `ChipTextEditingController.addChip` for each entry — the
+  /// chip lives inline in the composer text as a `\uFFFC` placeholder
+  /// + side-map metadata. See `lib/services/chat_chip.dart` for the
+  /// schema (single source of truth across composer, terminal, editor).
+  final List<ChatChip> _pendingChipInsertions = <ChatChip>[];
+
+  List<ChatChip> consumePendingChipInsertions() {
+    if (_pendingChipInsertions.isEmpty) return const <ChatChip>[];
+    final out = List<ChatChip>.from(_pendingChipInsertions);
+    _pendingChipInsertions.clear();
+    return out;
+  }
+
+  /// Public entry point used by every chip-producing surface. For
+  /// file/folder chips we *also* mirror into the legacy
+  /// `_pendingReferences` list so the existing model-prompt path
+  /// (which renders attached file/folder content into the system
+  /// preamble) keeps working without rewriting the prompt builder.
+  /// For terminal/code-range/doc chips the structured payload is
+  /// emitted at send time via [ChatChip.renderForModel].
+  void addPendingChip(ChatChip chip) {
+    if ((chip.kind == ChatChipKind.file ||
+            chip.kind == ChatChipKind.folder) &&
+        chip.path.isNotEmpty) {
+      // Mirror into existing references list — but skip the legacy
+      // string-token composer insertion path (chips replace it).
+      final exists = _pendingReferences.any(
+        (r) => p.equals(p.normalize(r.path), p.normalize(chip.path)),
+      );
+      if (!exists) {
+        _pendingReferences.add(
+          ChatReference(
+            path: p.normalize(chip.path),
+            workspaceRelativePath: chip.workspaceRelativePath,
+            kind: chip.kind == ChatChipKind.folder
+                ? ChatReferenceKind.folder
+                : ChatReferenceKind.file,
+          ),
+        );
+      }
+    }
+    _pendingChipInsertions.add(chip);
+    notifyListeners();
   }
 
   // Media playback is now owned by `MediaController` (see
