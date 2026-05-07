@@ -1287,7 +1287,62 @@ class _FileExplorerState extends State<FileExplorer> {
           child: Consumer<AppState>(
             builder: (context, appState, child) {
               if (appState.currentDirectory == null) {
-                return Container(color: DuckColors.bgRaised);
+                // Empty-workspace state: still render a `DropTarget`
+                // so dragging a folder from Windows Explorer onto
+                // the (otherwise blank) sidebar opens it as the
+                // active workspace. Without this the panel was a
+                // dead `Container` and the user's "drop folder to
+                // open" muscle memory failed silently.
+                return DropTarget(
+                  onDragEntered: (_) =>
+                      setState(() => _isDragging = true),
+                  onDragExited: (_) =>
+                      setState(() => _isDragging = false),
+                  onDragDone: (detail) async {
+                    setState(() => _isDragging = false);
+                    if (detail.files.isEmpty) return;
+                    // Pick the first dropped folder; if the user
+                    // dropped only files, fall back to their parent
+                    // directory so the workspace opens at a useful
+                    // root rather than an individual file.
+                    String? target;
+                    for (final f in detail.files) {
+                      if (FileSystemEntity.isDirectorySync(f.path)) {
+                        target = f.path;
+                        break;
+                      }
+                    }
+                    target ??= File(detail.files.first.path).parent.path;
+                    await appState.setDirectory(target);
+                  },
+                  child: Container(
+                    color: DuckColors.bgRaised,
+                    alignment: Alignment.center,
+                    child: AnimatedContainer(
+                      duration: DuckMotion.fast,
+                      decoration: BoxDecoration(
+                        border: _isDragging
+                            ? Border.all(
+                                color: DuckColors.accentMint,
+                                width: 1,
+                              )
+                            : null,
+                        borderRadius:
+                            BorderRadius.circular(DuckTheme.radiusM),
+                      ),
+                      padding: const EdgeInsets.all(16),
+                      child: const Text(
+                        'Drop a folder here to open as workspace',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: DuckColors.fgSubtle,
+                          fontSize: 12,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
+                  ),
+                );
               }
 
               final dir = Directory(appState.currentDirectory!);
@@ -2220,52 +2275,12 @@ class _ExplorerHeaderState extends State<_ExplorerHeader> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _IconBtn(
-                    icon: Icons.create_new_folder,
-                    tooltip: S.explorerNewFolder,
-                    onTap: widget.onNewFolder,
-                  ),
-                  _IconBtn(
-                    icon: Icons.note_add,
-                    tooltip: S.explorerNewFile,
-                    onTap: widget.onNewFile,
-                  ),
-                ],
-              ),
+              // New-file / new-folder icon buttons removed — the same
+              // actions are still available via the row's right-click
+              // context menu (`newFile` / `newFolder` cases below). The
+              // header now reflows cleanly: workspace name + (selected
+              // indicator) only, no awkward right-side icon cluster.
             ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _IconBtn extends StatelessWidget {
-  final IconData icon;
-  final String tooltip;
-  final VoidCallback onTap;
-  const _IconBtn({
-    required this.icon,
-    required this.tooltip,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: InkWell(
-          mouseCursor: SystemMouseCursors.click,
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-          child: Padding(
-            padding: const EdgeInsets.all(4),
-            child: Icon(icon, size: 14, color: DuckColors.fgMuted),
           ),
         ),
       ),

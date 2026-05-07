@@ -345,20 +345,28 @@ class ToolSchemas {
         },
         'required': ['path'],
       },
+      // Matches READ_FILE's regex group shape in `tool_registry.dart`:
+      //   r'<<<READ_FILE(?:_RANGE)?:\s*(.+?)(?::(\d+)-(\d+))?\s*>>>'
+      // group(1) = path, group(2) = start, group(3) = end. The executor
+      // reads them SEPARATELY (`hasRange = startStr != null && endStr != null`).
+      // We MUST return [path, start, end] here — collapsing into one
+      // group breaks ranged reads (the executor sees 'path:N-M' as a
+      // bogus filename + no range, and tries a full-file read on a
+      // path that doesn't exist). Mirror git_blame's pattern (line ~567).
       toGroups: (args) {
         final path = (args['path'] as String?) ?? '';
         final start = args['start_line'];
         final end = args['end_line'];
-        if (start != null && end != null) {
-          return ['$path:$start-$end'];
+        if (start is int && end is int) {
+          return [path, '$start', '$end'];
         }
-        return [path];
+        return [path, null, null];
       },
       toRawText: (args) {
         final path = (args['path'] as String?) ?? '';
         final start = args['start_line'];
         final end = args['end_line'];
-        return start != null && end != null
+        return start is int && end is int
             ? '<<<READ_FILE: $path:$start-$end>>>'
             : '<<<READ_FILE: $path>>>';
       },

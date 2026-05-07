@@ -52,6 +52,7 @@ class CouncilAgentRunner {
     required this.nativeToolIds,
     required this.onChunk,
     required this.onCouncilTool,
+    this.userImages = const <String>[],
   });
 
   final CouncilAgent agent;
@@ -60,6 +61,13 @@ class CouncilAgentRunner {
   final ToolExecutor toolExecutor;
   final String systemPrompt;
   final String userPrompt;
+  /// Base64 JPEG images to attach to the very first user turn. Wire shape
+  /// matches mid-session `_pendingUserNotes` and `ChatController` — the
+  /// Anthropic / Gemini / Ollama services convert this `images` key into
+  /// their respective vision blocks. Used by the Convene-the-Council
+  /// modal so pasted/picked images become real visual context for the
+  /// orchestrator instead of filename references in prose.
+  final List<String> userImages;
   final Set<String> nativeToolIds;
   final CouncilChunkCallback onChunk;
   final CouncilToolCallback onCouncilTool;
@@ -93,9 +101,16 @@ class CouncilAgentRunner {
   }
 
   Future<CouncilRunResult> run({int maxIterations = 12}) async {
+    final initialUser = <String, dynamic>{
+      'role': 'user',
+      'content': userPrompt,
+    };
+    if (userImages.isNotEmpty) {
+      initialUser['images'] = List<String>.unmodifiable(userImages);
+    }
     final messages = <Map<String, dynamic>>[
       {'role': 'system', 'content': systemPrompt},
-      {'role': 'user', 'content': userPrompt},
+      initialUser,
     ];
     final transcript = StringBuffer();
 

@@ -57,6 +57,14 @@ class AppState extends ChangeNotifier {
   /// header). Closed-set sentinel — exact-match only, never prefix.
   static const String knowledgeBaseSentinel = '__knowledge_base__';
 
+  /// Sentinel file path for the Council Theater virtual tab. Same
+  /// pattern as the other sentinels — routes to `CouncilTheater` from
+  /// the editor pane router. Lives here (not as a workbench-level
+  /// overlay anymore) so the user can keep using the rest of the IDE
+  /// while a council is running. The orchestration runs in
+  /// `CouncilController` regardless of whether the tab is mounted.
+  static const String councilTheaterSentinel = '__council_theater__';
+
   /// Prefix for untitled (unsaved) tabs created with Ctrl+T.
   static const String untitledPrefix = '__untitled__';
 
@@ -71,6 +79,10 @@ class AppState extends ChangeNotifier {
   static bool isKnowledgeBaseTab(String? path) =>
       path == knowledgeBaseSentinel;
 
+  /// Returns `true` when the given path is the council theater sentinel.
+  static bool isCouncilTheaterTab(String? path) =>
+      path == councilTheaterSentinel;
+
   /// All sentinel paths that should be excluded from real-file
   /// behaviours (filesystem watching, dirty-on-disk diffs, line-ref
   /// chips, accept/revoke decoration overlays). Closed enum — keep
@@ -79,6 +91,7 @@ class AppState extends ChangeNotifier {
     settingsSentinel,
     processManagerSentinel,
     knowledgeBaseSentinel,
+    councilTheaterSentinel,
   };
 
   static bool isSentinelPath(String? path) =>
@@ -481,6 +494,14 @@ class AppState extends ChangeNotifier {
       },
     );
     council.addListener(notifyListeners);
+    // Auto-open the council theater as an editor tab when the
+    // controller flips `theaterVisible` (start, resurrect, manual
+    // showTheater). Replaces the v1 layout-level overlay that swapped
+    // out the entire editor+terminal area — see `councilTheaterSentinel`
+    // doc for the rationale. The tab is mounted only on the
+    // false→true transition so manually closing it (X on the tab)
+    // doesn't immediately re-mount on the next council event.
+    council.addListener(_maybeOpenCouncilTab);
     autoBackup = AutoBackupScheduler(
       backups: backups,
       prefs: prefs,
@@ -490,6 +511,20 @@ class AppState extends ChangeNotifier {
     );
     KbService.writes.addListener(_onKbWrite);
     _bootstrap();
+  }
+
+  // Tracks the previous theater-visible state so we only react on
+  // the false→true edge. Without this, every notifyListeners() from
+  // council (every dispatch / agent update / chunk arrival) would
+  // try to re-open / re-focus the tab and yank the user back even
+  // if they intentionally clicked into a code tab to read something.
+  bool _lastCouncilTheaterVisible = false;
+  void _maybeOpenCouncilTab() {
+    final visible = council.theaterVisible;
+    if (visible && !_lastCouncilTheaterVisible) {
+      openCouncilTheaterTab();
+    }
+    _lastCouncilTheaterVisible = visible;
   }
 
   void _onKbWrite() {
@@ -717,6 +752,29 @@ class AppState extends ChangeNotifier {
     }
     _activeFile = _openFiles.firstWhere(
       (f) => f.path == knowledgeBaseSentinel,
+    );
+    notifyListeners();
+  }
+
+  /// Opens the Council theater as a virtual editor tab. Same sentinel
+  /// pattern as the other virtual tabs. Replaces the workbench-level
+  /// overlay that used to take over the entire editor+terminal area
+  /// while a council ran (and locked the user out of the rest of the
+  /// IDE). The orchestration runs in `CouncilController` regardless
+  /// of whether this tab is currently focused — the tab is just the
+  /// view onto the running session.
+  ///
+  /// Re-opening (or auto-open from `_runOrchestrator`) focuses the
+  /// existing tab instead of stacking duplicates.
+  void openCouncilTheaterTab() {
+    final sentinel = File(councilTheaterSentinel);
+    if (!_openFiles.any((f) => f.path == councilTheaterSentinel)) {
+      _openFiles.add(sentinel);
+      _fileContents[councilTheaterSentinel] = '';
+      _savedFileContents[councilTheaterSentinel] = '';
+    }
+    _activeFile = _openFiles.firstWhere(
+      (f) => f.path == councilTheaterSentinel,
     );
     notifyListeners();
   }

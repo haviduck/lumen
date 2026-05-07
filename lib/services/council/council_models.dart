@@ -271,6 +271,30 @@ class CouncilAgent {
   }
 }
 
+class CouncilBriefDoc {
+  final String name;
+  final int size;
+  final String content;
+
+  const CouncilBriefDoc({
+    required this.name,
+    required this.size,
+    required this.content,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'size': size,
+        'content': content,
+      };
+
+  static CouncilBriefDoc fromJson(Map<String, dynamic> json) => CouncilBriefDoc(
+        name: json['name'] as String? ?? '',
+        size: (json['size'] as num?)?.toInt() ?? 0,
+        content: json['content'] as String? ?? '',
+      );
+}
+
 class CouncilConfig {
   final String id;
   final String title;
@@ -279,6 +303,17 @@ class CouncilConfig {
   final List<CouncilAgent> agents;
   final CouncilAgent finalEvaluator;
   final DateTime createdAt;
+  /// Base64-encoded JPEG images attached to the brief by the user
+  /// (clipboard paste or image-file picker in the Convene modal).
+  /// Forwarded to the orchestrator's first user turn as `images` —
+  /// vision-capable providers (Anthropic, Gemini, Ollama) decode them
+  /// into proper vision blocks; text-only providers silently drop them.
+  final List<String> briefImages;
+  /// Document attachments (md / txt / code / small PDF text) attached
+  /// to the brief. Content is folded into the orchestrator's user
+  /// prompt as labeled `<attached-doc>` blocks so every provider sees
+  /// them as text regardless of vision support.
+  final List<CouncilBriefDoc> briefDocs;
 
   CouncilConfig({
     required this.id,
@@ -288,16 +323,20 @@ class CouncilConfig {
     required List<CouncilAgent> agents,
     CouncilAgent? finalEvaluator,
     DateTime? createdAt,
-  }) : agents = List.unmodifiable(agents),
-       finalEvaluator =
-           finalEvaluator ??
-           CouncilAgent(
-             id: 'final_evaluator',
-             name: S.councilFinalEvaluator,
-             role: RolePreset.reviewer,
-             model: orchestrator.model,
-           ),
-       createdAt = createdAt ?? DateTime.now();
+    List<String> briefImages = const <String>[],
+    List<CouncilBriefDoc> briefDocs = const <CouncilBriefDoc>[],
+  })  : agents = List.unmodifiable(agents),
+        briefImages = List.unmodifiable(briefImages),
+        briefDocs = List.unmodifiable(briefDocs),
+        finalEvaluator =
+            finalEvaluator ??
+            CouncilAgent(
+              id: 'final_evaluator',
+              name: S.councilFinalEvaluator,
+              role: RolePreset.reviewer,
+              model: orchestrator.model,
+            ),
+        createdAt = createdAt ?? DateTime.now();
 
   List<CouncilAgent> get allAgents => [orchestrator, ...agents, finalEvaluator];
 
@@ -309,6 +348,9 @@ class CouncilConfig {
     'agents': agents.map((a) => a.toJson()).toList(),
     'finalEvaluator': finalEvaluator.toJson(),
     'createdAt': createdAt.toIso8601String(),
+    if (briefImages.isNotEmpty) 'briefImages': briefImages,
+    if (briefDocs.isNotEmpty)
+      'briefDocs': briefDocs.map((d) => d.toJson()).toList(),
   };
 
   static CouncilConfig fromJson(Map<String, dynamic> json) {
@@ -332,6 +374,13 @@ class CouncilConfig {
       createdAt:
           DateTime.tryParse(json['createdAt'] as String? ?? '') ??
           DateTime.now(),
+      briefImages: ((json['briefImages'] as List?) ?? const [])
+          .whereType<String>()
+          .toList(),
+      briefDocs: ((json['briefDocs'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((m) => CouncilBriefDoc.fromJson(m.cast<String, dynamic>()))
+          .toList(),
     );
   }
 }

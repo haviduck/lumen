@@ -26,7 +26,10 @@ enum AgentIdleVariant {
   diagHairline,
   morphingDottedRule,
   caretPulse,
-  sineBars,
+  /// Horizontal "data stream": a baseline rule with a row of bright
+  /// particles traveling left→right, each trailing a short fading tail.
+  /// Used as the explicit "AI is awaiting / thinking" idle motion.
+  dataStream,
   orbitGlyph,
 }
 
@@ -111,8 +114,11 @@ class _AgentIdleIndicatorState extends State<AgentIdleIndicator>
         return const Duration(milliseconds: 3200);
       case AgentIdleVariant.caretPulse:
         return const Duration(milliseconds: 1600);
-      case AgentIdleVariant.sineBars:
-        return const Duration(milliseconds: 2400);
+      case AgentIdleVariant.dataStream:
+        // ~1500ms is sweet spot: particles read as continuously moving
+        // without feeling frantic. Each particle takes one full cycle to
+        // traverse, with 5 staggered → ~3.3 Hz pulse rate at the eye.
+        return const Duration(milliseconds: 1500);
       case AgentIdleVariant.orbitGlyph:
         return const Duration(milliseconds: 2600);
     }
@@ -173,8 +179,8 @@ class _IdlePainter extends CustomPainter {
       case AgentIdleVariant.caretPulse:
         _caretPulse(canvas, size);
         break;
-      case AgentIdleVariant.sineBars:
-        _sineBars(canvas, size);
+      case AgentIdleVariant.dataStream:
+        _dataStream(canvas, size);
         break;
       case AgentIdleVariant.orbitGlyph:
         _orbitGlyph(canvas, size);
@@ -310,27 +316,70 @@ class _IdlePainter extends CustomPainter {
     );
   }
 
-  /// 6. Five short bars rising / falling on phase-offset sines.
-  void _sineBars(Canvas canvas, Size size) {
-    const n = 5;
-    final centerY = size.height * 0.5;
-    final maxAmp = math.min(6.0, size.height * 0.22);
-    final spacing = math.min(7.0, size.width * 0.06);
-    final totalW = spacing * (n - 1);
-    final startX = (size.width - totalW) * 0.5;
-    final paint = Paint()
-      ..strokeWidth = 1.4
+  /// 6. Horizontal "data stream": a faint baseline rule with five bright
+  /// particles flowing left→right at staggered phase offsets, each
+  /// trailing a short fading tail. Reads as continuously moving "data
+  /// in the wire" — distinct from any other variant in this family.
+  void _dataStream(Canvas canvas, Size size) {
+    final left = size.width * 0.06;
+    final right = size.width * 0.94;
+    final width = (right - left).clamp(8.0, double.infinity);
+    final cy = size.height * 0.5;
+
+    // Faint baseline rule so the panel doesn't read empty between particles.
+    final baseline = Paint()
+      ..color = DuckColors.fgSubtle.withValues(alpha: 0.10)
+      ..strokeWidth = 1.0
       ..strokeCap = StrokeCap.round;
+    canvas.drawLine(Offset(left, cy), Offset(right, cy), baseline);
+
+    const n = 5;
+    const tailSteps = 4;
+
+    Offset positionAt(double phase, int slot) {
+      final x = left + width * phase;
+      // Subtle vertical drift per slot so particles feel organic.
+      final drift =
+          math.sin((phase * math.pi * 2) + slot * 1.13) * 1.6 +
+          math.sin((phase * math.pi * 4) + slot * 0.37) * 0.6;
+      return Offset(x, cy + drift);
+    }
+
     for (var i = 0; i < n; i++) {
-      final phase = (t + i * 0.12) % 1.0;
-      final s = math.sin(phase * math.pi * 2);
-      final h = 1.5 + s.abs() * maxAmp;
-      final x = startX + spacing * i;
-      paint.color = accent.withValues(alpha: 0.12 + s.abs() * 0.10);
-      canvas.drawLine(
-        Offset(x, centerY - h),
-        Offset(x, centerY + h),
-        paint,
+      final phase = (t + i / n) % 1.0;
+      // Bell envelope: fades in/out at the wire ends.
+      final env = math.sin(phase * math.pi);
+      if (env <= 0.04) continue;
+      final head = positionAt(phase, i);
+
+      // Trail: shrink + fade a few steps behind the head.
+      for (var k = tailSteps; k >= 1; k--) {
+        final tailPhase = phase - k * 0.028;
+        if (tailPhase <= 0) continue;
+        final p = positionAt(tailPhase, i);
+        final fade = env * (1.0 - k / (tailSteps + 1.0));
+        canvas.drawCircle(
+          p,
+          1.4 * (1.0 - k / (tailSteps + 1.5)),
+          Paint()..color = accent.withValues(alpha: 0.55 * fade),
+        );
+      }
+
+      // Soft halo behind the head.
+      canvas.drawCircle(
+        head,
+        4.2,
+        Paint()
+          ..color = accent.withValues(alpha: 0.20 * env)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3.5)
+          ..blendMode = BlendMode.plus,
+      );
+
+      // Bright head.
+      canvas.drawCircle(
+        head,
+        1.9,
+        Paint()..color = accent.withValues(alpha: 0.92 * env),
       );
     }
   }

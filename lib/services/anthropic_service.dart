@@ -175,7 +175,20 @@ class AnthropicService {
       'messages': merged,
     };
     if (systemParts.isNotEmpty) {
-      body['system'] = systemParts.join('\n\n');
+      // Send `system` as a content-block array (instead of a plain
+      // string) so we can attach `cache_control: {type: 'ephemeral'}`
+      // to the last block. Anthropic's prompt cache then covers the
+      // entire system prompt on every subsequent turn within ~5 min,
+      // turning a large prefill into a near-zero-cost lookup. Plain
+      // strings can't carry cache_control, hence the array form.
+      final joined = systemParts.join('\n\n');
+      body['system'] = [
+        {
+          'type': 'text',
+          'text': joined,
+          'cache_control': {'type': 'ephemeral'},
+        },
+      ];
     }
 
     // Attach native tool definitions when the caller wants the

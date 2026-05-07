@@ -242,10 +242,9 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
   static const int _maxPerAgent = 3;
   static const int _maxBubbleChars = 200;
 
-  // Drift travel = card.shortestSide × _driftSpan. Capped to the safe
-  // zone via clamp at projection time.
-  static const double _driftSpan = 1.7;
-  static const double _bubbleWidth = 268.0;
+  // (Drift / per-bubble width constants removed — bubbles now render in
+  // per-agent column layout; column width is the file-level
+  // `_columnWidth` constant declared at the bottom of this file.)
 
   final List<_Bubble> _bubbles = [];
   BubbleController? _injected;
@@ -489,7 +488,7 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     String? replyTo,
   }) {
     if (agentId.isEmpty) return;
-    final cleaned = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final cleaned = _normalizeBubbleText(text);
     if (cleaned.isEmpty) return;
     final display = cleaned.length > _maxBubbleChars
         ? '${cleaned.substring(0, _maxBubbleChars - 1)}…'
@@ -541,6 +540,22 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     });
   }
 
+  String _normalizeBubbleText(String raw) {
+    final original = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (original.isEmpty) return '';
+    var text = original;
+    text = text.replaceFirst(
+      RegExp(r'^(task|task name|objective)\s*[:\-–]\s*', caseSensitive: false),
+      '',
+    );
+    text = text.replaceFirst(
+      RegExp(r'^[\"“][^\"”\n]{3,90}[\"”]\s*[:\-–]\s*'),
+      '',
+    );
+    text = text.trim();
+    return text.isEmpty ? original : text;
+  }
+
   Offset _fallbackOutward(Offset cardCenter) {
     final ringC = widget.anchors.ringCenter;
     final v = cardCenter - ringC;
@@ -549,33 +564,74 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     return Offset(v.dx / len, v.dy / len);
   }
 
-  /// Test hook: rough on-screen rects of the visible bubbles.
+  /// Test hook: simple count of visible bubble entries grouped by agent.
+  /// Layout is now deterministic (per-agent column anchored to the card),
+  /// so detailed rect debugging is no longer load-bearing.
   @visibleForTesting
-  List<Rect> debugBubbleSlotRects() {
-    final out = <Rect>[];
+  Map<String, int> debugBubbleCountsByAgent() {
+    final out = <String, int>{};
     for (final b in _bubbles) {
-      final layout = _projectBubble(b, reduced: false);
-      if (layout == null) continue;
-      out.add(layout.rect);
+      out.update(b.originId, (v) => v + 1, ifAbsent: () => 1);
     }
     return out;
   }
 
   @override
   Widget build(BuildContext context) {
-    final reduced = MediaQuery.disableAnimationsOf(context);
     return AnimatedBuilder(
       animation: widget.anchors,
       builder: (context, _) {
         final cardRects = widget.anchors._rects;
+        final groups = <String, List<_Bubble>>{};
+        for (final b in _bubbles) {
+          groups.putIfAbsent(b.originId, () => <_Bubble>[]).add(b);
+        }
+        // Newest first → renders closest to the agent card edge.
+        for (final list in groups.values) {
+          list.sort((a, b) => b.spawnedAtMs.compareTo(a.spawnedAtMs));
+        }
+
+        // Compute one collision-aware placement per agent column.
+        // Recomputed every frame the anchors notify, so resize and
+        // ring reflows automatically reposition bubbles. This is the
+        // "never overlap a panel" invariant — see _kBubblePanelMinGap.
+        final placements = <String, _BubblePlacement>{};
+        for (final entry in groups.entries) {
+          final cardRect = cardRects[entry.key];
+          if (cardRect == null) continue;
+          placements[entry.key] = _placeColumn(
+            agentId: entry.key,
+            cardRect: cardRect,
+            allRects: cardRects,
+            bubbleCount: entry.value.length,
+          );
+        }
 
         return IgnorePointer(
-          // Bubbles drift; pinning/hover doesn't fit a moving target.
           child: Stack(
             clipBehavior: Clip.none,
             children: [
-              for (final b in _bubbles)
-                _buildBubble(b, cardRects, reduced: reduced),
+              // Hairline leaders below bubbles so the bubble body
+              // visually overlaps the line endpoint instead of vice
+              // versa. Painted only for reflowed placements (i.e.
+              // when the bubble is not on its preferred side and the
+              // association needs reinforcing).
+              Positioned.fill(
+                child: CustomPaint(
+                  painter: _LeaderLinesPainter(
+                    cardRects: cardRects,
+                    placements: placements,
+                  ),
+                ),
+              ),
+              for (final entry in groups.entries)
+                if (placements[entry.key] != null)
+                  _buildAgentColumn(
+                    agentId: entry.key,
+                    cardRect: cardRects[entry.key]!,
+                    bubbles: entry.value,
+                    placement: placements[entry.key]!,
+                  ),
             ],
           ),
         );
@@ -583,43 +639,240 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     );
   }
 
-  Widget _buildBubble(
-    _Bubble b,
-    Map<String, Rect> cardRects, {
-    required bool reduced,
+  /// Pick a non-overlapping rect for an agent's bubble column.
+  ///
+  /// Algorithm (in order):
+  ///   1. Preferred side = outward direction of the card on the ring
+  ///      (right wing → right, left wing → left).
+  ///   2. Try preferred → opposite → above → below. Each candidate is
+  ///      offset from the panel edge by [_kBubblePanelMinGap] so the
+  ///      bubble bbox can NEVER touch the panel rect.
+  ///   3. A candidate is rejected if its rect (a) escapes the theater
+  ///      safe zone, or (b) overlaps any sibling panel rect inflated
+  ///      by [_kBubblePanelMinGap]. The orchestrator counts as a
+  ///      sibling so bubbles never cross the centre card.
+  ///   4. If every side fails, fall back to the preferred side and
+  ///      flag the placement reflowed=true so a leader line paints.
+  ///   5. Column height is content-bounded (per bubble estimate ×
+  ///      count) so the column rect doesn't claim an entire wing's
+  ///      worth of vertical space for collision purposes.
+  _BubblePlacement _placeColumn({
+    required String agentId,
+    required Rect cardRect,
+    required Map<String, Rect> allRects,
+    required int bubbleCount,
   }) {
-    final layout = _projectBubble(b, reduced: reduced);
-    if (layout == null) return const SizedBox.shrink();
+    final outward = widget.anchors.outwardOf(agentId) ??
+        _fallbackOutward(cardRect.center);
+    final safe = widget.anchors.safeZone;
+    final preferred = outward.dx >= 0 ? _BubbleSide.right : _BubbleSide.left;
+    final inUpperHalf = !safe.isEmpty
+        ? cardRect.center.dy <= safe.center.dy
+        : cardRect.center.dy <= widget.anchors.ringCenter.dy;
 
-    // Card-overlap dim. Origin & current target are exempt.
-    var dim = 1.0;
-    final exemptIds = <String>{b.originId};
-    if (b.replyTo != null) exemptIds.add(b.replyTo!);
-    for (final entry in cardRects.entries) {
-      if (exemptIds.contains(entry.key)) continue;
-      if (layout.rect.overlaps(entry.value)) {
-        dim = math.min(dim, 0.22);
-      }
+    final order = <_BubbleSide>[
+      preferred,
+      preferred == _BubbleSide.right ? _BubbleSide.left : _BubbleSide.right,
+      inUpperHalf ? _BubbleSide.below : _BubbleSide.above,
+      inUpperHalf ? _BubbleSide.above : _BubbleSide.below,
+    ];
+
+    // Estimate column footprint from bubble count so collision testing
+    // doesn't reserve a whole wing's worth of vertical space.
+    final count = math.max(1, bubbleCount);
+    final estContent = count * _kEstBubbleHeight +
+        math.max(0, count - 1) * _columnGap;
+    final maxAvail = safe.isEmpty
+        ? 720.0
+        : math.max(120.0, safe.height - 24);
+    final estHeight = math.min(estContent, maxAvail);
+
+    for (final side in order) {
+      final rect = _candidateRect(cardRect, side, _columnWidth, estHeight);
+      if (!_safeContains(safe, rect)) continue;
+      if (_collidesWithSiblings(rect, allRects, agentId)) continue;
+      return _BubblePlacement(
+        rect: rect,
+        side: side,
+        reflowed: side != preferred,
+      );
     }
 
-    final agentLabel = _agentLabel(b.originId);
+    // Fallback: preferred side, clamped into safeZone, leader line on.
+    var fallback = _candidateRect(cardRect, preferred, _columnWidth, estHeight);
+    if (!safe.isEmpty) {
+      var l = fallback.left;
+      var t = fallback.top;
+      if (l < safe.left + 4) l = safe.left + 4;
+      if (l + fallback.width > safe.right - 4) {
+        l = safe.right - 4 - fallback.width;
+      }
+      if (t < safe.top + 4) t = safe.top + 4;
+      if (t + fallback.height > safe.bottom - 4) {
+        t = safe.bottom - 4 - fallback.height;
+      }
+      fallback = Rect.fromLTWH(l, t, fallback.width, fallback.height);
+    }
+    return _BubblePlacement(rect: fallback, side: preferred, reflowed: true);
+  }
+
+  Rect _candidateRect(Rect card, _BubbleSide side, double w, double h) {
+    switch (side) {
+      case _BubbleSide.right:
+        return Rect.fromLTWH(
+          card.right + _kBubblePanelMinGap,
+          card.top,
+          w,
+          h,
+        );
+      case _BubbleSide.left:
+        return Rect.fromLTWH(
+          card.left - _kBubblePanelMinGap - w,
+          card.top,
+          w,
+          h,
+        );
+      case _BubbleSide.above:
+        return Rect.fromLTWH(
+          card.center.dx - w / 2,
+          card.top - _kBubblePanelMinGap - h,
+          w,
+          h,
+        );
+      case _BubbleSide.below:
+        return Rect.fromLTWH(
+          card.center.dx - w / 2,
+          card.bottom + _kBubblePanelMinGap,
+          w,
+          h,
+        );
+    }
+  }
+
+  bool _safeContains(Rect safe, Rect r) {
+    if (safe.isEmpty) return true;
+    return r.left >= safe.left - 0.5 &&
+        r.right <= safe.right + 0.5 &&
+        r.top >= safe.top - 0.5 &&
+        r.bottom <= safe.bottom + 0.5;
+  }
+
+  bool _collidesWithSiblings(
+    Rect candidate,
+    Map<String, Rect> allRects,
+    String selfId,
+  ) {
+    for (final e in allRects.entries) {
+      if (e.key == selfId) continue;
+      final inflated = e.value.inflate(_kBubblePanelMinGap);
+      if (candidate.overlaps(inflated)) return true;
+    }
+    return false;
+  }
+
+  /// Per-agent commentary column, placed by [_placeColumn].
+  /// Newest entry sits closest to the card edge; older entries stack
+  /// away from it and fade out as they age.
+  Widget _buildAgentColumn({
+    required String agentId,
+    required Rect cardRect,
+    required List<_Bubble> bubbles,
+    required _BubblePlacement placement,
+  }) {
+    final rect = placement.rect;
+    final children = <Widget>[];
+    for (var i = 0; i < bubbles.length; i++) {
+      if (i > 0) children.add(const SizedBox(height: _columnGap));
+      children.add(_buildAgentBubble(bubbles[i]));
+    }
+
+    // Decide stack direction and cross-axis alignment per side so
+    // "newest closest to the card" holds regardless of which way we
+    // reflowed.
+    late final bool reverseChildren;
+    late final MainAxisAlignment mainAxis;
+    late final CrossAxisAlignment crossAxis;
+    switch (placement.side) {
+      case _BubbleSide.right:
+        reverseChildren = false;
+        mainAxis = MainAxisAlignment.start;
+        crossAxis = CrossAxisAlignment.start;
+        break;
+      case _BubbleSide.left:
+        reverseChildren = false;
+        mainAxis = MainAxisAlignment.start;
+        crossAxis = CrossAxisAlignment.end;
+        break;
+      case _BubbleSide.below:
+        reverseChildren = false;
+        mainAxis = MainAxisAlignment.start;
+        crossAxis = CrossAxisAlignment.center;
+        break;
+      case _BubbleSide.above:
+        // Newest at the bottom (nearest the card), older fade upward.
+        reverseChildren = true;
+        mainAxis = MainAxisAlignment.end;
+        crossAxis = CrossAxisAlignment.center;
+        break;
+    }
 
     return Positioned(
-      key: ValueKey('bubble-${b.id}'),
-      left: layout.rect.left,
-      top: layout.rect.top,
-      width: layout.rect.width,
-      child: Opacity(
-        opacity: (layout.opacity * dim).clamp(0.0, 1.0),
-        child: Transform.scale(
-          alignment: Alignment.center,
-          scale: layout.scale,
-          child: _BubbleText(
-            text: b.text,
-            kind: b.kind,
-            agentLabel: agentLabel,
-            softBackdrop: dim < 0.6,
+      key: ValueKey('council-col-$agentId'),
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      child: ClipRect(
+        // OverflowBox lets the inner Column take its intrinsic height
+        // even when bubble content (multi-line text + eyebrow) exceeds
+        // the placement rect's reserved height. The surrounding
+        // ClipRect still enforces the safe-zone visually, but Flutter
+        // no longer reports a yellow-stripe overflow under the
+        // bubbles. Reproduces what _kEstBubbleHeight always implied:
+        // the rect is a placement budget, not a hard layout box.
+        child: OverflowBox(
+          alignment: placement.side == _BubbleSide.above
+              ? Alignment.bottomCenter
+              : Alignment.topCenter,
+          minHeight: 0,
+          maxHeight: double.infinity,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: mainAxis,
+            crossAxisAlignment: crossAxis,
+            children: reverseChildren
+                ? children.reversed.toList(growable: false)
+                : children,
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAgentBubble(_Bubble b) {
+    final ageMs = _nowMs - b.spawnedAtMs;
+    final lifeMs = b.lifeMs;
+    final clamped = ageMs.clamp(0, lifeMs).toInt();
+
+    double opacity;
+    if (clamped < b.fadeInMs) {
+      opacity = _easeOutCubic(clamped / b.fadeInMs);
+    } else if (clamped > lifeMs - b.fadeOutMs) {
+      final t = (clamped - (lifeMs - b.fadeOutMs)) / b.fadeOutMs;
+      opacity = 1.0 - _easeInQuad(t.clamp(0.0, 1.0).toDouble());
+    } else {
+      opacity = 1.0;
+    }
+
+    return Opacity(
+      opacity: opacity,
+      child: SizedBox(
+        width: _columnWidth,
+        child: _BubbleText(
+          text: b.text,
+          kind: b.kind,
+          agentLabel: _agentLabel(b.originId),
+          softBackdrop: true,
         ),
       ),
     );
@@ -631,178 +884,110 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     return a.name.trim().toUpperCase();
   }
 
-  /// Project a bubble to its current rect/scale/opacity for `_nowMs`.
-  _BubbleLayout? _projectBubble(_Bubble b, {required bool reduced}) {
-    final ageMs = _nowMs - b.spawnedAtMs;
-    if (ageMs < 0) return null;
-    final lifeMs = b.lifeMs;
-    final clamped = ageMs.clamp(0, lifeMs).toInt();
-
-    final originEdge = _outwardEdge(b.originRect, b.driftDir);
-
-    Offset center;
-    double scale = 1.0;
-
-    if (reduced) {
-      center = originEdge + b.driftDir * 12;
-    } else if (b.isReply) {
-      final targetRect = widget.anchors.rectOf(b.replyTo!);
-      if (targetRect == null) {
-        center = _driftCenter(b, originEdge, clamped, lifeMs);
-      } else {
-        center = _replyCenter(
-          b,
-          originEdge: originEdge,
-          targetRect: targetRect,
-          ageMs: clamped,
-          lifeMs: lifeMs,
-        );
-        if (clamped < b.zoomMs) {
-          final t = clamped / b.zoomMs;
-          final eased = _easeInOutCubic(t);
-          // 0.9 → 1.0 with a tiny cosine overshoot.
-          scale = 0.9 + 0.10 * eased + 0.05 * math.sin(t * math.pi);
-        }
-      }
-    } else {
-      center = _driftCenter(b, originEdge, clamped, lifeMs);
-      if (clamped < b.fadeInMs) {
-        final t = clamped / b.fadeInMs;
-        scale = 0.94 + 0.06 * _easeOutCubic(t);
-      }
-    }
-
-    // Opacity envelope.
-    double opacity;
-    if (clamped < b.fadeInMs) {
-      opacity = _easeOutCubic(clamped / b.fadeInMs);
-    } else if (clamped > lifeMs - b.fadeOutMs) {
-      final t = (clamped - (lifeMs - b.fadeOutMs)) / b.fadeOutMs;
-      opacity = 1.0 - _easeInQuad(t.clamp(0.0, 1.0).toDouble());
-    } else {
-      opacity = 1.0;
-    }
-
-    final estimatedHeight = _estimateHeight(b.text);
-    var rect = Rect.fromCenter(
-      center: center,
-      width: _bubbleWidth,
-      height: estimatedHeight,
-    );
-
-    // Clamp into the published safe zone so bubbles never escape into
-    // header/footer chrome. Only clamp if a non-empty safe zone exists.
-    final safe = widget.anchors.safeZone;
-    if (!safe.isEmpty) {
-      var dx = 0.0, dy = 0.0;
-      if (rect.left < safe.left) dx = safe.left - rect.left;
-      if (rect.right > safe.right) dx = safe.right - rect.right;
-      if (rect.top < safe.top) dy = safe.top - rect.top;
-      if (rect.bottom > safe.bottom) dy = safe.bottom - rect.bottom;
-      if (dx != 0 || dy != 0) rect = rect.shift(Offset(dx, dy));
-    }
-
-    return _BubbleLayout(rect: rect, opacity: opacity, scale: scale);
-  }
-
-  Offset _driftCenter(
-    _Bubble b,
-    Offset originEdge,
-    int ageMs,
-    int lifeMs,
-  ) {
-    final t = (ageMs / lifeMs).clamp(0.0, 1.0).toDouble();
-    // 1 - exp(-3t): asymptotic ease-out; reaches ~95% by EOL.
-    final eased = 1.0 - math.exp(-3.0 * t);
-    final maxDistance = b.originRect.shortestSide * _driftSpan;
-    return originEdge + b.driftDir * (eased * maxDistance);
-  }
-
-  Offset _replyCenter(
-    _Bubble b, {
-    required Offset originEdge,
-    required Rect targetRect,
-    required int ageMs,
-    required int lifeMs,
-  }) {
-    final zoomMs = b.zoomMs;
-    final trailMs = b.trailMs;
-    final fadeOutMs = b.fadeOutMs;
-
-    final targetDir = widget.anchors.outwardOf(b.replyTo!) ??
-        _fallbackOutward(targetRect.center);
-    final targetEdge = _outwardEdge(targetRect, targetDir);
-    final landing = targetEdge + targetDir * 22;
-
-    if (ageMs <= zoomMs) {
-      // Phase A: zoom — origin → landing with a brief overshoot bias.
-      final t = (ageMs / zoomMs).clamp(0.0, 1.0).toDouble();
-      final eased = _easeInOutCubic(t);
-      final overshoot = math.sin(t * math.pi) * 0.06;
-      final extended = landing + targetDir * (overshoot * 24);
-      return Offset.lerp(originEdge, extended, eased)!;
-    } else if (ageMs <= zoomMs + trailMs) {
-      // Phase B: trail — sit at landing with a soft 2px bob.
-      final localT = (ageMs - zoomMs) / trailMs;
-      final bob = math.sin(localT * math.pi * 2) * 2.0;
-      return landing + Offset(0, bob);
-    } else {
-      // Phase C: release outward from the target.
-      final remaining = lifeMs - (zoomMs + trailMs);
-      final phaseLen = math.max(remaining, fadeOutMs);
-      final localMs = (ageMs - (zoomMs + trailMs)).clamp(0, phaseLen).toInt();
-      final t = (localMs / phaseLen).clamp(0.0, 1.0).toDouble();
-      final eased = 1.0 - math.exp(-3.0 * t);
-      final maxDistance = targetRect.shortestSide * _driftSpan;
-      b.driftDir = targetDir;
-      return landing + targetDir * (eased * maxDistance);
-    }
-  }
-
-  /// Midpoint of the side of `rect` that faces in the direction of
-  /// `outward` (unit vector pointing away from ring centre).
-  Offset _outwardEdge(Rect rect, Offset outward) {
-    final ax = outward.dx.abs();
-    final ay = outward.dy.abs();
-    if (ax > ay) {
-      return outward.dx >= 0
-          ? Offset(rect.right, rect.center.dy)
-          : Offset(rect.left, rect.center.dy);
-    } else {
-      return outward.dy >= 0
-          ? Offset(rect.center.dx, rect.bottom)
-          : Offset(rect.center.dx, rect.top);
-    }
-  }
-
   double _easeOutCubic(double t) {
     final u = 1.0 - t;
     return 1.0 - u * u * u;
   }
 
   double _easeInQuad(double t) => t * t;
-
-  double _easeInOutCubic(double t) {
-    if (t < 0.5) return 4 * t * t * t;
-    final f = 2 * t - 2;
-    return 0.5 * f * f * f + 1;
-  }
-
-  double _estimateHeight(String text) {
-    final lines = (text.length / 38).ceil().clamp(1, 6);
-    return 16.0 + 22.0 * lines + 12.0;
-  }
 }
 
-class _BubbleLayout {
+const double _columnWidth = 280;
+const double _columnGap = 6;
+
+/// Hard layout invariant: a speech-bubble column's bounding box must
+/// sit at least this many logical pixels away from EVERY agent panel
+/// rect (origin card included on its inside edge, all sibling cards
+/// fully). Never zero, never negative. If you tune this, keep it in
+/// the 8–12px band so bubbles read as "near the panel" without
+/// kissing it.
+const double _kBubblePanelMinGap = 10.0;
+
+/// Per-bubble vertical estimate used only for collision sizing — the
+/// actual bubble paints at its measured intrinsic height. Kept small
+/// so columns don't reserve more vertical space than they need when
+/// only one or two bubbles are alive.
+const double _kEstBubbleHeight = 78.0;
+
+/// Which side of the owning panel a bubble column was placed on.
+enum _BubbleSide { right, left, above, below }
+
+/// Result of the collision-aware placement pass. [reflowed] is true
+/// when the bubble could not sit on its preferred side and needed to
+/// be relocated; the leader-line painter uses this to draw a hairline
+/// connector reinforcing the bubble→panel association.
+class _BubblePlacement {
   final Rect rect;
-  final double opacity;
-  final double scale;
-  _BubbleLayout({
+  final _BubbleSide side;
+  final bool reflowed;
+  const _BubblePlacement({
     required this.rect,
-    required this.opacity,
-    required this.scale,
+    required this.side,
+    required this.reflowed,
   });
+}
+
+/// Hairline connector from a panel edge to its bubble column when the
+/// column is reflowed off the preferred side. Stays out of the way
+/// when the bubble is already adjacent to its panel — there's no
+/// value in re-labelling an obvious association.
+class _LeaderLinesPainter extends CustomPainter {
+  final Map<String, Rect> cardRects;
+  final Map<String, _BubblePlacement> placements;
+
+  _LeaderLinesPainter({
+    required this.cardRects,
+    required this.placements,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (placements.isEmpty) return;
+    final paint = Paint()
+      ..color = DuckColors.fgMuted.withValues(alpha: 0.32)
+      ..strokeWidth = 1.0
+      ..style = PaintingStyle.stroke
+      ..isAntiAlias = true;
+
+    placements.forEach((agentId, p) {
+      if (!p.reflowed) return;
+      final card = cardRects[agentId];
+      if (card == null) return;
+
+      late final Offset from;
+      late final Offset to;
+      switch (p.side) {
+        case _BubbleSide.right:
+          from = Offset(card.right, card.center.dy);
+          to = Offset(p.rect.left, p.rect.top + 18);
+          break;
+        case _BubbleSide.left:
+          from = Offset(card.left, card.center.dy);
+          to = Offset(p.rect.right, p.rect.top + 18);
+          break;
+        case _BubbleSide.above:
+          from = Offset(card.center.dx, card.top);
+          to = Offset(p.rect.center.dx, p.rect.bottom);
+          break;
+        case _BubbleSide.below:
+          from = Offset(card.center.dx, card.bottom);
+          to = Offset(p.rect.center.dx, p.rect.top);
+          break;
+      }
+      canvas.drawLine(from, to, paint);
+      // Subtle terminator dot at the bubble end so the eye knows
+      // which side the line "arrives" at.
+      final dot = Paint()
+        ..color = DuckColors.fgMuted.withValues(alpha: 0.45)
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(to, 1.6, dot);
+    });
+  }
+
+  @override
+  bool shouldRepaint(covariant _LeaderLinesPainter old) {
+    return old.placements != placements || old.cardRects != cardRects;
+  }
 }
 
 /// Chromeless body. White (fgPrimary) text on the existing dark
@@ -832,7 +1017,7 @@ class _BubbleText extends StatelessWidget {
       BubbleKind.poolReply => DuckColors.accentMint,
       BubbleKind.userReply => DuckColors.accentDuck,
       BubbleKind.userPing => DuckColors.accentDuck,
-      BubbleKind.done => DuckColors.stateOk,
+      BubbleKind.done => DuckColors.accentCyan,
       BubbleKind.error => DuckColors.stateError,
     };
   }
@@ -855,13 +1040,14 @@ class _BubbleText extends StatelessWidget {
     final accent = _accent;
     final kindLabel = _eyebrowKindLabel;
     final hasEyebrow = agentLabel.isNotEmpty || kindLabel.isNotEmpty;
-    final eyebrowText = [
-      if (agentLabel.isNotEmpty) agentLabel,
-      if (kindLabel.isNotEmpty) kindLabel,
-    ].join(' · ');
 
     final body = ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 268),
+      // Hard width contract: the bubble's parent SizedBox is 280px
+      // (`_columnWidth`). The DecoratedBox below adds 10px padding on
+      // each side, so the body must not exceed 280 - 20 = 260. We keep
+      // a small safety margin so the hairline border doesn't pixel-clip
+      // on fractional DPR scales.
+      constraints: const BoxConstraints(maxWidth: 256),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -878,19 +1064,36 @@ class _BubbleText extends StatelessWidget {
                     color: accent.withValues(alpha: 0.85),
                   ),
                   const SizedBox(width: 6),
-                  Flexible(
-                    child: Text(
-                      eyebrowText,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: accent.withValues(alpha: 0.95),
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 0.8,
+                  if (agentLabel.isNotEmpty)
+                    Flexible(
+                      child: Text(
+                        agentLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: accent.withValues(alpha: 0.98),
+                          fontSize: 10.4,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.75,
+                        ),
                       ),
                     ),
-                  ),
+                  if (kindLabel.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        kindLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: accent.withValues(alpha: 0.66),
+                          fontSize: 9.4,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -900,17 +1103,8 @@ class _BubbleText extends StatelessWidget {
             style: const TextStyle(
               color: DuckColors.fgPrimary,
               fontSize: 13,
-              height: 1.35,
+              height: 1.38,
               fontWeight: FontWeight.w500,
-              shadows: [
-                // Subtle readability shadow — keeps glyphs legible
-                // against the diagonal backdrop without a hard pill.
-                Shadow(
-                  color: Color(0xCC000000),
-                  blurRadius: 6,
-                  offset: Offset(0, 1),
-                ),
-              ],
             ),
           ),
         ],
@@ -918,20 +1112,31 @@ class _BubbleText extends StatelessWidget {
     );
 
     if (!softBackdrop) return body;
+    // Opaque dark-blue bubble surface. The user explicitly asked for
+    // a dark, opaque (alpha 1.0) fill that "fits" the modal palette —
+    // no translucent glass, no gradient bleed-through. We use the
+    // dedicated `councilBubbleBg` token (#0E1626) which sits a
+    // notch deeper than `councilSurface` so bubbles read as quoted
+    // utterances above the panels rather than another panel surface.
+    // Hairline `councilBorder` keeps the edge crisp at any DPR;
+    // `fgPrimary` (#D8DEE9) on this fill clears WCAG AA easily
+    // (contrast ≈ 11.6:1).
     return DecoratedBox(
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            DuckColors.bgDeepest.withValues(alpha: 0.30),
-            DuckColors.bgDeeper.withValues(alpha: 0.10),
-          ],
-        ),
-        borderRadius: BorderRadius.circular(6),
+        color: DuckColors.councilBubbleBg,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: DuckColors.councilBorder, width: 0.8),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x66000000),
+            blurRadius: 14,
+            spreadRadius: -2,
+            offset: Offset(0, 4),
+          ),
+        ],
       ),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
         child: body,
       ),
     );

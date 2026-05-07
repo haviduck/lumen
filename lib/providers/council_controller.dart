@@ -71,7 +71,6 @@ class CouncilController extends ChangeNotifier {
   final Map<String, List<String>> _activeLinks = <String, List<String>>{};
   // Agents that have already emitted `agent_arrived` this run. One-shot.
   final Set<String> _arrivedAgents = <String>{};
-  bool _collaborationNudgeUsed = false;
   // Per-session task ledger. Owns the planned/dispatched/running/done|failed
   // state machine and powers the report-shipping guard. Recreated on
   // startCouncil; rehydrated from session.tasks on reload.
@@ -86,6 +85,15 @@ class CouncilController extends ChangeNotifier {
   static const int _maxPoolExchangesPerSession = 2;
   static const int _maxPoolTargetsPerQuestion = 3;
   final List<String> _queuedSynthesisPings = <String>[];
+  int _orchestratorFailureStreak = 0;
+  bool _orchestratorFailureEscalated = false;
+  // After this many silent nudges, escalate to the user. Lowered from
+  // 3 → 2 in 2026-05 — three retries felt like the council was running
+  // forever even when the work was clearly stuck, and the user had no
+  // way to see what was wrong until the last strike. Two retries is
+  // plenty for legit "model briefly lost focus" recoveries; anything
+  // beyond that, the user wants to know.
+  static const int _orchestratorFailureEscalationThreshold = 2;
 
   /// True when the user is allowed to ping the orchestrator with a
   /// mid-session note. We allow this whenever the council is in a state
@@ -123,6 +131,7 @@ class CouncilController extends ChangeNotifier {
     _roundTwoDecision = null;
     _ledger = CouncilTaskLedger(onTransition: _onLedgerTransition);
     _taskIdByDispatchKey.clear();
+    _resetOrchestratorFailureWatchdog();
     _event(CouncilEventType.sessionStarted, message: config.brief);
     notifyListeners();
     await _persist();
@@ -142,7 +151,7 @@ class CouncilController extends ChangeNotifier {
 
     final prompt =
         '''
-You are designing a compact expert council for a software/technical task.
+You are designing a compact expert council to tackle the user's brief below.
 
 Return ONLY JSON. No markdown. Shape:
 {
@@ -152,29 +161,20 @@ Return ONLY JSON. No markdown. Shape:
       "role": "pentester|reviewer|researcher|architect|tester|writer|custom",
       "customRole": "deep specialist remit; required when role is custom",
       "mission": "what this agent must uncover or improve",
-      "rationale": "why this role is needed for this brief"
+      "rationale": "why this role is needed for THIS brief"
     }
   ]
 }
 
-Rules:
-- Choose the team size yourself between 3 and 8 agents. For ambitious product/platform prompts, prefer 6-8.
-- For this brief, aim for about $targetCount agents unless you can justify fewer.
-- Pick sharp, complementary specialist roles. Avoid generic "Architect / Reviewer / Tester" only.
-- Prefer custom roles when built-in labels are too blunt.
-- Each agent must have a distinct mission and must be capable of pushing back on at least one other agent.
-- Include a pentester only when security, threat modeling, auth, secrets, or pentesting is relevant.
-- Include a tester whenever implementation or debugging is likely.
-- If the user asks to make an IDE, app, product, workflow, or agentic system exceptional, include:
-  - product/UX strategy,
-  - agent orchestration/context/tools,
-  - codebase cartography,
-  - interaction design,
-  - reliability/testing,
-  - performance/platform,
-  - security/safety if tools or code execution are involved,
-  - a skeptical evaluator or adversarial reviewer.
-- Names should be short and useful in a visual dashboard.
+How to think about the team:
+- Read the user's brief carefully and design a roster that actually fits it. The user knows their own problem; your job is to translate that into the smallest team of complementary specialists who can ship a real artifact for what they asked.
+- Team size is 3–8. About $targetCount is a starting point — go smaller for tight focused asks, larger for ambitious product/platform/agentic-system work.
+- Pick sharp, complementary specialists. "Architect / Reviewer / Tester" alone is rarely the right roster for anything interesting.
+- Use the `custom` role when a built-in label would understate what the agent actually owns. Custom roles get a `customRole` describing the specific remit.
+- Every agent has a distinct mission and is capable of pushing back on at least one other agent.
+- Include a pentester / red-team role only when the brief is genuinely about security, attack surface, threat modeling, auth, secrets, exploitation, or hardening. Don't add one for "make this pretty" or "refactor this code".
+- Include a tester or QA-shaped role when implementation, debugging, or correctness validation matters.
+- Names are short, distinctive, and useful in a visual dashboard.
 
 User brief:
 $brief
@@ -229,8 +229,8 @@ $brief
     _queuedSynthesisPings.clear();
     _ledger?.cancelAll(reason: 'aborted');
     _taskIdByDispatchKey.clear();
+    _resetOrchestratorFailureWatchdog();
     _activeDispatches = 0;
-    _collaborationNudgeUsed = false;
     _orchestratorRunner = null;
     final pending = _roundTwoDecision;
     _roundTwoDecision = null;
@@ -355,6 +355,16 @@ $brief
       kickNote: kickNote,
     );
 
+    // Only the very first orchestrator run (fresh start, no kick / no
+    // follow-up) gets the brief's image attachments folded into the
+    // initial user turn. Resurrection / round-two re-entries reuse the
+    // session's existing context and must not re-paste images.
+    final isFreshStart =
+        kickNote.trim().isEmpty && roundFollowup == null;
+    final initialImages = isFreshStart
+        ? List<String>.from(session.config.briefImages)
+        : const <String>[];
+
     final runner = CouncilAgentRunner(
       agent: session.config.orchestrator,
       anthropic: anthropic,
@@ -362,6 +372,7 @@ $brief
       toolExecutor: _toolExecutor(session.config.orchestrator, workspace),
       systemPrompt: CouncilProtocol.orchestratorSystemPrompt(session.config),
       userPrompt: userPrompt,
+      userImages: initialImages,
       nativeToolIds: {...CouncilProtocol.orchestratorToolIds},
       onChunk: (chunk) => _appendTranscript(session.config.orchestrator, chunk),
       onCouncilTool: _handleOrchestratorTool,
@@ -369,20 +380,129 @@ $brief
     _runners.add(runner);
     _orchestratorRunner = runner;
     notifyListeners();
+    var thinkingEnded = false;
+    void endThinking() {
+      if (thinkingEnded) return;
+      thinkingEnded = true;
+      _emitThinkingEnded(session.config.orchestrator);
+    }
     try {
       final result = await runner.run(maxIterations: 24);
-      _emitThinkingEnded(session.config.orchestrator);
-      if (!result.cancelled &&
-          session.status != CouncilStatus.done &&
-          session.status != CouncilStatus.awaitingFollowup) {
-        await _finishWithReport(result.content);
+      endThinking();
+      if (result.cancelled) return;
+      if (session.status == CouncilStatus.done ||
+          session.status == CouncilStatus.awaitingFollowup ||
+          session.status == CouncilStatus.aborted) {
+        _resetOrchestratorFailureWatchdog();
+        return;
       }
+
+      final earlyFailureReason = _orchestratorEarlyExitReason(session);
+      if (earlyFailureReason != null) {
+        await _handleOrchestratorFailure(
+          session: session,
+          reason: earlyFailureReason,
+          draftReport: result.content,
+        );
+        return;
+      }
+
+      _resetOrchestratorFailureWatchdog();
+      await _finishWithReport(result.content);
+    } catch (e) {
+      endThinking();
+      await _handleOrchestratorFailure(
+        session: session,
+        reason: 'Orchestrator runner error: $e',
+        draftReport: '',
+      );
     } finally {
       if (identical(_orchestratorRunner, runner)) {
         _orchestratorRunner = null;
         notifyListeners();
       }
     }
+  }
+
+  String? _orchestratorEarlyExitReason(CouncilSession session) {
+    // If the orchestrator exits while tasks are still active, that is not a
+    // true terminal state; we should nudge it back in instead of failing fast.
+    if (ledger.pendingCount > 0 || _activeDispatches > 0) {
+      return 'Orchestrator returned early while ${ledger.pendingCount} task(s) are still in flight.';
+    }
+    // No dispatch at all is usually a no-op drift; attempt silent recovery
+    // before declaring a failed run.
+    if (!ledger.anyDispatchAttempted) {
+      return 'Orchestrator returned without dispatching any agent tasks.';
+    }
+    return null;
+  }
+
+  Future<void> _handleOrchestratorFailure({
+    required CouncilSession session,
+    required String reason,
+    required String draftReport,
+  }) async {
+    _orchestratorFailureStreak++;
+    final strikes = _orchestratorFailureStreak;
+    final orch = session.config.orchestrator;
+
+    // First/second strike: silently re-nudge orchestration with richer status.
+    if (strikes < _orchestratorFailureEscalationThreshold) {
+      session.status = CouncilStatus.working;
+      orch.status = CouncilAgentStatus.working;
+      notifyListeners();
+      await _persist();
+      final draft = draftReport.trim();
+      final cutoff = draft.length > 400 ? 400 : draft.length;
+      final draftSnippet = draft.isEmpty
+          ? ''
+          : '\n\nLatest orchestrator prose (trimmed):\n'
+                '${draft.substring(0, cutoff)}';
+      final note = '''
+Orchestrator watchdog nudge ($strikes/$_orchestratorFailureEscalationThreshold).
+
+Last failure signal:
+$reason
+$draftSnippet
+
+Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue dispatching/synthesizing as needed.
+''';
+      unawaited(_runOrchestrator(kickNote: note));
+      return;
+    }
+
+    // Third strike: escalate to user once.
+    if (_orchestratorFailureEscalated) return;
+    _orchestratorFailureEscalated = true;
+    orch
+      ..status = CouncilAgentStatus.error
+      ..lastError = reason;
+    _event(
+      CouncilEventType.agentError,
+      fromAgentId: orch.id,
+      message: reason,
+      data: {'orchestratorFailureStrikes': strikes},
+    );
+    notifyListeners();
+    await _persist();
+    unawaited(
+      _askUser(
+        orch.id,
+        CouncilToolCall(
+          id: 'orchestrator_fail_$strikes',
+          name: CouncilProtocol.askUserToolId,
+          arguments: {
+            'question': S.councilOrchestratorFailureEscalationQuestion(strikes),
+          },
+        ),
+      ),
+    );
+  }
+
+  void _resetOrchestratorFailureWatchdog() {
+    _orchestratorFailureStreak = 0;
+    _orchestratorFailureEscalated = false;
   }
 
   /// Builds the orchestrator's user-turn prompt for `_runOrchestrator`.
@@ -404,7 +524,33 @@ $brief
     required String kickNote,
   }) {
     if (kickNote.trim().isEmpty && roundFollowup == null) {
-      return 'Begin the Council session now.';
+      final docs = session.config.briefDocs;
+      final imageCount = session.config.briefImages.length;
+      if (docs.isEmpty && imageCount == 0) {
+        return 'Begin the Council session now.';
+      }
+      final buf = StringBuffer('Begin the Council session now.');
+      if (imageCount > 0) {
+        buf
+          ..writeln()
+          ..writeln()
+          ..writeln(
+            'The user attached $imageCount image${imageCount == 1 ? '' : 's'} '
+            'to this brief. They are included as vision inputs on this very '
+            'turn — read them as primary context, not decoration.',
+          );
+      }
+      for (final doc in docs) {
+        buf
+          ..writeln()
+          ..writeln()
+          ..writeln(
+            '<attached-doc filename="${doc.name}" size="${doc.size}">',
+          )
+          ..writeln(doc.content)
+          ..writeln('</attached-doc>');
+      }
+      return buf.toString();
     }
 
     final buf = StringBuffer();
@@ -717,11 +863,26 @@ $brief
 
   List<({String name, RolePreset role, String customRole})>
   _defaultFallbackSpecs(String briefLower) {
+    // Pentester fallback fires only when the brief is unambiguously
+    // security/CTF-flavored. Bare "auth" / "secret" leaked into mundane
+    // code-review tasks ("review the auth helper for clarity") that
+    // didn't actually need an attacker mindset — the lazy-mode prompt
+    // already tells the model "include pentester only when... is
+    // relevant", so this fallback only catches the safety net case.
+    final wantsPentester =
+        briefLower.contains('pentest') ||
+        briefLower.contains('penetration') ||
+        briefLower.contains('threat model') ||
+        briefLower.contains('attack surface') ||
+        briefLower.contains('red team') ||
+        briefLower.contains('exploit') ||
+        briefLower.contains('vuln') ||
+        briefLower.contains('owasp') ||
+        briefLower.contains(' ctf') ||
+        briefLower.startsWith('ctf') ||
+        briefLower.contains('capture the flag');
     return [
-      if (briefLower.contains('security') ||
-          briefLower.contains('pentest') ||
-          briefLower.contains('auth') ||
-          briefLower.contains('secret'))
+      if (wantsPentester)
         (
           name: _roleName(RolePreset.pentester),
           role: RolePreset.pentester,
@@ -789,20 +950,28 @@ $brief
         final ledgerRefusal = ledger.refusalReasonForReport();
         if (ledgerRefusal != null) {
           _emitDispatchGuardTripped(ledgerRefusal);
+          // Actionable, non-shouty feedback. Tells the orchestrator
+          // exactly which routes are open instead of just "BLOCKED".
+          // If real work didn't land, the right move is usually to
+          // surface that to the user via council_ask_user — phantom
+          // reports help no one, but neither does a dead-locked loop.
           return CouncilToolResult(
             feedback:
-                'BLOCKED: $ledgerRefusal You MUST invoke council_dispatch '
-                'on at least one agent (and let it complete) before '
-                'council_report. Phantom reports are forbidden.',
+                '$ledgerRefusal\n'
+                'Next move: either dispatch a doer agent that actually '
+                'produces an artifact, or call council_ask_user to '
+                'surface the blocker (timeout, missing intent, '
+                'unsupported scope) so the user can pick ship-partial '
+                'or abort.',
           );
         }
-        if (!_hasPoolCollaboration() && !_collaborationNudgeUsed) {
-          _collaborationNudgeUsed = true;
-          return const CouncilToolResult(
-            feedback:
-                'Before the final report, force one Council collaboration round. Dispatch a short follow-up task to an appropriate agent and explicitly require them to call council_ask_pool for challenge/validation.',
-          );
-        }
+        // The "must have one pool exchange before report" gate that
+        // used to live here was removed — it forced the orchestrator
+        // to dispatch fake collaboration tasks just to satisfy the
+        // gate, even when the work was mechanical and shippable.
+        // Pool is now genuinely opt-in: agents call it when they
+        // actually have a load-bearing question for a peer; otherwise
+        // they ship and the orchestrator reports.
         final markdown = call.arguments['markdown'] as String? ?? '';
         await _finishWithReport(markdown);
         return const CouncilToolResult(
@@ -1076,6 +1245,16 @@ $brief
     notifyListeners();
     await _persist();
 
+    // Parallel pool replies. Earlier this loop awaited each responder
+    // sequentially — with 3 responders × ~10s each, the asker sat
+    // staring at "askingPool" for 30s before getting anything back.
+    // Pool replies are short (`maxIterations: 2`) and independent,
+    // so we fan them out concurrently. The sibling-status / link /
+    // event emissions still happen per reply, just on whichever
+    // future settles first. Reply order in `entry.replies` follows
+    // the order responders return, not the roster — that's fine:
+    // the asker reads them all together via the feedback string.
+    final replyFutures = <Future<void>>[];
     for (final agent in responders) {
       final previousStatus = agent.status;
       agent.status = CouncilAgentStatus.replying;
@@ -1094,6 +1273,7 @@ $brief
         systemPrompt: CouncilProtocol.poolReplyPrompt(
           config: session.config,
           agent: agent,
+          asker: asker,
           question: question,
         ),
         userPrompt: question,
@@ -1101,30 +1281,33 @@ $brief
         onChunk: (_) {},
         onCouncilTool: (_) async => const CouncilToolResult(feedback: ''),
       );
-      final result = await replyRunner.run(maxIterations: 2);
-      final answer = result.content.trim();
-      entry.replies.add(
-        CouncilPoolReply(fromAgentId: agent.id, answer: answer),
-      );
-      agent.status = previousStatus;
-      _emitThinkingEnded(agent);
-      _event(
-        CouncilEventType.poolReply,
-        fromAgentId: agent.id,
-        toAgentId: asker.id,
-        message: answer,
-      );
-      _emitMessage(
-        kind: CouncilMessageKind.poolReply,
-        from: agent.id,
-        to: asker.id,
-        text: answer,
-        data: {'linkId': replyLinkId},
-      );
-      _emitLinkEnded(replyLinkId, reason: 'completed');
-      notifyListeners();
-      await _persist();
+      replyFutures.add(() async {
+        final result = await replyRunner.run(maxIterations: 2);
+        final answer = result.content.trim();
+        entry.replies.add(
+          CouncilPoolReply(fromAgentId: agent.id, answer: answer),
+        );
+        agent.status = previousStatus;
+        _emitThinkingEnded(agent);
+        _event(
+          CouncilEventType.poolReply,
+          fromAgentId: agent.id,
+          toAgentId: asker.id,
+          message: answer,
+        );
+        _emitMessage(
+          kind: CouncilMessageKind.poolReply,
+          from: agent.id,
+          to: asker.id,
+          text: answer,
+          data: {'linkId': replyLinkId},
+        );
+        _emitLinkEnded(replyLinkId, reason: 'completed');
+        notifyListeners();
+        await _persist();
+      }());
     }
+    await Future.wait(replyFutures);
 
     _emitLinkEnded(askLinkId, reason: 'completed');
     entry.resolved = true;
@@ -1190,8 +1373,14 @@ $brief
     final workspace = _workspacePath;
     if (session == null) return;
     // THE GUARD: refuse to ship a report when the ledger says no agent
-    // executed successfully. This is the explicit fix for "planned but
-    // nothing happened" — see services/council/FAILURE_MODES.md.
+    // produced reportable work. Earlier versions went silent into
+    // CouncilStatus.error here, which the user perceived as "stuck"
+    // (no path forward, no prompt, just a frozen council). Now we
+    // surface the refusal directly to the user via askUser — they
+    // become the watchdog and can choose abort / wait-for-retry / etc.
+    // The orchestrator's tool-call refusal already nudges it toward
+    // using askUser proactively, so reaching this branch usually means
+    // the orchestrator did fall over without escalating.
     final refusal = ledger.refusalReasonForReport();
     if (refusal != null) {
       _emitDispatchGuardTripped(refusal);
@@ -1203,12 +1392,32 @@ $brief
         reason: refusal,
         draftReport: refusalDraft,
       );
-      session.status = CouncilStatus.error;
       session.config.orchestrator
         ..status = CouncilAgentStatus.error
         ..lastError = refusal;
       notifyListeners();
       await _persist();
+      // Escalate. _askUser flips status to awaitingUser and parks for
+      // the user reply. Their answer doesn't auto-route anywhere
+      // (orchestrator is no longer running), but it gives the user
+      // a clear "this is where it stopped" surface and lets them
+      // hit the existing close/abort affordance with full context.
+      unawaited(
+        _askUser(
+          session.config.orchestrator.id,
+          CouncilToolCall(
+            id: 'report_guard_${++_questionSeq}',
+            name: CouncilProtocol.askUserToolId,
+            arguments: {
+              'question':
+                  'The council finished without producing reportable '
+                  'work.\n\n$refusal\n\nClose the council and review '
+                  'what each agent did, or restart with a tighter '
+                  'brief.',
+            },
+          ),
+        ),
+      );
       return;
     }
     session.status = CouncilStatus.synthesizing;
@@ -1487,15 +1696,6 @@ $brief
         rebriefAddendum: raw.trim(),
       );
     }
-  }
-
-  bool _hasPoolCollaboration() {
-    return _session?.events.any(
-          (e) =>
-              e.type == CouncilEventType.askedPool ||
-              e.type == CouncilEventType.poolReply,
-        ) ??
-        false;
   }
 
   int _poolExchangeCount() {

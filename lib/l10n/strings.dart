@@ -2133,6 +2133,22 @@ class S {
   static const String councilAskUserHeader = 'Council needs you';
   static const String councilUserAnswerHint = 'Type your answer...';
   static const String councilSubmitAnswer = 'Send answer';
+  // Convene-the-Council modal: doc / image attachment surfaces.
+  static const String councilWizardAttachDocsHint =
+      'Drag files in, paste images, or attach docs.';
+  static const String councilWizardDropHint =
+      'Drop to attach to the brief.';
+  static const String councilWizardPickDocs = 'Attach docs';
+  static String councilWizardDocsAttached(int count) =>
+      '$count document${count == 1 ? '' : 's'} attached.';
+  static String councilWizardDocUnsupported(String name) =>
+      '"$name" is not a supported document type.';
+  static String councilWizardDocTooLarge(String name) =>
+      '"$name" is too large (max 1 MB per doc).';
+  static const String councilWizardDocFolderSkipped =
+      'Folders are not attachable — drop individual files.';
+  static const String councilWizardReviewImages = 'Images attached';
+  static const String councilWizardReviewDocs = 'Docs attached';
   static const String councilNoPoolQuestions = 'No pool questions yet.';
   static const String councilNoTranscript = 'Waiting for first signal...';
   static const String councilOrchestrator = 'Orchestrator';
@@ -2173,6 +2189,9 @@ class S {
       'restate where things stand), dispatch follow-ups, ask the user '
       'with council_ask_user, or call council_report. Do not silently '
       'ignore the note.';
+  static String councilOrchestratorFailureEscalationQuestion(int strikes) =>
+      'Orchestrator failed to continue the run $strikes times while work was still in progress. '
+      'Choose what to do next: keep trying automatically, ship partial as failed run, or abort.';
   static const String councilFinalEvaluator = 'Final evaluator';
   static const String councilFinalEvaluatorTask =
       'Evaluate Council work and produce final report';
@@ -2228,6 +2247,29 @@ class S {
   static const String councilAgentDoing = 'doing';
   static const String councilAgentNoErrorDetail =
       'No error detail captured for this agent.';
+  // Floating agent inspector (clicked from a council card).
+  static const String councilInspectorClose = 'Close inspector';
+  static const String councilInspectorTranscriptLabel = 'TRANSCRIPT';
+  static const String councilInspectorTranscriptEmpty =
+      'No transcript yet. Output appears here as the agent thinks and acts.';
+  static const String councilInspectorCopyTranscriptTooltip =
+      'Copy full transcript';
+  static const String councilInspectorCopied = 'Copied to clipboard.';
+  static String councilInspectorTasksLabel(int count) =>
+      count == 1 ? 'TASKS · 1' : 'TASKS · $count';
+  static const String councilInspectorTasksEmpty =
+      'No dispatched tasks for this agent yet.';
+  static String councilInspectorPoolLabel(int count) =>
+      count == 1 ? 'POOL EXCHANGES · 1' : 'POOL EXCHANGES · $count';
+  static const String councilInspectorPoolEmpty =
+      'This agent hasn\'t engaged the pool yet.';
+  static const String councilInspectorPoolAsked = 'YOU ASKED THE POOL';
+  static String councilInspectorPoolFrom(String asker) =>
+      'POOL ASK FROM ${asker.toUpperCase()}';
+  static const String councilInspectorLastErrorLabel = 'LAST ERROR';
+  static const String councilInspectorMetaModel = 'model';
+  static const String councilInspectorMetaTask = 'current task';
+  static const String councilInspectorMetaTaskNone = '—';
   static String councilAgentErrorBadgeTooltip(int n) =>
       n == 1 ? '1 error on this agent' : '$n errors on this agent';
   static String councilReportSavedAt(String path) => 'Report saved at $path';

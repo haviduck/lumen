@@ -182,8 +182,8 @@ class _TaskRow extends StatelessWidget {
     final color = task.failed
         ? DuckColors.stateError
         : task.done
-        ? DuckColors.stateOk
-        : DuckColors.accentCyan;
+        ? DuckColors.accentCyan
+        : DuckColors.accentDuck;
     return Container(
       padding: const EdgeInsets.all(9),
       decoration: BoxDecoration(

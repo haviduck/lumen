@@ -8,6 +8,7 @@ import '../../providers/app_state.dart';
 import '../../providers/council_controller.dart';
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
+import 'council_agent_inspector.dart';
 import 'council_agent_sector.dart';
 import 'council_backdrop.dart';
 import 'council_blackboard.dart';
@@ -40,6 +41,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
   // out from under us (new council started, or session disposed).
   bool _reportOpen = false;
   String? _reportSessionId;
+  String? _inspectAgentId;
 
   @override
   void initState() {
@@ -171,50 +173,35 @@ class _CouncilTheaterState extends State<CouncilTheater>
   ) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        // Blackboards mount only when the viewport has the width to spare.
-        // Below this threshold the orbital stage cannot survive 2× ~280px
-        // chrome stolen from its layout, so we fall back to bubbles-only
-        // and let the evaluator's verdict still surface in chat.
+        // Right blackboard mounts only when the viewport has width to spare.
         final bool wideEnough = constraints.maxWidth >= 1280;
         final double panelW = wideEnough
             ? constraints.maxWidth.clamp(1280.0, 1920.0) * 0.18
             : 0;
-        final bool blackboardsMounted = wideEnough;
+        final bool blackboardMounted = wideEnough;
         return Stack(
           children: [
             Positioned.fill(
-              left: panelW,
+              left: 0,
               right: panelW,
               child: _CouncilStage(
                 session: session,
                 pulse: _pulse,
                 anchors: _anchors,
                 network: _network,
-                canPingOrchestrator: controller.canPingOrchestrator,
-                evaluatorOnBlackboard: blackboardsMounted,
-                onTapOrchestrator: controller.canPingOrchestrator
-                    ? () => setState(() => _pingOpen = true)
-                    : null,
+                onTapAgent: (agentId) =>
+                    setState(() => _inspectAgentId = agentId),
               ),
             ),
             Positioned.fill(
-              left: panelW,
+              left: 0,
               right: panelW,
               child: CouncilSpeechBubblesLayer(
                 session: session,
                 anchors: _anchors,
-                evaluatorOnBlackboard: blackboardsMounted,
               ),
             ),
-            if (blackboardsMounted)
-              Positioned(
-                left: 0,
-                top: 0,
-                bottom: 0,
-                width: panelW,
-                child: CouncilLeftBlackboard(session: session),
-              ),
-            if (blackboardsMounted)
+            if (blackboardMounted)
               Positioned(
                 right: 0,
                 top: 0,
@@ -222,9 +209,14 @@ class _CouncilTheaterState extends State<CouncilTheater>
                 width: panelW,
                 child: CouncilBlackboard(
                   session: session,
-                  onOpenReport: session.reportPath.isNotEmpty
-                      ? () => setState(() => _reportOpen = true)
-                      : null,
+                  onOpenReport: !session.reportPath.isNotEmpty
+                      ? null
+                      : () {
+                          setState(() {
+                            _reportOpen = true;
+                            _reportSessionId = session.config.id;
+                          });
+                        },
                 ),
               ),
             if (session.pendingUserQuestion != null)
@@ -245,6 +237,14 @@ class _CouncilTheaterState extends State<CouncilTheater>
                 controller: controller,
                 onClose: () => setState(() => _pingOpen = false),
               ),
+            if (_inspectAgentId != null &&
+                session.agentById(_inspectAgentId!) != null)
+              CouncilAgentInspector(
+                key: ValueKey('council-inspect-$_inspectAgentId'),
+                session: session,
+                agent: session.agentById(_inspectAgentId!)!,
+                onClose: () => setState(() => _inspectAgentId = null),
+              ),
           ],
         );
       },
@@ -257,18 +257,14 @@ class _CouncilStage extends StatelessWidget {
   final Animation<double> pulse;
   final CouncilStageAnchors anchors;
   final NetworkController network;
-  final bool canPingOrchestrator;
-  final bool evaluatorOnBlackboard;
-  final VoidCallback? onTapOrchestrator;
+  final void Function(String agentId)? onTapAgent;
 
   const _CouncilStage({
     required this.session,
     required this.pulse,
     required this.anchors,
     required this.network,
-    required this.canPingOrchestrator,
-    required this.evaluatorOnBlackboard,
-    required this.onTapOrchestrator,
+    required this.onTapAgent,
   });
 
   @override
@@ -399,17 +395,21 @@ class _CouncilStage extends StatelessWidget {
                             pulse: pulse,
                             anchors: anchors,
                             network: network,
-                            mutedAgentIds: evaluatorOnBlackboard
-                                ? {session.config.finalEvaluator.id}
-                                : const <String>{},
                           ),
                         ),
                       ),
                       _positioned(
                         layout[session.config.orchestrator.id]!,
-                        _OrchestratorTapTarget(
-                          canPing: canPingOrchestrator,
-                          onTap: onTapOrchestrator,
+                        _AgentTapTarget(
+                          // Orchestrator card click opens the inspector,
+                          // matching every other council card. Ping is now
+                          // the header-bar button only — the user wants
+                          // unconditional access to the inspector when
+                          // the orchestrator is erroring.
+                          onTap: onTapAgent == null
+                              ? null
+                              : () =>
+                                    onTapAgent!(session.config.orchestrator.id),
                           child: CouncilAgentSector(
                             agent: session.config.orchestrator,
                             isOrchestrator: true,
@@ -420,13 +420,18 @@ class _CouncilStage extends StatelessWidget {
                       for (var i = 0; i < agents.length; i++)
                         _positioned(
                           layout[agents[i].id]!,
-                          CouncilAgentSector(
-                            key: ValueKey('agent-${agents[i].id}'),
-                            agent: agents[i],
-                            // Stagger from the orchestrator outward: cards
-                            // closer to "12 o'clock" of the sweep arrive
-                            // first, latest cards land ~720ms after.
-                            spawnDelayMs: 120 + i * 80,
+                          _AgentTapTarget(
+                            onTap: onTapAgent == null
+                                ? null
+                                : () => onTapAgent!(agents[i].id),
+                            child: CouncilAgentSector(
+                              key: ValueKey('agent-${agents[i].id}'),
+                              agent: agents[i],
+                              // Stagger from the orchestrator outward: cards
+                              // closer to "12 o'clock" of the sweep arrive
+                              // first, latest cards land ~720ms after.
+                              spawnDelayMs: 120 + i * 80,
+                            ),
                           ),
                         ),
                     ],
@@ -454,12 +459,6 @@ class _CouncilStage extends StatelessWidget {
 
   List<CouncilAgent> _visibleAgents(CouncilSession session) {
     final evaluator = session.config.finalEvaluator;
-    // When the left blackboard is mounted it owns the evaluator's surface;
-    // keeping the evaluator in the orbital ring would double-render its
-    // status + transcript (Skeptic flag, round-two ruling).
-    if (evaluatorOnBlackboard) {
-      return [...session.config.agents];
-    }
     final showEvaluator =
         session.status == CouncilStatus.synthesizing ||
         session.status == CouncilStatus.done ||
@@ -469,20 +468,16 @@ class _CouncilStage extends StatelessWidget {
   }
 }
 
-class _OrchestratorTapTarget extends StatelessWidget {
-  final bool canPing;
+/// Click on a regular agent card → open the floating inspector for them.
+class _AgentTapTarget extends StatelessWidget {
   final VoidCallback? onTap;
   final Widget child;
 
-  const _OrchestratorTapTarget({
-    required this.canPing,
-    required this.onTap,
-    required this.child,
-  });
+  const _AgentTapTarget({required this.onTap, required this.child});
 
   @override
   Widget build(BuildContext context) {
-    if (!canPing || onTap == null) return child;
+    if (onTap == null) return child;
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: GestureDetector(

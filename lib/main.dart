@@ -25,7 +25,6 @@ import 'widgets/ai_chat/ai_chat.dart';
 import 'widgets/app_close_guard.dart';
 import 'widgets/common/ambient_background.dart';
 import 'widgets/common/duck_glass.dart';
-import 'widgets/council/council_theater.dart';
 import 'widgets/common/fast_popup_menu.dart';
 import 'widgets/editor/editor.dart';
 import 'widgets/file_explorer/file_explorer.dart';
@@ -290,7 +289,6 @@ class _IdeShell extends StatelessWidget {
                     child: _LayoutForMode(
                       mode: state.viewMode,
                       chatHidden: state.chatHidden,
-                      councilVisible: state.council.theaterVisible,
                     ),
                   ),
                   const _StatusBar(),
@@ -382,11 +380,9 @@ class _LayoutForMode extends StatefulWidget {
   // *is* the chat-only layout so toggling chat-hidden there would
   // produce an empty workspace.
   final bool chatHidden;
-  final bool councilVisible;
   const _LayoutForMode({
     required this.mode,
     required this.chatHidden,
-    required this.councilVisible,
   });
 
   @override
@@ -437,8 +433,7 @@ class _LayoutForModeState extends State<_LayoutForMode> {
     // specifically: any attempt to swap the areas list on an
     // existing controller is silently ignored.)
     if (oldWidget.mode != widget.mode ||
-        oldWidget.chatHidden != widget.chatHidden ||
-        oldWidget.councilVisible != widget.councilVisible) {
+        oldWidget.chatHidden != widget.chatHidden) {
       _rebuildControllers();
     }
   }
@@ -446,13 +441,20 @@ class _LayoutForModeState extends State<_LayoutForMode> {
   void _rebuildControllers() {
     switch (widget.mode) {
       case DuckViewMode.normal:
+        // Council theater used to swap out the entire (Editor +
+        // Terminal) area as a workbench-level overlay when running.
+        // That locked the user out of every other surface — code
+        // tabs, settings, terminal, file explorer interactions —
+        // until the council finished. v2 layout: council renders
+        // as an editor tab via the `__council_theater__` sentinel
+        // path (see `AppState.openCouncilTheaterTab` and the
+        // `editor.dart` pane router). The orchestration logic is
+        // unchanged; only the mounting surface moved.
         _centerVertical = MultiSplitViewController(
-          areas: widget.councilVisible
-              ? [Area(flex: 1, builder: (c, a) => const CouncilTheater())]
-              : [
-                  Area(flex: 0.72, builder: (c, a) => const Editor()),
-                  Area(flex: 0.28, builder: (c, a) => const TerminalPane()),
-                ],
+          areas: [
+            Area(flex: 0.72, builder: (c, a) => const Editor()),
+            Area(flex: 0.28, builder: (c, a) => const TerminalPane()),
+          ],
         );
         _rootAxis = Axis.horizontal;
         // Layout from L→R is: [Explorer] [Editor+Terminal] [Chat?]

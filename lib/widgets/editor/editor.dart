@@ -22,6 +22,7 @@ import '../process_manager/process_manager_view.dart';
 import '../settings_view.dart';
 import '../side_panes_column.dart';
 import '../common/duck_toast.dart';
+import '../council/council_theater.dart';
 import 'autocomplete_overlay.dart';
 import 'binary_preview.dart';
 import 'editor_themes.dart';
@@ -282,6 +283,25 @@ class _EditorState extends State<Editor> {
           appState.setActiveFile(file);
         },
         child: const KnowledgeBaseView(),
+      );
+    }
+    // Council theater sentinel — full live council UI (orbital ring,
+    // agent cards, blackboard, report viewer). Replaces the v1
+    // workbench-level overlay that hijacked the entire (Editor +
+    // Terminal) area. The orchestration runs in `CouncilController`
+    // regardless of whether this tab is currently focused — switch
+    // to a code tab and the council keeps running, switch back and
+    // you see the live state. Auto-opened by `AppState` whenever
+    // `council.theaterVisible` flips from false to true.
+    if (AppState.isCouncilTheaterTab(path)) {
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapDown: (_) {
+          setState(() => _focusedPane = paneIndex);
+          final file = appState.openFiles.firstWhere((f) => f.path == path);
+          appState.setActiveFile(file);
+        },
+        child: const CouncilTheater(),
       );
     }
 
@@ -1484,6 +1504,8 @@ class _EditorTabBar extends StatelessWidget {
                   final file = appState.openFiles[index];
                   final isSettings = AppState.isSettingsTab(file.path);
                   final isProcessMgr = AppState.isProcessManagerTab(file.path);
+                  final isKb = AppState.isKnowledgeBaseTab(file.path);
+                  final isCouncil = AppState.isCouncilTheaterTab(file.path);
                   final isUntitled = AppState.isUntitledTab(file.path);
                   // Remote-mirror tabs render as `<basename>  <host>:<path>`
                   // so the user sees what they're editing AND where it
@@ -1497,6 +1519,8 @@ class _EditorTabBar extends StatelessWidget {
                       ? S.settingsTitle
                       : isProcessMgr
                       ? S.processManagerTitle
+                      : isCouncil
+                      ? S.councilTitle
                       : isUntitled
                       ? 'Untitled-${file.path.replaceAll(AppState.untitledPrefix, '')}'
                       : remoteOrigin != null
@@ -1511,12 +1535,13 @@ class _EditorTabBar extends StatelessWidget {
                       fileName: fileName,
                       isActive: isActive,
                       isDirty: isDirty,
-                      // `isSettings` is currently the "virtual tab,
-                      // suppress the file-icon" flag — both the
-                      // Settings and Process Manager sentinels qualify.
-                      // Renaming would touch every call site; the
-                      // boolean intent is identical.
-                      isSettings: isSettings || isProcessMgr,
+                      // `isSettings` is the "virtual tab, suppress the
+                      // generic file-icon" flag for sentinel paths
+                      // (settings, process manager, knowledge base,
+                      // council theater). The label alone is enough
+                      // to identify them, and they aren't real files
+                      // so the document icon would lie.
+                      isSettings: isSettings || isProcessMgr || isKb || isCouncil,
                       onActivate: () => onActivate(file),
                       onClose: () => onClose(file),
                       onCloseOthers: () => onCloseOthers(file),

@@ -79,6 +79,36 @@ class DuckColors {
   // enough to read scope, but not bright enough to compete with code.
   static const Color editorIndentGuide = Color(0x55434C5E);
 
+  // ── Council theming — Nord-integrated, IDE chrome family ──
+  //
+  // Used by the Convene the Council modal: agent panels, speech
+  // bubbles, traffic / network lines. Surfaces sit on the same
+  // neutral ramp as the rest of the IDE (bgDeepest / bgDeeper /
+  // bgRaised) instead of a saturated navy ramp — that fixes the
+  // "blue/red gradient too much" reading. Accents are Nord frost
+  // (stateInfo / accentCyan) — same tokens the IDE uses for its
+  // own active chrome, so the council reads as part of the IDE
+  // rather than a separate themed dialog.
+  //
+  // Coordination contract for sibling agents (e.g. traffic-line
+  // painter): `councilAccent` is the canonical glow source. Pull
+  // it directly — do not re-derive a hue.
+  // Dark BLUE ramp restored 2026-05. The previous Nord-neutral grey
+  // ramp made the council read as "more IDE chrome" rather than the
+  // dedicated AI-visualization surface the user wanted. The new ramp
+  // is a deep midnight navy: still dark enough not to fight the
+  // editor, saturated enough to feel like its own room.
+  static const Color councilBase = Color(0xFF080D1C); // deep navy floor
+  static const Color councilSurface = Color(0xFF0E1530); // navy raised
+  static const Color councilSurfaceHi = Color(0xFF131C3D); // navy raised hi
+  static const Color councilBorder = Color(0xFF1F2A52); // navy hairline
+  static const Color councilAccent = Color(0xFF7AA2D9); // bright frost
+  static const Color councilAccentHi = Color(0xFF9CC4F0); // peak highlight
+  static const Color councilAccentDim = Color(0xFF4E6FA8); // dim polar
+  static const Color councilBubbleBg = Color(
+    0xFF0C1226,
+  ); // quoted utterance surface — sits between base and surface
+
   // ── Gradients ──
   static const Gradient brandGradient = LinearGradient(
     begin: Alignment.topLeft,

@@ -9,6 +9,7 @@ import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:pasteboard/pasteboard.dart';
+import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 import 'package:webview_windows/webview_windows.dart';
 
@@ -17,6 +18,7 @@ import '../../providers/app_state.dart';
 import '../../providers/chat_controller.dart';
 import '../../providers/media_controller.dart';
 import '../../providers/ssh_controller.dart';
+import '../../services/chat_chip.dart';
 import '../../services/chat_persistence_service.dart';
 import '../../services/reasoning_effort.dart';
 import '../../theme/app_colors.dart';
@@ -367,16 +369,54 @@ class _AiChatState extends State<AiChat> {
     }
   }
 
+  /// Convert a dropped OS / explorer path into a first-class
+  /// [ChatChip] (file or folder) and route it through the unified
+  /// chip pipeline. Replaces the previous `addPendingReference`
+  /// path which inserted a literal `@filename` token into the
+  /// composer's plain text — Cursor-style inline references are
+  /// real chip widgets above the textarea, not string tokens, so
+  /// the model receives a structured `<file path=…/>` block via
+  /// [ChatChip.renderForModel] and the user gets a removable pill
+  /// in the composer.
+  ///
+  /// `addPendingChip` already mirrors file/folder chips into the
+  /// legacy `_pendingReferences` list so the existing
+  /// system-preamble file-content-injection path keeps working
+  /// without a parallel API.
   void _addReferenceToChat(
     ChatController chat,
     String path, {
     String? workspacePath,
   }) {
-    final ok = chat.addPendingReference(path, workspacePath: workspacePath);
-    if (!ok) {
+    final type = FileSystemEntity.typeSync(path);
+    if (type != FileSystemEntityType.file &&
+        type != FileSystemEntityType.directory) {
       showDuckToast(context, S.chatReferenceMissing);
       return;
     }
+    final normalizedPath = p.normalize(path);
+    final normalizedWorkspace = workspacePath == null
+        ? null
+        : p.normalize(workspacePath);
+    String? rel;
+    if (normalizedWorkspace != null &&
+        (p.equals(normalizedPath, normalizedWorkspace) ||
+            p.isWithin(normalizedWorkspace, normalizedPath))) {
+      rel = p
+          .relative(normalizedPath, from: normalizedWorkspace)
+          .replaceAll(r'\', '/');
+      if (rel == '.') rel = p.basename(normalizedWorkspace);
+    }
+    final chip = type == FileSystemEntityType.directory
+        ? ChatChip.folder(
+            path: normalizedPath,
+            workspaceRelativePath: rel,
+          )
+        : ChatChip.file(
+            path: normalizedPath,
+            workspaceRelativePath: rel,
+          );
+    chat.addPendingChip(chip);
     showDuckToast(context, S.chatReferenceAdded);
     _focus.requestFocus();
   }
@@ -1057,39 +1097,35 @@ class _AiChatState extends State<AiChat> {
         children: [
           // ── Model badge row, above the text box ──
           //
-          // Layout: [picker] [Spacer] [settings cog]. The picker
-          // self-bounds (its internal LayoutBuilder clamps to 160 px),
-          // so we deliberately do NOT wrap it in `Flexible` /
-          // `Expanded` here — those would hand the picker half the
-          // row width, of which it would only USE 160, leaving a
-          // dead chunk between picker and Spacer. The result was a
-          // settings cog that drifted to ~70% of the row width
-          // instead of hugging the right edge after a panel resize.
-          // Plain widget + Spacer puts the cog at the actual right.
+          // Was previously [picker] [Spacer] [settings cog]; the cog
+          // duplicated functionality already reachable via the model
+          // picker's "Manage…" entry and the global settings menu, and
+          // it stained the otherwise-quiet composer chrome with an
+          // accent-coloured icon. Removing it leaves only the picker,
+          // which now sits flush-left in a quieter row.
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: Row(
               children: [
                 _ModelPicker(chat: chat),
-                const Spacer(),
-                Tooltip(
-                  message: S.chatOpenAiSettings,
-                  child: MouseRegion(
-                    cursor: SystemMouseCursors.click,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                      onTap: () => appState.openSettingsTab(category: 'aiChat'),
-                      child: const Padding(
-                        padding: EdgeInsets.all(4),
-                        child: Icon(
-                          Icons.settings_outlined,
-                          size: 15,
-                          color: DuckColors.fgMuted,
-                        ),
-                      ),
+                // Reasoning-effort dial — lifted out of the composer's
+                // bottom toolbar so it sits next to the model picker
+                // (the "model watcher" row). Same cycle / native-vs-
+                // prompt semantics as before; see the pill class for
+                // the underlying API-param mapping. Hidden on Ollama
+                // for the same reason as before.
+                if (chat
+                    .reasoningEffortPillApplicableForCurrentModel) ...[
+                  const SizedBox(width: 6),
+                  _ReasoningEffortPill(
+                    effort: chat.reasoningEffort,
+                    isNative: chat.reasoningEffortIsNativeForCurrentModel,
+                    compact: false,
+                    onCycle: () => chat.setReasoningEffort(
+                      _cycleEffort(chat.reasoningEffort),
                     ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
@@ -1245,39 +1281,11 @@ class _AiChatState extends State<AiChat> {
                           ),
                         ),
                       ),
-                      // Reasoning-effort dial — sits between attach
-                      // and auto-approve. Cycles Off → Standard →
-                      // Deep on tap. Translates to a real native
-                      // API param (Anthropic `thinking`, Gemini
-                      // `thinkingConfig`, OpenAI `reasoning_effort`)
-                      // when the active model supports it; falls
-                      // back to a system-prompt directive on
-                      // non-Ollama models that lack native support
-                      // (Haiku, gpt-4o, Gemini 2.0). The pill flags
-                      // which mode is in effect via tooltip wording.
-                      //
-                      // Hidden entirely on Ollama / Ollama Cloud:
-                      // Ollama auto-enables thinking for capable
-                      // models server-side (per
-                      // https://docs.ollama.com/capabilities/thinking)
-                      // and the dial's only effect there would have
-                      // been a weak prompt-suffix directive that
-                      // small local models routinely ignore. Showing
-                      // a control that does nothing real is dishonest
-                      // UX — see
-                      // `ChatController.reasoningEffortPillApplicableForCurrentModel`.
-                      if (chat
-                          .reasoningEffortPillApplicableForCurrentModel) ...[
-                        const SizedBox(width: 4),
-                        _ReasoningEffortPill(
-                          effort: chat.reasoningEffort,
-                          isNative: chat.reasoningEffortIsNativeForCurrentModel,
-                          compact: compact,
-                          onCycle: () => chat.setReasoningEffort(
-                            _cycleEffort(chat.reasoningEffort),
-                          ),
-                        ),
-                      ],
+                      // (Reasoning-effort dial moved to the model-picker
+                      // row above the textarea — see `_buildComposerBox`'s
+                      // sibling row in `build`. Lives next to the model
+                      // watcher so the "what is this model going to do"
+                      // controls are co-located.)
                       const SizedBox(width: 4),
                       // Auto-approve toggle pill — full label at normal
                       // chat widths; icon-only below ~230px so the
@@ -1325,13 +1333,20 @@ class _AiChatState extends State<AiChat> {
                               borderRadius: BorderRadius.circular(
                                 DuckTheme.radiusS,
                               ),
+                              hoverColor: DuckColors.bgRaisedHi,
                               onTap: send,
                               child: const Padding(
                                 padding: EdgeInsets.all(4),
+                                // Was `accentCyan` — too loud against the
+                                // otherwise neutral composer chrome.
+                                // `fgMuted` matches the surrounding pills
+                                // and tooltips; `InkWell.hoverColor` plus
+                                // its built-in focus ring keep the affordance
+                                // discoverable without screaming for attention.
                                 child: Icon(
                                   Icons.send,
                                   size: 17,
-                                  color: DuckColors.accentCyan,
+                                  color: DuckColors.fgMuted,
                                 ),
                               ),
                             ),
@@ -2255,8 +2270,15 @@ class _AutoApproveTogglePill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent = on ? DuckColors.accentCyan : DuckColors.fgFaint;
-    final fg = on ? DuckColors.accentCyan : DuckColors.fgMuted;
+    // Auto-approve was previously painted in `accentCyan` — same loud
+    // tint as the model badge and (now-removed) settings cog, which
+    // turned the composer's bottom rail into a sea of cyan pills. The
+    // pill is a quiet utility toggle, not a primary action, so both
+    // the on and off states now live in the neutral foreground ramp
+    // (`fgPrimary` when on, `fgMuted` when off). The "ON" pip and the
+    // mini-switch's track also pick up the same neutral gray.
+    final accent = on ? DuckColors.fgPrimary : DuckColors.fgFaint;
+    final fg = on ? DuckColors.fgPrimary : DuckColors.fgMuted;
     return Tooltip(
       message: on ? S.chatAutoApproveOnTooltip : S.chatAutoApproveOffTooltip,
       waitDuration: const Duration(milliseconds: 350),
@@ -2329,11 +2351,11 @@ class _MiniSwitch extends StatelessWidget {
       height: 12,
       decoration: BoxDecoration(
         color: on
-            ? DuckColors.accentCyan.withValues(alpha: 0.85)
+            ? DuckColors.fgMuted.withValues(alpha: 0.55)
             : DuckColors.bgRaisedHi,
         borderRadius: BorderRadius.circular(999),
         border: Border.all(
-          color: on ? DuckColors.accentCyan : DuckColors.glassSeam,
+          color: on ? DuckColors.fgMuted : DuckColors.glassSeam,
           width: 0.5,
         ),
       ),

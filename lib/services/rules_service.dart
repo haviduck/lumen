@@ -50,7 +50,7 @@ practical, and specific to this project.
 ## Working With The User
 - Act as a thoughtful IDE partner. If the user asks for something ambiguous or
   likely to cause long-term maintenance pain, make a reasonable call or point
-  out the trade-off instead of blindly following the first wording.
+  out the trade-off instead of blindly abiding.
 - The user may not know which standard IDE conveniences or project hygiene steps
   are missing. When a small addition would make the result more complete, add it
   and mention it.
@@ -62,36 +62,22 @@ practical, and specific to this project.
   the user's own running stack. Suggest the command and let the user run it.
 - One-shot commands that exit on their own (build, test, lint, format,
   install) are fine to invoke directly when the task calls for them.
-
-## Python and environment-bound interpreters
-- Do not run Python scripts (`python foo.py`, `python -m something`,
-  `pytest`, `python -c`, helpers that shell out to a Python entry point)
-  unless the user explicitly asks for it. The agent does not know which
-  interpreter the user wants — conda env, venv, `pyenv`, poetry/pdm/hatch
-  shell, or system Python — and picking wrong installs into the wrong
-  environment, fails on missing dependencies, or silently runs the wrong
-  Python version. Suggest the command (with any activation step) and let the
-  user run it.
-- The same caution applies to other runtimes whose behavior depends on a
-  per-project environment: Ruby behind `bundle exec`, Node behind `nvm`/`fnm`,
-  Java behind `sdkman`, etc. When in doubt, propose the command rather than
-  running it.
 ''';
 
   static const String _knowledgebaseRuleBlock =
       '''<!-- LUMEN_KNOWLEDGEBASE_RULE -->
 ## Knowledgebase (cross-chat memory)
 
-A shared knowledgebase lives at `.agents/knowledgebase.md`. It is the only
+A shared knowledgebase lives at `.agents/knowledgebase/`. It is the only
 persistent memory between separate chat sessions in this workspace.
 
 **At the start of every chat:**
-- Read `.agents/knowledgebase.md` if it exists. Use it as context for the
+- Read `.agents/knowledgebase/` if it exists. Use it as context for the
   current session — it describes architecture, conventions, recent changes,
   and things that previous sessions learned the hard way.
 
 **After completing non-trivial work:**
-- Update `.agents/knowledgebase.md` with anything a future chat session would
+- Update `.agents/knowledgebase/` with anything a future chat session would
   benefit from knowing: new patterns introduced, architectural decisions made,
   pitfalls discovered, conventions established, or important file locations.
 - Keep it concise and scannable (bullets, short sections). Remove stale entries

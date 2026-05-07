@@ -135,8 +135,16 @@ class NativeToolUse {
 /// - Gemini: `tools: [{function_declarations: [{name, description,
 ///   parameters}]}]` — single outer entry containing all decls.
 class NativeToolDefinitions {
+  /// Build Anthropic `tools[]`. The LAST entry gets a
+  /// `cache_control: {type: 'ephemeral'}` marker so Anthropic's
+  /// prompt cache covers the entire tools block (caching is
+  /// positional from the top of the prompt up to the marker).
+  /// On a warm cache this turns a multi-thousand-token prefill
+  /// into a near-zero-cost lookup, which is the single biggest
+  /// per-turn latency win for Claude. Other providers ignore
+  /// the field; we only emit it on the Anthropic shape.
   static List<Map<String, dynamic>> forAnthropic(Set<String> enabledIds) {
-    return [
+    final list = <Map<String, dynamic>>[
       for (final s in ToolSchemas.all)
         if (enabledIds.contains(s.id))
           {
@@ -145,6 +153,13 @@ class NativeToolDefinitions {
             'input_schema': s.inputSchema,
           },
     ];
+    if (list.isNotEmpty) {
+      list.last = {
+        ...list.last,
+        'cache_control': {'type': 'ephemeral'},
+      };
+    }
+    return list;
   }
 
   static List<Map<String, dynamic>> forOpenAi(Set<String> enabledIds) {

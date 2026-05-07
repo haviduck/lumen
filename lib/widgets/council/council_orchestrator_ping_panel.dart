@@ -143,25 +143,6 @@ class _CouncilOrchestratorPingPanelState
                     children: [
                       Row(
                         children: [
-                          Container(
-                            width: 32,
-                            height: 32,
-                            decoration: const BoxDecoration(
-                              shape: BoxShape.circle,
-                              gradient: LinearGradient(
-                                colors: [
-                                  DuckColors.accentCyan,
-                                  DuckColors.accentPurple,
-                                ],
-                              ),
-                            ),
-                            child: const Icon(
-                              Icons.hub_outlined,
-                              size: 18,
-                              color: DuckColors.bgDeepest,
-                            ),
-                          ),
-                          const SizedBox(width: 10),
                           const Expanded(
                             child: Text(
                               S.councilPingOrchestratorTitle,
