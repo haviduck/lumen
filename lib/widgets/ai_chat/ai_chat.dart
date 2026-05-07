@@ -25,7 +25,6 @@ import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
 import '../common/image_lightbox.dart';
 import '../common/media_pane_chrome.dart';
-import '../council/council_wizard_dialog.dart';
 import '../side_panes_column.dart';
 import 'approval_card.dart';
 import 'chat_tab_strip.dart';
@@ -112,15 +111,6 @@ class _AiChatState extends State<AiChat> {
     SlashCommandRegistry.register(CouncilCommand());
     SlashCommandRegistry.register(CouncilCommand(alias: 'counsil'));
     SlashCommandRegistry.register(PushCommand());
-  }
-
-  Future<void> _openCouncilWizard(AppState appState) async {
-    if (appState.currentDirectory == null ||
-        appState.currentDirectory!.isEmpty) {
-      showDuckToast(context, S.councilNoWorkspace);
-      return;
-    }
-    await showCouncilWizard(context);
   }
 
   /// Re-evaluate slash-picker state on every keystroke. Cheap — the
@@ -1250,28 +1240,6 @@ class _AiChatState extends State<AiChat> {
                                 Icons.attach_file,
                                 size: 15,
                                 color: DuckColors.fgMuted,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Tooltip(
-                        message: S.councilConvene,
-                        child: MouseRegion(
-                          cursor: SystemMouseCursors.click,
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(
-                              DuckTheme.radiusS,
-                            ),
-                            onTap: () =>
-                                _openCouncilWizard(context.read<AppState>()),
-                            child: const Padding(
-                              padding: EdgeInsets.all(4),
-                              child: Icon(
-                                Icons.hub_outlined,
-                                size: 15,
-                                color: DuckColors.accentDuck,
                               ),
                             ),
                           ),

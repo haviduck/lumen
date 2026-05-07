@@ -3,6 +3,16 @@
 > Per-workspace knowledge for AI coding agents. Update after non-trivial changes.
 > If you're a new chat, **read this first**.
 
+## Structured KB (preferred)
+
+This file remains a durable long-form log, but active guidance is now split into focused shards:
+- `.agents/kb/README.md` (index + reading order)
+- `.agents/kb/council.md` (council behavior, guardrails, current fixes)
+- `.agents/kb/providers.md` (model/provider contracts and refresh flows)
+- `.agents/kb/runtime.md` (chat/runtime architecture and safe-edit heuristics)
+
+When adding new knowledge, update the relevant shard first, then add a short note here only if it is cross-cutting or historical.
+
 ---
 
 ## Project shape
@@ -330,6 +340,23 @@ The index can be 1–N commits stale; re-analyze with `npx gitnexus analyze` whe
 - **2026-05 — Council orchestrator ping (mid-session note).** The user can click the orchestrator card during a live Council to send a course-correcting note ("ping"). Wire-up: `CouncilAgentRunner._pendingUserNotes` queue + `addUserNote(String)`; the queue drains at the start of each iteration and is appended as a fresh `user` turn that explicitly tells the orchestrator to bake the note in and re-dispatch agents with revised directives if needed. `CouncilController` tracks `_orchestratorRunner` across `_runOrchestrator` / `abort`, exposes `canPingOrchestrator` (gated on `isActive` + active runner), and `pingOrchestrator(note)` which queues + emits a `user_pinged_orchestrator` event. UI: `lib/widgets/council/council_orchestrator_ping_panel.dart` is a centred composer overlay with cyan accent (matches the orchestrator card palette); `_OrchestratorTapTarget` in `council_theater.dart` makes the orchestrator card tappable only when `canPingOrchestrator`; `CouncilAgentSector.tappableHint` adds the discoverable `S.councilPingBadge` chip in the card's top-right corner. All UI strings live under `S.councilPing*`.
 
 - **2026-05 — Council CTF doctrine.** When the user's brief is testing/security/CTF-flavored (any of: `test`, `tests`, `sectest`, `security test`, `pentest`/`pen test`, `penetration`, `pentesting`, `ctf`, `capture the flag`, `exploit`, `vuln`/`vulnerability`/`vulnerabilit`, `fuzz`/`fuzzing`, `audit`, `harden`/`hardening`, `threat model`, `red team`, `attack surface`, `owasp`), `CouncilProtocol._ctfDoctrineFor(brief)` returns a doctrine block that gets interpolated into both `orchestratorSystemPrompt` (after `=== Output ===`) and `agentSystemPrompt` (after `=== Reporting back ===`). Empty string when the brief doesn't match — non-test briefs are unaffected. Doctrine forces attacker-first thinking, attack-surface enumeration, vulnerability chaining, per-flag artifact contract (target/payload/expected/observed/severity/repro/mitigation), and bias-for-repro (working PoC > prose). **Detection is intentionally generous** — false positives only add attitude, never change protocol shape, so don't tighten the trigger list without a real reason.
+
+- **2026-05 — Council pool guardrails (runtime, not just prompt text).** Pool collaboration remains enabled, but it is now bounded and targeted in code:
+  - `CouncilController` enforces a hard per-session pool cap (`_maxPoolExchangesPerSession = 2`) and rejects additional `council_ask_pool` calls with an explicit feedback message.
+  - Pool questions are quality-gated by `_isSharpPoolQuestion`: soft prompts like "does this look ok" / "any thoughts" are rejected unless the question includes a falsifiable risk framing and a concrete surface hint.
+  - `council_ask_pool` now accepts optional `targets` (agent IDs). Runtime resolves responders via `_selectPoolResponders`; if omitted, it auto-picks up to 3 adversarial roles instead of broadcasting to all siblings.
+  - Auto-injected per-agent pushback was removed from `_runAgent`; pool is now explicitly invoked, not silently forced on every doer task.
+  - Tool schemas were updated in both `lib/services/council/council_protocol.dart` (`CouncilToolSchemas`) and `lib/services/tools/tool_schemas.dart` (`ToolSchemas`) so models can emit `targets` natively.
+
+- **2026-05 — Explorer media controls merged into one hub button.** `file_explorer.dart::_ExplorerActivityBar` no longer renders separate Watch + Teams icons. It now renders one `Icons.video_settings_outlined` tile (`S.explorerMediaHub`) that opens `showMediaUrlPrompt(...)`, which is now a unified modal in `lib/widgets/common/media_url_prompt.dart` with two mode chips (`Watch`, `Teams`). Watch mode keeps placement chips + forced-to-chat notice behavior; Teams mode has its own URL field and action button (`media.playTeams(customUrl)`), so users can launch default Teams or any tenant URL from the same modal. Keep this merged UX unless product explicitly asks for split shortcuts again.
+- **2026-05 — URL normalization now happens inside `MediaController`.** `lib/providers/media_controller.dart` adds `normalizeUserUrl(...)` and both `play(...)` + `playTeams(...)` route through it. Inputs like `youtube.com/...`, `teams.cloud.microsoft`, `www.example.com`, and malformed `https//...` are normalized (scheme auto-added/fixed) before loading WebView2. Localhost-like hosts default to `http://`; public hosts default to `https://`. If future UI surfaces accept media URLs, pass raw user input to controller methods and let this normalizer stay the single source of truth.
+
+- **2026-05 — Council regression fix pack (continuous ping, evaluator copyability, toolset hardening).**
+  - `CouncilController.canPingOrchestrator` now stays enabled for the full active session (`status != done/aborted`) instead of disappearing in intermediate states. This restores a steady "always talk to orchestrator" control surface.
+  - Pings sent during `synthesizing` are queued (`_queuedSynthesisPings`) and replayed immediately after evaluator synthesis completes, so user notes are never dropped and no orchestrator/evaluator race is introduced.
+  - `startCouncil` now normalizes tools on orchestrator/agents/final-evaluator via `_normalizeConfigTools`, forcing inclusion of `kCouncilDefaultTools` even if stale drafts/session payloads contain legacy read-only sets.
+  - Left evaluator blackboard now renders with `CouncilReportView(compact: true)` and includes a copy action (`S.councilLeftBlackboardCopy` / `S.councilLeftBlackboardCopied`), replacing the previous non-selectable plain-text section cards.
+  - Practical effect: evaluator output is selectable/copyable while streaming, mermaid/code rendering works in-rail, and "ping disappeared" behavior is eliminated.
 
 ## When to update this file
 

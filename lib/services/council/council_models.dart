@@ -1,4 +1,5 @@
 import '../../l10n/strings.dart';
+import 'council_task_ledger.dart';
 
 enum CouncilStatus {
   idle,
@@ -34,6 +35,16 @@ class CouncilEventType {
   static const agentThinkingEnded = 'agent_thinking_ended';
   static const agentDone = 'agent_done';
   static const agentError = 'agent_error';
+
+  // Task ledger (see council_task_ledger.dart for schema). Emitted on
+  // every state-machine transition: planned -> dispatched -> running ->
+  // done|failed|timeout|cancelled. Signal subscribes to render per-agent
+  // status, error counts, "waiting on X", and "next action Y".
+  static const taskStateChanged = 'task_state_changed';
+  // Loud, never-swallowed failure marker raised when the orchestrator
+  // produced a plan but no agents executed (or every dispatch failed and
+  // it tried to ship a report anyway). The UI MUST render this.
+  static const dispatchGuardTripped = 'dispatch_guard_tripped';
 
   // Communication
   static const messageSent = 'message_sent';
@@ -414,6 +425,9 @@ class CouncilSession {
   final List<CouncilEvent> events;
   final List<CouncilQuestion> poolQuestions;
   CouncilQuestion? pendingUserQuestion;
+  // Persisted task ledger snapshot. Rehydrated into a [CouncilTaskLedger]
+  // on reload so a crash mid-run can't lose pending dispatches.
+  final List<CouncilTask> tasks;
 
   CouncilSession({
     required this.config,
@@ -428,11 +442,13 @@ class CouncilSession {
     List<CouncilEvent>? events,
     List<CouncilQuestion>? poolQuestions,
     this.pendingUserQuestion,
+    List<CouncilTask>? tasks,
   }) : runId = runId ??
             '${config.id}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
        startedAt = startedAt ?? DateTime.now(),
        events = List<CouncilEvent>.from(events ?? const []),
-       poolQuestions = List<CouncilQuestion>.from(poolQuestions ?? const []);
+       poolQuestions = List<CouncilQuestion>.from(poolQuestions ?? const []),
+       tasks = List<CouncilTask>.from(tasks ?? const []);
 
   CouncilAgent? agentById(String id) {
     if (config.orchestrator.id == id) return config.orchestrator;
@@ -456,6 +472,7 @@ class CouncilSession {
     'events': events.map((e) => e.toJson()).toList(),
     'poolQuestions': poolQuestions.map((q) => q.toJson()).toList(),
     'pendingUserQuestion': pendingUserQuestion?.toJson(),
+    'tasks': tasks.map((t) => t.toJson()).toList(),
   };
 
   static CouncilSession fromJson(Map<String, dynamic> json) {
@@ -493,6 +510,10 @@ class CouncilSession {
               (json['pendingUserQuestion'] as Map).cast<String, dynamic>(),
             )
           : null,
+      tasks: ((json['tasks'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((t) => CouncilTask.fromJson(t.cast<String, dynamic>()))
+          .toList(),
     );
   }
 }

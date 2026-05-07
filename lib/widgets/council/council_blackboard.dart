@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../l10n/strings.dart';
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import '../common/duck_toast.dart';
+import 'council_report_viewer.dart';
 
 /// Which flank of the theater a blackboard panel is mounted on.
 /// Drives margin asymmetry only — both sides share visual language.
@@ -347,117 +350,42 @@ class CouncilLeftBlackboard extends StatelessWidget {
       );
     }
 
-    final sections = _parseSections(body);
     return BlackboardPanel(
       side: BlackboardSide.left,
       title: S.councilLeftBlackboardTitle,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (streaming) const _StreamingPip(),
-          Expanded(
-            child: ListView.separated(
-              itemCount: sections.length,
-              separatorBuilder: (_, _) => const SizedBox(height: 10),
-              itemBuilder: (_, i) => _SectionView(section: sections[i]),
-            ),
+          Row(
+            children: [
+              if (streaming) const _StreamingPip(),
+              const Spacer(),
+              Tooltip(
+                message: S.councilLeftBlackboardCopy,
+                child: InkResponse(
+                  radius: 16,
+                  onTap: () async {
+                    await Clipboard.setData(ClipboardData(text: body));
+                    if (context.mounted) {
+                      showDuckToast(context, S.councilLeftBlackboardCopied);
+                    }
+                  },
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Icon(
+                      Icons.copy_outlined,
+                      size: 14,
+                      color: DuckColors.fgMuted,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
-    );
-  }
-
-  /// Lightweight markdown sectioner: splits body on H1/H2/H3 headings.
-  /// Anything before the first heading becomes an untitled lead section.
-  static List<_BoardSection> _parseSections(String body) {
-    final lines = body.split('\n');
-    final sections = <_BoardSection>[];
-    String? currentTitle;
-    int? currentLevel;
-    final buf = StringBuffer();
-    void flush() {
-      final text = buf.toString().trim();
-      if (text.isEmpty && currentTitle == null) return;
-      sections.add(
-        _BoardSection(
-          title: currentTitle,
-          level: currentLevel ?? 0,
-          body: text,
-        ),
-      );
-      buf.clear();
-    }
-
-    final headingRe = RegExp(r'^(#{1,3})\s+(.+?)\s*$');
-    for (final line in lines) {
-      final m = headingRe.firstMatch(line);
-      if (m != null) {
-        flush();
-        currentLevel = m.group(1)!.length;
-        currentTitle = m.group(2)!.trim();
-      } else {
-        buf.writeln(line);
-      }
-    }
-    flush();
-    if (sections.isEmpty) {
-      sections.add(_BoardSection(title: null, level: 0, body: body.trim()));
-    }
-    return sections;
-  }
-}
-
-class _BoardSection {
-  final String? title;
-  final int level;
-  final String body;
-  const _BoardSection({
-    required this.title,
-    required this.level,
-    required this.body,
-  });
-}
-
-class _SectionView extends StatelessWidget {
-  final _BoardSection section;
-  const _SectionView({required this.section});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: DuckColors.bgDeepest.withValues(alpha: 0.72),
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-        border: Border.all(
-          color: DuckColors.accentMint.withValues(alpha: 0.20),
-          width: 0.7,
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (section.title != null) ...[
-            Text(
-              section.title!,
-              style: TextStyle(
-                color: DuckColors.fgPrimary,
-                fontWeight: FontWeight.w800,
-                fontSize: section.level <= 1 ? 13 : 12,
-                letterSpacing: section.level <= 1 ? 0.4 : 0.2,
-              ),
-            ),
-            const SizedBox(height: 6),
-          ],
-          if (section.body.isNotEmpty)
-            Text(
-              section.body,
-              style: const TextStyle(
-                color: DuckColors.fgSecondary,
-                fontSize: 11,
-                height: 1.35,
-              ),
-            ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: CouncilReportView(markdown: body, compact: true),
+          ),
         ],
       ),
     );

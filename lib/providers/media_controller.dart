@@ -177,12 +177,46 @@ class MediaController extends ChangeNotifier {
   /// references it; remove once we're sure nothing reads it.
   bool get watchMediaForcedToChat => false;
 
+  /// Normalizes user-entered URLs so inputs like `youtube.com/...` or
+  /// `teams.cloud.microsoft` still load without requiring the user to type
+  /// the full scheme.
+  String normalizeUserUrl(String rawUrl) {
+    var input = rawUrl.trim();
+    if (input.isEmpty) return input;
+
+    final lower = input.toLowerCase();
+    if (lower.startsWith('https//')) {
+      input = 'https://${input.substring(7)}';
+    } else if (lower.startsWith('http//')) {
+      input = 'http://${input.substring(6)}';
+    } else if (input.startsWith('//')) {
+      input = 'https:$input';
+    }
+
+    final parsed = Uri.tryParse(input);
+    if (parsed != null && parsed.hasScheme) return input;
+
+    final hostCandidate = input.split('/').first.toLowerCase();
+    final isLocalHost =
+        hostCandidate.startsWith('localhost') ||
+        hostCandidate.startsWith('127.0.0.1') ||
+        hostCandidate.startsWith('0.0.0.0') ||
+        hostCandidate.startsWith('[::1]');
+    final looksLikeHost = hostCandidate.contains('.') || isLocalHost;
+    if (!looksLikeHost) return input;
+
+    final scheme = isLocalHost ? 'http' : 'https';
+    return '$scheme://$input';
+  }
+
   /// Extract the YouTube video id from a watch / share / shorts URL.
   /// Returns null when the URL is not a recognisable YouTube link.
   String? extractYoutubeId(String url) {
+    final normalized = normalizeUserUrl(url);
     try {
-      if (url.contains('youtube.com')) {
-        final uri = Uri.parse(url);
+      final uri = Uri.parse(normalized);
+      final host = uri.host.toLowerCase();
+      if (host.contains('youtube.com')) {
         final v = uri.queryParameters['v'];
         if (v != null && v.isNotEmpty) return v;
         final shortsIdx = uri.pathSegments.indexOf('shorts');
@@ -190,16 +224,8 @@ class MediaController extends ChangeNotifier {
           return uri.pathSegments[shortsIdx + 1];
         }
       }
-      if (url.contains('youtu.be/')) {
-        return url
-            .split('youtu.be/')
-            .last
-            .split('?')
-            .first
-            .split('&')
-            .first
-            .split('/')
-            .first;
+      if (host.contains('youtu.be') && uri.pathSegments.isNotEmpty) {
+        return uri.pathSegments.first;
       }
     } catch (_) {}
     return null;
@@ -221,18 +247,19 @@ class MediaController extends ChangeNotifier {
     // and YouTube can coexist in the side column. Placement is
     // now strictly user-controlled via `setPlacement`.
 
-    final ytId = extractYoutubeId(url);
-    final isTwitch = ytId == null && url.contains('twitch.tv/');
+    final normalizedUrl = normalizeUserUrl(url);
+    final ytId = extractYoutubeId(normalizedUrl);
+    final isTwitch = ytId == null && normalizedUrl.contains('twitch.tv/');
     String targetUrl;
     if (ytId != null) {
       targetUrl = 'https://www.youtube.com/watch?v=$ytId&autoplay=1';
     } else if (isTwitch) {
-      if (url.contains('/videos/')) {
-        final vid = url.split('/videos/').last.split('?').first;
+      if (normalizedUrl.contains('/videos/')) {
+        final vid = normalizedUrl.split('/videos/').last.split('?').first;
         targetUrl =
             'https://player.twitch.tv/?video=$vid&parent=localhost&autoplay=true';
       } else {
-        final ch = url
+        final ch = normalizedUrl
             .split('twitch.tv/')
             .last
             .split('/')
@@ -246,7 +273,7 @@ class MediaController extends ChangeNotifier {
       // Anything else just loads as a normal browser tab — news,
       // streams, twitter, whatever the user wants up while they
       // work. Use zoom +/- to fit the page into the panel.
-      targetUrl = url;
+      targetUrl = normalizedUrl;
     }
 
     try {
@@ -258,8 +285,9 @@ class MediaController extends ChangeNotifier {
         // and "open in new tab" links working without flashing a
         // detached browser window over the IDE.
         try {
-          await webview
-              .setPopupWindowPolicy(WebviewPopupWindowPolicy.sameWindow);
+          await webview.setPopupWindowPolicy(
+            WebviewPopupWindowPolicy.sameWindow,
+          );
         } catch (_) {}
         // Load uBlock Origin Lite (MV3) from the bundled asset. uBOL
         // does the heavy lifting: in-stream YouTube ads, network
@@ -289,8 +317,9 @@ class MediaController extends ChangeNotifier {
         // WebviewController anyway). Don't drop the gates without
         // rebuilding context.
         try {
-          await webview
-              .addScriptToExecuteOnDocumentCreated(kPopupSuppressionScript);
+          await webview.addScriptToExecuteOnDocumentCreated(
+            kPopupSuppressionScript,
+          );
         } catch (_) {}
         _webviewInitialized = true;
       }
@@ -302,7 +331,7 @@ class MediaController extends ChangeNotifier {
         await webview.setZoomFactor(1.0);
       } catch (_) {}
       await webview.loadUrl(targetUrl);
-      _url = url;
+      _url = normalizedUrl;
       _youtubeId = ytId;
       _isTwitch = isTwitch;
       notifyListeners();
@@ -311,8 +340,11 @@ class MediaController extends ChangeNotifier {
     }
   }
 
-  Future<void> playTeams() async {
-    const url = 'https://teams.cloud.microsoft';
+  Future<void> playTeams([String? url]) async {
+    final raw = (url ?? '').trim();
+    final normalizedUrl = normalizeUserUrl(
+      raw.isEmpty ? 'teams.cloud.microsoft' : raw,
+    );
     try {
       if (!_teamsWebviewInitialized) {
         await teamsWebview.initialize();
@@ -321,8 +353,9 @@ class MediaController extends ChangeNotifier {
         // popup into this same Webview2 instance, which Teams
         // handles gracefully (popped-out view just loads in place).
         try {
-          await teamsWebview
-              .setPopupWindowPolicy(WebviewPopupWindowPolicy.sameWindow);
+          await teamsWebview.setPopupWindowPolicy(
+            WebviewPopupWindowPolicy.sameWindow,
+          );
         } catch (_) {}
         _teamsWebviewInitialized = true;
       }
@@ -336,8 +369,8 @@ class MediaController extends ChangeNotifier {
       try {
         await teamsWebview.setZoomFactor(1.0);
       } catch (_) {}
-      await teamsWebview.loadUrl(url);
-      _teamsUrl = url;
+      await teamsWebview.loadUrl(normalizedUrl);
+      _teamsUrl = normalizedUrl;
       // v1.4: previously this method also flipped watch-media
       // placement to `chat` so Teams could own the lone editor
       // right-slot. The new `SidePanesColumn` stacks SSH / Teams /

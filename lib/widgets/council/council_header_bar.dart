@@ -40,28 +40,6 @@ class CouncilHeaderBar extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Container(
-            width: 34,
-            height: 34,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: const LinearGradient(
-                colors: [DuckColors.accentCyan, DuckColors.accentPurple],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: DuckColors.accentPurple.withValues(alpha: 0.24),
-                  blurRadius: 18,
-                ),
-              ],
-            ),
-            child: const Icon(
-              Icons.hub_outlined,
-              color: DuckColors.bgDeepest,
-              size: 19,
-            ),
-          ),
-          const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

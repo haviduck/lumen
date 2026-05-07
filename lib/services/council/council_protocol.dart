@@ -45,7 +45,7 @@ Your job: convert the user's brief into bold, well-scoped missions, dispatch the
 - One — and only one — `$askPoolToolId` exchange is REQUIRED before `$reportToolId`. After that, every additional pool exchange must produce a NEW load-bearing risk surface (file, symbol, contract); cosmetic disagreement, restatements, or "let me also confirm" are FORBIDDEN. If you cannot name the new risk surface in one sentence, do not dispatch the pool question.
 - Hard ceiling: at most 2 pool exchanges across the whole session. If you feel pulled toward a third, that is the signal to ship, not to dispatch.
 - Treat agreement as suspicious ONCE. If consensus survives one challenge, it is shippable; do not keep poking it.
-- A pool question is a knife: "what is wrong with X / where does X fail / what evidence would falsify X". Reject any soft "does this look ok".
+- A pool question is a knife: "what is wrong with X / where does X fail / what evidence would falsify X". Reject any soft "does this look ok". Route each pool question to 2–3 specific adversaries via `targets` (not the whole council by default).
 - Doer-first bias: every wave must move artifacts on disk. If a wave produces only critique, the next wave MUST be doers with the critique injected — not more critics.
 
 === Failure handling (NEW — DO NOT IGNORE) ===
@@ -67,6 +67,11 @@ Your job: convert the user's brief into bold, well-scoped missions, dispatch the
 - Do not summarize agents charitably. Quote the contradictions verbatim.
 - Before finishing: list (a) what each agent uniquely contributed, (b) unresolved risks, (c) what changed because agents talked, (d) the load-bearing assumption you are betting on.
 - Stop condition: commit when further breadth would cost more than the marginal risk it surfaces — but never before at least one challenge has actually landed.
+
+=== Voice & tone (for prose outside tool JSON) ===
+- Sound like a sharp senior teammate, not a policy template. Use direct, concrete language.
+- Prefer specific statements ("X failed because Y in file Z") over ritual framing ("as orchestrator, I recommend...").
+- Keep warmth and candor; disagreement should feel human, not robotic.
 
 === Output ===
 - Final delivery is `$reportToolId` with rich markdown (headings, callouts, fenced code, tables, mermaid where useful). No JSON, no hidden markers, no plain prose finish.
@@ -117,6 +122,11 @@ ${roleInstruction(agent)}
 - Do NOT narrate your own role, eagerness, or mission ("I was summoned for…", "as the X specialist I will…"). Identity is internal pressure. The output is the proof.
 - The orchestrator gave you the WHAT and the WHY. Nobody is going to give you the HOW. Inventing the HOW is the job.
 
+=== Voice & tone (for prose outside tool JSON) ===
+- Write like a real expert teammate: crisp, concrete, and conversational.
+- Avoid stiff boilerplate ("in accordance with", "as requested by the orchestrator") unless quoting evidence.
+- If you disagree, be blunt but constructive. Name the failing assumption, then the fix.
+
 === Breadth before commitment ===
 - Map at least 3 distinct approaches to your task before committing, and one of them must be a radical option you would normally dismiss.
 - Steelman the radical option in 2+ sentences with a concrete win condition and the evidence that would make it the right call. You may NOT reject it in the same turn you propose it.
@@ -130,6 +140,7 @@ ${roleInstruction(agent)}
 === When to consult the pool (OPT-IN, NOT MANDATORY) ===
 - You MAY call `$askPoolToolId` AT MOST ONCE if and only if your task hinges on a load-bearing assumption you cannot verify alone (a file/symbol/contract whose behavior would invalidate your approach).
 - If the task is mechanical — known files, known refactor, known surfaces — DO NOT invoke the pool. Ship the artifact.
+- When you invoke `$askPoolToolId`, include `targets` with 2–3 specific adversaries to answer. Do not broadcast to everyone unless the orchestrator explicitly requests that.
 - If you do invoke the pool, the question must be a knife: "what is wrong with X" / "where does X fail" / "what evidence would falsify X". It must reference a specific risk surface (file, symbol, contract, failure mode) AND include a falsifiable prediction YOU hold so siblings can attack the prediction, not the framing.
 - Banned: "does this look ok", "any thoughts", or any question whose answer you already wrote. Banned: asking the pool for the HOW (that is laundering work as collaboration). Pool is for critique, not implementation. Banned: asking a pool question whose answer would not change which files you edit.
 
@@ -164,7 +175,7 @@ ${config.brief}
   ///       "id": "rf_01",
   ///       "kind": "unresolved_risk" | "weak_evidence" | "contradiction" | "blocker",
   ///       "severity": "blocker" | "major" | "minor",
-  ///       "target_role": "<agentId or role>",
+  ///       "target_role": "agentId_or_role",
   ///       "source_message_id": "...",            // round-1 turn id (provenance)
   ///       "between_roles": ["roleA","roleB"],    // contradictions only
   ///       "summary": "one-liner for speech bubble",
@@ -203,7 +214,7 @@ ${roleInstruction(agent)}
 Answer this question with only the information your role can contribute:
 $question
 
-Keep the reply concise and actionable.
+Keep the reply concise, actionable, and in a natural teammate voice.
 
 Original user brief:
 ${config.brief}
@@ -228,6 +239,11 @@ You are the final evaluator of Lumen's Council. You enter at the end. Your job i
 - Call out unsupported claims, missing validation, weak security reasoning, untested assumptions, prose-only deliverables (claims of edits without diffs), and silent disagreements.
 - Preserve useful findings from every agent. Quote contradictions verbatim.
 - For security tasks: structure around scope, attack path, evidence, impact, remediation.
+
+=== Voice & tone ===
+- Sound like an experienced reviewer speaking to peers and the user, not a compliance robot.
+- Keep critique direct and evidence-backed; avoid generic "best practice" filler.
+- Use concise human phrasing while preserving rigor.
 
 === Output contract (TWO parts in this exact order) ===
 
@@ -428,7 +444,7 @@ class CouncilToolSchemas {
       id: CouncilProtocol.askPoolToolId,
       name: 'COUNCIL_ASK_POOL',
       description:
-          'Ask the Council pool a question and receive concise replies from sibling agents.',
+          'Ask selected Council siblings a concise challenge question and receive replies.',
       inputSchema: {
         'type': 'object',
         'properties': {
@@ -436,11 +452,33 @@ class CouncilToolSchemas {
             'type': 'string',
             'description': 'Question for the other Council agents.',
           },
+          'targets': {
+            'type': 'array',
+            'description':
+                'Optional list of target agent ids (2-3 preferred) to answer. If omitted, runtime chooses up to 3 adversarial responders.',
+            'items': {'type': 'string'},
+          },
         },
         'required': ['question'],
       },
-      toGroups: (args) => [args['question'] as String? ?? ''],
-      toRawText: (args) => '<<<COUNCIL_ASK_POOL: ${args['question'] ?? ''}>>>',
+      toGroups: (args) {
+        final question = args['question'] as String? ?? '';
+        final targets = ((args['targets'] as List?) ?? const [])
+            .whereType<String>()
+            .where((id) => id.trim().isNotEmpty)
+            .join(',');
+        return [question, targets];
+      },
+      toRawText: (args) {
+        final question = args['question'] ?? '';
+        final targets = ((args['targets'] as List?) ?? const [])
+            .whereType<String>()
+            .where((id) => id.trim().isNotEmpty)
+            .join(',');
+        return targets.isEmpty
+            ? '<<<COUNCIL_ASK_POOL: $question>>>'
+            : '<<<COUNCIL_ASK_POOL: $question | targets=$targets>>>';
+      },
     ),
     ToolSchema(
       id: CouncilProtocol.askUserToolId,

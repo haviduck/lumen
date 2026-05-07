@@ -17,6 +17,7 @@ import 'council_report_viewer.dart';
 import 'council_speech_bubbles.dart';
 import 'council_traffic_layer.dart';
 import 'council_user_prompt_panel.dart';
+import 'network_controller.dart';
 
 class CouncilTheater extends StatefulWidget {
   const CouncilTheater({super.key});
@@ -29,6 +30,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
     with SingleTickerProviderStateMixin {
   late final AnimationController _pulse;
   final CouncilStageAnchors _anchors = CouncilStageAnchors();
+  final NetworkController _network = NetworkController();
   bool _pingOpen = false;
   // When true, the report viewer is docked as a right-side panel inside
   // the theater (NOT as a modal dialog). This is the "council doesn't
@@ -52,6 +54,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
   void dispose() {
     _pulse.dispose();
     _anchors.dispose();
+    _network.dispose();
     super.dispose();
   }
 
@@ -186,6 +189,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
                 session: session,
                 pulse: _pulse,
                 anchors: _anchors,
+                network: _network,
                 canPingOrchestrator: controller.canPingOrchestrator,
                 evaluatorOnBlackboard: blackboardsMounted,
                 onTapOrchestrator: controller.canPingOrchestrator
@@ -252,6 +256,7 @@ class _CouncilStage extends StatelessWidget {
   final CouncilSession session;
   final Animation<double> pulse;
   final CouncilStageAnchors anchors;
+  final NetworkController network;
   final bool canPingOrchestrator;
   final bool evaluatorOnBlackboard;
   final VoidCallback? onTapOrchestrator;
@@ -260,6 +265,7 @@ class _CouncilStage extends StatelessWidget {
     required this.session,
     required this.pulse,
     required this.anchors,
+    required this.network,
     required this.canPingOrchestrator,
     required this.evaluatorOnBlackboard,
     required this.onTapOrchestrator,
@@ -270,14 +276,43 @@ class _CouncilStage extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = Size(constraints.maxWidth, constraints.maxHeight);
-        final center = Offset(size.width / 2, size.height / 2);
-        // More breathing room: smaller cards, larger orbital radius.
-        final cardW = math.min(248.0, math.max(208.0, size.width * 0.20));
-        final cardH = math.min(208.0, math.max(176.0, size.height * 0.26));
-        final radius = math
-            .min(size.width * 0.42, size.height * 0.42)
-            .clamp(180.0, 380.0);
         final agents = _visibleAgents(session);
+
+        // ── Stage Director composition ─────────────────────────────────
+        // HOW: wide ellipse with a 50° dead-wedge at top AND bottom so
+        // the agent ring NEVER pokes into the header / footer safe zones.
+        // Cards therefore cluster on the LEFT and RIGHT wings. This:
+        //   • uses the horizontal axis aggressively (rx ≫ ry),
+        //   • leaves the vertical centre column for the orchestrator,
+        //   • leaves the top + bottom of the canvas EMPTY so Drift can
+        //     drift bubbles outward past the ring without clipping.
+        // Cards are smaller (vertical budget is tight) but every card has
+        // ≥ 28px gap to its neighbour at the worst-case packing.
+        const safePadTop = 28.0;
+        const safePadBottom = 28.0;
+        const safePadSide = 24.0;
+        final safeZone = Rect.fromLTRB(
+          safePadSide,
+          safePadTop,
+          size.width - safePadSide,
+          size.height - safePadBottom,
+        );
+        final center = safeZone.center;
+
+        // Cards: shrunk to fit the ring without overlap.  Width scales
+        // with viewport so wide screens get bigger, presentable cards;
+        // height stays modest because vertical room is the scarce axis.
+        final cardW = math.min(236.0, math.max(196.0, size.width * 0.18));
+        final cardH = math.min(196.0, math.max(168.0, size.height * 0.24));
+
+        // Ring radii.  rx is intentionally ~1.55× ry so cards splay
+        // sideways instead of stacking above / below the orchestrator.
+        // Both radii respect the safe zone minus a half-card pad so a
+        // card centred on the ring fits entirely inside safeZone.
+        final maxRx = (safeZone.width / 2) - cardW / 2 - 8;
+        final maxRy = (safeZone.height / 2) - cardH / 2 - 8;
+        final rx = math.max(180.0, maxRx);
+        final ry = math.max(120.0, math.min(maxRy, rx / 1.55));
 
         // Compute layout once and publish anchors so bubbles + traffic
         // align perfectly with cards.
@@ -289,24 +324,55 @@ class _CouncilStage extends StatelessWidget {
           cardH,
         );
         layout[session.config.orchestrator.id] = orchestratorRect;
-        for (var i = 0; i < agents.length; i++) {
-          final angle = -math.pi / 2 + (math.pi * 2 * i / agents.length);
-          final raw = Offset(
-            center.dx + math.cos(angle) * radius,
-            center.dy + math.sin(angle) * radius,
-          );
-          final left = (raw.dx - cardW / 2).clamp(
-            14.0,
-            size.width - cardW - 14,
-          );
-          final top = (raw.dy - cardH / 2).clamp(
-            14.0,
-            size.height - cardH - 14,
-          );
-          layout[agents[i].id] = Rect.fromLTWH(left, top, cardW, cardH);
+
+        // Skip a 50° wedge at TOP and BOTTOM so cards never invade the
+        // header / footer safe zones.  Agents are distributed across the
+        // remaining 310° split into LEFT (right→bottom→left, swept down)
+        // and RIGHT (top→right→bottom, swept up) wings.  For 9 agents
+        // this yields ~5 per wing with healthy lateral spacing.
+        final n = agents.length;
+        if (n > 0) {
+          const deadWedge = math.pi * 50 / 180; // 50° gap at top + bottom
+          final usable = math.pi * 2 - deadWedge * 2;
+          // Start just right of "12 o'clock + half-wedge", sweep clockwise.
+          final start = -math.pi / 2 + deadWedge / 2;
+          for (var i = 0; i < n; i++) {
+            // Two arcs separated by the bottom wedge: half the agents on
+            // the right arc (start → start+usable/2), then the bottom
+            // wedge is skipped, then the left arc.
+            double t;
+            if (n == 1) {
+              t = 0.5;
+            } else {
+              t = i / (n - 1);
+            }
+            // Inject the bottom dead-wedge in the middle of the sweep.
+            final angle = (t < 0.5)
+                ? start + (t * 2) * (usable / 2)
+                : start + (usable / 2) + deadWedge + ((t - 0.5) * 2) * (usable / 2);
+
+            final raw = Offset(
+              center.dx + math.cos(angle) * rx,
+              center.dy + math.sin(angle) * ry,
+            );
+            final left = (raw.dx - cardW / 2).clamp(
+              safePadSide,
+              size.width - cardW - safePadSide,
+            );
+            final top = (raw.dy - cardH / 2).clamp(
+              safePadTop,
+              size.height - cardH - safePadBottom,
+            );
+            layout[agents[i].id] = Rect.fromLTWH(left, top, cardW, cardH);
+          }
         }
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          anchors.update(layout);
+          anchors.update(
+            layout,
+            safeZone: safeZone,
+            ringCenter: center,
+            ringRadii: Size(rx, ry),
+          );
         });
 
         // Background is lifted OUT of the pulse AnimatedBuilder so
@@ -332,6 +398,7 @@ class _CouncilStage extends StatelessWidget {
                             events: session.events,
                             pulse: pulse,
                             anchors: anchors,
+                            network: network,
                             mutedAgentIds: evaluatorOnBlackboard
                                 ? {session.config.finalEvaluator.id}
                                 : const <String>{},
@@ -346,13 +413,21 @@ class _CouncilStage extends StatelessWidget {
                           child: CouncilAgentSector(
                             agent: session.config.orchestrator,
                             isOrchestrator: true,
+                            spawnDelayMs: 0,
                           ),
                         ),
                       ),
-                      for (final agent in agents)
+                      for (var i = 0; i < agents.length; i++)
                         _positioned(
-                          layout[agent.id]!,
-                          CouncilAgentSector(agent: agent),
+                          layout[agents[i].id]!,
+                          CouncilAgentSector(
+                            key: ValueKey('agent-${agents[i].id}'),
+                            agent: agents[i],
+                            // Stagger from the orchestrator outward: cards
+                            // closer to "12 o'clock" of the sweep arrive
+                            // first, latest cards land ~720ms after.
+                            spawnDelayMs: 120 + i * 80,
+                          ),
                         ),
                     ],
                   );

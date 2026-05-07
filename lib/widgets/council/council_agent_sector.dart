@@ -1,10 +1,11 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 
 import '../../l10n/strings.dart';
+import '../../providers/app_state.dart';
 import '../../services/council/council_models.dart';
 import '../../services/council/council_protocol.dart';
+import '../../services/council/council_task_ledger.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import 'council_agent_idle_indicator.dart';
@@ -12,11 +13,16 @@ import 'council_agent_idle_indicator.dart';
 class CouncilAgentSector extends StatefulWidget {
   final CouncilAgent agent;
   final bool isOrchestrator;
+  /// Delay before this card begins its arrival animation. The Stage
+  /// Director uses this to stagger the ring spawn so cards materialize
+  /// in a pulsating-inward sweep instead of all at once.
+  final int spawnDelayMs;
 
   const CouncilAgentSector({
     super.key,
     required this.agent,
     this.isOrchestrator = false,
+    this.spawnDelayMs = 0,
   });
 
   @override
@@ -33,10 +39,23 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
   @override
   void initState() {
     super.initState();
+    // Pulsating-inwards arrival: starts oversized + blurred + transparent,
+    // settles into the resting card.  See [_buildCard] for the curves.
+    //   • duration: 880ms easeOutCubic on scale + opacity, with an outer
+    //     ring that contracts inward to the card edge.
+    //   • staggered start via [widget.spawnDelayMs] so the ring lights up
+    //     as a sweep, not a flash.
     _arrive = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 720),
-    )..forward();
+      duration: const Duration(milliseconds: 880),
+    );
+    if (widget.spawnDelayMs <= 0) {
+      _arrive.forward();
+    } else {
+      Future.delayed(Duration(milliseconds: widget.spawnDelayMs), () {
+        if (mounted) _arrive.forward();
+      });
+    }
     _idle = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 2600),
@@ -83,9 +102,15 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     return AnimatedBuilder(
       animation: Listenable.merge([_arrive, _idle, _doneFlash]),
       builder: (context, _) {
-        final arriveT = Curves.easeOutBack.transform(_arrive.value);
-        final scale = 0.86 + 0.14 * arriveT;
-        final fadeIn = _arrive.value.clamp(0.0, 1.0);
+        // Pulsating-inwards spawn:
+        //   scale  : 1.32 → 1.00  (settles INWARD; easeOutCubic)
+        //   opacity: 0.00 → 1.00  (clamped)
+        //   blur   : the contracting ring acts as the "blur" cue —
+        //            painted around the card and pulled inward.
+        final raw = _arrive.value.clamp(0.0, 1.0);
+        final eased = Curves.easeOutCubic.transform(raw);
+        final scale = 1.32 - 0.32 * eased;
+        final fadeIn = Curves.easeOutCubic.transform(raw);
         // `done` intentionally maps to `accentCyan` — using `stateOk`
         // here painted every persisted-done card with a hard nord-green
         // border (and fed the same color into `_ArrivalRingPainter`,
@@ -107,13 +132,16 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
             child: Stack(
               clipBehavior: Clip.none,
               children: [
-                // Arrival ring pulse — fades after the first ~720ms.
-                if (_arrive.value < 1.0)
+                // Pulsating-inwards arrival ring — starts ~80px outside
+                // the card and contracts to the card edge as the card
+                // settles.  Replaces the old expand-outward ring which
+                // read as "exploding" rather than "materializing".
+                if (raw < 1.0)
                   Positioned.fill(
                     child: IgnorePointer(
                       child: CustomPaint(
                         painter: _ArrivalRingPainter(
-                          progress: _arrive.value,
+                          progress: raw,
                           accent: accent,
                         ),
                       ),
@@ -152,30 +180,74 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     required double desat,
   }) {
     final agent = widget.agent;
-    final ambientGlow = active ? 0.10 + 0.05 * idleT : 0.0;
-    final borderColor = errored
-        ? DuckColors.stateError.withValues(alpha: 0.5)
+    // Stronger card presence (Stage Director spec):
+    //   • Accent stroke (always present, 0.6 → 1.4px) — gives every card
+    //     a faint colored hairline so cards read as "lit objects" even
+    //     when idle.  Not neon: alpha sits low on idle, breathes with
+    //     activity.
+    //   • Outer glow (active only): wide soft accent halo behind card.
+    //   • Rim light (active + orchestrator): bright top-edge highlight
+    //     via a 1px inner gradient stroke — sells the depth.
+    //   • Layered shadow: a wide soft shadow + a tight contact shadow.
+    final ambientGlow = active ? 0.16 + 0.08 * idleT : 0.05;
+    final accentStrokeAlpha = errored
+        ? 0.65
+        : isOrchestrator
+        ? 0.55 + 0.20 * idleT
         : active
-        ? accent.withValues(alpha: 0.35 + 0.15 * idleT)
-        : DuckColors.glassSeam;
-    final borderWidth = active ? 1.0 : (errored ? 1.0 : 0.6);
+        ? 0.42 + 0.18 * idleT
+        : 0.16; // always-on subtle accent
+    final borderColor = errored
+        ? DuckColors.stateError.withValues(alpha: 0.72)
+        : accent.withValues(alpha: accentStrokeAlpha);
+    final borderWidth = errored
+        ? 1.2
+        : isOrchestrator
+        ? 1.0
+        : active
+        ? 0.9
+        : 0.7;
     return AnimatedContainer(
       duration: DuckMotion.medium,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: active ? DuckColors.bgRaisedHi : DuckColors.bgRaised,
         borderRadius: BorderRadius.circular(DuckTheme.radiusL),
+        // Inner top-to-bottom sheen: very subtle highlight at the top
+        // and a deeper sink toward the bottom — gives the card a sense
+        // of being lit from above without any explicit gradient panel.
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            (active ? DuckColors.bgRaisedHi : DuckColors.bgRaised)
+                .withValues(alpha: 1.0),
+            accent.withValues(alpha: active ? 0.06 : 0.025),
+            DuckColors.bgDeepest.withValues(alpha: 0.18),
+          ],
+          stops: const [0.0, 0.55, 1.0],
+        ),
         border: Border.all(color: borderColor, width: borderWidth),
-        boxShadow: active
-            ? [
-                BoxShadow(
-                  color: accent.withValues(alpha: ambientGlow),
-                  blurRadius: 18,
-                  spreadRadius: 0,
-                ),
-                ...DuckTheme.shadowSoft,
-              ]
-            : DuckTheme.shadowSoft,
+        boxShadow: [
+          // Wide ambient accent glow — taste-level alpha so the canvas
+          // gets the "subtle lighting" the user asked for without
+          // becoming neon vomit.
+          BoxShadow(
+            color: accent.withValues(alpha: ambientGlow),
+            blurRadius: active ? 24 : 14,
+            spreadRadius: active ? 1.0 : 0.0,
+            offset: Offset.zero,
+          ),
+          // Contact shadow: tight, dark, downward — anchors card to
+          // backdrop so it reads as an elevated surface.
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.42),
+            blurRadius: 18,
+            spreadRadius: -2,
+            offset: const Offset(0, 6),
+          ),
+          ...DuckTheme.shadowSoft,
+        ],
       ),
       child: Opacity(
         opacity: desat,
@@ -260,21 +332,11 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
               ),
             ),
             const SizedBox(height: 10),
-            Row(
-              children: [
-                Flexible(
-                  child: _Chip(icon: Icons.memory_outlined, label: agent.model),
-                ),
-                if (agent.currentTask.isNotEmpty) ...[
-                  const SizedBox(width: 6),
-                  Flexible(
-                    child: _Chip(
-                      icon: Icons.bolt_outlined,
-                      label: agent.currentTask,
-                    ),
-                  ),
-                ],
-              ],
+            _AgentStatusBlock(
+              agent: agent,
+              errored: errored,
+              done: done,
+              accent: accent,
             ),
             const SizedBox(height: 10),
             Expanded(
@@ -315,23 +377,43 @@ class _ArrivalRingPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final t = progress.clamp(0.0, 1.0);
     final eased = Curves.easeOutCubic.transform(t);
-    final maxRadius = math.max(size.width, size.height) * (0.6 + 0.4 * eased);
+    // Pulsating INWARD: ring starts ~70px outside the card edge and
+    // contracts to a tight halo at the card border as the card settles.
+    final outset = 70.0 * (1 - eased);
     final paint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0 * (1 - t)
-      ..color = accent.withValues(alpha: (1 - t) * 0.55);
+      ..strokeWidth = 1.4 + 1.6 * (1 - t)
+      ..color = accent.withValues(alpha: (1 - t) * 0.65)
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, 4 * (1 - t) + 0.6);
     canvas.drawRRect(
       RRect.fromRectAndRadius(
         Rect.fromLTWH(
-          -maxRadius * 0.06,
-          -maxRadius * 0.06,
-          size.width + maxRadius * 0.12,
-          size.height + maxRadius * 0.12,
-        ).deflate(-eased * 14),
-        const Radius.circular(20),
+          -outset,
+          -outset,
+          size.width + outset * 2,
+          size.height + outset * 2,
+        ),
+        Radius.circular(20 + outset * 0.4),
       ),
       paint,
     );
+
+    // Secondary inner sheen contracting on the card itself for the last
+    // third of the animation — gives a "settling" highlight.
+    if (t > 0.55) {
+      final s = ((t - 0.55) / 0.45).clamp(0.0, 1.0);
+      final sheen = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.8 * (1 - s)
+        ..color = accent.withValues(alpha: 0.45 * (1 - s));
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(0, 0, size.width, size.height).deflate(2.0 + 4 * s),
+          const Radius.circular(16),
+        ),
+        sheen,
+      );
+    }
   }
 
   @override
@@ -514,18 +596,74 @@ class _StatusPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-      decoration: BoxDecoration(
-        color: DuckColors.bgChip,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: DuckColors.border, width: 0.5),
-      ),
-      child: Text(
-        _label,
-        style: const TextStyle(color: DuckColors.fgMuted, fontSize: 10),
+    final (icon, color) = _glyph;
+    return Semantics(
+      label: 'Status: $_label',
+      child: Container(
+        height: 20,
+        padding: const EdgeInsets.symmetric(horizontal: 7),
+        decoration: BoxDecoration(
+          color: DuckColors.bgChip,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(
+            color: color.withValues(alpha: 0.45),
+            width: 0.6,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Status-bearing GLYPH (not just color) — required for
+            // reduced-motion / colorblind perceivability.
+            if (icon is _SpinnerGlyph)
+              const _SpinnerDot(color: DuckColors.accentCyan)
+            else
+              Icon(icon as IconData, size: 11, color: color),
+            const SizedBox(width: 5),
+            Text(
+              _label,
+              maxLines: 1,
+              softWrap: false,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: color, fontSize: 10),
+            ),
+          ],
+        ),
       ),
     );
+  }
+
+  // Returns either an `IconData` or a `_SpinnerGlyph` sentinel for the
+  // working/replying spinner (rendered as an animated dot).
+  (Object, Color) get _glyph {
+    return switch (status) {
+      CouncilAgentStatus.idle => (
+          Icons.fiber_manual_record,
+          DuckColors.fgSubtle,
+        ),
+      CouncilAgentStatus.queued => (
+          Icons.schedule_outlined,
+          DuckColors.fgMuted,
+        ),
+      CouncilAgentStatus.working => (_SpinnerGlyph(), DuckColors.accentCyan),
+      CouncilAgentStatus.askingPool => (
+          Icons.forum_outlined,
+          DuckColors.accentPurple,
+        ),
+      CouncilAgentStatus.awaitingUser => (
+          Icons.hourglass_bottom,
+          DuckColors.accentDuck,
+        ),
+      CouncilAgentStatus.replying => (_SpinnerGlyph(), DuckColors.accentMint),
+      CouncilAgentStatus.done => (
+          Icons.check_circle_outline,
+          DuckColors.stateOk,
+        ),
+      CouncilAgentStatus.error => (
+          Icons.warning_amber_rounded,
+          DuckColors.stateError,
+        ),
+    };
   }
 
   String get _label {
@@ -542,6 +680,358 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
+class _SpinnerGlyph {
+  const _SpinnerGlyph();
+}
+
+/// Tiny spinner used inside the status pill. Reduced-motion friendly:
+/// the sweep is small (~11px) and the dot is also drawn as a static
+/// solid mark so the status remains legible if motion is disabled or
+/// the widget is captured in a screenshot.
+class _SpinnerDot extends StatefulWidget {
+  final Color color;
+  const _SpinnerDot({required this.color});
+
+  @override
+  State<_SpinnerDot> createState() => _SpinnerDotState();
+}
+
+class _SpinnerDotState extends State<_SpinnerDot>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reduce = MediaQuery.of(context).disableAnimations;
+    if (reduce) {
+      return Icon(Icons.sync, size: 11, color: widget.color);
+    }
+    return SizedBox(
+      width: 11,
+      height: 11,
+      child: AnimatedBuilder(
+        animation: _c,
+        builder: (context, _) {
+          return Transform.rotate(
+            angle: _c.value * 6.28318,
+            child: Icon(Icons.sync, size: 11, color: widget.color),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Compact error badge — appears only when [count] > 0. Uses a static
+/// red dot with the integer count so the affordance remains
+/// perceivable without animation. The full last_error / waiting_on /
+/// next_intended_action stanza is reachable via the parent block's
+/// tooltip and tap-popover.
+class _ErrorBadge extends StatelessWidget {
+  final int count;
+  const _ErrorBadge({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: S.councilAgentErrorBadgeTooltip(count),
+      child: Container(
+        height: 20,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        decoration: BoxDecoration(
+          color: DuckColors.stateError.withValues(alpha: 0.18),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(
+            color: DuckColors.stateError.withValues(alpha: 0.55),
+            width: 0.7,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.warning_amber_rounded,
+              size: 11,
+              color: DuckColors.stateError,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              '$count',
+              style: const TextStyle(
+                color: DuckColors.stateError,
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Per-agent activity block. Replaces the old two-`Flexible`-chip Row
+/// whose bolt-chip wrapped to 2 lines and broke cross-axis baseline.
+///
+/// Layout (HOW-B):
+///   row 1 — model chip (fixed-height, single-line, ellipsis) +
+///           status pill + optional error badge.
+///   row 2 — ONE single-line activity hint, picked by priority:
+///             error  → ⚠ last_error
+///             waitingOn → ⏳ waiting on X
+///             nextIntendedAction → → next: Y
+///             currentTask → ⚡ doing Z
+///
+/// Binds to Forge's [CouncilTask] schema via the live session ledger.
+/// On hover/tap the full stanza (cause / waiting_on / next_action) is
+/// surfaced via the Tooltip — never as a copy-pasted error blob.
+class _AgentStatusBlock extends StatelessWidget {
+  final CouncilAgent agent;
+  final bool errored;
+  final bool done;
+  final Color accent;
+
+  const _AgentStatusBlock({
+    required this.agent,
+    required this.errored,
+    required this.done,
+    required this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final session = context
+        .select<AppState, CouncilSession?>((s) => s.council.session);
+    final task = _latestTaskFor(session, agent.id);
+    final errorCount = _errorCountFor(session, agent.id, task);
+    final hint = _activityHint(task);
+
+    final tooltip = _composeTooltip(task, errorCount);
+
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 350),
+      preferBelow: false,
+      textStyle: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontSize: 11,
+        height: 1.35,
+      ),
+      decoration: BoxDecoration(
+        color: DuckColors.bgDeepest.withValues(alpha: 0.97),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        border: Border.all(
+          color: errorCount > 0
+              ? DuckColors.stateError.withValues(alpha: 0.55)
+              : DuckColors.glassSeam,
+          width: 0.6,
+        ),
+      ),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Flexible(
+                child: _Chip(
+                  icon: Icons.memory_outlined,
+                  label: agent.model.isEmpty ? '—' : agent.model,
+                ),
+              ),
+              const SizedBox(width: 6),
+              if (!done) _StatusPill(status: agent.status),
+              if (errorCount > 0) ...[
+                const SizedBox(width: 6),
+                _ErrorBadge(count: errorCount),
+              ],
+            ],
+          ),
+          if (hint != null) ...[
+            const SizedBox(height: 6),
+            _ActivityHint(hint: hint, accent: accent),
+          ],
+        ],
+      ),
+    );
+  }
+
+  CouncilTask? _latestTaskFor(CouncilSession? session, String agentId) {
+    if (session == null) return null;
+    CouncilTask? latest;
+    for (final t in session.tasks) {
+      if (t.agentId != agentId) continue;
+      if (latest == null || t.updatedAt.isAfter(latest.updatedAt)) {
+        latest = t;
+      }
+    }
+    return latest;
+  }
+
+  int _errorCountFor(
+    CouncilSession? session,
+    String agentId,
+    CouncilTask? latest,
+  ) {
+    if (session == null) {
+      return errored ? 1 : 0;
+    }
+    var sum = 0;
+    for (final t in session.tasks) {
+      if (t.agentId == agentId) sum += t.errorCount;
+    }
+    if (sum == 0 && errored) return 1;
+    return sum;
+  }
+
+  _ActivityHintData? _activityHint(CouncilTask? task) {
+    // Priority: error > waiting > next > current task. We only ever
+    // surface ONE line at the row level; the full stanza is in the
+    // tooltip. This keeps every card the same height regardless of
+    // how rich the underlying ledger snapshot is.
+    if (errored || (task?.lastError?.isNotEmpty ?? false)) {
+      final msg = task?.lastError ?? agent.currentTask;
+      return _ActivityHintData(
+        icon: Icons.warning_amber_rounded,
+        color: DuckColors.stateError,
+        prefix: S.councilAgentLastError,
+        text: msg.isEmpty ? S.councilAgentNoErrorDetail : msg,
+      );
+    }
+    final waitingOn = task?.waitingOn;
+    if (waitingOn != null && waitingOn.isNotEmpty) {
+      return _ActivityHintData(
+        icon: Icons.hourglass_bottom,
+        color: DuckColors.accentDuck,
+        prefix: S.councilAgentWaitingOn,
+        text: waitingOn,
+      );
+    }
+    final next = task?.nextIntendedAction;
+    if (next != null && next.isNotEmpty) {
+      return _ActivityHintData(
+        icon: Icons.east_outlined,
+        color: DuckColors.accentMint,
+        prefix: S.councilAgentNextAction,
+        text: next,
+      );
+    }
+    if (agent.currentTask.isNotEmpty) {
+      return _ActivityHintData(
+        icon: Icons.bolt_outlined,
+        color: DuckColors.fgSubtle,
+        prefix: S.councilAgentDoing,
+        text: agent.currentTask,
+      );
+    }
+    return null;
+  }
+
+  String _composeTooltip(CouncilTask? task, int errorCount) {
+    // Structured tooltip — title / cause / waiting_on / next_action.
+    // Never a verbatim error blob.
+    final lines = <String>[];
+    final stateLabel = task?.state.name ?? agent.status.name;
+    lines.add('${agent.name} · $stateLabel');
+    if (errorCount > 0) {
+      lines.add('Errors: $errorCount');
+    }
+    if (task?.lastError != null && task!.lastError!.trim().isNotEmpty) {
+      lines.add('Cause: ${_clip(task.lastError!, 240)}');
+    }
+    if (task?.waitingOn != null && task!.waitingOn!.trim().isNotEmpty) {
+      lines.add('Waiting on: ${task.waitingOn}');
+    }
+    if (task?.nextIntendedAction != null &&
+        task!.nextIntendedAction!.trim().isNotEmpty) {
+      lines.add('Next: ${task.nextIntendedAction}');
+    }
+    if (agent.currentTask.isNotEmpty) {
+      lines.add('Doing: ${_clip(agent.currentTask, 200)}');
+    }
+    if (task != null) {
+      lines.add('Attempts: ${task.attempts}/${task.maxAttempts}');
+    }
+    return lines.join('\n');
+  }
+
+  String _clip(String s, int max) =>
+      s.length <= max ? s : '${s.substring(0, max)}…';
+}
+
+class _ActivityHintData {
+  final IconData icon;
+  final Color color;
+  final String prefix;
+  final String text;
+
+  const _ActivityHintData({
+    required this.icon,
+    required this.color,
+    required this.prefix,
+    required this.text,
+  });
+}
+
+class _ActivityHint extends StatelessWidget {
+  final _ActivityHintData hint;
+  final Color accent;
+
+  const _ActivityHint({required this.hint, required this.accent});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Icon(hint.icon, size: 12, color: hint.color),
+        const SizedBox(width: 6),
+        Expanded(
+          child: RichText(
+            maxLines: 1,
+            softWrap: false,
+            overflow: TextOverflow.ellipsis,
+            text: TextSpan(
+              style: const TextStyle(
+                color: DuckColors.fgMuted,
+                fontSize: 10.5,
+                height: 1.2,
+              ),
+              children: [
+                TextSpan(
+                  text: '${hint.prefix} ',
+                  style: TextStyle(
+                    color: hint.color.withValues(alpha: 0.95),
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.4,
+                  ),
+                ),
+                TextSpan(text: hint.text),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _Chip extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -550,25 +1040,39 @@ class _Chip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: DuckColors.bgChip,
-        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 12, color: DuckColors.fgSubtle),
-          const SizedBox(width: 5),
-          Flexible(
-            child: Text(
-              label,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: DuckColors.fgMuted, fontSize: 10),
+    // Fixed height + single-line text + ellipsis → guarantees the chip
+    // never bumps the surrounding Row's cross-axis baseline. This is
+    // the precise root cause of the user-reported asymmetry: the
+    // previous `Flexible(Text(...))` allowed the bolt chip's
+    // `currentTask` to wrap to 2 lines, making it taller than the
+    // model chip beside it.
+    return SizedBox(
+      height: 20,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          color: DuckColors.bgChip,
+          borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 12, color: DuckColors.fgSubtle),
+            const SizedBox(width: 5),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                softWrap: false,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: DuckColors.fgMuted,
+                  fontSize: 10,
+                ),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

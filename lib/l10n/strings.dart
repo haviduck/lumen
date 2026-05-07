@@ -99,6 +99,7 @@ class S {
   static const String menuBarSearchTooltip = 'Search files';
   static const String explorerScrollTopTooltip = 'Scroll to top';
   static const String explorerOpenTeams = 'Open Microsoft Teams';
+  static const String explorerMediaHub = 'Media and Teams';
   static const String menuBarToggleChat = 'Toggle AI chat panel';
 
   // Unsaved-changes confirm prompts (dirty tab close).
@@ -942,6 +943,17 @@ class S {
   static const String chatEnterMediaUrl = 'Watch media';
   static const String chatEnterMediaHint = 'YouTube / Twitch / any URL';
   static const String chatPlay = 'Play';
+  static const String mediaHubTitle = 'Media and Teams';
+  static const String mediaHubSubtitle =
+      'Open videos, websites, and Teams from one place.';
+  static const String mediaHubSourceLabel = 'SOURCE';
+  static const String mediaHubWatchTab = 'Watch';
+  static const String mediaHubTeamsTab = 'Teams';
+  static const String mediaHubAutoSchemeHint =
+      'Tip: if you skip https://, Lumen adds it automatically.';
+  static const String mediaHubTeamsHint =
+      'teams.cloud.microsoft or your Teams URL';
+  static const String mediaHubOpenTeams = 'Open Teams';
 
   // Media chrome controls.
   static const String mediaMute = 'Mute';
@@ -2093,14 +2105,29 @@ class S {
   static const String councilReportDeleteFailed =
       'Could not delete the report (file may be open).';
   static const String councilAskPoolHeader = 'Council pool';
+  static const String councilPoolRepliesHeader = 'Council pool replies:';
+  static String councilPoolBudgetExceeded(int maxExchanges) =>
+      'Pool budget reached ($maxExchanges exchanges). Ship now or ask the user how to proceed.';
+  static String councilPoolQuestionTooSoft(String minHints) =>
+      'Pool question rejected: make it falsifiable and anchored to a specific risk surface. Include at least one of: $minHints';
+  static const String councilPoolNoValidTargets =
+      'Pool question rejected: no valid target agents. Use known agent ids or omit targets.';
+  static const String councilPoolNoResponders =
+      'Pool question skipped: no eligible sibling responders were available.';
+  static const String councilPoolQuestionEmpty = 'Pool question was empty.';
+  static String councilPoolTargetsNote(String targetIds) =>
+      'Targeted responders: $targetIds';
+  static const String councilPoolFalsifiableHints =
+      'fail, break, risk, falsify, invariant, contract, assumption';
   static const String councilBlackboardTitle = 'Blackboard';
   static const String councilBlackboardEmpty =
       'Tasks appear here as the orchestrator dispatches work.';
   static const String councilBlackboardReportTitle = 'Final report';
   static const String councilLeftBlackboardTitle = 'Evaluator';
-  static const String councilLeftBlackboardEmpty =
-      'Awaiting evaluation…';
+  static const String councilLeftBlackboardEmpty = 'Awaiting evaluation…';
   static const String councilLeftBlackboardStreaming = 'Drafting verdict…';
+  static const String councilLeftBlackboardCopy = 'Copy evaluator text';
+  static const String councilLeftBlackboardCopied = 'Evaluator text copied.';
   static const String councilBlackboardReportBody =
       'The Council has finished. Review the report before leaving the theater.';
   static const String councilAskUserHeader = 'Council needs you';
@@ -2195,6 +2222,14 @@ class S {
   static const String councilAgentStatusQueued = 'queued';
   static const String councilAgentStatusAskingPool = 'asking pool';
   static const String councilAgentStatusReplying = 'replying';
+  static const String councilAgentWaitingOn = 'waiting on';
+  static const String councilAgentNextAction = 'next';
+  static const String councilAgentLastError = 'last error';
+  static const String councilAgentDoing = 'doing';
+  static const String councilAgentNoErrorDetail =
+      'No error detail captured for this agent.';
+  static String councilAgentErrorBadgeTooltip(int n) =>
+      n == 1 ? '1 error on this agent' : '$n errors on this agent';
   static String councilReportSavedAt(String path) => 'Report saved at $path';
   static String councilAgentSectorTitle(String name, String role) =>
       '$name · $role';

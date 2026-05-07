@@ -9,77 +9,112 @@ import '../../theme/app_theme.dart';
 import '../side_panes_column.dart';
 import 'duck_glass.dart';
 
-/// Watch-media prompt — pretty glass dialog with URL field +
-/// placement chips + play button. Replaces the old plain
-/// `AlertDialog` from the menu bar / explorer activity bar.
+/// Unified media hub prompt — controls both watch-media URLs and Teams.
 ///
 /// Wired through `MediaController.play(url)` directly (the previous
 /// `ChatController.requestMediaUrl` queueing pattern was deleted —
 /// it existed because `_AiChatState` owned the webview, which it
 /// no longer does).
-Future<void> showMediaUrlPrompt(BuildContext context) async {
+Future<void> showMediaUrlPrompt(
+  BuildContext context, {
+  MediaPromptMode initialMode = MediaPromptMode.watch,
+}) async {
   final media = context.read<MediaController>();
   await showDialog<void>(
     context: context,
     barrierColor: Colors.black.withValues(alpha: 0.55),
-    builder: (ctx) => _MediaUrlDialog(initialUrl: media.url ?? ''),
+    builder: (ctx) => _MediaUrlDialog(
+      initialWatchUrl: media.url ?? '',
+      initialTeamsUrl: media.teamsUrl ?? 'teams.cloud.microsoft',
+      initialMode: initialMode,
+    ),
   );
 }
 
+enum MediaPromptMode { watch, teams }
+
 class _MediaUrlDialog extends StatefulWidget {
-  final String initialUrl;
-  const _MediaUrlDialog({required this.initialUrl});
+  final String initialWatchUrl;
+  final String initialTeamsUrl;
+  final MediaPromptMode initialMode;
+  const _MediaUrlDialog({
+    required this.initialWatchUrl,
+    required this.initialTeamsUrl,
+    required this.initialMode,
+  });
 
   @override
   State<_MediaUrlDialog> createState() => _MediaUrlDialogState();
 }
 
 class _MediaUrlDialogState extends State<_MediaUrlDialog> {
-  late final TextEditingController _ctrl;
-  late final FocusNode _focus;
+  late final TextEditingController _watchCtrl;
+  late final TextEditingController _teamsCtrl;
+  late final FocusNode _watchFocus;
+  late final FocusNode _teamsFocus;
+  late MediaPromptMode _mode;
+
+  bool get _isWatchMode => _mode == MediaPromptMode.watch;
 
   @override
   void initState() {
     super.initState();
-    _ctrl = TextEditingController(text: widget.initialUrl);
-    _focus = FocusNode()..requestFocus();
+    _watchCtrl = TextEditingController(text: widget.initialWatchUrl);
+    _teamsCtrl = TextEditingController(text: widget.initialTeamsUrl);
+    _watchFocus = FocusNode();
+    _teamsFocus = FocusNode();
+    _mode = widget.initialMode;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      (_isWatchMode ? _watchFocus : _teamsFocus).requestFocus();
+    });
   }
 
   @override
   void dispose() {
-    _ctrl.dispose();
-    _focus.dispose();
+    _watchCtrl.dispose();
+    _teamsCtrl.dispose();
+    _watchFocus.dispose();
+    _teamsFocus.dispose();
     super.dispose();
   }
 
-  Future<void> _submit() async {
-    final url = _ctrl.text.trim();
+  void _setMode(MediaPromptMode next) {
+    if (_mode == next) return;
+    setState(() => _mode = next);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      (_isWatchMode ? _watchFocus : _teamsFocus).requestFocus();
+    });
+  }
+
+  Future<void> _submitWatch() async {
+    final url = _watchCtrl.text.trim();
     if (url.isEmpty) return;
     final media = context.read<MediaController>();
-    // v1.4: previously forced placement to chat when Teams was
-    // active because the editor right-slot could only host one
-    // webview. The new `SidePanesColumn` stacks SSH / Teams /
-    // Watch vertically with no exclusivity, so we leave the user's
-    // chosen placement alone here.
     Navigator.of(context).pop();
     await media.play(url);
   }
 
+  Future<void> _submitTeams() async {
+    final media = context.read<MediaController>();
+    Navigator.of(context).pop();
+    await media.playTeams(_teamsCtrl.text.trim());
+  }
+
+  Future<void> _submitActive() async {
+    if (_isWatchMode) {
+      await _submitWatch();
+      return;
+    }
+    await _submitTeams();
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Match the working pattern from `settings_dialog` /
-    // `backup_dialog`:
-    // - Dialog: `shape: const RoundedRectangleBorder()` so the
-    //   default rounded shape doesn't double-clip the BackdropFilter
-    //   inside `DuckGlass.hero`.
-    // - DuckGlass.hero with `borderColor: borderStrong` (not the
-    //   default luminous glass edge — better for dialog-class
-    //   surfaces).
-    // - Inner Container with **explicit width**: an earlier
-    //   iteration used `ConstrainedBox(maxWidth: 480)` which (a)
-    //   under-constrained the Column (only set a max) and (b)
-    //   tripped the Windows backdrop-filter blank-rectangle quirk
-    //   that the knowledgebase flags for the welcome / lock screens.
+    final accent = _isWatchMode
+        ? DuckColors.accentCyan
+        : DuckColors.accentPurple;
     return Dialog(
       backgroundColor: Colors.transparent,
       elevation: 0,
@@ -87,23 +122,22 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
       child: DuckGlass.hero(
         borderColor: DuckColors.borderStrong,
         child: Container(
-          width: 480,
+          width: 520,
           padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Header row — leading icon + title + close button.
               Row(
                 children: [
                   const Icon(
-                    Icons.ondemand_video_outlined,
+                    Icons.video_settings_outlined,
                     size: 18,
                     color: DuckColors.accentCyan,
                   ),
                   const SizedBox(width: 10),
                   const Text(
-                    S.chatWatchMedia,
+                    S.mediaHubTitle,
                     style: TextStyle(
                       fontSize: 14,
                       fontWeight: FontWeight.w600,
@@ -125,49 +159,123 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
                   ),
                 ],
               ),
+              const SizedBox(height: 4),
+              const Text(
+                S.mediaHubSubtitle,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: DuckColors.fgSubtle,
+                  height: 1.35,
+                ),
+              ),
               const SizedBox(height: 14),
-              // URL input — pill-shaped chip surface with cyan focus.
-              _UrlField(controller: _ctrl, focus: _focus, onSubmit: _submit),
-              const SizedBox(height: 14),
-              Consumer2<MediaController, SshController>(
-                // v1.5: when SSH or Teams is currently using the
-                // editor side stack, the user's "side" placement
-                // for watch-media gets overridden to chat (see
-                // `SidePanesColumn.watchForcedToChat`). The chip
-                // chooser still surfaces both options so the
-                // user's persisted preference is visible — we
-                // just add an inline notice explaining that the
-                // editor-placement option will defer to chat
-                // until SSH/Teams steps aside. Without this
-                // notice the user would set "side" and watch the
-                // video appear in chat, with no clue why.
-                builder: (context, media, ssh, _) {
-                  final forced = SidePanesColumn.watchForcedToChat(
-                    ssh: ssh,
-                    media: media,
-                  );
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        S.mediaPlacementLabel,
+              const Text(
+                S.mediaHubSourceLabel,
+                style: TextStyle(
+                  fontSize: 11,
+                  letterSpacing: 0.6,
+                  color: DuckColors.fgMuted,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _ModeChip(
+                      selected: _isWatchMode,
+                      icon: Icons.smart_display_outlined,
+                      label: S.mediaHubWatchTab,
+                      onTap: () => _setMode(MediaPromptMode.watch),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _ModeChip(
+                      selected: !_isWatchMode,
+                      icon: Icons.groups_outlined,
+                      label: S.mediaHubTeamsTab,
+                      onTap: () => _setMode(MediaPromptMode.teams),
+                      accent: DuckColors.accentPurple,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              _UrlField(
+                controller: _isWatchMode ? _watchCtrl : _teamsCtrl,
+                focus: _isWatchMode ? _watchFocus : _teamsFocus,
+                hintText: _isWatchMode
+                    ? S.chatEnterMediaHint
+                    : S.mediaHubTeamsHint,
+                leadingIcon: _isWatchMode
+                    ? Icons.link_rounded
+                    : Icons.language_rounded,
+                onSubmit: _submitActive,
+              ),
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: DuckColors.bgChip.withValues(alpha: 0.7),
+                  border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(
+                      Icons.auto_fix_high_rounded,
+                      size: 13,
+                      color: DuckColors.fgSubtle,
+                    ),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        S.mediaHubAutoSchemeHint,
                         style: TextStyle(
-                          fontSize: 11,
-                          letterSpacing: 0.6,
+                          fontSize: 11.5,
                           color: DuckColors.fgMuted,
-                          fontWeight: FontWeight.w500,
+                          height: 1.35,
                         ),
                       ),
-                      const SizedBox(height: 8),
-                      const _PlacementChips(),
-                      if (forced) ...[
-                        const SizedBox(height: 8),
-                        const _ForcedToChatNotice(),
-                      ],
-                    ],
-                  );
-                },
+                    ),
+                  ],
+                ),
               ),
+              if (_isWatchMode) ...[
+                const SizedBox(height: 14),
+                Consumer2<MediaController, SshController>(
+                  builder: (context, media, ssh, _) {
+                    final forced = SidePanesColumn.watchForcedToChat(
+                      ssh: ssh,
+                      media: media,
+                    );
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          S.mediaPlacementLabel,
+                          style: TextStyle(
+                            fontSize: 11,
+                            letterSpacing: 0.6,
+                            color: DuckColors.fgMuted,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        const _PlacementChips(),
+                        if (forced) ...[
+                          const SizedBox(height: 8),
+                          const _ForcedToChatNotice(),
+                        ],
+                      ],
+                    );
+                  },
+                ),
+              ],
               const SizedBox(height: 18),
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
@@ -185,11 +293,18 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
                   ),
                   const SizedBox(width: 6),
                   ElevatedButton.icon(
-                    icon: const Icon(Icons.play_arrow_rounded, size: 18),
-                    label: const Text(S.chatPlay),
-                    onPressed: _submit,
+                    icon: Icon(
+                      _isWatchMode
+                          ? Icons.play_arrow_rounded
+                          : Icons.groups_rounded,
+                      size: 18,
+                    ),
+                    label: Text(
+                      _isWatchMode ? S.chatPlay : S.mediaHubOpenTeams,
+                    ),
+                    onPressed: _submitActive,
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: DuckColors.accentCyan,
+                      backgroundColor: accent,
                       foregroundColor: DuckColors.bgDeepest,
                       padding: const EdgeInsets.symmetric(
                         horizontal: 16,
@@ -214,13 +329,70 @@ class _MediaUrlDialogState extends State<_MediaUrlDialog> {
   }
 }
 
+class _ModeChip extends StatelessWidget {
+  final bool selected;
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final Color accent;
+  const _ModeChip({
+    required this.selected,
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.accent = DuckColors.accentCyan,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+      child: AnimatedContainer(
+        duration: DuckMotion.fast,
+        curve: DuckMotion.standard,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: BoxDecoration(
+          color: selected
+              ? accent.withValues(alpha: 0.12)
+              : DuckColors.bgChip.withValues(alpha: 0.55),
+          border: Border.all(
+            color: selected ? accent : DuckColors.glassSeam,
+            width: selected ? 1 : 0.5,
+          ),
+          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 14, color: selected ? accent : DuckColors.fgMuted),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: selected ? DuckColors.fgPrimary : DuckColors.fgMuted,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _UrlField extends StatefulWidget {
   final TextEditingController controller;
   final FocusNode focus;
+  final String hintText;
+  final IconData leadingIcon;
   final VoidCallback onSubmit;
   const _UrlField({
     required this.controller,
     required this.focus,
+    required this.hintText,
+    required this.leadingIcon,
     required this.onSubmit,
   });
 
@@ -261,15 +433,15 @@ class _UrlFieldState extends State<_UrlField> {
       child: Row(
         children: [
           const SizedBox(width: 12),
-          const Icon(Icons.link_rounded, size: 15, color: DuckColors.fgSubtle),
+          Icon(widget.leadingIcon, size: 15, color: DuckColors.fgSubtle),
           const SizedBox(width: 8),
           Expanded(
             child: TextField(
               controller: widget.controller,
               focusNode: widget.focus,
               style: const TextStyle(fontSize: 13, color: DuckColors.fgPrimary),
-              decoration: const InputDecoration(
-                hintText: S.chatEnterMediaHint,
+              decoration: InputDecoration(
+                hintText: widget.hintText,
                 hintStyle: TextStyle(fontSize: 13, color: DuckColors.fgFaint),
                 border: InputBorder.none,
                 enabledBorder: InputBorder.none,
@@ -431,11 +603,7 @@ class _ForcedToChatNotice extends StatelessWidget {
       child: const Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(
-            Icons.info_outline,
-            size: 13,
-            color: DuckColors.fgSubtle,
-          ),
+          Icon(Icons.info_outline, size: 13, color: DuckColors.fgSubtle),
           SizedBox(width: 8),
           Expanded(
             child: Text(

@@ -11,7 +11,6 @@ import 'package:provider/provider.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
-import '../../providers/media_controller.dart';
 import '../../providers/ssh_controller.dart';
 import '../../services/gitignore_matcher.dart';
 import '../../services/timeline_models.dart';
@@ -22,6 +21,7 @@ import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
 import '../common/fast_popup_menu.dart';
 import '../common/media_url_prompt.dart';
+import '../council/council_wizard_dialog.dart';
 import '../menu_bar.dart';
 import '../ssh/ssh_session_picker.dart';
 import '../timeline/timeline_dialog.dart';
@@ -820,19 +820,6 @@ class _FileExplorerState extends State<FileExplorer> {
     });
   }
 
-  /// Force-route the watch-media `MediaController` to the editor
-  /// split placement and load Microsoft Teams. Bypasses the URL
-  /// prompt — the user explicitly asked for a one-click Teams
-  /// shortcut, and the Teams web app only fits the editor split
-  /// (the chat panel's 16:9 clamp is too cramped for a productivity
-  /// app's UI). Doesn't persist the placement override; only this
-  /// session is forced to `editor` until the user changes it from
-  /// the modal.
-  Future<void> _openTeams(BuildContext context) async {
-    final media = context.read<MediaController>();
-    await media.playTeams();
-  }
-
   void _copyDirectory(Directory source, Directory destination) {
     destination.createSync(recursive: true);
     for (final entity in source.listSync(recursive: false)) {
@@ -1388,13 +1375,19 @@ class _FileExplorerState extends State<FileExplorer> {
                       // Cursor-style activity-bar strip — sits above the
                       // workspace-name row so the cluster reads as the
                       // top-of-sidebar nav. Folder = scroll-to-top focus,
-                      // search = Quick Open, media = watch-media URL prompt.
+                      // search = Quick Open, media = watch + Teams hub.
                       _ExplorerActivityBar(
                         onSettings: () => handleMenuAction(context, 'settings'),
                         onSearch: () => appState.ideActions.openQuickOpen(),
-                        onMedia: () => showMediaUrlPrompt(context),
-                        onTeams: () => _openTeams(context),
-                        onTimeline: () => showTimelineDialog(context),
+                        onMediaHub: () => showMediaUrlPrompt(context),
+                        onCouncil: () {
+                          if (appState.currentDirectory == null ||
+                              appState.currentDirectory!.isEmpty) {
+                            showDuckToast(context, S.councilNoWorkspace);
+                            return;
+                          }
+                          unawaited(showCouncilWizard(context));
+                        },
                       ),
                       _ExplorerHeader(
                         workspaceName: rootName,
@@ -1919,7 +1912,7 @@ class _FileExplorerState extends State<FileExplorer> {
 /// pattern of putting workspace-navigation icons (files / search /
 /// extras) immediately under the title bar.
 ///
-/// Three actions, all delegated up to `_FileExplorerState`:
+/// Four actions, all delegated up to `_FileExplorerState`:
 /// - **folder**  → `onFocus` — animates the explorer's scroll
 ///   controller back to offset 0 and pulses the panel border to
 ///   `accentCyan` for ~320ms (the same `_onFocusRequested` action
@@ -1928,11 +1921,9 @@ class _FileExplorerState extends State<FileExplorer> {
 /// - **search**  → `onSearch` — opens Quick Open via the
 ///   shared overlay. Doesn't switch panels, just opens the
 ///   palette over the workbench.
-/// - **media**   → `onMedia` — opens the watch-media URL prompt
-///   from `widgets/common/media_url_prompt.dart`; on confirm,
-///   `MediaController.play` loads the URL into the shared webview
-///   and the chat / editor panel renders it depending on the
-///   user's `MediaPlacement` preference.
+/// - **media**   → `onMediaHub` — opens the media hub modal
+///   from `widgets/common/media_url_prompt.dart` that controls
+///   both watch-media URLs and Teams URLs.
 ///
 /// Visual rules: 34px tall, `glassSeam` 0.5px hairline along the
 /// bottom (seams with `_ExplorerHeader` below), no top border (it
@@ -1944,16 +1935,14 @@ class _FileExplorerState extends State<FileExplorer> {
 class _ExplorerActivityBar extends StatelessWidget {
   final VoidCallback onSettings;
   final VoidCallback onSearch;
-  final VoidCallback onMedia;
-  final VoidCallback onTeams;
-  final VoidCallback onTimeline;
+  final VoidCallback onMediaHub;
+  final VoidCallback onCouncil;
 
   const _ExplorerActivityBar({
     required this.onSettings,
     required this.onSearch,
-    required this.onMedia,
-    required this.onTeams,
-    required this.onTimeline,
+    required this.onMediaHub,
+    required this.onCouncil,
   });
 
   @override
@@ -1975,27 +1964,16 @@ class _ExplorerActivityBar extends StatelessWidget {
         onTap: onSearch,
       ),
       BrightIconButton(
-        icon: Icons.ondemand_video_outlined,
-        tooltip: S.chatWatchMedia,
-        onTap: onMedia,
+        icon: Icons.video_settings_outlined,
+        tooltip: S.explorerMediaHub,
+        onTap: onMediaHub,
       ),
-      // Teams shortcut — one click loads `teams.cloud.microsoft`
-      // into the editor split. Sits between the watch-media icon
-      // and the timeline/history controls, grouped with productivity nav.
+      // Council launcher moved from chat composer to the explorer
+      // activity bar. This replaces the old timeline slot.
       BrightIconButton(
-        icon: Icons.groups_outlined,
-        tooltip: S.explorerOpenTeams,
-        onTap: onTeams,
-      ),
-      // File revision timeline — opens the floating diff panel
-      // pre-scoped to the active file when one is open. Mounted
-      // here (not on the menu bar) because revision history is a
-      // workspace-nav concept; the menu bar carries IDE-config
-      // affordances only.
-      BrightIconButton(
-        icon: Icons.history,
-        tooltip: S.timelineMenuTooltip,
-        onTap: onTimeline,
+        icon: Icons.hub_outlined,
+        tooltip: S.councilConvene,
+        onTap: onCouncil,
       ),
       // SSH host fast-menu. Tap opens an anchored host-picker
       // dropdown; a mint dot under the icon indicates at least one
@@ -2058,8 +2036,7 @@ class _SshActivityButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final hasLive =
-        context.select<SshController, bool>((s) => s.hasSessions);
+    final hasLive = context.select<SshController, bool>((s) => s.hasSessions);
     // `context` here is bound to this widget's element (the Stack).
     // The Stack's RenderBox sizes to its child (the BrightIconButton),
     // so passing it as the picker's anchor positions the dropdown
@@ -2113,8 +2090,6 @@ class _KnowledgeBaseButton extends StatelessWidget {
 // was retired from the file-explorer activity bar — the slot now hosts
 // `_KnowledgeBaseButton` above. The deletion is local to this file;
 // `gitnexus_service.dart` itself is removed by Copilot Onboarder.
-
-
 
 /// Workspace-root header. The whole row is tappable — clicking toggles the
 /// tree collapse/expand exactly like a real folder row. New-file / new-folder
@@ -3123,10 +3098,7 @@ class _RenameFieldState extends State<_RenameField> {
           autofocus: true,
           maxLines: 1,
           textInputAction: TextInputAction.done,
-          style: const TextStyle(
-            fontSize: 12.5,
-            color: DuckColors.fgPrimary,
-          ),
+          style: const TextStyle(fontSize: 12.5, color: DuckColors.fgPrimary),
           decoration: const InputDecoration(
             isDense: true,
             // No surrounding border / padding — the field is meant

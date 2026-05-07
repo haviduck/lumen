@@ -347,8 +347,13 @@ class _HeaderAction extends StatelessWidget {
 /// the AI chat bubble) — no parallel renderer.
 class CouncilReportView extends StatelessWidget {
   final String markdown;
+  final bool compact;
 
-  const CouncilReportView({super.key, required this.markdown});
+  const CouncilReportView({
+    super.key,
+    required this.markdown,
+    this.compact = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -371,7 +376,9 @@ class CouncilReportView extends StatelessWidget {
           // SelectionArea owns selection so flutter_markdown_plus's own
           // SelectableText widgets don't fight it.
           selectable: false,
-          padding: const EdgeInsets.fromLTRB(34, 24, 34, 32),
+          padding: compact
+              ? const EdgeInsets.fromLTRB(12, 10, 12, 12)
+              : const EdgeInsets.fromLTRB(34, 24, 34, 32),
           extensionSet: md.ExtensionSet.gitHubFlavored,
           builders: {'pre': _CodeBlockBuilder()},
           styleSheet: _styleSheet(),
@@ -381,51 +388,55 @@ class CouncilReportView extends StatelessWidget {
   }
 
   MarkdownStyleSheet _styleSheet() {
+    final h1Size = compact ? 18.0 : 28.0;
+    final h2Size = compact ? 16.0 : 22.0;
+    final h3Size = compact ? 14.0 : 17.0;
+    final pSize = compact ? 12.0 : 14.0;
     return MarkdownStyleSheet(
-      h1: const TextStyle(
+      h1: TextStyle(
         color: DuckColors.fgPrimary,
-        fontSize: 28,
+        fontSize: h1Size,
         height: 1.25,
         fontWeight: FontWeight.w800,
         letterSpacing: -0.2,
       ),
-      h1Padding: const EdgeInsets.only(top: 6, bottom: 8),
-      h2: const TextStyle(
+      h1Padding: EdgeInsets.only(top: compact ? 2 : 6, bottom: compact ? 4 : 8),
+      h2: TextStyle(
         color: DuckColors.fgPrimary,
-        fontSize: 22,
+        fontSize: h2Size,
         height: 1.3,
         fontWeight: FontWeight.w800,
       ),
-      h2Padding: const EdgeInsets.only(top: 22, bottom: 6),
-      h3: const TextStyle(
+      h2Padding: EdgeInsets.only(top: compact ? 10 : 22, bottom: compact ? 4 : 6),
+      h3: TextStyle(
         color: DuckColors.fgPrimary,
-        fontSize: 17,
+        fontSize: h3Size,
         height: 1.35,
         fontWeight: FontWeight.w700,
       ),
-      h3Padding: const EdgeInsets.only(top: 16, bottom: 4),
+      h3Padding: EdgeInsets.only(top: compact ? 8 : 16, bottom: 4),
       h4: const TextStyle(
         color: DuckColors.fgSecondary,
         fontSize: 15,
         fontWeight: FontWeight.w700,
       ),
-      h4Padding: const EdgeInsets.only(top: 12, bottom: 2),
-      p: const TextStyle(
+      h4Padding: EdgeInsets.only(top: compact ? 6 : 12, bottom: 2),
+      p: TextStyle(
         color: DuckColors.fgPrimary,
-        fontSize: 14,
+        fontSize: pSize,
         height: 1.6,
       ),
-      pPadding: const EdgeInsets.only(bottom: 6),
-      listIndent: 22,
-      listBullet: const TextStyle(
+      pPadding: EdgeInsets.only(bottom: compact ? 3 : 6),
+      listIndent: compact ? 16 : 22,
+      listBullet: TextStyle(
         color: DuckColors.accentMint,
-        fontSize: 14,
+        fontSize: compact ? 12 : 14,
         fontWeight: FontWeight.w700,
       ),
-      listBulletPadding: const EdgeInsets.only(right: 6),
-      checkbox: const TextStyle(
+      listBulletPadding: EdgeInsets.only(right: compact ? 4 : 6),
+      checkbox: TextStyle(
         color: DuckColors.accentMint,
-        fontSize: 14,
+        fontSize: compact ? 12 : 14,
       ),
       em: const TextStyle(
         color: DuckColors.fgPrimary,
@@ -435,13 +446,14 @@ class CouncilReportView extends StatelessWidget {
         color: DuckColors.fgPrimary,
         fontWeight: FontWeight.w800,
       ),
-      a: const TextStyle(
+      a: TextStyle(
         color: DuckColors.accentCyan,
+        fontSize: compact ? 12 : null,
         decoration: TextDecoration.underline,
       ),
-      code: const TextStyle(
+      code: TextStyle(
         fontFamily: DuckTheme.monoFont,
-        fontSize: 12.5,
+        fontSize: compact ? 11 : 12.5,
         color: DuckColors.accentCyan,
         backgroundColor: Color(0xFF11161E),
       ),
@@ -456,8 +468,9 @@ class CouncilReportView extends StatelessWidget {
         ),
       ),
       blockquotePadding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
-      blockquote: const TextStyle(
+      blockquote: TextStyle(
         color: DuckColors.fgSecondary,
+        fontSize: compact ? 12 : null,
         fontStyle: FontStyle.italic,
         height: 1.5,
       ),
@@ -465,9 +478,9 @@ class CouncilReportView extends StatelessWidget {
         color: DuckColors.fgPrimary,
         fontWeight: FontWeight.w800,
       ),
-      tableBody: const TextStyle(
+      tableBody: TextStyle(
         color: DuckColors.fgSecondary,
-        fontSize: 13,
+        fontSize: compact ? 11.5 : 13,
         height: 1.45,
       ),
       tableBorder: TableBorder.all(
@@ -475,9 +488,9 @@ class CouncilReportView extends StatelessWidget {
         width: 0.5,
       ),
       tableHeadAlign: TextAlign.left,
-      tableCellsPadding: const EdgeInsets.symmetric(
-        horizontal: 12,
-        vertical: 8,
+      tableCellsPadding: EdgeInsets.symmetric(
+        horizontal: compact ? 8 : 12,
+        vertical: compact ? 5 : 8,
       ),
       tableColumnWidth: const IntrinsicColumnWidth(),
       horizontalRuleDecoration: const BoxDecoration(

@@ -93,16 +93,30 @@ class CouncilPersistenceService {
 
   Future<Directory> _ensureReportRoot() async {
     if (_reportRoot != null) return _reportRoot!;
-    final base = await getApplicationDocumentsDirectory();
-    final dir = Directory(p.join(base.path, 'Lumen', 'CouncilReports'));
-    if (!await dir.exists()) await dir.create(recursive: true);
-    _reportRoot = dir;
-    if (!_sweptStaleTmp) {
-      _sweptStaleTmp = true;
-      // Fire-and-forget; never let a sweep failure break a save.
-      unawaited(_sweepStaleTmp(dir));
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory(p.join(docs.path, 'Lumen', 'CouncilReports'));
+      if (!await dir.exists()) await dir.create(recursive: true);
+      _activateReportRoot(dir);
+      return dir;
+    } catch (_) {
+      // Documents can be unavailable/locked on some setups (OneDrive/KFM,
+      // enterprise policies). Fall back to app-support so reports still
+      // persist and the reports menu remains useful.
+      final support = await getApplicationSupportDirectory();
+      final dir = Directory(p.join(support.path, 'Lumen', 'CouncilReports'));
+      if (!await dir.exists()) await dir.create(recursive: true);
+      _activateReportRoot(dir);
+      return dir;
     }
-    return dir;
+  }
+
+  void _activateReportRoot(Directory dir) {
+    _reportRoot = dir;
+    if (_sweptStaleTmp) return;
+    _sweptStaleTmp = true;
+    // Fire-and-forget; never let a sweep failure break a save.
+    unawaited(_sweepStaleTmp(dir));
   }
 
   Future<void> _sweepStaleTmp(Directory dir) async {
@@ -133,7 +147,6 @@ class CouncilPersistenceService {
     String? workspacePath,
     String? summary,
   }) async {
-    final root = await _ensureReportRoot();
     final now = DateTime.now().toUtc();
     final stamp = _stamp(now);
     final titleSrc = session.config.title.trim().isNotEmpty
@@ -142,10 +155,7 @@ class CouncilPersistenceService {
     final slug = _slug(titleSrc);
     final rand = _rand4();
     final base = '$stamp-$slug-$rand';
-    final mdPath = p.join(root.path, '$base.md');
-    final jsonPath = p.join(root.path, '$base.json');
-
-    final sidecar = <String, dynamic>{
+    final sidecarData = <String, dynamic>{
       'schema': 1,
       'runId': session.runId,
       'title': titleSrc,
@@ -158,37 +168,53 @@ class CouncilPersistenceService {
         for (final a in session.config.allAgents)
           {'id': a.id, 'name': a.name, 'role': a.role, 'model': a.model},
       ],
-      'markdownFile': p.basename(mdPath),
     };
 
-    // Write sidecar first, then markdown. A present `.md` therefore implies
-    // a sidecar already landed (or its absence means we know to fall back).
-    await _atomicWriteBytes(
-      jsonPath,
-      utf8.encode(const JsonEncoder.withIndent('  ').convert(sidecar)),
-    );
-    await _atomicWriteBytes(mdPath, utf8.encode(markdown));
-
-    // Best-effort workspace mirror — preserves the prior behaviour where
-    // reports also lived under `<workspace>/.lumen/council/`. If it fails,
-    // the canonical artifact in the global library is still safe.
-    if (workspacePath != null && workspacePath.isNotEmpty) {
-      try {
-        final mirrorDir = Directory(
-          p.join(workspacePath, '.lumen', 'council'),
-        );
-        if (!await mirrorDir.exists()) {
-          await mirrorDir.create(recursive: true);
-        }
-        await File(
-          p.join(mirrorDir.path, '$base.md'),
-        ).writeAsBytes(utf8.encode(markdown));
-      } catch (_) {
-        // Mirror is optional. Don't surface — the global save succeeded.
-      }
+    Future<String> writePair(Directory root) async {
+      final mdPath = p.join(root.path, '$base.md');
+      final jsonPath = p.join(root.path, '$base.json');
+      final sidecar = <String, dynamic>{
+        ...sidecarData,
+        'markdownFile': p.basename(mdPath),
+      };
+      await _atomicWriteBytes(
+        jsonPath,
+        utf8.encode(const JsonEncoder.withIndent('  ').convert(sidecar)),
+      );
+      await _atomicWriteBytes(mdPath, utf8.encode(markdown));
+      return mdPath;
     }
 
-    return mdPath;
+    try {
+      final root = await _ensureReportRoot();
+      final mdPath = await writePair(root);
+      // Best-effort workspace mirror — preserves prior behavior.
+      if (workspacePath != null && workspacePath.isNotEmpty) {
+        try {
+          final mirrorDir = Directory(p.join(workspacePath, '.lumen', 'council'));
+          if (!await mirrorDir.exists()) {
+            await mirrorDir.create(recursive: true);
+          }
+          await File(
+            p.join(mirrorDir.path, '$base.md'),
+          ).writeAsBytes(utf8.encode(markdown));
+        } catch (_) {
+          // Mirror is optional. Don't surface — canonical save succeeded.
+        }
+      }
+      return mdPath;
+    } catch (_) {
+      // Canonical root failed. Fall back to workspace-local persistence so
+      // the run still lands as an artifact.
+      if (workspacePath == null || workspacePath.isEmpty) rethrow;
+      final mirrorDir = Directory(p.join(workspacePath, '.lumen', 'council'));
+      if (!await mirrorDir.exists()) {
+        await mirrorDir.create(recursive: true);
+      }
+      final mdPath = await writePair(mirrorDir);
+      _activateReportRoot(mirrorDir);
+      return mdPath;
+    }
   }
 
   /// Atomic-ish write: bytes → `*.tmp` → `rename`. Retries on Windows file

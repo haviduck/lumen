@@ -714,16 +714,38 @@ class ToolSchemas {
       id: 'council_ask_pool',
       name: 'COUNCIL_ASK_POOL',
       description:
-          'Ask sibling Council agents a concise question and receive their replies.',
+          'Ask selected Council siblings a concise challenge question and receive replies.',
       inputSchema: {
         'type': _objectSchema,
         'properties': {
           'question': _strProp('Question for the other Council agents.'),
+          'targets': {
+            'type': 'array',
+            'description':
+                'Optional list of target agent ids (2-3 preferred). If omitted, runtime chooses up to 3 adversarial responders.',
+            'items': {'type': _stringSchema},
+          },
         },
         'required': ['question'],
       },
-      toGroups: (args) => [(args['question'] as String?) ?? ''],
-      toRawText: (args) => '<<<COUNCIL_ASK_POOL: ${args['question'] ?? ''}>>>',
+      toGroups: (args) {
+        final question = (args['question'] as String?) ?? '';
+        final targets = ((args['targets'] as List?) ?? const [])
+            .whereType<String>()
+            .where((id) => id.trim().isNotEmpty)
+            .join(',');
+        return [question, targets];
+      },
+      toRawText: (args) {
+        final question = args['question'] ?? '';
+        final targets = ((args['targets'] as List?) ?? const [])
+            .whereType<String>()
+            .where((id) => id.trim().isNotEmpty)
+            .join(',');
+        return targets.isEmpty
+            ? '<<<COUNCIL_ASK_POOL: $question>>>'
+            : '<<<COUNCIL_ASK_POOL: $question | targets=$targets>>>';
+      },
     ),
     ToolSchema(
       id: 'council_ask_user',

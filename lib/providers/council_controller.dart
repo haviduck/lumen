@@ -10,6 +10,7 @@ import '../services/council/council_agent_runner.dart';
 import '../services/council/council_models.dart';
 import '../services/council/council_persistence_service.dart';
 import '../services/council/council_protocol.dart';
+import '../services/council/council_task_ledger.dart';
 import '../services/council/council_tool_lock.dart';
 import '../services/tool_executor.dart';
 
@@ -71,8 +72,20 @@ class CouncilController extends ChangeNotifier {
   // Agents that have already emitted `agent_arrived` this run. One-shot.
   final Set<String> _arrivedAgents = <String>{};
   bool _collaborationNudgeUsed = false;
+  // Per-session task ledger. Owns the planned/dispatched/running/done|failed
+  // state machine and powers the report-shipping guard. Recreated on
+  // startCouncil; rehydrated from session.tasks on reload.
+  CouncilTaskLedger? _ledger;
+  CouncilTaskLedger get ledger =>
+      _ledger ??= CouncilTaskLedger(onTransition: _onLedgerTransition);
+  // Map dispatch-site task ids → ledger task ids so completion/failure
+  // callbacks in `_dispatch` can update the right row even for parallel runs.
+  final Map<String, String> _taskIdByDispatchKey = <String, String>{};
   Completer<bool>? _roundTwoDecision;
   CouncilAgentRunner? _orchestratorRunner;
+  static const int _maxPoolExchangesPerSession = 2;
+  static const int _maxPoolTargetsPerQuestion = 3;
+  final List<String> _queuedSynthesisPings = <String>[];
 
   /// True when the user is allowed to ping the orchestrator with a
   /// mid-session note. We allow this whenever the council is in a state
@@ -85,30 +98,31 @@ class CouncilController extends ChangeNotifier {
   ///   left to say), the controller resurrects a fresh orchestrator turn
   ///   with a status digest + the note baked in. See [pingOrchestrator].
   ///
-  /// Disabled during `synthesizing` (final evaluator already running),
-  /// `awaitingUser` (the user has their own input affordance), and any
-  /// terminal status. This is what gives the user a deterministic
-  /// "kick the council loose" lever — they ARE the watchdog.
+  /// Enabled for the whole active run (including synthesizing/followup)
+  /// so the user has a steady "talk to orchestrator" channel.
+  ///
+  /// During `synthesizing`, notes are queued and replayed immediately
+  /// after the evaluator pass finishes (to avoid racing `_finishWithReport`).
   bool get canPingOrchestrator {
     final s = _session;
     if (s == null) return false;
-    return s.status == CouncilStatus.dispatching ||
-        s.status == CouncilStatus.working ||
-        s.status == CouncilStatus.awaitingPool ||
-        s.status == CouncilStatus.awaitingFollowup;
+    return s.status != CouncilStatus.done && s.status != CouncilStatus.aborted;
   }
 
   Future<void> startCouncil(CouncilConfig config, String workspacePath) async {
     await abort();
     _workspacePath = workspacePath;
+    final normalized = _normalizeConfigTools(config);
     _session = CouncilSession(
-      config: config,
+      config: normalized,
       status: CouncilStatus.dispatching,
     );
     _theaterVisible = true;
     _arrivedAgents.clear();
     _activeLinks.clear();
     _roundTwoDecision = null;
+    _ledger = CouncilTaskLedger(onTransition: _onLedgerTransition);
+    _taskIdByDispatchKey.clear();
     _event(CouncilEventType.sessionStarted, message: config.brief);
     notifyListeners();
     await _persist();
@@ -212,6 +226,9 @@ $brief
     _userQuestions.clear();
     _activeLinks.clear();
     _arrivedAgents.clear();
+    _queuedSynthesisPings.clear();
+    _ledger?.cancelAll(reason: 'aborted');
+    _taskIdByDispatchKey.clear();
     _activeDispatches = 0;
     _collaborationNudgeUsed = false;
     _orchestratorRunner = null;
@@ -520,6 +537,17 @@ $brief
       message: eventMessage,
       data: const {'resurrect': true},
     );
+    if (session.status == CouncilStatus.synthesizing) {
+      final queued = images.isEmpty
+          ? trimmed
+          : (trimmed.isEmpty
+                ? '(user attached ${images.length} image(s) during evaluator pass)'
+                : '$trimmed\n\n(plus ${images.length} image(s) attached during evaluator pass)');
+      _queuedSynthesisPings.add(queued);
+      notifyListeners();
+      await _persist();
+      return;
+    }
     notifyListeners();
     await _persist();
     // Resurrect the orchestrator with a status digest + the user's
@@ -758,6 +786,16 @@ $brief
       case CouncilProtocol.askUserToolId:
         return _askUser(_session!.config.orchestrator.id, call);
       case CouncilProtocol.reportToolId:
+        final ledgerRefusal = ledger.refusalReasonForReport();
+        if (ledgerRefusal != null) {
+          _emitDispatchGuardTripped(ledgerRefusal);
+          return CouncilToolResult(
+            feedback:
+                'BLOCKED: $ledgerRefusal You MUST invoke council_dispatch '
+                'on at least one agent (and let it complete) before '
+                'council_report. Phantom reports are forbidden.',
+          );
+        }
         if (!_hasPoolCollaboration() && !_collaborationNudgeUsed) {
           _collaborationNudgeUsed = true;
           return const CouncilToolResult(
@@ -833,10 +871,17 @@ $brief
     agent.status = CouncilAgentStatus.queued;
     agent.currentTask = task;
     session.status = CouncilStatus.working;
+    final taskId = ledger.recordDispatch(
+      agentId: agent.id,
+      agentName: agent.name,
+      task: task,
+      runId: session.runId,
+      nextIntendedAction: 'spawn agent runner',
+    );
     notifyListeners();
     await _persist();
 
-    final future = _runWithDispatchSlot(() => _runAgent(agent, task))
+    final future = _runWithDispatchSlot(() => _runAgent(agent, task, taskId))
         .catchError((Object error, StackTrace stackTrace) {
           agent
             ..status = CouncilAgentStatus.error
@@ -846,6 +891,14 @@ $brief
             CouncilEventType.agentError,
             fromAgentId: agent.id,
             message: '$error',
+          );
+          // Loud, never-swallowed: ledger transitions to failed and emits
+          // a task_state_changed so Signal can surface the error.
+          _safeLedgerTransition(
+            taskId,
+            CouncilTaskState.failed,
+            lastError: '$error',
+            incrementErrorCount: true,
           );
           notifyListeners();
         })
@@ -881,11 +934,17 @@ $brief
     }
   }
 
-  Future<void> _runAgent(CouncilAgent agent, String task) async {
+  Future<void> _runAgent(CouncilAgent agent, String task, String taskId) async {
     final session = _session;
     final workspace = _workspacePath;
     if (session == null || workspace == null) return;
     agent.status = CouncilAgentStatus.working;
+    _safeLedgerTransition(
+      taskId,
+      CouncilTaskState.running,
+      waitingOn: 'model',
+      nextIntendedAction: 'agent streams + tool calls',
+    );
     _event(CouncilEventType.agentStarted, toAgentId: agent.id, message: task);
     _emitThinkingStarted(agent);
     notifyListeners();
@@ -908,30 +967,22 @@ $brief
       onCouncilTool: (call) => _handleAgentTool(agent, call),
     );
     _runners.add(runner);
-    final taskPoolCountBefore = _poolQuestionCountFrom(agent.id);
     final result = await runner.run();
     if (result.cancelled) {
       _emitThinkingEnded(agent);
-      return;
-    }
-    final taskPoolCountAfter = _poolQuestionCountFrom(agent.id);
-    if (taskPoolCountAfter == taskPoolCountBefore &&
-        session.config.agents.length > 1) {
-      final pushback = await _askPool(
-        agent,
-        CouncilToolCall(
-          id: 'auto_pushback_${++_questionSeq}',
-          name: CouncilProtocol.askPoolToolId,
-          arguments: {
-            'question': S.councilAutoPushbackQuestion(agent.name, task),
-          },
-        ),
+      _safeLedgerTransition(
+        taskId,
+        CouncilTaskState.cancelled,
+        lastError: 'agent runner cancelled',
       );
-      agent.transcript +=
-          '\n\n${S.councilPushbackHeader}:\n${pushback.feedback.trim()}\n';
+      return;
     }
     _emitThinkingEnded(agent);
     final summary = _summariseTranscript(agent.transcript);
+    _safeLedgerTransition(
+      taskId,
+      CouncilTaskState.done,
+    );
     _event(
       CouncilEventType.agentDone,
       fromAgentId: agent.id,
@@ -961,7 +1012,37 @@ $brief
     if (workspace == null) {
       return const CouncilToolResult(feedback: 'No workspace is open.');
     }
-    final question = call.arguments['question'] as String? ?? '';
+    final question = (call.arguments['question'] as String? ?? '').trim();
+    if (question.isEmpty) {
+      return const CouncilToolResult(feedback: S.councilPoolQuestionEmpty);
+    }
+    if (_poolExchangeCount() >= _maxPoolExchangesPerSession) {
+      return CouncilToolResult(
+        feedback: S.councilPoolBudgetExceeded(_maxPoolExchangesPerSession),
+      );
+    }
+    if (!_isSharpPoolQuestion(question)) {
+      return CouncilToolResult(
+        feedback: S.councilPoolQuestionTooSoft(S.councilPoolFalsifiableHints),
+      );
+    }
+    final rawTargets = call.arguments['targets'];
+    final requestedTargets = (rawTargets is List ? rawTargets : const <dynamic>[])
+        .whereType<String>()
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty)
+        .toList();
+    final responders = _selectPoolResponders(
+      session: session,
+      asker: asker,
+      requestedTargets: requestedTargets,
+    );
+    if (requestedTargets.isNotEmpty && responders.isEmpty) {
+      return const CouncilToolResult(feedback: S.councilPoolNoValidTargets);
+    }
+    if (responders.isEmpty) {
+      return const CouncilToolResult(feedback: S.councilPoolNoResponders);
+    }
     final entry = CouncilQuestion(
       id: 'pool_${++_questionSeq}',
       fromAgentId: asker.id,
@@ -974,6 +1055,11 @@ $brief
       CouncilEventType.askedPool,
       fromAgentId: asker.id,
       message: question,
+      data: {
+        'requestedTargets': requestedTargets,
+        'resolvedTargets': responders.map((a) => a.id).toList(),
+        'budget': '${_poolExchangeCount()}/$_maxPoolExchangesPerSession',
+      },
     );
     final askLinkId = _emitLinkStarted(
       from: asker.id,
@@ -990,8 +1076,7 @@ $brief
     notifyListeners();
     await _persist();
 
-    for (final agent in session.config.agents) {
-      if (agent.id == asker.id) continue;
+    for (final agent in responders) {
       final previousStatus = agent.status;
       agent.status = CouncilAgentStatus.replying;
       _emitThinkingStarted(agent);
@@ -1045,7 +1130,10 @@ $brief
     entry.resolved = true;
     asker.status = CouncilAgentStatus.working;
     session.status = CouncilStatus.working;
-    final feedback = StringBuffer('Council pool replies:\n');
+    final feedback = StringBuffer(S.councilPoolRepliesHeader)..writeln();
+    feedback.writeln(
+      S.councilPoolTargetsNote(responders.map((a) => a.id).join(', ')),
+    );
     for (final reply in entry.replies) {
       final name =
           session.agentById(reply.fromAgentId)?.name ?? reply.fromAgentId;
@@ -1101,93 +1189,211 @@ $brief
     final session = _session;
     final workspace = _workspacePath;
     if (session == null) return;
+    // THE GUARD: refuse to ship a report when the ledger says no agent
+    // executed successfully. This is the explicit fix for "planned but
+    // nothing happened" — see services/council/FAILURE_MODES.md.
+    final refusal = ledger.refusalReasonForReport();
+    if (refusal != null) {
+      _emitDispatchGuardTripped(refusal);
+      final refusalDraft = markdown.trim().isEmpty
+          ? '# Council Report\n\nNo final report was produced.'
+          : markdown.trim();
+      await _persistFailureArtifact(
+        session: session,
+        reason: refusal,
+        draftReport: refusalDraft,
+      );
+      session.status = CouncilStatus.error;
+      session.config.orchestrator
+        ..status = CouncilAgentStatus.error
+        ..lastError = refusal;
+      notifyListeners();
+      await _persist();
+      return;
+    }
     session.status = CouncilStatus.synthesizing;
     notifyListeners();
     await Future.wait(_dispatches);
     final draftReport = markdown.trim().isEmpty
         ? '# Council Report\n\nNo final report was produced.'
         : markdown.trim();
-    final evaluatorOutput = await _runFinalEvaluator(draftReport);
-    // Split the evaluator output into its two contracted parts: the
-    // markdown report (for the user / artifact) and the structured
-    // `council_followup` JSON block (for the round-two re-brief loop).
-    final split = _splitEvaluatorOutput(evaluatorOutput, draftReport);
-    final report = split.markdown;
-    final followup = _buildReviewerFollowup(
-      raw: split.followupJson,
-      summaryFallback:
-          'Reviewer produced a report. Review the findings before deciding on round two.',
-      roundIndex: session.roundIndex + 1,
-    );
+    try {
+      final evaluatorOutput = await _runFinalEvaluator(draftReport);
+      // Split the evaluator output into its two contracted parts: the
+      // markdown report (for the user / artifact) and the structured
+      // `council_followup` JSON block (for the round-two re-brief loop).
+      final split = _splitEvaluatorOutput(evaluatorOutput, draftReport);
+      final report = split.markdown;
+      final followup = _buildReviewerFollowup(
+        raw: split.followupJson,
+        summaryFallback:
+            'Reviewer produced a report. Review the findings before deciding on round two.',
+        roundIndex: session.roundIndex + 1,
+      );
 
-    final path = await persistence.writeReport(
-      workspacePath: workspace,
+      final path = await persistence.writeReport(
+        workspacePath: workspace,
+        session: session,
+        markdown: report,
+        summary: followup.summary,
+      );
+      // Report is now durable on disk. Fire the success-only hook BEFORE
+      // emitting the terminal state so any listener that re-opens the
+      // wizard on completion sees an already-cleared brief, not a stale
+      // one. Swallow callback errors — a prefs write failure must not
+      // poison the council finish path.
+      final hook = onReportPersisted;
+      if (hook != null) {
+        try {
+          await hook();
+        } catch (_) {
+          // intentionally silent — callback is best-effort UX cleanup
+        }
+      }
+      session
+        ..reportMarkdown = report
+        ..reportPath = path
+        ..reviewerFollowup = followup
+        // KEY: no auto-`done`. Hand off to the user via awaitingFollowup so
+        // the council window stays open until they choose round two / close.
+        ..status = CouncilStatus.awaitingFollowup;
+      session.config.orchestrator.status = CouncilAgentStatus.done;
+      for (final agent in session.config.agents) {
+        if (agent.status != CouncilAgentStatus.error) {
+          agent.status = CouncilAgentStatus.done;
+        }
+      }
+      _event(CouncilEventType.reported, message: path);
+      _event(
+        CouncilEventType.councilRoundCompleted,
+        data: {
+          'roundIndex': session.roundIndex,
+          'final': false,
+          'reportPath': path,
+        },
+      );
+      _event(
+        CouncilEventType.reviewerFollowup,
+        fromAgentId: session.config.finalEvaluator.id,
+        toAgentId: 'user',
+        message: followup.summary,
+        data: followup.toJson(),
+      );
+      _emitMessage(
+        kind: CouncilMessageKind.followup,
+        from: session.config.finalEvaluator.id,
+        to: 'user',
+        text: followup.summary,
+        data: {'reportPath': path, 'weaknessCount': followup.weaknesses.length},
+      );
+      _event(
+        CouncilEventType.awaitingUserFollowup,
+        toAgentId: 'user',
+        message: followup.summary,
+        data: {
+          'suggestedRoundTwo': followup.suggestedRoundTwo,
+          'weaknessCount': followup.weaknesses.length,
+          'reportPath': path,
+        },
+      );
+      _roundTwoDecision = Completer<bool>();
+      notifyListeners();
+      await _persist();
+    } catch (e) {
+      final reason = 'Final report pipeline failed: $e';
+      _event(
+        CouncilEventType.agentError,
+        fromAgentId: session.config.finalEvaluator.id,
+        message: reason,
+      );
+      await _persistFailureArtifact(
+        session: session,
+        reason: reason,
+        draftReport: draftReport,
+      );
+      session.status = CouncilStatus.error;
+      session.config.orchestrator
+        ..status = CouncilAgentStatus.error
+        ..lastError = reason;
+      notifyListeners();
+      await _persist();
+    }
+    if (_queuedSynthesisPings.isNotEmpty) {
+      final pending = _queuedSynthesisPings.join('\n\n---\n\n');
+      _queuedSynthesisPings.clear();
+      unawaited(
+        _runOrchestrator(
+          roundFollowup: session.reviewerFollowup,
+          kickNote: pending,
+        ),
+      );
+    }
+  }
+
+  Future<void> _persistFailureArtifact({
+    required CouncilSession session,
+    required String reason,
+    required String draftReport,
+  }) async {
+    final workspace = _workspacePath;
+    final report = _buildFailureReportMarkdown(
       session: session,
-      markdown: report,
-      summary: followup.summary,
+      reason: reason,
+      draftReport: draftReport,
     );
-    // Report is now durable on disk. Fire the success-only hook BEFORE
-    // emitting the terminal state so any listener that re-opens the
-    // wizard on completion sees an already-cleared brief, not a stale
-    // one. Swallow callback errors — a prefs write failure must not
-    // poison the council finish path.
-    final hook = onReportPersisted;
-    if (hook != null) {
-      try {
-        await hook();
-      } catch (_) {
-        // intentionally silent — callback is best-effort UX cleanup
-      }
+    final summary = 'Council run failed: $reason';
+    try {
+      final path = await persistence.writeReport(
+        workspacePath: workspace,
+        session: session,
+        markdown: report,
+        summary: summary,
+      );
+      session
+        ..reportMarkdown = report
+        ..reportPath = path;
+      _event(
+        CouncilEventType.reported,
+        message: path,
+        data: {'failed': true, 'reason': reason},
+      );
+    } catch (e) {
+      // Last-resort in-memory fallback so the user still has text to copy
+      // in-session even if disk persistence is unavailable.
+      session.reportMarkdown = report;
+      _event(
+        CouncilEventType.agentError,
+        fromAgentId: session.config.orchestrator.id,
+        message: 'Failed to persist failure report: $e',
+      );
     }
-    session
-      ..reportMarkdown = report
-      ..reportPath = path
-      ..reviewerFollowup = followup
-      // KEY: no auto-`done`. Hand off to the user via awaitingFollowup so
-      // the council window stays open until they choose round two / close.
-      ..status = CouncilStatus.awaitingFollowup;
-    session.config.orchestrator.status = CouncilAgentStatus.done;
-    for (final agent in session.config.agents) {
-      if (agent.status != CouncilAgentStatus.error) {
-        agent.status = CouncilAgentStatus.done;
-      }
-    }
-    _event(CouncilEventType.reported, message: path);
-    _event(
-      CouncilEventType.councilRoundCompleted,
-      data: {
-        'roundIndex': session.roundIndex,
-        'final': false,
-        'reportPath': path,
-      },
-    );
-    _event(
-      CouncilEventType.reviewerFollowup,
-      fromAgentId: session.config.finalEvaluator.id,
-      toAgentId: 'user',
-      message: followup.summary,
-      data: followup.toJson(),
-    );
-    _emitMessage(
-      kind: CouncilMessageKind.followup,
-      from: session.config.finalEvaluator.id,
-      to: 'user',
-      text: followup.summary,
-      data: {'reportPath': path, 'weaknessCount': followup.weaknesses.length},
-    );
-    _event(
-      CouncilEventType.awaitingUserFollowup,
-      toAgentId: 'user',
-      message: followup.summary,
-      data: {
-        'suggestedRoundTwo': followup.suggestedRoundTwo,
-        'weaknessCount': followup.weaknesses.length,
-        'reportPath': path,
-      },
-    );
-    _roundTwoDecision = Completer<bool>();
-    notifyListeners();
-    await _persist();
+  }
+
+  String _buildFailureReportMarkdown({
+    required CouncilSession session,
+    required String reason,
+    required String draftReport,
+  }) {
+    final b = StringBuffer()
+      ..writeln('# Council Report (Failed Run)')
+      ..writeln()
+      ..writeln('## Failure summary')
+      ..writeln(reason)
+      ..writeln()
+      ..writeln('## Run metadata')
+      ..writeln('- Run id: `${session.runId}`')
+      ..writeln('- Round: `${session.roundIndex + 1}`')
+      ..writeln('- Dispatch success count: `${ledger.successCount}`')
+      ..writeln('- Dispatch failure count: `${ledger.failureCount}`')
+      ..writeln('- Dispatch pending count: `${ledger.pendingCount}`')
+      ..writeln()
+      ..writeln('## Last available draft')
+      ..writeln(
+        draftReport.trim().isEmpty
+            ? '_No draft content captured._'
+            : draftReport.trim(),
+      );
+    return b.toString().trim();
   }
 
   /// Splits the evaluator's output into the user-facing markdown report and
@@ -1292,15 +1498,83 @@ $brief
         false;
   }
 
-  int _poolQuestionCountFrom(String agentId) {
-    return _session?.events
-            .where(
-              (e) =>
-                  e.type == CouncilEventType.askedPool &&
-                  e.fromAgentId == agentId,
-            )
-            .length ??
-        0;
+  int _poolExchangeCount() {
+    return _session?.poolQuestions.length ?? 0;
+  }
+
+  bool _isSharpPoolQuestion(String question) {
+    final q = question.toLowerCase();
+    final bannedSoft = <String>[
+      'does this look ok',
+      'any thoughts',
+      'thoughts?',
+      'looks good?',
+      'can someone review',
+    ];
+    if (bannedSoft.any(q.contains)) return false;
+    final hasRiskVerb = <String>[
+      'fail',
+      'fails',
+      'failure',
+      'break',
+      'risk',
+      'falsif',
+      'invariant',
+      'contract',
+      'assumption',
+      'load-bearing',
+      'regress',
+      'edge case',
+    ].any(q.contains);
+    final hasSurface = q.contains('`') ||
+        q.contains('/') ||
+        q.contains('_') ||
+        q.contains('.') ||
+        q.contains('symbol') ||
+        q.contains('file') ||
+        q.contains('path') ||
+        q.contains('api');
+    return q.contains('?') && hasRiskVerb && hasSurface;
+  }
+
+  List<CouncilAgent> _selectPoolResponders({
+    required CouncilSession session,
+    required CouncilAgent asker,
+    required List<String> requestedTargets,
+  }) {
+    final siblings = session.config.agents
+        .where((a) => a.id != asker.id)
+        .toList(growable: false);
+    if (siblings.isEmpty) return const <CouncilAgent>[];
+
+    if (requestedTargets.isNotEmpty) {
+      final byId = <String, CouncilAgent>{for (final a in siblings) a.id: a};
+      final selected = <CouncilAgent>[];
+      for (final id in requestedTargets) {
+        final found = byId[id];
+        if (found == null) continue;
+        if (selected.any((a) => a.id == found.id)) continue;
+        selected.add(found);
+      }
+      return selected.take(_maxPoolTargetsPerQuestion).toList(growable: false);
+    }
+
+    final ranked = [...siblings]..sort(
+      (a, b) => _poolRolePriority(a.role).compareTo(_poolRolePriority(b.role)),
+    );
+    return ranked.take(_maxPoolTargetsPerQuestion).toList(growable: false);
+  }
+
+  int _poolRolePriority(RolePreset role) {
+    return switch (role) {
+      RolePreset.reviewer => 0,
+      RolePreset.tester => 1,
+      RolePreset.pentester => 2,
+      RolePreset.architect => 3,
+      RolePreset.researcher => 4,
+      RolePreset.writer => 5,
+      RolePreset.custom => 6,
+    };
   }
 
   Future<String> _runFinalEvaluator(String draftReport) async {
@@ -1546,6 +1820,78 @@ $brief
     if (!_eventStream.isClosed) _eventStream.add(event);
   }
 
+  /// Bridge from ledger transitions to the public council event stream.
+  /// Persists the ledger snapshot back onto the session so a reload can
+  /// rehydrate without losing pending dispatches.
+  void _onLedgerTransition(CouncilTask task) {
+    final session = _session;
+    if (session != null) {
+      session.tasks
+        ..clear()
+        ..addAll(_ledger?.tasks ?? const []);
+    }
+    _event(
+      CouncilEventType.taskStateChanged,
+      fromAgentId: task.agentId,
+      message: task.task,
+      data: task.toJson(),
+    );
+  }
+
+  /// Wraps [CouncilTaskLedger.transition] so an illegal-transition exception
+  /// in some unforeseen control path cannot crash the controller. Illegal
+  /// transitions are surfaced as a guard-tripped event rather than swallowed.
+  void _safeLedgerTransition(
+    String taskId,
+    CouncilTaskState next, {
+    String? lastError,
+    String? waitingOn,
+    String? nextIntendedAction,
+    bool incrementErrorCount = false,
+  }) {
+    try {
+      ledger.transition(
+        taskId,
+        next,
+        lastError: lastError,
+        waitingOn: waitingOn,
+        nextIntendedAction: nextIntendedAction,
+        incrementErrorCount: incrementErrorCount,
+      );
+    } on LedgerTransitionError catch (e) {
+      _emitDispatchGuardTripped(
+        'Illegal ledger transition for $taskId: ${e.reason} '
+        '(${e.from.name} -> ${e.to.name})',
+      );
+    }
+  }
+
+  /// LOUD failure surface. Never swallowed. Drives the UI's red-banner
+  /// "dispatch guard tripped" state so the user sees exactly why the
+  /// council refused to ship.
+  void _emitDispatchGuardTripped(String reason) {
+    _event(
+      CouncilEventType.dispatchGuardTripped,
+      message: reason,
+      data: {
+        'successCount': ledger.successCount,
+        'failureCount': ledger.failureCount,
+        'pendingCount': ledger.pendingCount,
+        'errorCountByAgent': ledger.errorCountByAgent,
+      },
+    );
+    // Mirror onto agentError on the orchestrator for legacy panels that
+    // already render agentError as a red badge.
+    final orchId = _session?.config.orchestrator.id ?? '';
+    if (orchId.isNotEmpty) {
+      _event(
+        CouncilEventType.agentError,
+        fromAgentId: orchId,
+        message: reason,
+      );
+    }
+  }
+
   @override
   void dispose() {
     _eventStream.close();
@@ -1556,6 +1902,26 @@ $brief
     final session = _session;
     if (session == null) return;
     await persistence.saveSession(session);
+  }
+
+  /// Ensures every council participant always has the canonical writable
+  /// toolkit. This protects against stale drafts/sessions that may still
+  /// carry legacy read-only tool sets.
+  CouncilConfig _normalizeConfigTools(CouncilConfig config) {
+    CouncilAgent ensure(CouncilAgent agent) {
+      final merged = <String>{...kCouncilDefaultTools, ...agent.enabledTools};
+      return agent.copyWith(enabledTools: merged);
+    }
+
+    return CouncilConfig(
+      id: config.id,
+      title: config.title,
+      brief: config.brief,
+      orchestrator: ensure(config.orchestrator),
+      agents: config.agents.map(ensure).toList(growable: false),
+      finalEvaluator: ensure(config.finalEvaluator),
+      createdAt: config.createdAt,
+    );
   }
 }
 
