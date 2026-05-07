@@ -133,6 +133,9 @@ class CouncilController extends ChangeNotifier {
     _taskIdByDispatchKey.clear();
     _resetOrchestratorFailureWatchdog();
     _event(CouncilEventType.sessionStarted, message: config.brief);
+    if (_session!.isPentestMode) {
+      _event(CouncilEventType.pentestConspiring);
+    }
     notifyListeners();
     await _persist();
     unawaited(_runOrchestrator());
@@ -1007,6 +1010,21 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final agentId = call.arguments['agentId'] as String? ?? '';
     final task = call.arguments['task'] as String? ?? '';
     final parallel = call.arguments['parallel'] == true;
+
+    // --- Pentest goal extraction ---
+    // Priority: explicit `goal` argument on the dispatch call (added to the
+    // tool schema). Fallback: parse "GOAL: <text>" from the task text itself,
+    // since the CTF doctrine instructs the orchestrator to embed it there.
+    if (session.isPentestMode && session.pentestGoal.isEmpty) {
+      final goalFromArg = (call.arguments['goal'] as String? ?? '').trim();
+      final goalFromText = _extractGoalFromText(task);
+      final goal = goalFromArg.isNotEmpty ? goalFromArg : goalFromText;
+      if (goal.isNotEmpty) {
+        session.pentestGoal = goal;
+        _event(CouncilEventType.pentestGoalIdentified, message: goal);
+      }
+    }
+
     final agent = session.agentById(agentId);
     if (agent == null || agent.id == session.config.orchestrator.id) {
       return CouncilToolResult(
@@ -1165,11 +1183,340 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       text: summary,
       data: {'final': true},
     );
+
+    // --- Pentest attack-landed visual event ---
+    if (session.isPentestMode && summary.isNotEmpty) {
+      final sev = _inferPentestSeverity(summary);
+      final label = _extractFindingLabel(summary, sev, agent.name);
+      final finding = PentestFinding(
+        agentId: agent.id,
+        summary: label,
+        severity: sev,
+        timestamp: DateTime.now(),
+      );
+      session.pentestFindings.add(finding);
+      _event(
+        CouncilEventType.pentestAttackLanded,
+        fromAgentId: agent.id,
+        message: label,
+        data: {'severity': sev.name},
+      );
+    }
+
     agent
       ..status = CouncilAgentStatus.idle
       ..currentTask = '';
     notifyListeners();
     await _persist();
+  }
+
+  /// Merge the evaluator's output into the rich pentest draft.
+  /// The draft is the source of truth for findings; the evaluator's
+  /// prose is appended as a verification section. Never substitute.
+  String _mergePentestReport({
+    required String richDraft,
+    required String evaluatorOutput,
+  }) {
+    final evalTrimmed = evaluatorOutput.trim();
+    final buf = StringBuffer(richDraft.trimRight());
+    buf.writeln();
+    buf.writeln();
+    buf.writeln('---');
+    buf.writeln();
+    buf.writeln('## Final Evaluator Verification');
+    buf.writeln();
+    if (evalTrimmed.isEmpty) {
+      buf.writeln('_The final evaluator did not produce verification output. '
+          'The findings above are taken directly from the agents and have '
+          'not been independently cross-checked._');
+    } else if (evalTrimmed.length < 200) {
+      // Evaluator phoned it in. Show what it said but flag it.
+      buf.writeln('_The final evaluator produced minimal verification. '
+          'Findings above are agent-reported and not cross-checked by the '
+          'evaluator._');
+      buf.writeln();
+      buf.writeln('**Evaluator note:**');
+      buf.writeln();
+      buf.writeln('> $evalTrimmed');
+    } else {
+      // Substantial evaluator output — strip any duplicated H1 title.
+      var clean = evalTrimmed;
+      if (clean.startsWith('# ')) {
+        final firstNewline = clean.indexOf('\n');
+        if (firstNewline > 0) {
+          clean = clean.substring(firstNewline + 1).trim();
+        }
+      }
+      buf.writeln(clean);
+    }
+    return buf.toString();
+  }
+
+  /// Build a structured pentest report draft from agent findings,
+  /// transcripts, and tasks. This gives the evaluator concrete evidence
+  /// to verify rather than forcing it to write from scratch.
+  String _enrichPentestDraft(CouncilSession session, String orchestratorDraft) {
+    final buf = StringBuffer();
+    final goal = session.pentestGoal.isNotEmpty
+        ? session.pentestGoal
+        : session.config.brief;
+
+    buf.writeln('# Penetration Test Report — $goal');
+    buf.writeln();
+
+    // Executive summary from orchestrator
+    buf.writeln('## Executive Summary');
+    buf.writeln();
+    final findings = session.pentestFindings;
+    final critical = findings.where((f) => f.severity == PentestSeverity.critical).length;
+    final major = findings.where((f) => f.severity == PentestSeverity.major).length;
+    final minor = findings.where((f) => f.severity == PentestSeverity.minor).length;
+    final info = findings.where((f) => f.severity == PentestSeverity.info).length;
+    buf.writeln('- ${findings.length} findings total: '
+        '$critical critical, $major major, $minor minor, $info informational.');
+    buf.writeln('- ${session.config.agents.length} agents dispatched.');
+    if (orchestratorDraft.length > 100) {
+      buf.writeln('- Orchestrator notes: ${_summariseTranscript(orchestratorDraft)}');
+    }
+    buf.writeln();
+
+    // Target & scope
+    buf.writeln('## Target & Scope');
+    buf.writeln();
+    buf.writeln('- Goal: $goal');
+    buf.writeln('- Brief: ${session.config.brief}');
+    buf.writeln();
+
+    // Findings table — the core deliverable
+    buf.writeln('## Findings');
+    buf.writeln();
+    if (findings.isEmpty) {
+      buf.writeln('No findings were reported by agents.');
+    } else {
+      buf.writeln('| ID | Agent | Severity | Finding | Detail |');
+      buf.writeln('|---|---|---|---|---|');
+      for (var i = 0; i < findings.length; i++) {
+        final f = findings[i];
+        final agentName = session.agentById(f.agentId)?.name ?? f.agentId;
+        buf.writeln(
+          '| F-${(i + 1).toString().padLeft(3, '0')} '
+          '| $agentName '
+          '| ${f.severity.name.toUpperCase()} '
+          '| ${f.summary} '
+          '| (see agent transcript) |',
+        );
+      }
+    }
+    buf.writeln();
+
+    // Per-agent work log with transcript excerpts
+    buf.writeln('## Agent Attack Log');
+    buf.writeln();
+    for (final agent in session.config.agents) {
+      final transcript = agent.transcript.trim();
+      final task = agent.currentTask.isNotEmpty
+          ? agent.currentTask
+          : (session.tasks
+                .where((t) => t.agentId == agent.id)
+                .map((t) => t.task)
+                .join('; '));
+      final agentFindings = findings.where((f) => f.agentId == agent.id);
+      buf.writeln('### ${agent.name} (${CouncilProtocol.roleInstruction(agent).split('.').first})');
+      buf.writeln();
+      buf.writeln('**Task:** $task');
+      buf.writeln();
+      if (agentFindings.isNotEmpty) {
+        buf.writeln('**Findings:**');
+        for (final f in agentFindings) {
+          buf.writeln('- [${f.severity.name.toUpperCase()}] ${f.summary}');
+        }
+        buf.writeln();
+      }
+      if (transcript.isNotEmpty) {
+        final excerpt = transcript.length > 800
+            ? transcript.substring(transcript.length - 800)
+            : transcript;
+        buf.writeln('**Transcript excerpt:**');
+        buf.writeln();
+        buf.writeln('> ${excerpt.replaceAll('\n', '\n> ')}');
+        buf.writeln();
+      }
+    }
+
+    // Pool exchanges
+    if (session.poolQuestions.isNotEmpty) {
+      buf.writeln('## What Changed Because Agents Conspired');
+      buf.writeln();
+      for (final q in session.poolQuestions) {
+        final asker = session.agentById(q.fromAgentId)?.name ?? q.fromAgentId;
+        buf.writeln('- **$asker** asked: ${q.question}');
+        for (final r in q.replies) {
+          final responder = session.agentById(r.fromAgentId)?.name ?? r.fromAgentId;
+          buf.writeln('  - **$responder**: ${r.answer}');
+        }
+      }
+      buf.writeln();
+    }
+
+    // Remediation placeholder
+    buf.writeln('## Remediation Priority Matrix');
+    buf.writeln();
+    if (findings.isNotEmpty) {
+      buf.writeln('| Priority | Finding(s) | Fix | Effort | Risk if Unfixed |');
+      buf.writeln('|---|---|---|---|---|');
+      var priority = 1;
+      for (var i = 0; i < findings.length; i++) {
+        final f = findings[i];
+        if (f.severity == PentestSeverity.critical ||
+            f.severity == PentestSeverity.major) {
+          buf.writeln(
+            '| $priority | F-${(i + 1).toString().padLeft(3, '0')} '
+            '| (evaluator to fill) '
+            '| (evaluator to assess) '
+            '| ${f.severity.name} risk |',
+          );
+          priority++;
+        }
+      }
+    }
+    buf.writeln();
+
+    // Open vectors
+    buf.writeln('## Open Attack Vectors (untested)');
+    buf.writeln();
+    buf.writeln('(Evaluator: identify vectors that were planned but not tested within session budget.)');
+    buf.writeln();
+
+    // Append orchestrator's original draft as appendix
+    if (orchestratorDraft.trim().isNotEmpty &&
+        orchestratorDraft != '# Council Report\n\nNo final report was produced.') {
+      buf.writeln('## Appendix — Orchestrator Draft');
+      buf.writeln();
+      buf.writeln(orchestratorDraft.trim());
+    }
+
+    return buf.toString();
+  }
+
+  /// Parse "GOAL: <description>" from the task text. The CTF doctrine
+  /// instructs the orchestrator to embed this in the first dispatch.
+  static String _extractGoalFromText(String text) {
+    final match = RegExp(
+      r'GOAL:\s*(.+?)(?:\n|$)',
+      caseSensitive: false,
+    ).firstMatch(text);
+    return match?.group(1)?.trim() ?? '';
+  }
+
+  /// Extract a short, readable label for a finding from agent output.
+  /// Scans for known vulnerability/risk patterns and returns the first
+  /// match as a concise label. Falls back to agent name + severity.
+  static String _extractFindingLabel(
+    String text,
+    PentestSeverity severity,
+    String agentName,
+  ) {
+    final lower = text.toLowerCase();
+    // Known vulnerability patterns → short labels
+    const patterns = <String, String>{
+      'sql injection': 'SQL Injection',
+      'sqli': 'SQL Injection',
+      'xss': 'Cross-Site Scripting',
+      'cross-site scripting': 'Cross-Site Scripting',
+      'csrf': 'CSRF',
+      'cross-site request': 'CSRF',
+      'rce': 'Remote Code Execution',
+      'remote code execution': 'Remote Code Execution',
+      'command injection': 'Command Injection',
+      'auth bypass': 'Auth Bypass',
+      'authentication bypass': 'Auth Bypass',
+      'privilege escalation': 'Privilege Escalation',
+      'path traversal': 'Path Traversal',
+      'directory traversal': 'Directory Traversal',
+      'ssrf': 'SSRF',
+      'server-side request': 'SSRF',
+      'open redirect': 'Open Redirect',
+      'insecure deserialization': 'Insecure Deserialization',
+      'broken access control': 'Broken Access Control',
+      'idor': 'IDOR',
+      'information disclosure': 'Info Disclosure',
+      'info leak': 'Info Leak',
+      'sensitive data': 'Data Exposure',
+      'hardcoded secret': 'Hardcoded Secret',
+      'hardcoded password': 'Hardcoded Password',
+      'hardcoded key': 'Hardcoded Key',
+      'api key': 'Exposed API Key',
+      'weak cipher': 'Weak Cipher',
+      'weak encryption': 'Weak Encryption',
+      'missing auth': 'Missing Auth',
+      'no authentication': 'No Authentication',
+      'default credential': 'Default Credentials',
+      'default password': 'Default Password',
+      'open port': 'Open Port',
+      'exposed service': 'Exposed Service',
+      'unencrypted': 'Unencrypted Traffic',
+      'tls': 'TLS Misconfiguration',
+      'ssl': 'SSL Issue',
+      'certificate': 'Certificate Issue',
+      'cors': 'CORS Misconfiguration',
+      'rate limit': 'Missing Rate Limit',
+      'brute force': 'Brute Force',
+      'dos': 'Denial of Service',
+      'denial of service': 'Denial of Service',
+      'buffer overflow': 'Buffer Overflow',
+      'prototype pollution': 'Prototype Pollution',
+      'template injection': 'Template Injection',
+      'ssti': 'SSTI',
+      'xml external': 'XXE',
+      'xxe': 'XXE',
+      'file upload': 'File Upload Vuln',
+      'unrestricted upload': 'Unrestricted Upload',
+      'race condition': 'Race Condition',
+      'misconfiguration': 'Misconfiguration',
+      'misconfig': 'Misconfiguration',
+      'debug endpoint': 'Debug Endpoint',
+      'exposed admin': 'Exposed Admin',
+      'admin panel': 'Admin Panel Exposed',
+      'dns zone transfer': 'DNS Zone Transfer',
+      'snmp': 'SNMP Exposure',
+      'redis': 'Redis Exposure',
+      'mongodb': 'MongoDB Exposure',
+      'docker': 'Docker Exposure',
+      'kubernetes': 'K8s Exposure',
+      'container escape': 'Container Escape',
+      'lateral movement': 'Lateral Movement',
+      'token': 'Token Vulnerability',
+      'session': 'Session Issue',
+      'jwt': 'JWT Vulnerability',
+    };
+    for (final entry in patterns.entries) {
+      if (lower.contains(entry.key)) return entry.value;
+    }
+    return '${agentName} — ${severity.name.toUpperCase()}';
+  }
+
+  /// Infer severity from agent output by scanning for keywords.
+  PentestSeverity _inferPentestSeverity(String text) {
+    final lower = text.toLowerCase();
+    if (lower.contains('critical') ||
+        lower.contains('rce') ||
+        lower.contains('remote code') ||
+        lower.contains('injection') ||
+        lower.contains('sql injection')) {
+      return PentestSeverity.critical;
+    }
+    if (lower.contains('major') ||
+        lower.contains('xss') ||
+        lower.contains('auth bypass') ||
+        lower.contains('privilege escalation')) {
+      return PentestSeverity.major;
+    }
+    if (lower.contains('minor') ||
+        lower.contains('info leak') ||
+        lower.contains('misconfiguration')) {
+      return PentestSeverity.minor;
+    }
+    return PentestSeverity.info;
   }
 
   Future<CouncilToolResult> _askPool(
@@ -1423,16 +1770,36 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     session.status = CouncilStatus.synthesizing;
     notifyListeners();
     await Future.wait(_dispatches);
-    final draftReport = markdown.trim().isEmpty
+    var draftReport = markdown.trim().isEmpty
         ? '# Council Report\n\nNo final report was produced.'
         : markdown.trim();
+    // For pentest sessions, enrich the draft with structured findings
+    // harvested directly from agent data so the evaluator reviews
+    // concrete evidence, not a blank canvas.
+    if (session.isPentestMode) {
+      draftReport = _enrichPentestDraft(session, draftReport);
+    }
     try {
       final evaluatorOutput = await _runFinalEvaluator(draftReport);
       // Split the evaluator output into its two contracted parts: the
       // markdown report (for the user / artifact) and the structured
       // `council_followup` JSON block (for the round-two re-brief loop).
       final split = _splitEvaluatorOutput(evaluatorOutput, draftReport);
-      final report = split.markdown;
+      // Pentest mode: the rich draft we built from agent findings IS the
+      // report — it contains the findings table, attack log, transcripts,
+      // and remediation matrix. The evaluator's output is APPENDED as
+      // a verification section, never substituted. This guarantees the
+      // user always sees the actual findings even if the evaluator
+      // phones it in with a one-line "let me verify" preamble.
+      final String report;
+      if (session.isPentestMode) {
+        report = _mergePentestReport(
+          richDraft: draftReport,
+          evaluatorOutput: split.markdown,
+        );
+      } else {
+        report = split.markdown;
+      }
       final followup = _buildReviewerFollowup(
         raw: split.followupJson,
         summaryFallback:
@@ -1777,6 +2144,10 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     };
   }
 
+  /// Runs the final evaluator with a watchdog that retries when output is
+  /// too sparse to be a real report. Two retries max, each with a stronger
+  /// nudge. After that, return whatever we got — `_mergePentestReport`
+  /// handles the "evaluator phoned it in" case gracefully.
   Future<String> _runFinalEvaluator(String draftReport) async {
     final session = _session;
     final workspace = _workspacePath;
@@ -1797,48 +2168,177 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     );
     notifyListeners();
 
-    final runner = CouncilAgentRunner(
-      agent: evaluator,
-      anthropic: anthropic,
-      copilot: copilot,
-      toolExecutor: _toolExecutor(evaluator, workspace),
-      systemPrompt: CouncilProtocol.finalEvaluatorSystemPrompt(
-        config: session.config,
-        draftReport: draftReport,
-      ),
-      userPrompt: 'Evaluate the Council now and produce the final report.',
-      nativeToolIds: evaluator.enabledTools,
-      onChunk: (chunk) => _appendTranscript(evaluator, chunk),
-      onCouncilTool: (_) async => const CouncilToolResult(
-        feedback: 'The final evaluator should produce prose only.',
-      ),
-    );
-    _runners.add(runner);
-    final result = await runner.run(maxIterations: 4);
-    _emitThinkingEnded(evaluator);
-    if (result.cancelled || evaluator.transcript.trim().isEmpty) {
-      evaluator.status = CouncilAgentStatus.error;
-      _event(
-        CouncilEventType.evaluatorDone,
-        fromAgentId: evaluator.id,
-        message: draftReport,
+    const maxAttempts = 3;
+    String lastOutput = '';
+    String? lastFailReason;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      final isRetry = attempt > 1;
+      final userPrompt = isRetry
+          ? _evaluatorRetryPrompt(
+              attempt: attempt,
+              previousOutput: lastOutput,
+              reason: lastFailReason ?? 'output too sparse',
+              draftReport: draftReport,
+            )
+          : 'Evaluate the Council now and produce the final report. '
+              'You MUST output the complete structured report — not a '
+              'preamble, not a one-liner. Begin the report immediately.';
+
+      // Reset transcript on retry so we don't fold prior attempts together.
+      if (isRetry) {
+        evaluator.transcript = '';
+      }
+
+      final runner = CouncilAgentRunner(
+        agent: evaluator,
+        anthropic: anthropic,
+        copilot: copilot,
+        toolExecutor: _toolExecutor(evaluator, workspace),
+        systemPrompt: CouncilProtocol.finalEvaluatorSystemPrompt(
+          config: session.config,
+          draftReport: draftReport,
+        ),
+        userPrompt: userPrompt,
+        nativeToolIds: evaluator.enabledTools,
+        onChunk: (chunk) => _appendTranscript(evaluator, chunk),
+        onCouncilTool: (_) async => const CouncilToolResult(
+          feedback: 'The final evaluator should produce prose only.',
+        ),
       );
-      return draftReport;
+      _runners.add(runner);
+      final result = await runner.run(maxIterations: 4);
+
+      if (result.cancelled) {
+        _emitThinkingEnded(evaluator);
+        evaluator.status = CouncilAgentStatus.error;
+        _event(
+          CouncilEventType.evaluatorDone,
+          fromAgentId: evaluator.id,
+          message: draftReport,
+        );
+        return draftReport;
+      }
+
+      lastOutput = evaluator.transcript.trim();
+      final failReason = _evaluatorOutputFailureReason(lastOutput);
+      if (failReason == null) {
+        // Substantial output — accept it.
+        _emitThinkingEnded(evaluator);
+        evaluator.status = CouncilAgentStatus.done;
+        _event(
+          CouncilEventType.evaluatorDone,
+          fromAgentId: evaluator.id,
+          message: evaluator.transcript,
+          data: {'attempts': attempt},
+        );
+        _emitMessage(
+          kind: CouncilMessageKind.review,
+          from: evaluator.id,
+          to: 'pool',
+          text: _summariseTranscript(evaluator.transcript),
+        );
+        notifyListeners();
+        return lastOutput;
+      }
+
+      // Output failed quality gate — retry with stronger nudge.
+      lastFailReason = failReason;
+      _event(
+        CouncilEventType.agentError,
+        fromAgentId: evaluator.id,
+        message: 'Evaluator watchdog: attempt $attempt rejected — $failReason',
+        data: {'attempt': attempt, 'reason': failReason},
+      );
     }
-    evaluator.status = CouncilAgentStatus.done;
+
+    // All retries exhausted. Return whatever we got — merge step will
+    // wrap it appropriately so the user still gets the rich draft.
+    _emitThinkingEnded(evaluator);
+    evaluator.status = lastOutput.isEmpty
+        ? CouncilAgentStatus.error
+        : CouncilAgentStatus.done;
     _event(
       CouncilEventType.evaluatorDone,
       fromAgentId: evaluator.id,
-      message: evaluator.transcript,
-    );
-    _emitMessage(
-      kind: CouncilMessageKind.review,
-      from: evaluator.id,
-      to: 'pool',
-      text: _summariseTranscript(evaluator.transcript),
+      message: lastOutput.isEmpty ? draftReport : evaluator.transcript,
+      data: {
+        'attempts': maxAttempts,
+        'watchdogTripped': true,
+        'lastFailReason': lastFailReason,
+      },
     );
     notifyListeners();
-    return evaluator.transcript.trim();
+    return lastOutput;
+  }
+
+  /// Quality gate for evaluator output. Returns null when output is
+  /// substantial enough to ship as a report, or a failure reason string
+  /// when the evaluator phoned it in.
+  ///
+  /// Heuristics (any one trips):
+  /// - Empty or near-empty (< 200 chars).
+  /// - No section headings (no `##` markers).
+  /// - Output is shorter than 600 chars AND contains hedging phrases
+  ///   like "let me verify", "i need to", "i'll start by" without
+  ///   actually producing the report content.
+  static String? _evaluatorOutputFailureReason(String output) {
+    final trimmed = output.trim();
+    if (trimmed.length < 200) {
+      return 'output too short (${trimmed.length} chars; minimum 200)';
+    }
+    if (!trimmed.contains('##')) {
+      return 'no markdown section headings found';
+    }
+    if (trimmed.length < 600) {
+      final lower = trimmed.toLowerCase();
+      const hedges = [
+        'let me verify',
+        'let me start by',
+        'i need to verify',
+        'i\'ll start',
+        'i will start',
+        'let me first',
+        'i\'ll begin',
+      ];
+      if (hedges.any(lower.contains)) {
+        return 'hedging preamble without report body '
+            '(${trimmed.length} chars)';
+      }
+    }
+    return null;
+  }
+
+  /// Build a stronger user prompt for evaluator retry attempts.
+  String _evaluatorRetryPrompt({
+    required int attempt,
+    required String previousOutput,
+    required String reason,
+    required String draftReport,
+  }) {
+    final preview = previousOutput.length > 300
+        ? previousOutput.substring(0, 300)
+        : previousOutput;
+    return '''
+WATCHDOG RETRY $attempt/3.
+
+Your previous attempt was REJECTED. Reason: $reason.
+
+Previous output (first 300 chars):
+"""
+$preview
+"""
+
+This is unacceptable. The user is waiting for a complete pentest report. You have ALL the data you need in the draft below — findings, agent transcripts, severity assessments. Your job is NOT to re-investigate. Your job is to PRODUCE THE REPORT NOW.
+
+Strict requirements for this attempt:
+1. Begin output with `# ` (markdown H1 title) — no preamble, no "let me", no "I need to".
+2. Include EVERY section heading from the report template: Executive Summary, Target & Scope, Attack Tree, Findings (with subsections per severity), Exploit Chains, Agent Attack Log, What Changed Because Agents Conspired, Remediation Priority Matrix, Open Attack Vectors.
+3. Findings table MUST contain every finding from the draft. If you can't verify one, mark `verified? = no` with a reason — do NOT delete it.
+4. Output must be at least 1500 characters. The draft you were given is already well-structured; you are ENRICHING it with verification, chains, and remediation, not summarizing it.
+5. Output the report directly — no meta commentary, no "here is the report:", no fenced markdown wrapper.
+
+Produce the full report now. No preamble.
+''';
   }
 
   ToolExecutor _toolExecutor(CouncilAgent agent, String workspace) {

@@ -1209,6 +1209,12 @@ class ChatController extends ChangeNotifier {
 
     if (droppedSpan.isEmpty) return null;
 
+    final now = DateTime.now();
+    if (now.difference(_lastUtilityCall) < _kUtilityCooldown) {
+      return cached;
+    }
+
+    _lastUtilityCall = now;
     final summary = await HistorySummarizer.summarize(
       droppedMessages: droppedSpan,
       generate: (messages, {required String model}) =>
@@ -1234,6 +1240,17 @@ class ChatController extends ChangeNotifier {
     return summary;
   }
 
+  /// Cooldown gate for utility-model calls (compression + summarization
+  /// combined). Without this, a multi-tool iteration fires compression
+  /// on every tool result AND summarization on the history prune — the
+  /// user saw the utility model called twice within 5 seconds on back-
+  /// to-back tool executions in the same turn. The cooldown ensures at
+  /// most one utility-model round-trip per [_kUtilityCooldown] window;
+  /// calls that land inside the window skip compression (raw feedback
+  /// is fine — it just costs a few more tokens on the main model).
+  static const Duration _kUtilityCooldown = Duration(seconds: 15);
+  DateTime _lastUtilityCall = DateTime(2000);
+
   Future<String> _compressToolFeedback(
     String rawFeedback, {
     CancellationToken? token,
@@ -1246,7 +1263,13 @@ class ChatController extends ChangeNotifier {
       return rawFeedback;
     }
 
+    final now = DateTime.now();
+    if (now.difference(_lastUtilityCall) < _kUtilityCooldown) {
+      return rawFeedback;
+    }
+
     try {
+      _lastUtilityCall = now;
       final compressed = await generateUtilityText(
         [
           {

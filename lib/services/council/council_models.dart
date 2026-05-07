@@ -1,4 +1,5 @@
 import '../../l10n/strings.dart';
+import 'council_protocol.dart';
 import 'council_task_ledger.dart';
 
 enum CouncilStatus {
@@ -64,6 +65,17 @@ class CouncilEventType {
   static const evaluatorStarted = 'evaluator_started';
   static const evaluatorDone = 'evaluator_done';
   static const agentChunk = 'agent_chunk';
+
+  // Pentest / security-theater visual events
+  /// Emitted once when pentest mode detects the goal target from the brief
+  /// or orchestrator's first dispatch. Data: { 'goal': '<description>' }.
+  static const pentestGoalIdentified = 'pentest_goal_identified';
+  /// Emitted when an agent reports a finding that constitutes an "attack"
+  /// on the goal. Data: { 'finding': '<summary>', 'severity': 'critical|major|minor' }.
+  static const pentestAttackLanded = 'pentest_attack_landed';
+  /// Emitted when agents enter the planning / conspiring phase before
+  /// dispatching attack waves. Agents visually huddle.
+  static const pentestConspiring = 'pentest_conspiring';
 }
 
 /// Kind of a `message_sent` event. Drives speech-bubble styling.
@@ -461,6 +473,43 @@ class CouncilPoolReply {
   }
 }
 
+/// Severity levels for pentest findings — drive visual urgency.
+enum PentestSeverity { critical, major, minor, info }
+
+/// A single finding reported during a pentest/sectest council session.
+class PentestFinding {
+  final String agentId;
+  final String summary;
+  final PentestSeverity severity;
+  final DateTime timestamp;
+
+  PentestFinding({
+    required this.agentId,
+    required this.summary,
+    this.severity = PentestSeverity.info,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  Map<String, dynamic> toJson() => {
+    'agentId': agentId,
+    'summary': summary,
+    'severity': severity.name,
+    'timestamp': timestamp.toIso8601String(),
+  };
+
+  static PentestFinding fromJson(Map<String, dynamic> json) {
+    return PentestFinding(
+      agentId: json['agentId'] as String? ?? '',
+      summary: json['summary'] as String? ?? '',
+      severity: PentestSeverity.values.firstWhere(
+        (s) => s.name == json['severity'],
+        orElse: () => PentestSeverity.info,
+      ),
+      timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ?? DateTime.now(),
+    );
+  }
+}
+
 class CouncilSession {
   final CouncilConfig config;
   final String runId;
@@ -478,6 +527,20 @@ class CouncilSession {
   // on reload so a crash mid-run can't lose pending dispatches.
   final List<CouncilTask> tasks;
 
+  /// Whether this session is in pentest / security-test mode. Computed from
+  /// the brief at construction time. The visual layer uses this to switch
+  /// to attack-theater styling (goal panel, attack lines, conspiring FX).
+  late final bool isPentestMode = CouncilProtocol.isSecurityBrief(config.brief);
+
+  /// The attack goal/target identified by the orchestrator. Set when a
+  /// `pentest_goal_identified` event fires. The visual layer renders a
+  /// goal panel with this text.
+  String pentestGoal = '';
+
+  /// Pentest findings reported by agents. Each entry is a short summary
+  /// used by the visual layer to animate attack-line strikes.
+  final List<PentestFinding> pentestFindings = <PentestFinding>[];
+
   CouncilSession({
     required this.config,
     String? runId,
@@ -492,6 +555,7 @@ class CouncilSession {
     List<CouncilQuestion>? poolQuestions,
     this.pendingUserQuestion,
     List<CouncilTask>? tasks,
+    this.pentestGoal = '',
   }) : runId = runId ??
             '${config.id}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
        startedAt = startedAt ?? DateTime.now(),
@@ -522,10 +586,13 @@ class CouncilSession {
     'poolQuestions': poolQuestions.map((q) => q.toJson()).toList(),
     'pendingUserQuestion': pendingUserQuestion?.toJson(),
     'tasks': tasks.map((t) => t.toJson()).toList(),
+    if (pentestGoal.isNotEmpty) 'pentestGoal': pentestGoal,
+    if (pentestFindings.isNotEmpty)
+      'pentestFindings': pentestFindings.map((f) => f.toJson()).toList(),
   };
 
   static CouncilSession fromJson(Map<String, dynamic> json) {
-    return CouncilSession(
+    final session = CouncilSession(
       config: CouncilConfig.fromJson(
         (json['config'] as Map?)?.cast<String, dynamic>() ??
             const <String, dynamic>{},
@@ -563,7 +630,13 @@ class CouncilSession {
           .whereType<Map>()
           .map((t) => CouncilTask.fromJson(t.cast<String, dynamic>()))
           .toList(),
+      pentestGoal: json['pentestGoal'] as String? ?? '',
     );
+    final findings = ((json['pentestFindings'] as List?) ?? const [])
+        .whereType<Map>()
+        .map((f) => PentestFinding.fromJson(f.cast<String, dynamic>()));
+    session.pentestFindings.addAll(findings);
+    return session;
   }
 }
 

@@ -38,6 +38,10 @@ class CouncilStageAnchors extends ChangeNotifier {
   Offset _ringCenter = Offset.zero;
   Size _ringRadii = Size.zero;
 
+  /// Unmodifiable snapshot of all registered agent rects (id -> bounding box).
+  /// Used by the pentest attack-lines painter to locate agent origins.
+  Map<String, Rect> get agentRects => Map.unmodifiable(_rects);
+
   Rect? rectOf(String id) => _rects[id];
   Offset? topOf(String id) {
     final r = _rects[id];

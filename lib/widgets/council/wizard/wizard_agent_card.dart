@@ -243,25 +243,22 @@ class _Header extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Row(
+              Wrap(
+                spacing: WizardTokens.s6,
+                runSpacing: 2,
                 children: [
-                  if (indexLabel != null) ...[
+                  if (indexLabel != null)
                     Text(
                       indexLabel!.toString().padLeft(2, '0'),
                       style: WizardTokens.eyebrow.copyWith(
                         color: DuckColors.fgSubtle,
                       ),
                     ),
-                    const SizedBox(width: WizardTokens.s6),
-                  ],
                   if (isOrchestrator)
-                    Padding(
-                      padding: const EdgeInsets.only(right: WizardTokens.s6),
-                      child: WizardPill(
-                        label: 'ORCHESTRATOR',
-                        color: accent,
-                        solid: true,
-                      ),
+                    WizardPill(
+                      label: 'ORCHESTRATOR',
+                      color: accent,
+                      solid: true,
                     ),
                 ],
               ),
@@ -457,7 +454,6 @@ class _FallbackModelPicker extends StatelessWidget {
             value: m,
             height: 32,
             child: Row(
-              mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
                   compactModelLabel(m),
@@ -468,11 +464,14 @@ class _FallbackModelPicker extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 10),
-                Text(
-                  m,
-                  style: const TextStyle(
-                    color: DuckColors.fgSubtle,
-                    fontSize: 10,
+                Flexible(
+                  child: Text(
+                    m,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: DuckColors.fgSubtle,
+                      fontSize: 10,
+                    ),
                   ),
                 ),
               ],

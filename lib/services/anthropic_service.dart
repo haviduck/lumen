@@ -221,38 +221,38 @@ class AnthropicService {
     // the two; defaults to legacy on unknown models so older Claudes
     // still work. [modelSupportsNative] gates Haiku / 3.x out from
     // both paths.
-    if (effort != null && effort != ReasoningEffort.off) {
-      final supports = ReasoningEffortHelper.modelSupportsNative(
-        provider: 'claude',
-        rawModel: model,
-      );
-      if (supports) {
-        if (ReasoningEffortHelper.usesAdaptiveThinking(rawModel: model)) {
-          final effortStr =
-              ReasoningEffortHelper.anthropicAdaptiveEffort(effort);
-          if (effortStr != null) {
-            body['thinking'] = {'type': 'adaptive'};
-            body['output_config'] = {'effort': effortStr};
-            body['temperature'] = 1.0;
+    final thinkingCapable = ReasoningEffortHelper.modelSupportsNative(
+      provider: 'claude',
+      rawModel: model,
+    );
+    // Anthropic enforces `temperature == 1` on thinking-capable models
+    // (Sonnet 4+, Opus 4+) regardless of whether a `thinking` block is
+    // present. Sending any other value 400s with "temperature may only
+    // be set to 1 when thinking is enabled". Override unconditionally
+    // so callers that don't pass `effort` (e.g. the council agent
+    // runner) don't hit this.
+    if (thinkingCapable) {
+      body['temperature'] = 1.0;
+    }
+
+    if (effort != null && effort != ReasoningEffort.off && thinkingCapable) {
+      if (ReasoningEffortHelper.usesAdaptiveThinking(rawModel: model)) {
+        final effortStr =
+            ReasoningEffortHelper.anthropicAdaptiveEffort(effort);
+        if (effortStr != null) {
+          body['thinking'] = {'type': 'adaptive'};
+          body['output_config'] = {'effort': effortStr};
+        }
+      } else {
+        final budget = ReasoningEffortHelper.anthropicBudget(effort);
+        if (budget != null) {
+          if (budget >= (body['max_tokens'] as int)) {
+            body['max_tokens'] = budget + 8192;
           }
-        } else {
-          final budget = ReasoningEffortHelper.anthropicBudget(effort);
-          if (budget != null) {
-            // Anthropic requires `max_tokens > thinking.budget_tokens`.
-            // The previous `budget < maxTokens` check silently DROPPED
-            // the thinking block when Deep (16384) tied with maxTokens
-            // (16384) — model behaved like vanilla Opus, no warning.
-            // Bump max_tokens above the budget instead so the user
-            // gets what they asked for.
-            if (budget >= (body['max_tokens'] as int)) {
-              body['max_tokens'] = budget + 8192;
-            }
-            body['thinking'] = {
-              'type': 'enabled',
-              'budget_tokens': budget,
-            };
-            body['temperature'] = 1.0;
-          }
+          body['thinking'] = {
+            'type': 'enabled',
+            'budget_tokens': budget,
+          };
         }
       }
     }

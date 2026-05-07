@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -14,6 +15,8 @@ import 'council_backdrop.dart';
 import 'council_blackboard.dart';
 import 'council_header_bar.dart';
 import 'council_orchestrator_ping_panel.dart';
+import 'council_pentest_attack_lines.dart';
+import 'council_pentest_goal_panel.dart';
 import 'council_report_viewer.dart';
 import 'council_speech_bubbles.dart';
 import 'council_traffic_layer.dart';
@@ -33,15 +36,13 @@ class _CouncilTheaterState extends State<CouncilTheater>
   final CouncilStageAnchors _anchors = CouncilStageAnchors();
   final NetworkController _network = NetworkController();
   bool _pingOpen = false;
-  // When true, the report viewer is docked as a right-side panel inside
-  // the theater (NOT as a modal dialog). This is the "council doesn't
-  // go away when report is clicked" guarantee — both surfaces stay
-  // mounted, so mid-council chat (ping panel) keeps working. Cleared by
-  // the report panel's × button. Auto-cleared if the session changes
-  // out from under us (new council started, or session disposed).
   bool _reportOpen = false;
   String? _reportSessionId;
   String? _inspectAgentId;
+
+  // --- Pentest visual state ---
+  bool _pentestConspiring = false;
+  StreamSubscription<CouncilEvent>? _eventSub;
 
   @override
   void initState() {
@@ -53,7 +54,62 @@ class _CouncilTheaterState extends State<CouncilTheater>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _rebindEventStream();
+  }
+
+  void _rebindEventStream() {
+    final controller = context.read<AppState>().council;
+    _eventSub?.cancel();
+    _eventSub = controller.events.listen(_onCouncilEvent);
+  }
+
+  /// Safe setState that never fires during gesture/mouse processing.
+  /// Uses Future.microtask to escape the current synchronous call stack
+  /// (gesture handler, stream listener, animation tick) before rebuilding.
+  void _safeSetState(VoidCallback fn) {
+    Future.microtask(() {
+      if (mounted) setState(fn);
+    });
+  }
+
+  void _onCouncilEvent(CouncilEvent event) {
+    switch (event.type) {
+      case CouncilEventType.pentestConspiring:
+        _safeSetState(() => _pentestConspiring = true);
+      case CouncilEventType.pentestGoalIdentified:
+        break;
+      case CouncilEventType.pentestAttackLanded:
+        _safeSetState(() => _pentestConspiring = false);
+      case CouncilEventType.sessionStarted:
+        _safeSetState(() => _pentestConspiring = false);
+      case CouncilEventType.reported:
+        final session = context.read<AppState>().council.session;
+        if (session != null && session.reportPath.isNotEmpty) {
+          _safeSetState(() {
+            _reportOpen = true;
+            _reportSessionId = session.config.id;
+          });
+        }
+    }
+  }
+
+  String? _maxPentestSeverity(CouncilSession session) {
+    if (session.pentestFindings.isEmpty) return null;
+    const rank = {'critical': 0, 'major': 1, 'minor': 2, 'info': 3};
+    var best = 'info';
+    for (final f in session.pentestFindings) {
+      if ((rank[f.severity.name] ?? 3) < (rank[best] ?? 3)) {
+        best = f.severity.name;
+      }
+    }
+    return best;
+  }
+
+  @override
   void dispose() {
+    _eventSub?.cancel();
     _pulse.dispose();
     _anchors.dispose();
     _network.dispose();
@@ -90,7 +146,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
           CouncilHeaderBar(
             controller: controller,
             onPingOrchestrator: controller.canPingOrchestrator
-                ? () => setState(() => _pingOpen = true)
+                ? () => _safeSetState(() => _pingOpen = true)
                 : null,
             onOpenReport: !reportAvailable
                 ? null
@@ -99,7 +155,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
                     // theater stays mounted underneath, the ping panel
                     // remains usable, mid-council chat keeps working.
                     // This is the "council DOESN'T GO AWAY" guarantee.
-                    setState(() {
+                    _safeSetState(() {
                       _reportOpen = true;
                       _reportSessionId = session.config.id;
                     });
@@ -162,7 +218,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
         agentRoster: [for (final a in session.config.allAgents) a.name],
         savedAt: session.finishedAt ?? DateTime.now(),
         embedded: true,
-        onClose: () => setState(() => _reportOpen = false),
+        onClose: () => _safeSetState(() => _reportOpen = false),
       ),
     );
   }
@@ -179,6 +235,37 @@ class _CouncilTheaterState extends State<CouncilTheater>
             ? constraints.maxWidth.clamp(1280.0, 1920.0) * 0.18
             : 0;
         final bool blackboardMounted = wideEnough;
+        final isPentest = session.isPentestMode;
+        final goalText = session.pentestGoal;
+        final mainGoalVisible = isPentest && goalText.isNotEmpty;
+        final stageW = constraints.maxWidth - panelW;
+        final mainGoalCenter = Offset(stageW / 2, 70);
+
+        // Every finding becomes a target panel. Laid out across the
+        // top of the stage (the "target zone" the formation faces).
+        final findings = session.pentestFindings;
+        final findingLayouts = <int, Offset>{};
+        final attackMap = <String, Offset>{};
+        if (isPentest && findings.isNotEmpty) {
+          const targetPanelW = 180.0;
+          final usableW = stageW - 40;
+          final n = findings.length;
+          for (var i = 0; i < n; i++) {
+            final t = n == 1 ? 0.5 : i / (n - 1);
+            final x = 20.0 + t * (usableW - targetPanelW);
+            final y = i.isEven ? 8.0 : 52.0;
+            final center = Offset(x + targetPanelW / 2, y + 45);
+            findingLayouts[i] = center;
+            attackMap[findings[i].agentId] = center;
+          }
+        }
+        // If no findings yet but conspiring, all agents aim at main goal.
+        if (isPentest && findings.isEmpty && mainGoalVisible) {
+          for (final a in session.config.agents) {
+            attackMap[a.id] = mainGoalCenter;
+          }
+        }
+
         return Stack(
           children: [
             Positioned.fill(
@@ -190,17 +277,71 @@ class _CouncilTheaterState extends State<CouncilTheater>
                 anchors: _anchors,
                 network: _network,
                 onTapAgent: (agentId) =>
-                    setState(() => _inspectAgentId = agentId),
+                    _safeSetState(() => _inspectAgentId = agentId),
               ),
             ),
-            Positioned.fill(
-              left: 0,
-              right: panelW,
-              child: CouncilSpeechBubblesLayer(
-                session: session,
-                anchors: _anchors,
+            if (isPentest)
+              Positioned.fill(
+                left: 0,
+                right: panelW,
+                child: IgnorePointer(
+                  child: CouncilPentestAttackLines(
+                    anchors: _anchors,
+                    attacks: attackMap,
+                    pulse: _pulse,
+                    conspiring: _pentestConspiring,
+                    mainGoalCenter: mainGoalVisible ? mainGoalCenter : null,
+                  ),
+                ),
               ),
-            ),
+            // --- Main goal panel — always visible in pentest mode ---
+            if (isPentest)
+              Positioned(
+                left: stageW / 2 - 100,
+                top: 16,
+                child: _TargetTapHandler(
+                  onTap: () => _safeSetState(() =>
+                      _inspectAgentId = session.config.orchestrator.id),
+                  child: CouncilPentestGoalPanel(
+                    goal: goalText.isNotEmpty
+                        ? goalText
+                        : S.councilPentestGoalLabel,
+                    findingCount: session.pentestFindings.length,
+                    maxSeverity: _maxPentestSeverity(session),
+                    underAttack: session.pentestFindings.isNotEmpty,
+                  ),
+                ),
+              ),
+            // --- Per-finding target panels ---
+            for (var i = 0; i < findings.length; i++)
+              if (findingLayouts.containsKey(i))
+                Positioned(
+                  left: findingLayouts[i]!.dx - 90,
+                  top: findingLayouts[i]!.dy - 30,
+                  child: _TargetTapHandler(
+                    onTap: () {
+                      final agentId = findings[i].agentId;
+                      _safeSetState(() => _inspectAgentId = agentId);
+                    },
+                    child: CouncilPentestGoalPanel(
+                      goal: findings[i].summary.length > 60
+                          ? '${findings[i].summary.substring(0, 57)}...'
+                          : findings[i].summary,
+                      findingCount: 1,
+                      maxSeverity: findings[i].severity.name,
+                      underAttack: true,
+                    ),
+                  ),
+                ),
+            if (!isPentest)
+              Positioned.fill(
+                left: 0,
+                right: panelW,
+                child: CouncilSpeechBubblesLayer(
+                  session: session,
+                  anchors: _anchors,
+                ),
+              ),
             if (blackboardMounted)
               Positioned(
                 right: 0,
@@ -212,7 +353,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
                   onOpenReport: !session.reportPath.isNotEmpty
                       ? null
                       : () {
-                          setState(() {
+                          _safeSetState(() {
                             _reportOpen = true;
                             _reportSessionId = session.config.id;
                           });
@@ -235,7 +376,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
             if (_pingOpen)
               CouncilOrchestratorPingPanel(
                 controller: controller,
-                onClose: () => setState(() => _pingOpen = false),
+                onClose: () => _safeSetState(() => _pingOpen = false),
               ),
             if (_inspectAgentId != null &&
                 session.agentById(_inspectAgentId!) != null)
@@ -243,7 +384,7 @@ class _CouncilTheaterState extends State<CouncilTheater>
                 key: ValueKey('council-inspect-$_inspectAgentId'),
                 session: session,
                 agent: session.agentById(_inspectAgentId!)!,
-                onClose: () => setState(() => _inspectAgentId = null),
+                onClose: () => _safeSetState(() => _inspectAgentId = null),
               ),
           ],
         );
@@ -310,56 +451,86 @@ class _CouncilStage extends StatelessWidget {
         final rx = math.max(180.0, maxRx);
         final ry = math.max(120.0, math.min(maxRy, rx / 1.55));
 
-        // Compute layout once and publish anchors so bubbles + traffic
-        // align perfectly with cards.
         final layout = <String, Rect>{};
-        final orchestratorRect = Rect.fromLTWH(
-          center.dx - cardW / 2,
-          center.dy - cardH / 2,
-          cardW,
-          cardH,
-        );
-        layout[session.config.orchestrator.id] = orchestratorRect;
 
-        // Skip a 50° wedge at TOP and BOTTOM so cards never invade the
-        // header / footer safe zones.  Agents are distributed across the
-        // remaining 310° split into LEFT (right→bottom→left, swept down)
-        // and RIGHT (top→right→bottom, swept up) wings.  For 9 agents
-        // this yields ~5 per wing with healthy lateral spacing.
-        final n = agents.length;
-        if (n > 0) {
-          const deadWedge = math.pi * 50 / 180; // 50° gap at top + bottom
-          final usable = math.pi * 2 - deadWedge * 2;
-          // Start just right of "12 o'clock + half-wedge", sweep clockwise.
-          final start = -math.pi / 2 + deadWedge / 2;
-          for (var i = 0; i < n; i++) {
-            // Two arcs separated by the bottom wedge: half the agents on
-            // the right arc (start → start+usable/2), then the bottom
-            // wedge is skipped, then the left arc.
-            double t;
-            if (n == 1) {
-              t = 0.5;
+        if (session.isPentestMode) {
+          // ── Pentest formation layout ────────────────────────────────
+          // Row-based: offensive/recon agents up front (top, near targets),
+          // support roles in the back, orchestrator rear-center commanding.
+          final front = <CouncilAgent>[];
+          final back = <CouncilAgent>[];
+          for (final a in agents) {
+            if (_isOffensiveRole(a)) {
+              front.add(a);
             } else {
-              t = i / (n - 1);
+              back.add(a);
             }
-            // Inject the bottom dead-wedge in the middle of the sweep.
-            final angle = (t < 0.5)
-                ? start + (t * 2) * (usable / 2)
-                : start + (usable / 2) + deadWedge + ((t - 0.5) * 2) * (usable / 2);
+          }
+          // Leave top ~30% of stage for target panels
+          const targetZoneRatio = 0.28;
+          final formationTop = safeZone.top + safeZone.height * targetZoneRatio;
+          final rowH = cardH + 12;
+          final gap = 14.0;
 
-            final raw = Offset(
-              center.dx + math.cos(angle) * rx,
-              center.dy + math.sin(angle) * ry,
-            );
-            final left = (raw.dx - cardW / 2).clamp(
-              safePadSide,
-              size.width - cardW - safePadSide,
-            );
-            final top = (raw.dy - cardH / 2).clamp(
-              safePadTop,
-              size.height - cardH - safePadBottom,
-            );
-            layout[agents[i].id] = Rect.fromLTWH(left, top, cardW, cardH);
+          void layRow(List<CouncilAgent> row, double y) {
+            if (row.isEmpty) return;
+            final totalW = row.length * cardW + (row.length - 1) * gap;
+            var x = center.dx - totalW / 2;
+            for (final a in row) {
+              layout[a.id] = Rect.fromLTWH(
+                x.clamp(safePadSide, size.width - cardW - safePadSide),
+                y.clamp(safePadTop, size.height - cardH - safePadBottom),
+                cardW,
+                cardH,
+              );
+              x += cardW + gap;
+            }
+          }
+
+          layRow(front, formationTop);
+          layRow(back, formationTop + rowH);
+          // Orchestrator rear-center, behind both rows
+          layout[session.config.orchestrator.id] = Rect.fromLTWH(
+            (center.dx - cardW / 2).clamp(
+              safePadSide, size.width - cardW - safePadSide),
+            (formationTop + rowH * 2).clamp(
+              safePadTop, size.height - cardH - safePadBottom),
+            cardW,
+            cardH,
+          );
+        } else {
+          // ── Standard elliptical ring layout ───────────────────────
+          layout[session.config.orchestrator.id] = Rect.fromLTWH(
+            center.dx - cardW / 2,
+            center.dy - cardH / 2,
+            cardW,
+            cardH,
+          );
+          final n = agents.length;
+          if (n > 0) {
+            const deadWedge = math.pi * 50 / 180;
+            final usable = math.pi * 2 - deadWedge * 2;
+            final start = -math.pi / 2 + deadWedge / 2;
+            for (var i = 0; i < n; i++) {
+              double t;
+              if (n == 1) {
+                t = 0.5;
+              } else {
+                t = i / (n - 1);
+              }
+              final angle = (t < 0.5)
+                  ? start + (t * 2) * (usable / 2)
+                  : start + (usable / 2) + deadWedge + ((t - 0.5) * 2) * (usable / 2);
+              final raw = Offset(
+                center.dx + math.cos(angle) * rx,
+                center.dy + math.sin(angle) * ry,
+              );
+              final left = (raw.dx - cardW / 2).clamp(
+                safePadSide, size.width - cardW - safePadSide);
+              final top = (raw.dy - cardH / 2).clamp(
+                safePadTop, size.height - cardH - safePadBottom);
+              layout[agents[i].id] = Rect.fromLTWH(left, top, cardW, cardH);
+            }
           }
         }
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -401,19 +572,17 @@ class _CouncilStage extends StatelessWidget {
                       _positioned(
                         layout[session.config.orchestrator.id]!,
                         _AgentTapTarget(
-                          // Orchestrator card click opens the inspector,
-                          // matching every other council card. Ping is now
-                          // the header-bar button only — the user wants
-                          // unconditional access to the inspector when
-                          // the orchestrator is erroring.
                           onTap: onTapAgent == null
                               ? null
                               : () =>
                                     onTapAgent!(session.config.orchestrator.id),
-                          child: CouncilAgentSector(
-                            agent: session.config.orchestrator,
-                            isOrchestrator: true,
-                            spawnDelayMs: 0,
+                          child: _maybeWithTicker(
+                            session.config.orchestrator,
+                            CouncilAgentSector(
+                              agent: session.config.orchestrator,
+                              isOrchestrator: true,
+                              spawnDelayMs: 0,
+                            ),
                           ),
                         ),
                       ),
@@ -424,13 +593,13 @@ class _CouncilStage extends StatelessWidget {
                             onTap: onTapAgent == null
                                 ? null
                                 : () => onTapAgent!(agents[i].id),
-                            child: CouncilAgentSector(
-                              key: ValueKey('agent-${agents[i].id}'),
-                              agent: agents[i],
-                              // Stagger from the orchestrator outward: cards
-                              // closer to "12 o'clock" of the sweep arrive
-                              // first, latest cards land ~720ms after.
-                              spawnDelayMs: 120 + i * 80,
+                            child: _maybeWithTicker(
+                              agents[i],
+                              CouncilAgentSector(
+                                key: ValueKey('agent-${agents[i].id}'),
+                                agent: agents[i],
+                                spawnDelayMs: 120 + i * 80,
+                              ),
                             ),
                           ),
                         ),
@@ -442,6 +611,74 @@ class _CouncilStage extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+
+  Widget _maybeWithTicker(CouncilAgent agent, Widget card) {
+    if (!session.isPentestMode) return card;
+    final transcript = agent.transcript.trim();
+    if (transcript.isEmpty) return card;
+    // Strip tool-call noise, grab the last few meaningful lines
+    var cleaned = transcript
+        .replaceAll(RegExp(r'<<<[A-Z_]+(?::\s*[^>]*)?\s*>>>'), '')
+        .replaceAll(
+          RegExp(r'<<<END_(?:FILE|EDIT|APPEND)>>>'),
+          '',
+        )
+        .replaceAll(RegExp(r'<!-- LUMEN_[^>]*-->'), '')
+        .replaceAll(RegExp(r'<tool_result>[\s\S]*?</tool_result>'), '')
+        .replaceAll(RegExp(r'^\[FAILED\]\s*', multiLine: true), '');
+    final lines = cleaned
+        .split('\n')
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty && !l.startsWith('|') && l.length > 3)
+        .toList();
+    if (lines.isEmpty) return card;
+    final tail = lines.length <= 3 ? lines : lines.sublist(lines.length - 3);
+    final display = tail.join('\n');
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        card,
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: IgnorePointer(
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(10, 14, 10, 8),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  stops: const [0.0, 0.25, 1.0],
+                  colors: [
+                    Colors.black.withValues(alpha: 0.0),
+                    Colors.black.withValues(alpha: 0.7),
+                    Colors.black.withValues(alpha: 0.92),
+                  ],
+                ),
+                borderRadius: const BorderRadius.only(
+                  bottomLeft: Radius.circular(12),
+                  bottomRight: Radius.circular(12),
+                ),
+              ),
+              child: Text(
+                display,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.75),
+                  fontSize: 10,
+                  height: 1.35,
+                  letterSpacing: 0.1,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -466,6 +703,34 @@ class _CouncilStage extends StatelessWidget {
         evaluator.status != CouncilAgentStatus.idle;
     return [...session.config.agents, if (showEvaluator) evaluator];
   }
+
+  static bool _isOffensiveRole(CouncilAgent agent) {
+    if (agent.role == RolePreset.pentester ||
+        agent.role == RolePreset.tester) {
+      return true;
+    }
+    if (agent.role == RolePreset.custom) {
+      final lower = agent.customRole.toLowerCase();
+      return lower.contains('recon') ||
+          lower.contains('offensive') ||
+          lower.contains('exploit') ||
+          lower.contains('attack') ||
+          lower.contains('scan') ||
+          lower.contains('probe') ||
+          lower.contains('red team') ||
+          lower.contains('ctf') ||
+          lower.contains('pentest') ||
+          lower.contains('breach');
+    }
+    final nameLower = agent.name.toLowerCase();
+    return nameLower.contains('recon') ||
+        nameLower.contains('exploit') ||
+        nameLower.contains('attack') ||
+        nameLower.contains('scan') ||
+        nameLower.contains('probe') ||
+        nameLower.contains('ctf') ||
+        nameLower.contains('breach');
+  }
 }
 
 /// Click on a regular agent card → open the floating inspector for them.
@@ -478,6 +743,27 @@ class _AgentTapTarget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (onTap == null) return child;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Click on a pentest target panel → open the inspector for the
+/// agent who produced that finding (or orchestrator for main goal).
+class _TargetTapHandler extends StatelessWidget {
+  final VoidCallback onTap;
+  final Widget child;
+
+  const _TargetTapHandler({required this.onTap, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: GestureDetector(

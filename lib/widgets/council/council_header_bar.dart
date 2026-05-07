@@ -66,6 +66,14 @@ class CouncilHeaderBar extends StatelessWidget {
               ],
             ),
           ),
+          // Header button audit (2026-05): only show buttons that
+          // actually affect the running council. Ping is conditional
+          // on a live runner, Open Report is conditional on a saved
+          // report path, Abort is conditional on the session still
+          // being active. The previous "Back to editor" button only
+          // flipped an internal `_theaterVisible` flag without closing
+          // the council tab — visually a no-op — so it's been removed.
+          // The X on the editor tab is the canonical close.
           if (controller.canPingOrchestrator && onPingOrchestrator != null)
             Padding(
               padding: const EdgeInsets.only(right: 6),
@@ -77,25 +85,21 @@ class CouncilHeaderBar extends StatelessWidget {
                 onTap: onPingOrchestrator,
               ),
             ),
-          if (session?.reportPath.isNotEmpty == true)
+          if (session?.reportPath.isNotEmpty == true) ...[
             _HeaderButton(
               icon: Icons.description_outlined,
               label: S.councilOpenReport,
               onTap: onOpenReport,
             ),
-          const SizedBox(width: 6),
-          _HeaderButton(
-            icon: Icons.keyboard_return_outlined,
-            label: S.councilBackToEditor,
-            onTap: controller.hideTheater,
-          ),
-          const SizedBox(width: 6),
-          _HeaderButton(
-            icon: Icons.stop_circle_outlined,
-            label: S.councilAbort,
-            danger: true,
-            onTap: () => controller.abort(),
-          ),
+            const SizedBox(width: 6),
+          ],
+          if (controller.isActive)
+            _HeaderButton(
+              icon: Icons.stop_circle_outlined,
+              label: S.councilAbort,
+              danger: true,
+              onTap: () => controller.abort(),
+            ),
         ],
       ),
     );

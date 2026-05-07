@@ -77,7 +77,7 @@ Your job: convert the user's brief into well-scoped missions, dispatch them in p
 - Mermaid blocks must be `flowchart TD` or `flowchart LR`. The in-app renderer only paints flowcharts; other kinds (sequenceDiagram, stateDiagram, classDiagram, erDiagram, gantt, journey, pie, mindmap, gitGraph) fall back to a source-only card.
 - `$askUserToolId` is for blocking decisions only (missing intent, credentials, risk acceptance, round-two trigger).
 
-${_structuredReportTemplateBlock()}
+${_reportTemplateFor(config.brief)}
 $ctf
 Council agents:
 $agents
@@ -304,7 +304,7 @@ Rules for the JSON:
 
 Part 2 — One complete markdown report for the user, filling the STRUCTURED TEMPLATE below in order. The user reads this report end-to-end inside the Lumen Council viewer; it is the deliverable they judge the entire session by. No JSON inside the markdown. No hidden markers. Mermaid blocks must be `flowchart TD` or `flowchart LR` — no sequenceDiagram / stateDiagram / classDiagram / erDiagram / gantt / journey / pie / mindmap / gitGraph (the in-app renderer only paints flowcharts; everything else falls back to a source-only card).
 
-${_structuredReportTemplateBlock()}
+${_reportTemplateFor(config.brief)}
 
 === Style for Part 2 ===
 - Voice: senior reviewer talking to peers. Direct, evidence-backed, human. No corporate filler, no "in conclusion".
@@ -312,6 +312,17 @@ ${_structuredReportTemplateBlock()}
 - File paths inline as `lib/foo/bar.dart` or `lib/foo/bar.dart:42`. Don't link to URLs unless the agent actually produced one.
 - Tables: keep cells short (one short sentence max). Long detail goes in the prose under the table.
 - If you remove or weaken something the draft claimed, say so explicitly in the Findings table (`verified? = no`) — don't silently delete.
+
+=== CRITICAL: Report completeness ===
+The draft report below ALREADY CONTAINS findings tables, agent attack logs, severity assessments, and transcript excerpts harvested from the agents' actual work. Your job:
+1. KEEP every finding row from the draft. Do NOT delete findings — mark unverified ones as `verified? = no` with a reason.
+2. For each finding: add or confirm the Evidence, Reproduction, and Remediation columns. If the agent transcript contains a PoC, code snippet, or file path — quote it.
+3. Add a `Verified?` column to the findings table. Cross-check each claim against the agent transcripts provided below.
+4. Fill the Remediation Priority Matrix with concrete fixes, not placeholders.
+5. Identify exploit chains — findings that combine into higher-impact attacks.
+6. List untested vectors from the attack tree that agents didn't cover.
+
+Do NOT output a two-line "let me verify" preamble as your report. The user needs the FULL report with ALL findings, ALL agent work, and YOUR verification verdict on each one. The report must be LONGER than the draft, not shorter — you are adding verification, chains, and remediation, not summarizing.
 $ctf
 Original user brief:
 ${config.brief}
@@ -322,6 +333,15 @@ $draftReport
 Agent work:
 $agents
 ''';
+  }
+
+  /// Picks the right report template based on whether the brief triggers
+  /// pentest/CTF mode. Lives in one place so orchestrator and evaluator
+  /// always agree on the expected shape.
+  static String _reportTemplateFor(String brief) {
+    return isSecurityBrief(brief)
+        ? _pentestReportTemplateBlock()
+        : _structuredReportTemplateBlock();
   }
 
   /// The opinionated final-report template both the orchestrator (draft) and
@@ -408,6 +428,122 @@ End of template. Everything between the outer ```markdown fences IS your Part 2 
 ''';
   }
 
+  /// Pentest-specific report template. Used instead of the standard template
+  /// when the brief triggers CTF/security mode. Structured around findings,
+  /// severity, attack chains, and remediation rather than generic work flow.
+  static String _pentestReportTemplateBlock() {
+    return r'''
+=== Pentest report template (fill every section, in order) ===
+Conventions:
+- Every `##` heading below stays. If a section has no content, write `none`.
+- Headings appear in this exact order. Extras go under "Appendix".
+- Mermaid: `flowchart TD` or `flowchart LR` only.
+- Tables use GitHub markdown syntax. Keep cells to a short sentence.
+
+```markdown
+# Penetration Test Report — <target system / surface under test>
+
+## Executive Summary
+- 3 to 5 bullets, max one short sentence each.
+- Lead with the highest-severity finding and its impact.
+- State the overall security posture: strong / acceptable / weak / critical.
+- Count: X critical, Y major, Z minor, W informational findings.
+
+## Target & Scope
+- What was tested (system, endpoints, surfaces, codepaths).
+- What was explicitly OUT of scope.
+- Testing methodology (static analysis, dynamic probing, fuzzing, manual review).
+
+## Attack Tree
+A `flowchart TD` showing the attack plan — each root is an attack class, each leaf is a specific vector that was tested. Mark nodes that yielded findings with a distinct style.
+
+```mermaid
+flowchart TD
+  root["Target System"] --> auth["Authentication"]
+  root --> input["Input Handling"]
+  root --> config["Configuration"]
+  root --> net["Network/Infra"]
+  auth --> a1["Brute force"]
+  auth --> a2["Token reuse"]
+  input --> i1["SQL injection"]
+  input --> i2["XSS"]
+  config --> c1["Debug endpoints"]
+  net --> n1["Open ports"]
+  net --> n2["TLS weaknesses"]
+  net --> n3["Service exposure"]
+  style a2 fill:#ff1744,color:#fff
+  style i1 fill:#ff6d00,color:#fff
+  style n1 fill:#ff6d00,color:#fff
+```
+
+## Findings
+
+### Critical Findings
+For each critical finding:
+#### F-001: <title>
+| Field | Detail |
+|---|---|
+| Severity | Critical |
+| Target | `file/endpoint/surface` |
+| Vector | How it was exploited |
+| Impact | What an attacker gains |
+| Evidence | PoC, payload, test output |
+| Reproduction | Step-by-step to reproduce |
+| Remediation | Concrete fix, not "apply best practices" |
+
+### Major Findings
+(Same format as Critical)
+
+### Minor Findings
+(Same format, briefer evidence is acceptable)
+
+### Informational
+(One-liner table is fine for info-level)
+
+| ID | Target | Observation | Recommendation |
+|---|---|---|---|
+
+## Exploit Chains
+Findings that chain together into higher-impact attacks. For each chain:
+- Components: F-001 + F-003 → <combined impact>
+- Chain path: step-by-step how the chain works
+- Combined severity: <severity of the chain, not the individual parts>
+
+If no chains were found, write `none`.
+
+## Agent Attack Log
+Who attacked what, what they found, and where they pushed back on each other.
+
+| Agent | Target | Attack Vector | Findings | Verified? |
+|---|---|---|---|---|
+| agent_0 | Auth endpoint | Brute force | F-001: rate limit bypass | yes |
+| agent_1 | Comment API | Input fuzzing | F-002: stored XSS | yes |
+| agent_2 | Port 6379 | Redis probe | F-003: no auth on Redis | yes |
+| agent_3 | TLS config | Cipher scan | F-004: weak ciphers | yes |
+
+## What Changed Because Agents Conspired
+Concrete examples of cross-pollination — where one agent's finding materially altered another's attack path. If nothing crossed, write `none`.
+
+## Remediation Priority Matrix
+
+| Priority | Finding(s) | Fix | Effort | Risk if Unfixed |
+|---|---|---|---|---|
+| 1 (immediate) | F-001 | Add rate limiting | low | account takeover |
+| 2 (this sprint) | F-002 | Sanitize HTML output | medium | stored XSS |
+
+## Open Attack Vectors (untested)
+Vectors identified but not tested within session budget. Each entry: vector, why it matters, recommended next action.
+
+1. <vector>. **Why it matters:** <reason>. **Next action:** <concrete step>.
+
+## Appendix (optional)
+Raw payloads, full PoC scripts, extended evidence. Omit heading if empty.
+```
+
+End of template.
+''';
+  }
+
   /// Round-two re-brief addendum injected into the orchestrator's user prompt
   /// when the user confirms a second round. Keeps reviewer findings front
   /// and center so agents address them concretely.
@@ -453,14 +589,10 @@ End of template. Everything between the outer ```markdown fences IS your Part 2 
   /// "sectest" and "pen test" alongside formal ones like "threat model"
   /// and "OWASP"). False positives here are cheap — the doctrine is
   /// only attitudinal, it does not change protocol shape.
-  static String _ctfDoctrineFor(String brief) {
+  /// Whether [brief] triggers CTF / pentest / security-test mode.
+  /// Public so the visual layer can switch to attack-theater styling.
+  static bool isSecurityBrief(String brief) {
     final b = brief.toLowerCase();
-    // Trigger list is intentionally narrow now. Earlier versions fired
-    // on bare `test` / `tests`, which dragged the attacker-mindset
-    // doctrine into mundane "add unit tests for this widget" briefs
-    // where it just made the agents adversarial about a UI flow. Only
-    // phrases that meaningfully imply security / CTF / red-team work
-    // should pull in this lens.
     const triggers = <String>[
       'sectest',
       'security test',
@@ -483,11 +615,31 @@ End of template. Everything between the outer ```markdown fences IS your Part 2 
       'attack surface',
       'owasp',
       'adversarial test',
+      // Network / infrastructure security triggers
+      'port scan',
+      'nmap',
+      'network scan',
+      'network security',
+      'network audit',
+      'firewall',
+      'open port',
+      'service enumeration',
+      'network pentest',
+      'infrastructure test',
+      'infra audit',
+      'lateral movement',
+      'network segmentation',
+      'dns enumeration',
+      'ssl cert',
+      'tls config',
+      'misconfig',
     ];
-    // Bare `ctf` is a real signal but matches "select" / "octfree" too;
-    // require word boundaries via leading/trailing space or string ends.
     final ctfWord = RegExp(r'(^|\W)ctf(\W|$)').hasMatch(b);
-    if (!ctfWord && !triggers.any(b.contains)) return '';
+    return ctfWord || triggers.any(b.contains);
+  }
+
+  static String _ctfDoctrineFor(String brief) {
+    if (!isSecurityBrief(brief)) return '';
     return '''
 
 === CTF attitude (active because this brief is testing / security / CTF flavored) ===
@@ -495,12 +647,45 @@ End of template. Everything between the outer ```markdown fences IS your Part 2 
 - Think like an attacker, not a defender. Default question is "how do I break this?" before "how do I document it?".
 - Map the attack surface first: every entry point, every trust boundary, every assumption. Enumerate before you exploit.
 - Chain weaknesses. A small input quirk + a permissive parser + an over-broad permission is a finding; each in isolation is noise.
-- For each candidate flag, produce: target (file/symbol/endpoint), input/payload, expected behavior, observed behavior, severity (blocker/major/minor), reproduction path, and one suggested mitigation.
+- For each candidate flag, produce: target (file/symbol/endpoint), input/payload, expected behavior, observed behavior, severity (critical/major/minor/info), reproduction path, and one suggested mitigation.
 - Bias hard for repro: a working PoC, a failing test, or a script the next person can run. Prose without a repro is weak evidence.
 - Prioritise by exploit likelihood x blast radius, not by aesthetics or feature parity.
 - Assume no permission boundary, validation, or auth check holds until you have either broken it or formally proved it. Write the test that proves it either way.
 - When the brief says "tests" or "testing": include real adversarial tests (negative inputs, boundary conditions, race conditions, fuzz seeds, malformed payloads), not just happy-path coverage.
 - When the brief says "security": prefer one fully-chained, repro-able exploit over five vague "could be vulnerable" notes.
+
+=== Think further than the user ===
+The user asked for a pentest / security test. Your job is to think FURTHER and DEEPER than they did. They named a target — you must name the vectors they forgot:
+
+1. ENUMERATE BEYOND THE BRIEF:
+   - If the user said "check auth" → also probe session fixation, token entropy, refresh-token reuse, CSRF, privilege escalation, lateral movement, JWT algorithm confusion, password reset flow abuse, brute-force rate limits, account lockout bypass.
+   - If the user said "check the API" → also probe rate limiting, IDOR, mass assignment, GraphQL introspection, header injection, SSRF via URL params, deserialization attacks, error message information leakage.
+   - If the user said "check inputs" → also probe stored XSS, DOM XSS, prototype pollution, template injection (SSTI), path traversal, null byte injection, Unicode normalization attacks, multipart boundary abuse.
+   - If the user said "check the network" / "ports" / "infrastructure" → also probe: open ports and unnecessary services, default credentials on exposed services, TLS/SSL configuration (weak ciphers, expired certs, missing HSTS), DNS zone transfer, SNMP community strings, banner grabbing for version disclosure, firewall rule gaps, network segmentation bypass (can host A reach host B?), ARP spoofing surface, unencrypted management protocols (Telnet, FTP, HTTP admin panels), NTP amplification, IPMI/BMC exposure, VPN misconfig, rogue DHCP/DNS, IPv6 dual-stack leaks.
+   - If the user said "check servers" / "services" → also probe: service-specific CVEs for discovered versions, default/weak admin passwords, directory traversal on web services, misconfigured CORS, exposed debug/status endpoints (/metrics, /health, /env, /actuator), database ports exposed without auth, Redis/Memcached open to the network, container escape surface (Docker socket, privileged mode), orchestration API exposure (Kubernetes API, etcd), log injection, server-side request forgery via internal services.
+   - Always ask: "what DIDN'T the user mention that a real attacker would try?"
+
+2. BUILD AN ATTACK TREE (your first orchestrator action):
+   - Before any dispatch, produce a mental attack tree. Roots are high-level attack classes: auth bypass, injection, logic flaw, infra/network misconfiguration, service exposure, supply chain, lateral movement. Each leaf is a concrete test an agent can run.
+   - For network/infrastructure briefs, roots should be: port/service enumeration, credential attacks, TLS/cert weaknesses, network segmentation, service-specific exploits, management plane exposure, data-in-transit interception. Each agent should OWN a specific target surface (a host, a port range, a service) — not "scan everything".
+   - Map the tree to dispatches: each branch becomes a parallel agent task. Share the full tree with every agent so they see the campaign shape, not just their slice. Name the SPECIFIC TARGET each agent is attacking (e.g. "Agent 0: attack the Redis instance on port 6379", "Agent 1: probe the admin panel at /admin").
+   - Pass the `goal` field on your first dispatch (structured argument, not just in the task text). This is the system / endpoint / surface under test. The UI renders it as a visual target panel. For network tests, the goal should name the network segment or host range.
+
+3. CHAIN-FINDING BETWEEN WAVES:
+   - After wave 1 returns, actively look for CHAINS. Can finding A feed into surface B? Example: a low-severity open redirect + a permissive OAuth callback + an admin-only endpoint = a critical privilege escalation chain.
+   - Dispatch a wave 2 that specifically tests these chains. Tell agents: "Agent X found <finding>. Test whether this chains into <surface> to achieve <impact>."
+   - Grade findings by exploitability × blast radius, not just existence. A theoretical SQLi behind two auth walls is noise next to an unauthenticated SSRF.
+
+4. BEFORE SHIPPING THE REPORT:
+   - Ask yourself: "If I were a real attacker with these findings, what would I do NEXT?" If the answer is obvious and untested, dispatch one more targeted probe.
+   - For each finding, ensure there is: a reproduction path, a severity grade, and a concrete remediation. Vague "apply best practices" is not remediation.
+
+5. GOAL PANEL:
+   - Your first dispatch MUST include the `goal` argument on the COUNCIL_DISPATCH tool call — this is the system / endpoint / surface under test. The visual layer renders a goal panel with animated target reticle.
+   - Example: dispatch with `goal: "Lumen AI chat API — auth, input handling, session management"`.
+
+=== Pentest report structure ===
+When producing the final report for a pentest/sectest session, use the PENTEST REPORT TEMPLATE instead of the standard report template. The final evaluator will also use this structure.
 === End CTF block ===
 ''';
   }
@@ -553,6 +738,13 @@ class CouncilToolSchemas {
             'type': 'boolean',
             'description':
                 'Whether this task can run concurrently with other dispatches.',
+          },
+          'goal': {
+            'type': 'string',
+            'description':
+                'Pentest/sectest only: the attack target or system under test. '
+                'Set this on the FIRST dispatch of a security session so the '
+                'visual layer can render a goal panel.',
           },
         },
         'required': ['agentId', 'task'],

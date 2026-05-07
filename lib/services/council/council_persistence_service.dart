@@ -166,7 +166,7 @@ class CouncilPersistenceService {
       'roundIndex': session.roundIndex,
       'agentRoster': [
         for (final a in session.config.allAgents)
-          {'id': a.id, 'name': a.name, 'role': a.role, 'model': a.model},
+          {'id': a.id, 'name': a.name, 'role': a.role.name, 'model': a.model},
       ],
     };
 

@@ -1001,6 +1001,7 @@ class _SettingsViewState extends State<SettingsView> {
                   children: [
                     DropdownButtonFormField<String>(
                       initialValue: selectedModel,
+                      isExpanded: true,
                       decoration: const InputDecoration(
                         contentPadding: EdgeInsets.symmetric(
                           horizontal: 10,

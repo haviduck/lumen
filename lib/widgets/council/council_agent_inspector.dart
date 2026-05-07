@@ -1,5 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:markdown/markdown.dart' as md;
 
 import '../../l10n/strings.dart';
 import '../../services/council/council_models.dart';
@@ -8,7 +12,6 @@ import '../../services/council/council_task_ledger.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/duck_toast.dart';
-import 'council_report_viewer.dart';
 
 /// Floating inspection panel for a single Council member.
 ///
@@ -38,7 +41,21 @@ class CouncilAgentInspector extends StatefulWidget {
 
 class _CouncilAgentInspectorState extends State<CouncilAgentInspector>
     with SingleTickerProviderStateMixin {
+  // Why composited transitions rather than `AnimatedBuilder` rebuilding
+  // the whole Stack every tick:
+  //
+  // The previous version called setState (via AnimatedBuilder) on every
+  // animation frame. That re-inflates the entire subtree — including
+  // the MouseRegion / SelectionArea / Tooltip widgets inside. Each
+  // re-inflation re-registers the MouseTrackerAnnotation. When mouse
+  // tracking is mid-update during one of those frames, Flutter trips
+  // `!_debugDuringDeviceUpdate` and spams the console (the bug the
+  // user filed). FadeTransition + ScaleTransition mutate compositor
+  // values directly without rebuilding their child, so MouseRegions
+  // are stable across the entrance animation.
   late final AnimationController _enter;
+  late final Animation<double> _scrim;
+  late final Animation<double> _scale;
   bool _closing = false;
 
   @override
@@ -46,9 +63,14 @@ class _CouncilAgentInspectorState extends State<CouncilAgentInspector>
     super.initState();
     _enter = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 240),
-      reverseDuration: const Duration(milliseconds: 180),
-    )..forward();
+      duration: const Duration(milliseconds: 220),
+      reverseDuration: const Duration(milliseconds: 160),
+    );
+    _scrim = CurvedAnimation(parent: _enter, curve: Curves.easeOut);
+    _scale = Tween<double>(begin: 0.94, end: 1.0).animate(
+      CurvedAnimation(parent: _enter, curve: Curves.easeOutCubic),
+    );
+    _enter.forward();
   }
 
   @override
@@ -68,37 +90,34 @@ class _CouncilAgentInspectorState extends State<CouncilAgentInspector>
   @override
   Widget build(BuildContext context) {
     return Positioned.fill(
-      child: AnimatedBuilder(
-        animation: _enter,
-        builder: (context, _) {
-          final t = Curves.easeOutCubic.transform(_enter.value);
-          return Stack(
-            children: [
-              Positioned.fill(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _close,
-                  child: ColoredBox(
-                    color: DuckColors.bgDeepest.withValues(alpha: 0.55 * t),
-                  ),
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _close,
+              child: FadeTransition(
+                opacity: _scrim,
+                child: const ColoredBox(
+                  color: Color(0x8C000000),
                 ),
               ),
-              Center(
-                child: Opacity(
-                  opacity: t,
-                  child: Transform.scale(
-                    scale: 0.92 + 0.08 * t,
-                    child: _InspectorCard(
-                      session: widget.session,
-                      agent: widget.agent,
-                      onClose: _close,
-                    ),
-                  ),
+            ),
+          ),
+          Center(
+            child: FadeTransition(
+              opacity: _enter,
+              child: ScaleTransition(
+                scale: _scale,
+                child: _InspectorCard(
+                  session: widget.session,
+                  agent: widget.agent,
+                  onClose: _close,
                 ),
               ),
-            ],
-          );
-        },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -502,7 +521,29 @@ class _CopyAction extends StatelessWidget {
   }
 }
 
-class _TranscriptBlock extends StatelessWidget {
+/// Transcript renderer with stream-debounced markdown.
+///
+/// **Why MarkdownBody and not Markdown / CouncilReportView:**
+/// the inspector body is itself a `ListView`, so the transcript is
+/// rendered into an unbounded-height slot. `Markdown` (and therefore
+/// `CouncilReportView`, which wraps `Markdown`) is implemented as
+/// its own scrolling `ListView` — embedding one inside another gives
+/// the inner viewport unbounded height. Result: layout silently
+/// collapses to zero (the original "blank panel" bug), with downstream
+/// damage spilling into the rendering pipeline. `MarkdownBody` is the
+/// non-scrolling, shrink-wrapping primitive — same one the chat
+/// bubbles use — and slots into a parent ListView correctly.
+///
+/// **Why this is stateful:**
+/// the parent inspector rebuilds on every `AppState.notifyListeners()`
+/// tick (the runner fires per streamed token). Re-running the markdown
+/// parser on a continuously-growing string at token rate stalls the
+/// main isolate, and any half-streamed ` ``` ` fence throws layout
+/// exceptions. We snapshot the transcript and only re-parse when the
+/// stream has been quiet for [_settleDelay], OR when [_maxStaleness]
+/// has elapsed. Inspector chrome (status, tasks, pool) keeps updating
+/// live — only the heavy markdown is throttled.
+class _TranscriptBlock extends StatefulWidget {
   final String text;
   const _TranscriptBlock({required this.text});
 
@@ -519,52 +560,385 @@ class _TranscriptBlock extends StatelessWidget {
   /// Anything else passes through verbatim so the agent's prose +
   /// fenced code + headings render properly.
   static String _sanitize(String input) {
-    return input
-        .replaceAll(
-          RegExp(
-            r'<!-- LUMEN_THINKING[^>]*-->[\s\S]*?<!-- /LUMEN_THINKING -->',
-          ),
-          '',
-        )
-        .replaceAll(RegExp(r'<!-- LUMEN_TOOL:[^>]*-->'), '')
-        .replaceAll(RegExp(r'<!-- LUMEN_ERR:[^>]*-->'), '')
-        .replaceAll(RegExp(r'<!-- LUMEN_TRUNCATED:[^>]*-->'), '')
-        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
-        .trim();
+    var s = input;
+    s = s.replaceAll(
+      RegExp(r'<!-- LUMEN_THINKING[^>]*-->[\s\S]*?<!-- /LUMEN_THINKING -->'),
+      '',
+    );
+    s = s.replaceAll(RegExp(r'<!-- LUMEN_TOOL:[^>]*-->'), '');
+    s = s.replaceAll(RegExp(r'<!-- LUMEN_ERR:[^>]*-->'), '');
+    s = s.replaceAll(RegExp(r'<!-- LUMEN_TRUNCATED:[^>]*-->'), '');
+
+    s = s.replaceAll(
+      RegExp(
+        r'<<<(?:EDIT_FILE|CREATE_FILE|MULTI_EDIT|APPEND_FILE|EDIT_RANGE):\s*.*?>>>[\s\S]*?<<<END_(?:FILE|EDIT|APPEND)>>>',
+        dotAll: true,
+      ),
+      '[tool call]',
+    );
+    s = s.replaceAll(
+      RegExp(r'<<<[A-Z_]+(?::\s*[^>]*)?\s*>>>'),
+      '[tool call]',
+    );
+    s = s.replaceAll(
+      RegExp(r'<tool_result>[\s\S]*?</tool_result>', dotAll: true),
+      '',
+    );
+    s = s.replaceAll(RegExp(r'^\[FAILED\]\s*', multiLine: true), '');
+
+    s = s.replaceAll(RegExp(r'\n{3,}'), '\n\n');
+    return s.trim();
+  }
+
+  /// Drop any markdown that ends mid-fenced-block. An odd number of
+  /// ` ``` ` markers means the stream is currently inside a code
+  /// block — handing that to the markdown parser mid-flight produces
+  /// TextPainter / layout exceptions on the half-formed fence. We
+  /// render the prose UP TO the unterminated fence and show a subtle
+  /// "streaming" line; the next settle replaces it with a balanced
+  /// render.
+  static String _trimUnclosedFence(String input) {
+    var fences = 0;
+    var lastFenceStart = -1;
+    final lines = input.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].trimLeft().startsWith('```')) {
+        fences++;
+        lastFenceStart = i;
+      }
+    }
+    if (fences.isEven) return input;
+    return lines.sublist(0, lastFenceStart).join('\n').trimRight();
+  }
+
+  @override
+  State<_TranscriptBlock> createState() => _TranscriptBlockState();
+}
+
+class _TranscriptBlockState extends State<_TranscriptBlock> {
+  static const Duration _settleDelay = Duration(milliseconds: 350);
+  static const Duration _maxStaleness = Duration(milliseconds: 1200);
+
+  Timer? _settleTimer;
+  String _settledRaw = '';
+  String _settledClean = '';
+  DateTime _lastFlush = DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  void initState() {
+    super.initState();
+    final raw = widget.text;
+    _settledRaw = raw;
+    _settledClean = _TranscriptBlock._sanitize(
+      _TranscriptBlock._trimUnclosedFence(raw),
+    );
+    _lastFlush = DateTime.now();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TranscriptBlock old) {
+    super.didUpdateWidget(old);
+    if (widget.text == old.text) return;
+    if (widget.text == _settledRaw) return;
+    final now = DateTime.now();
+    if (now.difference(_lastFlush) >= _maxStaleness) {
+      _flush(widget.text);
+      return;
+    }
+    _settleTimer?.cancel();
+    _settleTimer = Timer(_settleDelay, () {
+      if (!mounted) return;
+      _flush(widget.text);
+    });
+  }
+
+  void _flush(String raw) {
+    _settleTimer?.cancel();
+    final balanced = _TranscriptBlock._trimUnclosedFence(raw);
+    final cleaned = _TranscriptBlock._sanitize(balanced);
+    if (!mounted) return;
+    setState(() {
+      _settledRaw = raw;
+      _settledClean = cleaned;
+      _lastFlush = DateTime.now();
+    });
+  }
+
+  @override
+  void dispose() {
+    _settleTimer?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (text.isEmpty) {
+    final raw = widget.text;
+    if (raw.isEmpty) {
       return Text(
         S.councilInspectorTranscriptEmpty,
         style: const TextStyle(color: DuckColors.fgMuted, fontSize: 12),
       );
     }
-    final cleaned = _sanitize(text);
-    if (cleaned.isEmpty) {
-      // Transcript was non-empty but only contained stream-internal
-      // markers (e.g. an aborted run with thinking-only content).
-      // Surface that explicitly instead of rendering an empty card.
+    final streaming = raw != _settledRaw;
+    if (_settledClean.isEmpty) {
       return Text(
         S.councilInspectorTranscriptEmpty,
         style: const TextStyle(color: DuckColors.fgMuted, fontSize: 12),
       );
     }
+    return RepaintBoundary(
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        decoration: BoxDecoration(
+          color: DuckColors.bgDeepest.withValues(alpha: 0.5),
+          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+          border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // KeyedSubtree forces a clean subtree only when the
+            // snapshot LENGTH actually changed, so identical settled
+            // snapshots don't re-parse the markdown AST.
+            KeyedSubtree(
+              key: ValueKey<int>(_settledClean.length),
+              child: MarkdownBody(
+                data: _settledClean,
+                // SelectionArea above (in the inspector card) owns
+                // selection — keeping `selectable: false` here
+                // prevents flutter_markdown_plus from wrapping every
+                // text run in its own SelectableText, which would
+                // fight the SelectionArea's drag.
+                selectable: false,
+                shrinkWrap: true,
+                fitContent: true,
+                extensionSet: md.ExtensionSet.gitHubFlavored,
+                builders: <String, MarkdownElementBuilder>{
+                  'pre': _TranscriptCodeBuilder(),
+                },
+                styleSheet: _transcriptStyleSheet(),
+              ),
+            ),
+            if (streaming)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(0, 6, 0, 0),
+                child: _StreamingHint(),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  MarkdownStyleSheet _transcriptStyleSheet() {
+    return MarkdownStyleSheet(
+      h1: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontSize: 16,
+        height: 1.3,
+        fontWeight: FontWeight.w800,
+      ),
+      h2: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontSize: 14.5,
+        height: 1.3,
+        fontWeight: FontWeight.w800,
+      ),
+      h3: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontSize: 13,
+        height: 1.35,
+        fontWeight: FontWeight.w700,
+      ),
+      p: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontSize: 12.5,
+        height: 1.5,
+      ),
+      em: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontStyle: FontStyle.italic,
+      ),
+      strong: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontWeight: FontWeight.w800,
+      ),
+      a: const TextStyle(
+        color: DuckColors.accentCyan,
+        decoration: TextDecoration.underline,
+      ),
+      code: const TextStyle(
+        fontFamily: DuckTheme.monoFont,
+        fontSize: 11.5,
+        color: DuckColors.accentCyan,
+        backgroundColor: Color(0xFF11161E),
+      ),
+      codeblockPadding: EdgeInsets.zero,
+      codeblockDecoration: const BoxDecoration(),
+      blockquoteDecoration: BoxDecoration(
+        color: const Color(0xFF11161E),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+        border: const Border(
+          left: BorderSide(color: DuckColors.accentPurple, width: 3),
+        ),
+      ),
+      blockquotePadding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      blockquote: const TextStyle(
+        color: DuckColors.fgSecondary,
+        fontSize: 12,
+        fontStyle: FontStyle.italic,
+        height: 1.45,
+      ),
+      listBullet: const TextStyle(
+        color: DuckColors.accentMint,
+        fontSize: 12.5,
+        fontWeight: FontWeight.w700,
+      ),
+      tableHead: const TextStyle(
+        color: DuckColors.fgPrimary,
+        fontWeight: FontWeight.w800,
+      ),
+      tableBody: const TextStyle(
+        color: DuckColors.fgSecondary,
+        fontSize: 12,
+        height: 1.45,
+      ),
+    );
+  }
+}
+
+/// Custom `<pre>` builder for the transcript: renders fenced code in
+/// a quiet panel with a copy chip. Stays compact (no language pill /
+/// outline) since the inspector is small. Mermaid blocks intentionally
+/// fall through to plain code rendering — the inspector is not the
+/// place for diagram canvases (the report viewer is).
+class _TranscriptCodeBuilder extends MarkdownElementBuilder {
+  @override
+  bool isBlockElement() => true;
+
+  @override
+  Widget? visitElementAfterWithContext(
+    BuildContext context,
+    md.Element element,
+    TextStyle? preferredStyle,
+    TextStyle? parentStyle,
+  ) {
+    final children = element.children;
+    if (children == null || children.isEmpty) return null;
+    final inner = children.first;
+    if (inner is! md.Element || inner.tag != 'code') return null;
+    final code = inner.textContent.trimRight();
+    return _TranscriptCodeBlock(code: code);
+  }
+}
+
+class _TranscriptCodeBlock extends StatefulWidget {
+  final String code;
+  const _TranscriptCodeBlock({required this.code});
+
+  @override
+  State<_TranscriptCodeBlock> createState() => _TranscriptCodeBlockState();
+}
+
+class _TranscriptCodeBlockState extends State<_TranscriptCodeBlock> {
+  bool _copied = false;
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: widget.code));
+    if (!mounted) return;
+    setState(() => _copied = true);
+    showDuckToast(context, S.chatMessageCopied);
+    Future.delayed(const Duration(milliseconds: 1300), () {
+      if (!mounted) return;
+      setState(() => _copied = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+      margin: const EdgeInsets.symmetric(vertical: 6),
       decoration: BoxDecoration(
-        color: DuckColors.bgDeepest.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+        color: const Color(0xFF0A0E14),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
         border: Border.all(color: DuckColors.glassSeam, width: 0.5),
       ),
-      // Reuses the report viewer's markdown pipeline (compact mode):
-      // GitHub-flavored markdown, code blocks with copy chips, mermaid
-      // flowcharts. Same renderer the user already sees on final
-      // reports — keeps the typography consistent across the council
-      // surface.
-      child: CouncilReportView(markdown: cleaned, compact: true),
+      clipBehavior: Clip.hardEdge,
+      child: Stack(
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(10, 9, 36, 9),
+            child: SelectableText(
+              widget.code,
+              style: const TextStyle(
+                fontFamily: DuckTheme.monoFont,
+                fontSize: 11.5,
+                color: DuckColors.fgPrimary,
+                height: 1.45,
+              ),
+            ),
+          ),
+          Positioned(
+            top: 4,
+            right: 4,
+            child: Tooltip(
+              message: _copied
+                  ? S.chatCodeBlockCopied
+                  : S.chatCodeBlockCopy,
+              child: InkResponse(
+                radius: 14,
+                onTap: _copy,
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Icon(
+                    _copied ? Icons.check : Icons.copy_outlined,
+                    size: 13,
+                    color: _copied
+                        ? DuckColors.accentMint
+                        : DuckColors.fgMuted,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StreamingHint extends StatelessWidget {
+  const _StreamingHint();
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: 10,
+          height: 10,
+          child: CircularProgressIndicator(
+            strokeWidth: 1.4,
+            valueColor: AlwaysStoppedAnimation(
+              DuckColors.accentCyan.withValues(alpha: 0.7),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          S.councilInspectorTranscriptStreaming,
+          style: const TextStyle(
+            color: DuckColors.fgMuted,
+            fontSize: 10.5,
+            fontStyle: FontStyle.italic,
+            letterSpacing: 0.3,
+          ),
+        ),
+      ],
     );
   }
 }

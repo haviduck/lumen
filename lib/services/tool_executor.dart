@@ -189,7 +189,7 @@ class ToolExecutor {
     // The recorder's by-tool snapshotting reads from `inv.match.group(N)`
     // which the synthetic match provides.
     final result = await _executeTool(tool, match, inv);
-    final isFailure = _looksLikeFailure(result);
+    final isFailure = looksLikeFailure(result);
     final feedbackBuf = StringBuffer();
     if (isFailure) {
       feedbackBuf.writeln('[FAILED] $result');
@@ -273,7 +273,7 @@ class ToolExecutor {
         // suffix makes the failure structurally distinct from
         // success lines that might sit next to it in the same
         // result batch.
-        final isFailure = _looksLikeFailure(result);
+        final isFailure = looksLikeFailure(result);
         if (isFailure) {
           feedback.writeln('[FAILED] $result');
           feedback.writeln(
@@ -351,13 +351,38 @@ class ToolExecutor {
   /// True when a tool's textual result represents a non-successful
   /// outcome. Mirrors `_friendlyReplacement`'s status detection so a
   /// row's chat-card status and its `<tool_result>` framing always
-  /// agree. Conservative — only triggers on the explicit error words
-  /// our tool bodies emit (`Error:`, `Failed`, `Denied`), so a
-  /// stdout that happens to contain "error" in passing isn't tagged.
-  static bool _looksLikeFailure(String result) {
-    return result.contains('Error:') ||
-        result.contains('Failed') ||
-        result.contains('Denied');
+  /// agree.
+  ///
+  /// **Why first-line only?** Every tool in `tool_registry.dart`
+  /// structures its failure as a single header line in the shape
+  /// `<TOOL_NAME> <arg>: Error: ...` / `: Failed ...` / `: Denied ...`.
+  /// Successful results either omit those words entirely
+  /// (`MOVE_FILE foo -> bar: Success`) or wrap them inside a body that
+  /// arrives on lines 2+ (`READ_FILE foo.dart lines 1-50:\n<contents>`).
+  ///
+  /// **Why `: Error` instead of bare `Error:`?** The first-line-only
+  /// check eliminated false positives from file *body* content, but
+  /// the first line still embeds the **file path**, which is user-
+  /// controlled content. Filenames like `ErrorBoundary.dart`,
+  /// `FailedLoginHandler.dart`, or `AccessDeniedPage.dart` contain
+  /// the bare keywords and triggered the old check. The structural
+  /// pattern `<path>: Error:` / `<path>: Failed` / `<path>: Denied`
+  /// is what every tool emits on failure — the `: ` (colon-space)
+  /// before the keyword is always present on real failures and never
+  /// collides with filenames (colons are illegal in filenames on
+  /// Windows; on Unix they're legal but never preceded by `: ` in
+  /// the tool header format).
+  ///
+  /// Public to allow regression tests in
+  /// `test/services/tool_executor_failure_detection_test.dart` —
+  /// production callers should still treat it as an internal helper.
+  static bool looksLikeFailure(String result) {
+    final newlineIndex = result.indexOf('\n');
+    final firstLine =
+        newlineIndex < 0 ? result : result.substring(0, newlineIndex);
+    return firstLine.contains(': Error') ||
+        firstLine.contains(': Failed') ||
+        firstLine.contains(': Denied');
   }
 
   /// Pre-pass that normalizes a chunk of LLM output so the
@@ -435,7 +460,7 @@ class ToolExecutor {
   /// wrote because a real tool ran" from "marker the model wrote
   /// because it pattern-matched the shape from history".
   String _friendlyReplacement(AgentTool tool, Match m, String rawResult) {
-    final isError = _looksLikeFailure(rawResult);
+    final isError = looksLikeFailure(rawResult);
     // Most tools use capture group 1 as the relevant target. MOVE_FILE and
     // COPY_FILE are the exceptions: group 1 is the source and group 2 is the
     // destination. If we only encode the source, the chat card tries to open

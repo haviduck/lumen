@@ -2049,9 +2049,13 @@ class S {
       'Council requires a Claude or Copilot Claude model.';
   static const String councilWizardTitle = 'Convene the Council';
   static const String councilWizardStepBrief = 'Brief';
+  static const String councilWizardStepTeam = 'Team';
   static const String councilWizardStepAgents = 'Agents';
   static const String councilWizardStepOrchestrator = 'Orchestrator';
   static const String councilWizardStepReview = 'Review';
+  static const String councilWizardBriefSummary = 'What you sent the Council';
+  static const String councilWizardTeamSummary = 'Who will be in the room';
+  static const String councilWizardEmptyBrief = 'No brief written yet.';
   static const String councilLazyModeTitle = 'Lazy mode';
   static const String councilLazyModeBody =
       'Let the orchestrator design the council from your brief.';
@@ -2254,6 +2258,8 @@ class S {
       'No transcript yet. Output appears here as the agent thinks and acts.';
   static const String councilInspectorCopyTranscriptTooltip =
       'Copy full transcript';
+  static const String councilInspectorTranscriptStreaming =
+      'streaming…';
   static const String councilInspectorCopied = 'Copied to clipboard.';
   static String councilInspectorTasksLabel(int count) =>
       count == 1 ? 'TASKS · 1' : 'TASKS · $count';
@@ -2282,4 +2288,19 @@ class S {
   static const String councilRoleTester = 'Tester';
   static const String councilRoleWriter = 'Writer';
   static const String councilRoleCustom = 'Custom';
+
+  // --- Pentest / security-test mode ---
+  static const String councilPentestGoalLabel = 'TARGET';
+  static const String councilPentestConspiring = 'Agents conspiring...';
+  static const String councilPentestAttacking = 'Under attack';
+  static String councilPentestFindingsCount(int n) =>
+      n == 1 ? '1 finding' : '$n findings';
+  static const String councilPentestSeverityCritical = 'CRITICAL';
+  static const String councilPentestSeverityMajor = 'MAJOR';
+  static const String councilPentestSeverityMinor = 'MINOR';
+  static const String councilPentestSeverityInfo = 'INFO';
+  static const String councilPentestReportTitle = 'Penetration Test Report';
+  static const String councilPentestAttackSurface = 'Attack Surface';
+  static const String councilPentestExploitChains = 'Exploit Chains';
+  static const String councilPentestRemediation = 'Remediation';
 }
