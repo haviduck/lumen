@@ -34,6 +34,17 @@ class ModelTier {
   /// this with `_enabledTools` so user toggles still apply.
   final Set<String> allowedToolIds;
 
+  /// How many recent messages to keep in the API payload. Smaller
+  /// models get a tighter window to leave room for system prompt,
+  /// memory, and the actual task. The cross-session memory +
+  /// HistorySummarizer compensate for the lost history.
+  int get historyKeepRecent => switch (level) {
+    ModelTierLevel.pro => 40,
+    ModelTierLevel.standard => 30,
+    ModelTierLevel.lite => 18,
+    ModelTierLevel.legacy => 14,
+  };
+
   const ModelTier._(this.level, this.allowedToolIds);
 
   /// All registered tools — Pro tier surface.
@@ -61,6 +72,7 @@ class ModelTier {
     'verify',
     'web_search',
     'web_fetch',
+    'save_memory',
   };
 
   static const _standard = <String>{
@@ -79,6 +91,7 @@ class ModelTier {
     'check_url',
     'run_cmd',
     'verify',
+    'save_memory',
   };
 
   static const _lite = <String>{
@@ -91,6 +104,7 @@ class ModelTier {
     'glob',
     'run_cmd',
     'verify',
+    'save_memory',
   };
 
   static const _legacy = <String>{
@@ -100,6 +114,7 @@ class ModelTier {
     'list_dir',
     'search_text',
     'run_cmd',
+    'save_memory',
   };
 
   static const ModelTier pro = ModelTier._(ModelTierLevel.pro, _pro);

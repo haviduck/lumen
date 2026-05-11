@@ -696,6 +696,44 @@ class ToolSchemas {
       toRawText: (args) => '<<<WEB_FETCH: ${args['url'] ?? ''}>>>',
     ),
     ToolSchema(
+      id: 'save_memory',
+      name: 'SAVE_MEMORY',
+      description:
+          'Persist a fact to cross-session memory. Facts are injected '
+          'into the system prompt of every future chat turn. Use for '
+          'user preferences, codebase patterns, and important decisions.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'fact': _strProp(
+            'The fact to remember. Be concise — one bullet point per call.',
+          ),
+          'scope': {
+            'type': _stringSchema,
+            'description': '"workspace" for project-specific facts, '
+                '"global" for user-wide facts.',
+            'enum': ['workspace', 'global'],
+          },
+          'replace': _boolProp(
+            'When true, overwrites the entire memory file (for '
+            'consolidation/pruning). Default false (append).',
+          ),
+        },
+        'required': ['fact', 'scope'],
+      },
+      toGroups: (args) => [
+        (args['scope'] as String?) ?? 'workspace',
+        '${args['replace'] == true}',
+        (args['fact'] as String?) ?? '',
+      ],
+      toRawText: (args) {
+        final scope = args['scope'] ?? 'workspace';
+        final replace = args['replace'] == true;
+        return '<<<SAVE_MEMORY: scope=$scope${replace ? ' replace=true' : ''}>>>\n'
+            '${args['fact'] ?? ''}\n<<<END_MEMORY>>>';
+      },
+    ),
+    ToolSchema(
       id: 'council_dispatch',
       name: 'COUNCIL_DISPATCH',
       description:

@@ -96,6 +96,11 @@ class SystemPromptInputs {
   /// model has a stable self-identifier across providers.
   final String providerLabel;
 
+  /// Pre-loaded cross-session memory (merged workspace + global).
+  /// Empty string when no memory exists. Injected early in the
+  /// prompt so the model starts every turn with accumulated context.
+  final String memory;
+
   const SystemPromptInputs({
     required this.workspacePath,
     required this.activeFilePath,
@@ -109,6 +114,7 @@ class SystemPromptInputs {
     required this.effortIsNative,
     required this.useNativeTools,
     required this.providerLabel,
+    this.memory = '',
   });
 }
 
@@ -121,6 +127,7 @@ class SystemPromptBuilder {
   static String build(SystemPromptInputs i) {
     final sections = <String>[
       _identity(),
+      _memory(i),
       _continuity(i),
       _shortReplies(),
       _workspace(i),
@@ -136,6 +143,15 @@ class SystemPromptBuilder {
   static String _identity() => '''You are Lumen, the AI coding assistant built into the Lumen IDE.
 You are a senior software engineer working as the user's pair programmer.
 Not a Q&A bot — propose, execute, verify, and report back concisely.''';
+
+  static String _memory(SystemPromptInputs i) {
+    if (i.memory.isEmpty) return '';
+    return '## Memory (cross-session)\n'
+        'Facts remembered from previous sessions. Treat as ground truth '
+        'unless the user corrects something. Use `SAVE_MEMORY` to persist '
+        'new facts you learn (user preferences, codebase patterns, '
+        'important decisions).\n\n${i.memory}';
+  }
 
   static String _continuity(SystemPromptInputs i) {
     final pauseLine = i.resumedAfterPause

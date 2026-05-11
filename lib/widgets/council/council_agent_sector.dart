@@ -396,13 +396,13 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
 
   String _roleLabel(RolePreset role) {
     return switch (role) {
-      RolePreset.pentester => 'Pentester',
-      RolePreset.reviewer => 'Reviewer',
-      RolePreset.researcher => 'Researcher',
-      RolePreset.architect => 'Architect',
-      RolePreset.tester => 'Tester',
-      RolePreset.writer => 'Writer',
-      RolePreset.custom => 'Agent',
+      RolePreset.pentester => S.councilRolePentester,
+      RolePreset.reviewer => S.councilRoleReviewer,
+      RolePreset.researcher => S.councilRoleResearcher,
+      RolePreset.architect => S.councilRoleArchitect,
+      RolePreset.tester => S.councilRoleTester,
+      RolePreset.writer => S.councilRoleWriter,
+      RolePreset.custom => S.councilRoleCustom,
     };
   }
 }

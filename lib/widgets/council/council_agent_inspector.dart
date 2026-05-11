@@ -6,6 +6,7 @@ import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:markdown/markdown.dart' as md;
 
 import '../../l10n/strings.dart';
+import '../../providers/council_controller.dart';
 import '../../services/council/council_models.dart';
 import '../../services/council/council_protocol.dart';
 import '../../services/council/council_task_ledger.dart';
@@ -27,12 +28,14 @@ class CouncilAgentInspector extends StatefulWidget {
   final CouncilSession session;
   final CouncilAgent agent;
   final VoidCallback onClose;
+  final CouncilController? controller;
 
   const CouncilAgentInspector({
     super.key,
     required this.session,
     required this.agent,
     required this.onClose,
+    this.controller,
   });
 
   @override
@@ -113,6 +116,7 @@ class _CouncilAgentInspectorState extends State<CouncilAgentInspector>
                   session: widget.session,
                   agent: widget.agent,
                   onClose: _close,
+                  controller: widget.controller,
                 ),
               ),
             ),
@@ -123,24 +127,63 @@ class _CouncilAgentInspectorState extends State<CouncilAgentInspector>
   }
 }
 
-class _InspectorCard extends StatelessWidget {
+class _InspectorCard extends StatefulWidget {
   final CouncilSession session;
   final CouncilAgent agent;
   final VoidCallback onClose;
+  final CouncilController? controller;
 
   const _InspectorCard({
     required this.session,
     required this.agent,
     required this.onClose,
+    this.controller,
   });
 
   @override
+  State<_InspectorCard> createState() => _InspectorCardState();
+}
+
+class _InspectorCardState extends State<_InspectorCard> {
+  bool _pingOpen = false;
+  final TextEditingController _pingText = TextEditingController();
+  final FocusNode _pingFocus = FocusNode();
+  bool _sending = false;
+
+  @override
+  void dispose() {
+    _pingText.dispose();
+    _pingFocus.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendPing() async {
+    final text = _pingText.text.trim();
+    if (text.isEmpty || _sending) return;
+    final c = widget.controller;
+    if (c == null) return;
+    setState(() => _sending = true);
+    try {
+      await c.pingAgent(widget.agent.id, text);
+      if (!mounted) return;
+      _pingText.clear();
+      setState(() => _pingOpen = false);
+      showDuckToast(context, S.councilPingAgentSent);
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final agent = widget.agent;
+    final session = widget.session;
     final media = MediaQuery.of(context);
     final w = (media.size.width * 0.78).clamp(420.0, 880.0);
     final h = (media.size.height * 0.82).clamp(360.0, 720.0);
 
     final accent = _accentForStatus(agent.status, isOrchestrator: _isOrchestrator);
+    final canPing = widget.controller?.canPingAgent(agent.id) ?? false;
 
     final tasks = _tasksForAgent();
     final pool = _poolForAgent();
@@ -174,8 +217,111 @@ class _InspectorCard extends StatelessWidget {
               agent: agent,
               isOrchestrator: _isOrchestrator,
               accent: accent,
-              onClose: onClose,
+              onClose: widget.onClose,
+              canPing: canPing,
+              onPing: canPing
+                  ? () => setState(() {
+                        _pingOpen = !_pingOpen;
+                        if (_pingOpen) {
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (mounted) _pingFocus.requestFocus();
+                          });
+                        }
+                      })
+                  : null,
             ),
+            if (_pingOpen) ...[
+              Container(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 10),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF161B24),
+                  border: Border(
+                    bottom: BorderSide(color: DuckColors.glassSeam),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Focus(
+                        onKeyEvent: (node, event) {
+                          if (event is KeyDownEvent &&
+                              event.logicalKey ==
+                                  LogicalKeyboardKey.enter &&
+                              !HardwareKeyboard.instance.isShiftPressed) {
+                            _sendPing();
+                            return KeyEventResult.handled;
+                          }
+                          return KeyEventResult.ignored;
+                        },
+                        child: TextField(
+                          controller: _pingText,
+                          focusNode: _pingFocus,
+                          enabled: !_sending,
+                          maxLines: 2,
+                          minLines: 1,
+                          style: const TextStyle(
+                            color: DuckColors.fgPrimary,
+                            fontSize: 12,
+                          ),
+                          decoration: InputDecoration(
+                            hintText: S.councilPingAgentHint,
+                            hintStyle: const TextStyle(
+                              color: DuckColors.fgSubtle,
+                              fontSize: 12,
+                            ),
+                            isDense: true,
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 8,
+                            ),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(
+                                DuckTheme.radiusS,
+                              ),
+                              borderSide: const BorderSide(
+                                color: DuckColors.glassSeam,
+                              ),
+                            ),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(
+                                DuckTheme.radiusS,
+                              ),
+                              borderSide: const BorderSide(
+                                color: DuckColors.glassSeam,
+                              ),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(
+                                DuckTheme.radiusS,
+                              ),
+                              borderSide: const BorderSide(
+                                color: DuckColors.accentCyan,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      onPressed: _sending ? null : _sendPing,
+                      icon: _sending
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.send, size: 16),
+                      color: DuckColors.accentCyan,
+                      iconSize: 16,
+                      tooltip: S.councilPingAgentSend,
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const Divider(
               height: 1,
               thickness: 1,
@@ -231,20 +377,21 @@ class _InspectorCard extends StatelessWidget {
     );
   }
 
-  bool get _isOrchestrator => session.config.orchestrator.id == agent.id;
+  bool get _isOrchestrator =>
+      widget.session.config.orchestrator.id == widget.agent.id;
 
   List<CouncilTask> _tasksForAgent() {
     return [
-      for (final t in session.tasks)
-        if (t.agentId == agent.id) t,
+      for (final t in widget.session.tasks)
+        if (t.agentId == widget.agent.id) t,
     ]..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
   }
 
   List<CouncilQuestion> _poolForAgent() {
     return [
-      for (final q in session.poolQuestions)
-        if (q.fromAgentId == agent.id ||
-            q.replies.any((r) => r.fromAgentId == agent.id))
+      for (final q in widget.session.poolQuestions)
+        if (q.fromAgentId == widget.agent.id ||
+            q.replies.any((r) => r.fromAgentId == widget.agent.id))
           q,
     ];
   }
@@ -265,12 +412,16 @@ class _Header extends StatelessWidget {
   final bool isOrchestrator;
   final Color accent;
   final VoidCallback onClose;
+  final bool canPing;
+  final VoidCallback? onPing;
 
   const _Header({
     required this.agent,
     required this.isOrchestrator,
     required this.accent,
     required this.onClose,
+    this.canPing = false,
+    this.onPing,
   });
 
   @override
@@ -330,6 +481,49 @@ class _Header extends StatelessWidget {
               ],
             ),
           ),
+          if (canPing && onPing != null)
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: Tooltip(
+                message: S.councilPingAgentTooltip,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                  onTap: onPing,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: DuckColors.accentCyan.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                      border: Border.all(
+                        color: DuckColors.accentCyan.withValues(alpha: 0.40),
+                        width: 0.6,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: const [
+                        Icon(
+                          Icons.send_outlined,
+                          size: 13,
+                          color: DuckColors.accentCyan,
+                        ),
+                        SizedBox(width: 4),
+                        Text(
+                          S.councilPingAgentLabel,
+                          style: TextStyle(
+                            color: DuckColors.accentCyan,
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
           IconButton(
             tooltip: S.councilInspectorClose,
             onPressed: onClose,
@@ -377,14 +571,17 @@ class _StatusChip extends StatelessWidget {
 
   String _label(CouncilAgentStatus s) {
     return switch (s) {
-      CouncilAgentStatus.idle => 'IDLE',
-      CouncilAgentStatus.queued => 'QUEUED',
-      CouncilAgentStatus.working => 'WORKING',
-      CouncilAgentStatus.askingPool => 'POOL',
-      CouncilAgentStatus.awaitingUser => 'WAITING',
-      CouncilAgentStatus.replying => 'REPLYING',
-      CouncilAgentStatus.done => 'DONE',
-      CouncilAgentStatus.error => 'ERROR',
+      CouncilAgentStatus.idle => S.councilStatusIdle.toUpperCase(),
+      CouncilAgentStatus.queued => S.councilAgentStatusQueued.toUpperCase(),
+      CouncilAgentStatus.working => S.councilStatusWorking.toUpperCase(),
+      CouncilAgentStatus.askingPool =>
+        S.councilAgentStatusAskingPool.toUpperCase(),
+      CouncilAgentStatus.awaitingUser =>
+        S.councilStatusAwaitingUser.toUpperCase(),
+      CouncilAgentStatus.replying =>
+        S.councilAgentStatusReplying.toUpperCase(),
+      CouncilAgentStatus.done => S.councilStatusDone.toUpperCase(),
+      CouncilAgentStatus.error => S.councilStatusError.toUpperCase(),
     };
   }
 }
@@ -1005,7 +1202,8 @@ class _TaskRow extends StatelessWidget {
               ),
               const Spacer(),
               Text(
-                'attempt ${task.attempts}/${task.maxAttempts}',
+                S.councilInspectorTaskAttempts(
+                    task.attempts, task.maxAttempts),
                 style: const TextStyle(
                   color: DuckColors.fgSubtle,
                   fontSize: 10,

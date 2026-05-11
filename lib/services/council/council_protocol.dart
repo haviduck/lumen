@@ -5,12 +5,14 @@ class CouncilProtocol {
   CouncilProtocol._();
 
   static const String dispatchToolId = 'council_dispatch';
+  static const String waitToolId = 'council_wait';
   static const String askPoolToolId = 'council_ask_pool';
   static const String askUserToolId = 'council_ask_user';
   static const String reportToolId = 'council_report';
 
   static const Set<String> allCouncilToolIds = {
     dispatchToolId,
+    waitToolId,
     askPoolToolId,
     askUserToolId,
     reportToolId,
@@ -18,6 +20,7 @@ class CouncilProtocol {
 
   static const Set<String> orchestratorToolIds = {
     dispatchToolId,
+    waitToolId,
     askUserToolId,
     reportToolId,
   };
@@ -41,6 +44,11 @@ Your job: convert the user's brief into well-scoped missions, dispatch them in p
 - For non-trivial briefs, sketch two viable HOWs as examples (signaling the solution space is open) without saying which to pick.
 - Briefs name a deliverable artifact only that role can produce, not a generic "investigate".
 - When two agents' tasks touch the same surface, mention each by name in their respective briefs — they should know who else is in the room and on what.
+
+=== Waiting for parallel work ===
+- After dispatching a parallel wave, call `$waitToolId` to block until all agents finish. It returns each agent's status and transcript summary so you can synthesize their work.
+- Do NOT spin, produce filler status text, or try to "check on" agents. `$waitToolId` is the only way to get results from parallel dispatches.
+- Typical flow: dispatch wave (parallel=true) → `$waitToolId` → read digests → dispatch follow-up wave or `$reportToolId`.
 
 === Pool collaboration (opt-in, budgeted) ===
 - The pool is for cross-checks between named peers — not a formality. Use it when an agent (or you) genuinely needs another agent's view on a load-bearing assumption (file, symbol, contract) that would change the work. If the work is mechanical or already shipped, skip the pool and report.
@@ -757,6 +765,21 @@ class CouncilToolSchemas {
       toRawText: (args) =>
           '<<<COUNCIL_DISPATCH: ${args['agentId'] ?? ''}>>>'
           '\n${args['task'] ?? ''}\n<<<END_COUNCIL>>>',
+    ),
+    ToolSchema(
+      id: CouncilProtocol.waitToolId,
+      name: 'COUNCIL_WAIT',
+      description:
+          'Block until all parallel-dispatched agents have finished, then '
+          'return a digest of each agent\'s status and transcript tail. '
+          'Call this after dispatching a parallel wave so you can '
+          'synthesize their results before reporting.',
+      inputSchema: {
+        'type': 'object',
+        'properties': <String, dynamic>{},
+      },
+      toGroups: (args) => const ['wait'],
+      toRawText: (args) => '<<<COUNCIL_WAIT>>>',
     ),
     ToolSchema(
       id: CouncilProtocol.askPoolToolId,

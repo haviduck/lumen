@@ -239,12 +239,22 @@ $brief
   }
 
   Future<void> abort() async {
-    for (final runner in _runners) {
+    // Snapshot runners before clearing — cancel every token first so
+    // in-flight streams see `isCancelled` immediately, even for runners
+    // that were spawned in pool-reply or evaluator paths.
+    final snapshot = List<CouncilAgentRunner>.from(_runners);
+    for (final runner in snapshot) {
       runner.token.cancel();
     }
     if (_session != null && isActive) {
       _session!.status = CouncilStatus.aborted;
       _session!.finishedAt = DateTime.now();
+      for (final agent in _session!.config.allAgents) {
+        if (agent.status != CouncilAgentStatus.done &&
+            agent.status != CouncilAgentStatus.error) {
+          agent.status = CouncilAgentStatus.idle;
+        }
+      }
       _event(CouncilEventType.aborted);
       await _persist();
     }
@@ -262,6 +272,12 @@ $brief
     final pending = _roundTwoDecision;
     _roundTwoDecision = null;
     if (pending != null && !pending.isCompleted) pending.complete(false);
+    // Complete any pending user-question completers so awaiting code
+    // unblocks instead of hanging forever after abort.
+    for (final c in _userQuestions.values) {
+      if (!c.isCompleted) c.complete('');
+    }
+    _userQuestions.clear();
     notifyListeners();
   }
 
@@ -405,6 +421,8 @@ $brief
       nativeToolIds: {...CouncilProtocol.orchestratorToolIds},
       onChunk: (chunk) => _appendTranscript(session.config.orchestrator, chunk),
       onCouncilTool: _handleOrchestratorTool,
+      onStall: _onAgentStall,
+      stallTimeoutSeconds: 90,
     );
     _runners.add(runner);
     _orchestratorRunner = runner;
@@ -501,7 +519,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       return;
     }
 
-    // Third strike: escalate to user once.
+    // Third strike: escalate to user, but also auto-nudge so the
+    // orchestrator can self-recover while the user reads the modal.
     if (_orchestratorFailureEscalated) return;
     _orchestratorFailureEscalated = true;
     orch
@@ -515,23 +534,113 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     );
     notifyListeners();
     await _persist();
-    unawaited(
-      _askUser(
-        orch.id,
-        CouncilToolCall(
-          id: 'orchestrator_fail_$strikes',
-          name: CouncilProtocol.askUserToolId,
-          arguments: {
-            'question': S.councilOrchestratorFailureEscalationQuestion(strikes),
-          },
-        ),
+
+    // Fire the user modal and an auto-nudge in parallel. Whichever
+    // resolves first wins: if the nudge recovers the orchestrator the
+    // modal is dismissed automatically; if the user answers first
+    // their directive feeds the re-kick.
+    final askFuture = _askUser(
+      orch.id,
+      CouncilToolCall(
+        id: 'orchestrator_fail_$strikes',
+        name: CouncilProtocol.askUserToolId,
+        arguments: {
+          'question': S.councilOrchestratorFailureEscalationQuestion(strikes),
+        },
       ),
     );
+
+    // Background: attempt an auto-nudge restart while the user reads
+    // the modal. If it succeeds the session moves to working/done and
+    // we dismiss the pending question so the modal disappears.
+    unawaited(_autoNudgeWhileAskingUser(
+      askFuture: askFuture,
+      reason: reason,
+      draftReport: draftReport,
+    ));
+  }
+
+  /// Runs alongside the user-facing escalation modal. Kicks the
+  /// orchestrator with a rich status nudge; if the orchestrator
+  /// recovers (session leaves `awaitingUser`), the pending user
+  /// question is auto-dismissed.
+  Future<void> _autoNudgeWhileAskingUser({
+    required Future<CouncilToolResult> askFuture,
+    required String reason,
+    required String draftReport,
+  }) async {
+    final session = _session;
+    if (session == null) return;
+
+    final draft = draftReport.trim();
+    final cutoff = draft.length > 400 ? 400 : draft.length;
+    final draftSnippet = draft.isEmpty
+        ? ''
+        : '\n\nLatest orchestrator prose (trimmed):\n'
+              '${draft.substring(0, cutoff)}';
+    final note = '''
+Auto-recovery nudge (user has been prompted but orchestrator should try to self-recover).
+
+Last failure signal:
+$reason
+$draftSnippet
+
+Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue dispatching/synthesizing as needed.
+''';
+
+    // Brief pause so the UI has time to show the modal before the
+    // orchestrator restart flips the session status.
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (_session == null ||
+        _session!.status == CouncilStatus.done ||
+        _session!.status == CouncilStatus.aborted) {
+      return;
+    }
+
+    // Kick the orchestrator — sets status back to dispatching/working.
+    session.status = CouncilStatus.working;
+    session.config.orchestrator.status = CouncilAgentStatus.working;
+    notifyListeners();
+    unawaited(_runOrchestrator(kickNote: note));
+
+    // If the orchestrator recovers before the user answers, dismiss
+    // the pending question so the modal closes automatically.
+    await Future<void>.delayed(const Duration(seconds: 8));
+    final q = _session?.pendingUserQuestion;
+    if (q != null && _session?.status != CouncilStatus.awaitingUser) {
+      _session!.pendingUserQuestion = null;
+      _userQuestions.remove(q.id)?.complete(S.councilAutoNudgeRecovered);
+      notifyListeners();
+    }
   }
 
   void _resetOrchestratorFailureWatchdog() {
     _orchestratorFailureStreak = 0;
     _orchestratorFailureEscalated = false;
+  }
+
+  /// Stall callback shared by all agent runners. Fires when a runner's
+  /// stream has been silent for its configured timeout. Returns true to
+  /// auto-nudge the runner, false to leave it alone.
+  ///
+  /// Emits a `agentError`-level event so the UI shows the stall, and
+  /// nudges the runner with a continuation prompt. After 3 auto-nudges
+  /// the runner stops nudging and the user can ping manually.
+  bool _onAgentStall(String agentId, int silentSeconds) {
+    final session = _session;
+    if (session == null) return false;
+    if (session.status == CouncilStatus.aborted ||
+        session.status == CouncilStatus.done) {
+      return false;
+    }
+    _event(
+      CouncilEventType.agentStalled,
+      fromAgentId: agentId,
+      message: S.councilAgentStalledMessage(silentSeconds),
+      data: {'silentSeconds': silentSeconds},
+    );
+    notifyListeners();
+    return true;
   }
 
   /// Builds the orchestrator's user-turn prompt for `_runOrchestrator`.
@@ -679,6 +788,62 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
   /// No-op when the council is not in a ping-legal state (see
   /// [canPingOrchestrator]) or when the message + attachments are
   /// empty.
+  /// True when the user is allowed to ping a specific agent. Only
+  /// agents with a live runner (currently executing) can be pinged.
+  /// Also checks agent status — a runner may linger in [_runners]
+  /// after its [run()] loop exits, but the note queue would never
+  /// be drained so pinging it is a no-op black hole.
+  bool canPingAgent(String agentId) {
+    final s = _session;
+    if (s == null) return false;
+    if (s.status == CouncilStatus.done || s.status == CouncilStatus.aborted) {
+      return false;
+    }
+    final agent = s.agentById(agentId);
+    if (agent == null) return false;
+    if (agent.status == CouncilAgentStatus.done ||
+        agent.status == CouncilAgentStatus.error ||
+        agent.status == CouncilAgentStatus.idle) {
+      return false;
+    }
+    return _runners.any(
+      (r) => r.agent.id == agentId && !r.token.isCancelled,
+    );
+  }
+
+  /// Inject a mid-session note into a specific agent's runner. The
+  /// note is queued on the runner's message stream and picked up at
+  /// its next iteration boundary. No-op if the agent has no live
+  /// runner (use [canPingAgent] to check beforehand).
+  Future<void> pingAgent(
+    String agentId,
+    String note, {
+    List<String> images = const [],
+  }) async {
+    final session = _session;
+    if (session == null) return;
+    if (!canPingAgent(agentId)) return;
+    final trimmed = note.trim();
+    if (trimmed.isEmpty && images.isEmpty) return;
+
+    final runner = _runners.firstWhere(
+      (r) => r.agent.id == agentId && !r.token.isCancelled,
+      orElse: () => throw StateError('No live runner for $agentId'),
+    );
+
+    runner.addUserNote(trimmed, images: images);
+    final eventMessage = images.isEmpty
+        ? trimmed
+        : '$trimmed [+${images.length} image(s) attached]';
+    _event(
+      CouncilEventType.userPingedAgent,
+      toAgentId: agentId,
+      message: eventMessage,
+    );
+    notifyListeners();
+    await _persist();
+  }
+
   Future<void> pingOrchestrator(
     String note, {
     List<String> images = const [],
@@ -973,6 +1138,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     switch (call.name) {
       case CouncilProtocol.dispatchToolId:
         return _dispatch(call);
+      case CouncilProtocol.waitToolId:
+        return _waitForAgents();
       case CouncilProtocol.askUserToolId:
         return _askUser(_session!.config.orchestrator.id, call);
       case CouncilProtocol.reportToolId:
@@ -1029,6 +1196,57 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           CouncilToolResult(feedback: 'Unknown Council tool: ${call.name}'),
         );
     }
+  }
+
+  /// Block until every in-flight parallel dispatch completes, then return
+  /// a digest of each agent's final status + transcript tail so the
+  /// orchestrator can synthesize before reporting.
+  Future<CouncilToolResult> _waitForAgents() async {
+    final session = _session;
+    if (session == null) {
+      return const CouncilToolResult(feedback: 'No active session.');
+    }
+    if (_dispatches.isEmpty) {
+      return const CouncilToolResult(
+        feedback: 'No parallel dispatches in flight. '
+            'Continue with synthesis or report.',
+      );
+    }
+
+    session.status = CouncilStatus.working;
+    notifyListeners();
+
+    await Future.wait(
+      _dispatches.map((f) => f.catchError((_) {})),
+    );
+    _dispatches.clear();
+
+    final buf = StringBuffer();
+    buf.writeln('All dispatched agents have finished. Results:\n');
+    for (final agent in session.config.agents) {
+      if (agent.status == CouncilAgentStatus.idle &&
+          agent.transcript.trim().isEmpty) {
+        continue;
+      }
+      final status = agent.status.name.toUpperCase();
+      buf.writeln('--- ${agent.name} ($status) ---');
+      final transcript = agent.transcript.trim();
+      if (transcript.isEmpty) {
+        buf.writeln('(no output)');
+      } else {
+        buf.writeln(_summariseTranscript(transcript));
+      }
+      if (agent.lastError.trim().isNotEmpty) {
+        buf.writeln('Last error: ${agent.lastError.trim()}');
+      }
+      buf.writeln();
+    }
+    buf.writeln(
+      'Proceed to synthesize findings and produce the final report '
+      'via council_report, or dispatch a follow-up wave if gaps remain.',
+    );
+
+    return CouncilToolResult(feedback: buf.toString());
   }
 
   Future<CouncilToolResult> _dispatch(CouncilToolCall call) async {
@@ -1180,6 +1398,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       nativeToolIds: {...CouncilProtocol.agentToolIds, ...agent.enabledTools},
       onChunk: (chunk) => _appendTranscript(agent, chunk),
       onCouncilTool: (call) => _handleAgentTool(agent, call),
+      onStall: _onAgentStall,
+      stallTimeoutSeconds: 90,
     );
     _runners.add(runner);
     final result = await runner.run();
@@ -1658,6 +1878,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         onChunk: (_) {},
         onCouncilTool: (_) async => const CouncilToolResult(feedback: ''),
       );
+      _runners.add(replyRunner);
       replyFutures.add(() async {
         final result = await replyRunner.run(maxIterations: 2);
         final answer = result.content.trim();

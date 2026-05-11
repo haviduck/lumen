@@ -1,3 +1,4 @@
+import 'memory_service.dart';
 import 'ollama_service.dart' show CancellationToken;
 import 'timeline_recorder.dart';
 import 'tool_registry.dart';
@@ -12,10 +13,44 @@ import 'tools/tool_schemas.dart';
 /// file path for edit/read tools, query for search tools, command
 /// for run_cmd, etc. Good enough for "what happened here" without
 /// embedding entire payloads.
+///
+/// [signatureSuffix] is consulted by the chat controller's stall
+/// detector (`maxUnproductiveStreak`) to differentiate calls whose
+/// `firstArg` collides but whose semantic target differs. Today
+/// only `READ_FILE` populates it (range reads `:start-end` live in
+/// regex groups 2/3, NOT in group 1, so 5 paginated reads of the
+/// same file would otherwise look like 5 stalls). Empty string for
+/// every other tool — paginated tools that already inline their
+/// pagination flags into group 1 (`SEARCH_TEXT :max=`, `GIT_LOG
+/// :n=`) need no help here.
 class FiredTool {
   final String id;
   final String firstArg;
-  const FiredTool({required this.id, required this.firstArg});
+  final String signatureSuffix;
+  const FiredTool({
+    required this.id,
+    required this.firstArg,
+    this.signatureSuffix = '',
+  });
+}
+
+/// Extracts the stall-detector suffix for a tool match. Centralised so
+/// both the text-grammar path and the native-dispatch path stay in
+/// agreement (and so adding a new paginated tool only touches one
+/// switch case). See `FiredTool.signatureSuffix` doc for rationale.
+String _signatureSuffixFor(String toolId, Match match) {
+  switch (toolId) {
+    case 'read_file':
+      // groups 2/3 = start/end of the line range. Either both are
+      // present (ranged read) or both null (full-file read). When
+      // present, embed them so each page is a distinct signature.
+      final start = match.groupCount >= 2 ? match.group(2) : null;
+      final end = match.groupCount >= 3 ? match.group(3) : null;
+      if (start != null && end != null) return ':$start-$end';
+      return '';
+    default:
+      return '';
+  }
 }
 
 /// Output of a single executor pass.
@@ -95,6 +130,9 @@ class ToolExecutor {
   /// directly to arbitrary URLs from the host process.
   WebFetchFn? webFetch;
 
+  /// Cross-session memory service for the `SAVE_MEMORY` tool.
+  MemoryService? memoryService;
+
   /// Per-message random hex token baked into every
   /// `<!-- LUMEN_TOOL:... -->` marker emitted by `_friendlyReplacement`
   /// and `_SalvageOutcome.from`. The chat-side renderer validates
@@ -123,6 +161,7 @@ class ToolExecutor {
     this.agentTerminalLauncher,
     this.webSearch,
     this.webFetch,
+    this.memoryService,
   }) : enabledTools =
            enabledTools ??
            ToolRegistry.all
@@ -184,6 +223,7 @@ class ToolExecutor {
       agentTerminalLauncher: agentTerminalLauncher,
       webSearch: webSearch,
       webFetch: webFetch,
+      memoryService: memoryService,
     );
     // Recorder pre/post — same contract as the text-grammar path.
     // The recorder's by-tool snapshotting reads from `inv.match.group(N)`
@@ -204,7 +244,13 @@ class ToolExecutor {
     }
     final firstArg = match.groupCount >= 1 ? (match.group(1) ?? '') : '';
     final friendly = _friendlyReplacement(tool, match, result);
-    final fired = <FiredTool>[FiredTool(id: tool.id, firstArg: firstArg)];
+    final fired = <FiredTool>[
+      FiredTool(
+        id: tool.id,
+        firstArg: firstArg,
+        signatureSuffix: _signatureSuffixFor(tool.id, match),
+      ),
+    ];
     return ToolPassResult(
       friendly,
       true,
@@ -246,11 +292,6 @@ class ToolExecutor {
         final inv = ToolInvocation(
           match: raw,
           workspaceDir: workspaceDir,
-          // Bake the current tool's id into the 2-arg
-          // `ToolInvocation.approver` so individual `AgentTool.execute`
-          // bodies don't need to know about the per-tool approval
-          // mechanism — they just call `inv.approver(label, detail)`
-          // exactly like before.
           approver: (label, detail) => approver(tool.id, label, detail),
           allowWritesOutsideWorkspace: allowWritesOutsideWorkspace,
           onOutput: onToolOutput,
@@ -258,6 +299,7 @@ class ToolExecutor {
           agentTerminalLauncher: agentTerminalLauncher,
           webSearch: webSearch,
           webFetch: webFetch,
+          memoryService: memoryService,
         );
         // Pre-snapshot the file the tool will touch (if any). Cheap —
         // when the file already has a baseline / head this is a no-op;
@@ -292,7 +334,13 @@ class ToolExecutor {
         // "click chat message → revert" feature has every agent-
         // origin entry already grouped per turn.
         final firstArg = (raw.groupCount >= 1 ? raw.group(1) : '') ?? '';
-        fired.add(FiredTool(id: tool.id, firstArg: firstArg));
+        fired.add(
+          FiredTool(
+            id: tool.id,
+            firstArg: firstArg,
+            signatureSuffix: _signatureSuffixFor(tool.id, raw),
+          ),
+        );
 
         final friendly = _friendlyReplacement(tool, raw, result);
         processed = processed.replaceAll(raw.group(0)!, friendly);

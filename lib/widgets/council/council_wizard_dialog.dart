@@ -21,15 +21,9 @@ import 'wizard/wizard_tokens.dart';
 
 /// Convene-the-Council modal.
 ///
-/// 2026-05 redesign back to a focused step wizard. The previous "single
-/// composed surface" version stuffed every section onto one screen with
-/// PROTECTED / N MODELS / READY badges, eyebrow rules, gradient lazy-mode
-/// cards and a BEFORE THEY CONVENE summary chip row — too much chrome
-/// for a setup dialog. This pass collapses all of that into three tight
-/// steps (Brief → Team → Review) with a calm step indicator and a
-/// per-step content area. The state model (_DraftAgent, _ConveneDocs,
-/// brief images, lazy-mode generation) is preserved unchanged; only the
-/// shell was rewritten.
+/// 2026-05 redesign back to a focused step wizard. Two steps
+/// (Brief → Team) with a calm step indicator and a per-step content
+/// area. The council is triggered directly from the Team step.
 Future<void> showCouncilWizard(BuildContext context) {
   return showGeneralDialog<void>(
     context: context,
@@ -55,8 +49,7 @@ Future<void> showCouncilWizard(BuildContext context) {
 
 const int _stepBrief = 0;
 const int _stepTeam = 1;
-const int _stepReview = 2;
-const int _stepCount = 3;
+const int _stepCount = 2;
 
 class CouncilWizardDialog extends StatefulWidget {
   const CouncilWizardDialog({super.key});
@@ -283,14 +276,6 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
                                     onChanged: () => setState(() {}),
                                     onAddAgent: _addAgent,
                                     onRemoveAgent: _removeAgent,
-                                  ),
-                                _stepReview => _ReviewStep(
-                                    title: _title.text,
-                                    brief: _brief.text,
-                                    imageCount: _images.length,
-                                    docs: _docs.docs,
-                                    agents: _agents,
-                                    orchestrator: _orchestrator,
                                   ),
                                 _ => const SizedBox.shrink(),
                               },
@@ -742,7 +727,6 @@ class _StepIndicator extends StatelessWidget {
     const labels = [
       S.councilWizardStepBrief,
       S.councilWizardStepTeam,
-      S.councilWizardStepReview,
     ];
     return Container(
       padding: const EdgeInsets.fromLTRB(
@@ -1272,239 +1256,6 @@ class _TeamStep extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-//  STEP 3 · REVIEW
-// ─────────────────────────────────────────────────────────────────────
-
-class _ReviewStep extends StatelessWidget {
-  final String title;
-  final String brief;
-  final int imageCount;
-  final List<CouncilBriefDoc> docs;
-  final List<_DraftAgent> agents;
-  final _DraftAgent orchestrator;
-
-  const _ReviewStep({
-    required this.title,
-    required this.brief,
-    required this.imageCount,
-    required this.docs,
-    required this.agents,
-    required this.orchestrator,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final displayTitle = title.trim().isEmpty ? S.councilTitle : title.trim();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          displayTitle,
-          style: const TextStyle(
-            color: DuckColors.fgPrimary,
-            fontSize: 18,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.2,
-          ),
-        ),
-        const SizedBox(height: WizardTokens.s14),
-        const _ReviewSectionLabel(label: S.councilWizardBriefSummary),
-        const SizedBox(height: WizardTokens.s6),
-        Container(
-          padding: const EdgeInsets.all(WizardTokens.s12),
-          decoration: BoxDecoration(
-            color: DuckColors.bgDeeper.withValues(alpha: 0.55),
-            borderRadius: BorderRadius.circular(WizardTokens.radiusS),
-            border: Border.all(color: DuckColors.glassSeam, width: 0.6),
-          ),
-          child: Text(
-            brief.trim().isEmpty ? S.councilWizardEmptyBrief : brief.trim(),
-            style: TextStyle(
-              color: brief.trim().isEmpty
-                  ? DuckColors.fgSubtle
-                  : DuckColors.fgPrimary,
-              fontSize: 12.5,
-              height: 1.45,
-            ),
-          ),
-        ),
-        if (imageCount > 0 || docs.isNotEmpty) ...[
-          const SizedBox(height: WizardTokens.s10),
-          Wrap(
-            spacing: WizardTokens.s8,
-            runSpacing: WizardTokens.s6,
-            children: [
-              if (imageCount > 0)
-                _ReviewMeta(
-                  icon: Icons.image_outlined,
-                  label: '$imageCount image${imageCount == 1 ? '' : 's'}',
-                ),
-              if (docs.isNotEmpty)
-                _ReviewMeta(
-                  icon: Icons.description_outlined,
-                  label: '${docs.length} doc${docs.length == 1 ? '' : 's'}',
-                ),
-            ],
-          ),
-        ],
-        const SizedBox(height: WizardTokens.s18),
-        const _ReviewSectionLabel(label: S.councilWizardTeamSummary),
-        const SizedBox(height: WizardTokens.s6),
-        _ReviewRosterRow(agent: orchestrator, isOrchestrator: true),
-        for (var i = 0; i < agents.length; i++)
-          Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: _ReviewRosterRow(agent: agents[i]),
-          ),
-      ],
-    );
-  }
-}
-
-class _ReviewSectionLabel extends StatelessWidget {
-  final String label;
-
-  const _ReviewSectionLabel({required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Text(
-      label,
-      style: const TextStyle(
-        color: DuckColors.fgSubtle,
-        fontSize: 11,
-        fontWeight: FontWeight.w600,
-        letterSpacing: 0.3,
-      ),
-    );
-  }
-}
-
-class _ReviewMeta extends StatelessWidget {
-  final IconData icon;
-  final String label;
-
-  const _ReviewMeta({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, size: 12, color: DuckColors.fgSubtle),
-        const SizedBox(width: 5),
-        Text(
-          label,
-          style: const TextStyle(color: DuckColors.fgMuted, fontSize: 11.5),
-        ),
-      ],
-    );
-  }
-}
-
-class _ReviewRosterRow extends StatelessWidget {
-  final _DraftAgent agent;
-  final bool isOrchestrator;
-
-  const _ReviewRosterRow({
-    required this.agent,
-    this.isOrchestrator = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final accent = WizardRolePalette.colorFor(agent.role);
-    final roleLabel = agent.role == RolePreset.custom
-        ? (agent.customRole.text.trim().isEmpty
-            ? WizardRolePalette.labelFor(agent.role)
-            : agent.customRole.text.trim())
-        : WizardRolePalette.labelFor(agent.role);
-    return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: WizardTokens.s10,
-        vertical: WizardTokens.s8,
-      ),
-      decoration: BoxDecoration(
-        color: DuckColors.bgChip.withValues(alpha: 0.55),
-        borderRadius: BorderRadius.circular(WizardTokens.radiusS),
-        border: Border.all(
-          color: isOrchestrator
-              ? accent.withValues(alpha: 0.4)
-              : DuckColors.border,
-          width: 0.6,
-        ),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(
-              color: accent,
-              shape: BoxShape.circle,
-            ),
-          ),
-          const SizedBox(width: WizardTokens.s10),
-          Flexible(
-            child: Text(
-              agent.name.text.trim().isEmpty
-                  ? (isOrchestrator
-                      ? S.councilOrchestrator
-                      : roleLabel)
-                  : agent.name.text.trim(),
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: DuckColors.fgPrimary,
-                fontSize: 12.5,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-          const SizedBox(width: 6),
-          Flexible(
-            child: Text(
-              '· $roleLabel',
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: DuckColors.fgMuted,
-                fontSize: 11.5,
-              ),
-            ),
-          ),
-          if (isOrchestrator) ...[
-            const SizedBox(width: 6),
-            Text(
-              '· ${S.councilOrchestrator}',
-              style: TextStyle(
-                color: accent,
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 0.3,
-              ),
-            ),
-          ],
-          if ((agent.model ?? '').isNotEmpty) ...[
-            const SizedBox(width: 8),
-            Flexible(
-              child: Text(
-                agent.model!,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: DuckColors.fgSubtle,
-                  fontSize: 10.5,
-                  fontFamily: 'monospace',
-                  fontFamilyFallback: ['Consolas', 'Menlo', 'Courier New'],
-                ),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────
 //  FOOTER
 // ─────────────────────────────────────────────────────────────────────
 
@@ -1533,7 +1284,7 @@ class _Footer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isReview = step >= stepCount - 1;
+    final isLastStep = step >= stepCount - 1;
     final isBrief = step == _stepBrief;
     return Container(
       padding: const EdgeInsets.fromLTRB(
@@ -1566,7 +1317,7 @@ class _Footer extends StatelessWidget {
             ),
             const SizedBox(width: WizardTokens.s8),
           ],
-          if (!isReview)
+          if (!isLastStep)
             ElevatedButton.icon(
               onPressed: canAdvance && !isGenerating ? onNext : null,
               icon: isBrief

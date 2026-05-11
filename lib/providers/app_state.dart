@@ -16,6 +16,7 @@ import '../services/council/council_persistence_service.dart';
 import '../services/file_kind.dart';
 import '../services/gemini_service.dart';
 import '../services/ide_actions.dart';
+import '../services/memory_service.dart';
 import '../services/lumen_process_tracker.dart';
 import '../services/ollama_service.dart';
 import '../services/preferences_service.dart';
@@ -65,6 +66,11 @@ class AppState extends ChangeNotifier {
   /// `CouncilController` regardless of whether the tab is mounted.
   static const String councilTheaterSentinel = '__council_theater__';
 
+  /// Sentinel file path for the Council Sessions browser virtual tab.
+  /// Lists all persisted council sessions with transcripts, events,
+  /// and report data for post-mortem review.
+  static const String councilSessionsSentinel = '__council_sessions__';
+
   /// Prefix for untitled (unsaved) tabs created with Ctrl+T.
   static const String untitledPrefix = '__untitled__';
 
@@ -83,6 +89,10 @@ class AppState extends ChangeNotifier {
   static bool isCouncilTheaterTab(String? path) =>
       path == councilTheaterSentinel;
 
+  /// Returns `true` when the given path is the council sessions sentinel.
+  static bool isCouncilSessionsTab(String? path) =>
+      path == councilSessionsSentinel;
+
   /// All sentinel paths that should be excluded from real-file
   /// behaviours (filesystem watching, dirty-on-disk diffs, line-ref
   /// chips, accept/revoke decoration overlays). Closed enum — keep
@@ -92,6 +102,7 @@ class AppState extends ChangeNotifier {
     processManagerSentinel,
     knowledgeBaseSentinel,
     councilTheaterSentinel,
+    councilSessionsSentinel,
   };
 
   static bool isSentinelPath(String? path) =>
@@ -131,6 +142,7 @@ class AppState extends ChangeNotifier {
   final CouncilPersistenceService _councilPersistence =
       CouncilPersistenceService();
   final RulesService rules = RulesService();
+  final MemoryService _memoryService = MemoryService();
   final IdeActions ideActions = IdeActions();
   // Tracks PIDs that Lumen explicitly spawned (terminal PTYs, agent
   // tool processes) so the process manager can offer a
@@ -347,6 +359,7 @@ class AppState extends ChangeNotifier {
   // View / lock
   DuckViewMode _viewMode = DuckViewMode.normal;
   bool _isLocked = false;
+  bool _lockOnStartup = false;
 
   // UI accessibility / GPU escape hatches (drive `DuckGlass` and
   // `DuckMotion` so users on weak GPUs / on battery can opt out without
@@ -424,6 +437,7 @@ class AppState extends ChangeNotifier {
 
   DuckViewMode get viewMode => _viewMode;
   bool get isLocked => _isLocked;
+  bool get lockOnStartup => _lockOnStartup;
 
   bool get reduceMotion => _reduceMotion;
   bool get reduceTransparency => _reduceTransparency;
@@ -464,6 +478,7 @@ class AppState extends ChangeNotifier {
       recentEdits: recentEdits,
       skills: workspaceSkills,
       agentTerminals: agentTerminals,
+      memoryService: _memoryService,
     );
     council = CouncilController(
       anthropic: _anthropicService,
@@ -618,7 +633,8 @@ class AppState extends ChangeNotifier {
       (v) => v.name == view,
       orElse: () => DuckViewMode.normal,
     );
-    _isLocked = await prefs.hasPin();
+    _lockOnStartup = await prefs.getLockOnStartup();
+    _isLocked = _lockOnStartup && await prefs.hasPin();
     _reduceMotion = await prefs.getReduceMotion();
     _reduceTransparency = await prefs.getReduceTransparency();
     _allowAgentOutsideWorkspaceWrites = await prefs
@@ -781,6 +797,22 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Opens the Council Sessions browser as a virtual editor tab.
+  /// Same sentinel pattern as the other virtual tabs — lists all
+  /// persisted sessions for post-mortem review.
+  void openCouncilSessionsTab() {
+    final sentinel = File(councilSessionsSentinel);
+    if (!_openFiles.any((f) => f.path == councilSessionsSentinel)) {
+      _openFiles.add(sentinel);
+      _fileContents[councilSessionsSentinel] = '';
+      _savedFileContents[councilSessionsSentinel] = '';
+    }
+    _activeFile = _openFiles.firstWhere(
+      (f) => f.path == councilSessionsSentinel,
+    );
+    notifyListeners();
+  }
+
   Future<void> updateEditorSettings({
     String? theme,
     double? fontSize,
@@ -855,6 +887,13 @@ class AppState extends ChangeNotifier {
   }
 
   Future<bool> hasPin() => prefs.hasPin();
+
+  Future<void> setLockOnStartup(bool v) async {
+    if (_lockOnStartup == v) return;
+    _lockOnStartup = v;
+    await prefs.setLockOnStartup(v);
+    notifyListeners();
+  }
 
   // --- Workspace ---
   Future<void> _loadRecentProjects() async {

@@ -4,7 +4,7 @@
 ///
 /// Why this exists: hour-long agentic sessions produce 100+ messages
 /// that the model needs to *remember* (decisions made, files touched,
-/// dead ends ruled out). The pre-existing `_kHistoryKeepRecent`
+/// dead ends ruled out). The pre-existing `ModelTier.historyKeepRecent`
 /// pruning in `chat_controller.dart` keeps the first user message
 /// plus the last 40 messages and replaces the omitted middle with a
 /// one-line "X messages elided" stub. That bound the token budget but

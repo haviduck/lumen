@@ -30,6 +30,7 @@ class PreferencesService {
   static const String _kEditorWordWrap = 'editor.wordWrap';
   static const String _kViewMode = 'view.mode';
   static const String _kLockPinHash = 'lock.pinHash';
+  static const String _kLockOnStartup = 'lock.onStartup';
   static const String _kCurrentSessionId = 'chat.currentSessionId';
   // Selected chat model (prefixed: `ollama:foo` / `gemini:foo`).
   // Persisted so restarts don't silently flip routing to whatever
@@ -608,6 +609,11 @@ class PreferencesService {
     if (stored == null || stored.isEmpty) return false;
     return stored == _hashPin(pin);
   }
+
+  Future<bool> getLockOnStartup() async =>
+      (await _p).getBool(_kLockOnStartup) ?? false;
+  Future<void> setLockOnStartup(bool v) async =>
+      (await _p).setBool(_kLockOnStartup, v);
 
   // --- GitNexus ---
   Future<bool> getGitNexusEnabled() async =>

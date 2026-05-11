@@ -57,9 +57,14 @@ class CouncilHeaderBar extends StatelessWidget {
                 ),
                 Text(
                   _statusLabel(session?.status ?? CouncilStatus.idle),
-                  style: const TextStyle(
-                    color: DuckColors.accentMint,
+                  style: TextStyle(
+                    color: _isComplete(session?.status)
+                        ? DuckColors.accentCyan
+                        : DuckColors.accentMint,
                     fontSize: 11,
+                    fontWeight: _isComplete(session?.status)
+                        ? FontWeight.w700
+                        : FontWeight.normal,
                     letterSpacing: 0.8,
                   ),
                 ),
@@ -105,6 +110,11 @@ class CouncilHeaderBar extends StatelessWidget {
     );
   }
 
+  bool _isComplete(CouncilStatus? status) {
+    return status == CouncilStatus.awaitingFollowup ||
+        status == CouncilStatus.done;
+  }
+
   String _statusLabel(CouncilStatus status) {
     return switch (status) {
       CouncilStatus.idle => S.councilStatusIdle,
@@ -113,7 +123,7 @@ class CouncilHeaderBar extends StatelessWidget {
       CouncilStatus.awaitingUser => S.councilStatusAwaitingUser,
       CouncilStatus.awaitingPool => S.councilStatusAwaitingPool,
       CouncilStatus.synthesizing => S.councilStatusSynthesizing,
-      CouncilStatus.awaitingFollowup => S.councilStatusAwaitingUser,
+      CouncilStatus.awaitingFollowup => S.councilStatusComplete,
       CouncilStatus.done => S.councilStatusDone,
       CouncilStatus.aborted => S.councilStatusAborted,
       CouncilStatus.error => S.councilStatusError,

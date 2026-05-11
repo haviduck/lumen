@@ -72,9 +72,11 @@ class S {
   static const String menuCloseWorkspace = 'Close Workspace';
   static const String menuSettings = 'Settings…';
   static const String menuLockIde = 'Lock IDE';
+  static const String menuLockOnStartup = 'Lock on Startup';
   static const String menuBackup = 'Backup Project…';
   static const String menuZenMode = 'Toggle Zen Mode';
   static const String menuSideEye = 'Toggle Side-Eye Mode';
+  static const String menuTimeline = 'Project Timeline';
   static const String menuNormalLayout = 'Normal Layout';
   static const String menuNewTerminal = 'New Terminal';
   static const String menuKillTerminal = 'Kill Terminal';
@@ -2072,10 +2074,6 @@ class S {
   static const String councilWizardStepTeam = 'Team';
   static const String councilWizardStepAgents = 'Agents';
   static const String councilWizardStepOrchestrator = 'Orchestrator';
-  static const String councilWizardStepReview = 'Review';
-  static const String councilWizardBriefSummary = 'What you sent the Council';
-  static const String councilWizardTeamSummary = 'Who will be in the room';
-  static const String councilWizardEmptyBrief = 'No brief written yet.';
   static const String councilLazyModeTitle = 'Lazy mode';
   static const String councilLazyModeBody =
       'Let the orchestrator design the council from your brief.';
@@ -2128,6 +2126,37 @@ class S {
   static const String councilReportDeleteTitle = 'Delete report?';
   static const String councilReportDeleteFailed =
       'Could not delete the report (file may be open).';
+
+  // Council Sessions browser
+  static const String councilSessionsMenuItem = 'Council Sessions';
+  static const String councilSessionsTitle = 'Council Sessions';
+  static const String councilSessionsEmpty =
+      'No council sessions recorded yet.\n'
+      'Sessions are saved automatically when a council runs.';
+  static const String councilSessionsRefresh = 'Refresh';
+  static const String councilSessionsDeleteTitle = 'Delete session?';
+  static const String councilSessionsDeleteFailed =
+      'Could not delete the session.';
+  static const String councilSessionDetailTitle = 'Session Detail';
+  static const String councilSessionTabOverview = 'Overview';
+  static const String councilSessionTabTranscripts = 'Transcripts';
+  static const String councilSessionTabEvents = 'Events';
+  static const String councilSessionTabReport = 'Report';
+  static const String councilSessionStatusLabel = 'Status';
+  static const String councilSessionRoundsLabel = 'Rounds';
+  static const String councilSessionStartedLabel = 'Started';
+  static const String councilSessionFinishedLabel = 'Finished';
+  static const String councilSessionDurationLabel = 'Duration';
+  static const String councilSessionBriefLabel = 'Brief';
+  static const String councilSessionAgentsLabel = 'Agents';
+  static const String councilSessionNoTranscript = 'No transcript recorded.';
+  static const String councilSessionNoEvents = 'No events recorded.';
+  static const String councilSessionNoReport = 'No report generated.';
+  static const String councilSessionEventsCount = 'events';
+  static String councilSessionAgentCount(int n) =>
+      n == 1 ? '1 agent' : '$n agents';
+  static String councilSessionRoundCount(int n) =>
+      n == 1 ? '1 round' : '$n rounds';
   static const String councilAskPoolHeader = 'Council pool';
   static const String councilPoolRepliesHeader = 'Council pool replies:';
   static String councilPoolBudgetExceeded(int maxExchanges) =>
@@ -2152,6 +2181,7 @@ class S {
   static const String councilLeftBlackboardStreaming = 'Drafting verdict…';
   static const String councilLeftBlackboardCopy = 'Copy evaluator text';
   static const String councilLeftBlackboardCopied = 'Evaluator text copied.';
+  static const String councilLeftBlackboardLive = 'LIVE';
   static const String councilBlackboardReportBody =
       'The Council has finished. Review the report before leaving the theater.';
   static const String councilAskUserHeader = 'Council needs you';
@@ -2197,6 +2227,21 @@ class S {
   static const String councilPingHeaderLabel = 'Ping';
   static const String councilPingHeaderTooltip =
       'Send the orchestrator a mid-session note (resurrects it if quiet)';
+
+  // Per-agent ping
+  static const String councilPingAgentLabel = 'Ping';
+  static const String councilPingAgentTooltip =
+      'Send this agent a mid-session note to nudge or redirect it';
+  static const String councilPingAgentHint =
+      'e.g. focus on the auth module, skip the UI tests...';
+  static const String councilPingAgentSend = 'Send to agent';
+  static const String councilPingAgentSent = 'Note sent to agent.';
+
+  // Stall detection
+  static String councilAgentStalledMessage(int seconds) =>
+      'Agent has been silent for ${seconds}s — auto-nudging to continue.';
+  static const String councilAutoNudgeRecovered =
+      'Orchestrator recovered automatically.';
   static const String councilOrchestratorKickHeader =
       'You are continuing a previously-started Council session. The user '
       'has sent a follow-up note that you must address. Treat the note as '
@@ -2308,6 +2353,28 @@ class S {
   static const String councilRoleTester = 'Tester';
   static const String councilRoleWriter = 'Writer';
   static const String councilRoleCustom = 'Custom';
+
+  // --- Council finished view ---
+  static const String councilStatusComplete = 'COMPLETE';
+  static const String councilFinishedTitle = 'Council Complete';
+  static const String councilFinishedSubtitle =
+      'All agents have finished. Review the report or start a follow-up round.';
+  static String councilFinishedElapsed(String duration) =>
+      'Elapsed: $duration';
+  static String councilFinishedAgentsDone(int done, int total) =>
+      '$done / $total agents done';
+  static const String councilFinishedViewReport = 'View Report';
+  static const String councilFinishedDismiss = 'Back to stage';
+  static const String councilFinishedAgentDone = 'DONE';
+  static const String councilFinishedAgentError = 'ERROR';
+  static String councilFinishedErrors(int n) =>
+      n == 1 ? '1 error' : '$n errors';
+  static const String councilFinishedRoundTwo = 'Run Round Two';
+  static const String councilFinishedFinish = 'Finish Council';
+  static const String councilFinishedReviewerSummary = 'REVIEWER FINDINGS';
+  static String councilFinishedRound(int n) => 'Round $n';
+  static String councilInspectorTaskAttempts(int current, int max) =>
+      'attempt $current/$max';
 
   // --- Pentest / security-test mode ---
   static const String councilPentestGoalLabel = 'TARGET';

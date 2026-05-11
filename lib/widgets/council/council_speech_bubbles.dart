@@ -241,7 +241,7 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
   static const int _replyZoomMs = 900;
   static const int _replyTrailMs = 1200;
 
-  static const Duration _coalesceIdle = Duration(milliseconds: 450);
+  static const Duration _coalesceIdle = Duration(milliseconds: 1500);
   static const int _maxConcurrent = 14;
   static const int _maxPerAgent = 3;
   static const int _maxBubbleChars = 200;
@@ -262,6 +262,10 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
   final Map<String, StringBuffer> _chunkBuffers = {};
   final Map<String, Timer> _chunkTimers = {};
   final Map<String, bool> _agentSawChunks = {};
+  // Tracks the single "live" chunk-sourced bubble per agent. When new
+  // chunks arrive, the existing bubble is replaced rather than spawning
+  // a new one — ensures at most ONE streaming bubble per agent at any time.
+  final Map<String, int> _liveChunkBubbleIds = {};
 
   late final Ticker _ticker;
   int _nowMs = 0;
@@ -407,28 +411,34 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
       case CouncilEventType.agentDone:
       case CouncilEventType.evaluatorDone:
         if (_isEvaluatorMuted(e.fromAgentId)) break;
+        // Retire the live streaming bubble — the agent is done, so
+        // its final summary replaces whatever partial text was showing.
+        _retireLiveBubble(e.fromAgentId);
         _flushChunkBuffer(e.fromAgentId);
-        if (!(_agentSawChunks[e.fromAgentId] ?? false) &&
-            e.message.trim().isNotEmpty) {
+        // Show ONE final summary bubble regardless of whether we saw
+        // chunks — this is the consolidated "done" message.
+        if (e.message.trim().isNotEmpty) {
           _spawn(
             agentId: e.fromAgentId,
             text: e.message,
-            kind: BubbleKind.speak,
+            kind: e.type == CouncilEventType.evaluatorDone
+                ? BubbleKind.done
+                : BubbleKind.done,
           );
         }
-        if (e.type == CouncilEventType.evaluatorDone &&
-            e.message.trim().isNotEmpty) {
-          _spawn(
-            agentId: e.fromAgentId,
-            text: e.message,
-            kind: BubbleKind.done,
-          );
-        }
+        _agentSawChunks.remove(e.fromAgentId);
         break;
       case CouncilEventType.agentError:
         _spawn(
           agentId: e.fromAgentId,
           text: e.message.isEmpty ? 'error' : e.message,
+          kind: BubbleKind.error,
+        );
+        break;
+      case CouncilEventType.agentStalled:
+        _spawn(
+          agentId: e.fromAgentId,
+          text: e.message.isEmpty ? 'stalled' : e.message,
           kind: BubbleKind.error,
         );
         break;
@@ -441,10 +451,14 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     final buf = _chunkBuffers.putIfAbsent(agentId, () => StringBuffer());
     buf.write(delta);
     _chunkTimers[agentId]?.cancel();
+    // Longer coalesce window — chunks flow into the single live bubble
+    // rather than spawning many separate ones.
     _chunkTimers[agentId] = Timer(_coalesceIdle, () {
       _flushChunkBuffer(agentId);
     });
-    if (buf.length > 320) _flushChunkBuffer(agentId);
+    // Still flush when the buffer gets large, but into the SAME live
+    // bubble so the user sees consolidated text, not a burst of widgets.
+    if (buf.length > 600) _flushChunkBuffer(agentId);
   }
 
   void _flushChunkBuffer(String agentId) {
@@ -454,35 +468,40 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     buf.clear();
     _chunkTimers[agentId]?.cancel();
     _chunkTimers.remove(agentId);
-    for (final piece in _splitForBubbles(text)) {
-      _spawn(agentId: agentId, text: piece, kind: BubbleKind.speak);
-    }
-  }
-
-  Iterable<String> _splitForBubbles(String text) sync* {
+    // Instead of spawning multiple bubbles, take the tail of the
+    // accumulated text and replace the existing live bubble. This
+    // guarantees at most ONE chunk-sourced bubble per agent.
     final cleaned = text.replaceAll(RegExp(r'\s+'), ' ').trim();
     if (cleaned.isEmpty) return;
-    if (cleaned.length <= _maxBubbleChars) {
-      yield cleaned;
-      return;
+    final display = cleaned.length > _maxBubbleChars
+        ? cleaned.substring(cleaned.length - _maxBubbleChars)
+        : cleaned;
+    _replaceLiveBubble(agentId: agentId, text: display);
+  }
+
+
+  /// Replace the single live chunk-bubble for [agentId]. If one exists,
+  /// it is removed before spawning the replacement so the agent never
+  /// has more than one streaming bubble on screen at a time.
+  void _replaceLiveBubble({
+    required String agentId,
+    required String text,
+  }) {
+    final existingId = _liveChunkBubbleIds[agentId];
+    if (existingId != null) {
+      _bubbles.removeWhere((b) => b.id == existingId);
     }
-    final parts = cleaned.split(RegExp(r'(?<=[.!?])\s+'));
-    final buf = StringBuffer();
-    for (final p in parts) {
-      if (buf.length + p.length + 1 > _maxBubbleChars && buf.isNotEmpty) {
-        yield buf.toString().trim();
-        buf.clear();
-      }
-      if (p.length > _maxBubbleChars) {
-        for (var i = 0; i < p.length; i += _maxBubbleChars) {
-          yield p.substring(i, math.min(i + _maxBubbleChars, p.length));
-        }
-        continue;
-      }
-      if (buf.isNotEmpty) buf.write(' ');
-      buf.write(p);
-    }
-    if (buf.isNotEmpty) yield buf.toString().trim();
+    _spawn(
+      agentId: agentId,
+      text: text,
+      kind: BubbleKind.speak,
+      isLiveChunk: true,
+    );
+  }
+
+  /// Remove the live chunk bubble for an agent (e.g. when it finishes).
+  void _retireLiveBubble(String agentId) {
+    _liveChunkBubbleIds.remove(agentId);
   }
 
   void _spawn({
@@ -490,6 +509,7 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     required String text,
     required BubbleKind kind,
     String? replyTo,
+    bool isLiveChunk = false,
   }) {
     if (agentId.isEmpty) return;
     final cleaned = _normalizeBubbleText(text);
@@ -525,9 +545,13 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
       _bubbles.removeAt(0);
     }
 
+    final bubbleId = _nextId++;
+    if (isLiveChunk) {
+      _liveChunkBubbleIds[agentId] = bubbleId;
+    }
     setState(() {
       _bubbles.add(_Bubble(
-        id: _nextId++,
+        id: bubbleId,
         originId: agentId,
         replyTo: replyTo,
         text: display,
@@ -825,30 +849,17 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
       left: rect.left,
       top: rect.top,
       width: rect.width,
-      height: rect.height,
-      child: ClipRect(
-        // OverflowBox lets the inner Column take its intrinsic height
-        // even when bubble content (multi-line text + eyebrow) exceeds
-        // the placement rect's reserved height. The surrounding
-        // ClipRect still enforces the safe-zone visually, but Flutter
-        // no longer reports a yellow-stripe overflow under the
-        // bubbles. Reproduces what _kEstBubbleHeight always implied:
-        // the rect is a placement budget, not a hard layout box.
-        child: OverflowBox(
-          alignment: placement.side == _BubbleSide.above
-              ? Alignment.bottomCenter
-              : Alignment.topCenter,
-          minHeight: 0,
-          maxHeight: double.infinity,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: mainAxis,
-            crossAxisAlignment: crossAxis,
-            children: reverseChildren
-                ? children.reversed.toList(growable: false)
-                : children,
-          ),
-        ),
+      // Height is intentionally omitted — the Column sizes itself to
+      // its intrinsic height. The placement rect's height is a
+      // collision-detection budget only; clamping the Positioned to it
+      // caused multi-line bubble text to clip at the bottom.
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: mainAxis,
+        crossAxisAlignment: crossAxis,
+        children: reverseChildren
+            ? children.reversed.toList(growable: false)
+            : children,
       ),
     );
   }
@@ -908,10 +919,10 @@ const double _columnGap = 6;
 const double _kBubblePanelMinGap = 10.0;
 
 /// Per-bubble vertical estimate used only for collision sizing — the
-/// actual bubble paints at its measured intrinsic height. Kept small
-/// so columns don't reserve more vertical space than they need when
-/// only one or two bubbles are alive.
-const double _kEstBubbleHeight = 78.0;
+/// actual bubble paints at its measured intrinsic height. Accounts for
+/// multi-line consolidated live-bubbles (up to 200 chars wrapping at
+/// ~260px column width ≈ 4–5 text lines + eyebrow + padding).
+const double _kEstBubbleHeight = 120.0;
 
 /// Which side of the owning panel a bubble column was placed on.
 enum _BubbleSide { right, left, above, below }

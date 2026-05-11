@@ -13,6 +13,7 @@ import 'council_agent_inspector.dart';
 import 'council_agent_sector.dart';
 import 'council_backdrop.dart';
 import 'council_blackboard.dart';
+import 'council_finished_overlay.dart';
 import 'council_header_bar.dart';
 import 'council_orchestrator_ping_panel.dart';
 import 'council_pentest_attack_lines.dart';
@@ -39,6 +40,8 @@ class _CouncilTheaterState extends State<CouncilTheater>
   bool _reportOpen = false;
   String? _reportSessionId;
   String? _inspectAgentId;
+  bool _finishedDismissed = false;
+  CouncilStatus? _lastStatus;
 
   // --- Pentest visual state ---
   bool _pentestConspiring = false;
@@ -83,7 +86,10 @@ class _CouncilTheaterState extends State<CouncilTheater>
       case CouncilEventType.pentestAttackLanded:
         _safeSetState(() => _pentestConspiring = false);
       case CouncilEventType.sessionStarted:
-        _safeSetState(() => _pentestConspiring = false);
+        _safeSetState(() {
+          _pentestConspiring = false;
+          _finishedDismissed = false;
+        });
       case CouncilEventType.reported:
         final session = context.read<AppState>().council.session;
         if (session != null && session.reportPath.isNotEmpty) {
@@ -135,6 +141,15 @@ class _CouncilTheaterState extends State<CouncilTheater>
     if (_reportSessionId != null && _reportSessionId != session.config.id) {
       _reportOpen = false;
       _reportSessionId = null;
+    }
+    // Reset the finished overlay dismissal when the council goes back
+    // to active work (e.g. a follow-up round was kicked off).
+    if (_lastStatus != session.status) {
+      if (session.status == CouncilStatus.working ||
+          session.status == CouncilStatus.dispatching) {
+        _finishedDismissed = false;
+      }
+      _lastStatus = session.status;
     }
     final reportAvailable = session.reportPath.isNotEmpty;
     final showReportPanel = _reportOpen && reportAvailable;
@@ -385,6 +400,44 @@ class _CouncilTheaterState extends State<CouncilTheater>
                 session: session,
                 agent: session.agentById(_inspectAgentId!)!,
                 onClose: () => _safeSetState(() => _inspectAgentId = null),
+                controller: controller,
+              ),
+            if (!_finishedDismissed &&
+                _inspectAgentId == null &&
+                !_pingOpen &&
+                session.pendingUserQuestion == null &&
+                (session.status == CouncilStatus.awaitingFollowup ||
+                    session.status == CouncilStatus.done))
+              Positioned.fill(
+                child: CouncilFinishedOverlay(
+                  key: ValueKey('council-finished-${session.runId}'),
+                  session: session,
+                  onViewReport: session.reportPath.isNotEmpty
+                      ? () {
+                          _safeSetState(() {
+                            _finishedDismissed = true;
+                            _reportOpen = true;
+                            _reportSessionId = session.config.id;
+                          });
+                        }
+                      : null,
+                  onDismiss: () =>
+                      _safeSetState(() => _finishedDismissed = true),
+                  onRoundTwo: session.reviewerFollowup != null &&
+                          session.reviewerFollowup!.suggestedRoundTwo &&
+                          session.status == CouncilStatus.awaitingFollowup
+                      ? () {
+                          _safeSetState(() => _finishedDismissed = true);
+                          controller.confirmRoundTwo();
+                        }
+                      : null,
+                  onFinish: session.status == CouncilStatus.awaitingFollowup
+                      ? () {
+                          _safeSetState(() => _finishedDismissed = true);
+                          controller.declineRoundTwo();
+                        }
+                      : null,
+                ),
               ),
           ],
         );

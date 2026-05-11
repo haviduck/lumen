@@ -411,7 +411,7 @@ class _StreamingPip extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           const Text(
-            'LIVE',
+            S.councilLeftBlackboardLive,
             style: TextStyle(
               color: DuckColors.accentMint,
               fontSize: 9,

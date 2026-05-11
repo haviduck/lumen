@@ -24,6 +24,12 @@ migrate_working_dir/
 # + the staging step in dist/. Regeneratable; never commit binaries.
 dist/
 
+# Throwaway preview output from `tools/extract_logo_no_bg.dart` and any
+# future tooling-side debug renders. The script writes a dark-glass
+# composite of the in-app logo here so an operator can sanity-check
+# the alpha-keying before committing the asset; not a shipped file.
+tools/_out/
+
 # Secrets and local environment
 .env
 .env.*

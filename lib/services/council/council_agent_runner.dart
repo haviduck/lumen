@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../anthropic_service.dart';
 import '../copilot_service.dart';
 import '../gemini_service.dart';
@@ -42,6 +44,12 @@ typedef CouncilChunkCallback = void Function(String chunk);
 typedef CouncilToolCallback =
     Future<CouncilToolResult> Function(CouncilToolCall call);
 
+/// Callback fired when a runner detects that the model has gone silent.
+/// [agentId] identifies the stalled agent; [silentSeconds] is how long
+/// the stream has been quiet. Return true to auto-nudge the runner with
+/// a continuation prompt; return false to leave it alone.
+typedef StallCallback = bool Function(String agentId, int silentSeconds);
+
 class CouncilAgentRunner {
   CouncilAgentRunner({
     required this.agent,
@@ -56,6 +64,8 @@ class CouncilAgentRunner {
     required this.onChunk,
     required this.onCouncilTool,
     this.userImages = const <String>[],
+    this.onStall,
+    this.stallTimeoutSeconds = 90,
   });
 
   final CouncilAgent agent;
@@ -77,6 +87,20 @@ class CouncilAgentRunner {
   final CouncilChunkCallback onChunk;
   final CouncilToolCallback onCouncilTool;
   final CancellationToken token = CancellationToken();
+
+  /// Fired when the model has been silent for [stallTimeoutSeconds].
+  /// If callback returns true, a nudge message is injected automatically.
+  final StallCallback? onStall;
+
+  /// Seconds of silence before firing [onStall]. Default 90s — long
+  /// enough for legitimate thinking pauses, short enough to catch
+  /// genuinely stuck Ollama / weaker models.
+  final int stallTimeoutSeconds;
+
+  Timer? _stallTimer;
+  DateTime _lastChunkAt = DateTime.now();
+  int _nudgeCount = 0;
+  static const int _maxAutoNudges = 3;
 
   /// Mid-session messages from the human to splice into the agent's
   /// message list at the next iteration boundary. Used by the orchestrator
@@ -119,6 +143,8 @@ class CouncilAgentRunner {
     ];
     final transcript = StringBuffer();
 
+    _startStallTimer();
+    try {
     for (var i = 0; i < maxIterations; i++) {
       if (token.isCancelled) {
         return CouncilRunResult(
@@ -152,6 +178,7 @@ class CouncilAgentRunner {
       final visible = StringBuffer();
       NativeToolUse? pendingTool;
 
+      _resetStallTimer();
       await for (final rawChunk in _stream(messages)) {
         if (token.isCancelled) {
           return CouncilRunResult(
@@ -159,6 +186,8 @@ class CouncilAgentRunner {
             cancelled: true,
           );
         }
+
+        _resetStallTimer();
 
         if (rawChunk.contains(NativeToolUseMarker.prefix)) {
           final parsed = NativeToolUseMarker.tryParse(rawChunk);
@@ -229,6 +258,53 @@ class CouncilAgentRunner {
     }
 
     return CouncilRunResult(content: transcript.toString());
+    } finally {
+      _cancelStallTimer();
+    }
+  }
+
+  void _startStallTimer() {
+    _lastChunkAt = DateTime.now();
+    _nudgeCount = 0;
+    _cancelStallTimer();
+    if (stallTimeoutSeconds <= 0 || onStall == null) return;
+    _stallTimer = Timer.periodic(
+      Duration(seconds: stallTimeoutSeconds ~/ 3),
+      (_) => _checkStall(),
+    );
+  }
+
+  void _resetStallTimer() {
+    _lastChunkAt = DateTime.now();
+  }
+
+  void _cancelStallTimer() {
+    _stallTimer?.cancel();
+    _stallTimer = null;
+  }
+
+  void _checkStall() {
+    if (token.isCancelled) {
+      _cancelStallTimer();
+      return;
+    }
+    final silentSecs = DateTime.now().difference(_lastChunkAt).inSeconds;
+    if (silentSecs < stallTimeoutSeconds) return;
+    if (_nudgeCount >= _maxAutoNudges) {
+      _cancelStallTimer();
+      return;
+    }
+    final shouldNudge = onStall?.call(agent.id, silentSecs) ?? false;
+    if (shouldNudge) {
+      _nudgeCount++;
+      _lastChunkAt = DateTime.now();
+      addUserNote(
+        'SYSTEM NUDGE (auto-generated — the model has been silent for '
+        '${silentSecs}s). You are mid-task. Continue producing output. '
+        'If you are stuck, describe the blocker. Do NOT start over — '
+        'resume from where you left off.',
+      );
+    }
   }
 
   String _cleanVisibleChunk(String chunk) {

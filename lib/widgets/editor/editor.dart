@@ -23,6 +23,7 @@ import '../process_manager/process_manager_view.dart';
 import '../settings_view.dart';
 import '../side_panes_column.dart';
 import '../common/duck_toast.dart';
+import '../council/council_sessions_browser.dart';
 import '../council/council_theater.dart';
 import 'autocomplete_overlay.dart';
 import 'binary_preview.dart';
@@ -303,6 +304,17 @@ class _EditorState extends State<Editor> {
           appState.setActiveFile(file);
         },
         child: const CouncilTheater(),
+      );
+    }
+    if (AppState.isCouncilSessionsTab(path)) {
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapDown: (_) {
+          setState(() => _focusedPane = paneIndex);
+          final file = appState.openFiles.firstWhere((f) => f.path == path);
+          appState.setActiveFile(file);
+        },
+        child: const CouncilSessionsBrowser(),
       );
     }
 

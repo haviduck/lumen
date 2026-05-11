@@ -13,6 +13,7 @@ import '../services/chat_chip.dart';
 import '../services/chat_persistence_service.dart';
 import '../services/external_tool_loader.dart';
 import '../services/gemini_service.dart';
+import '../services/memory_service.dart';
 import '../services/model_capabilities.dart';
 import '../services/ollama_service.dart';
 import '../services/preferences_service.dart';
@@ -426,19 +427,6 @@ class ChatController extends ChangeNotifier {
   /// instead of grinding through the full hard cap.
   static const int maxUnproductiveStreak = 5;
 
-  /// How many recent messages to always send verbatim in the API
-  /// payload. Beyond this, the middle of the conversation is replaced
-  /// with a one-line ellipsis marker so token cost on long sessions
-  /// stays bounded. The first user message is always kept too — the
-  /// original ask is load-bearing context for any follow-up turn.
-  ///
-  /// 40 picked empirically: a turn with 8 tool calls expands to
-  /// ~16 messages (assistant + tool_result pair per call), so 40
-  /// covers ~2.5 full turns of recent activity. Below that and the
-  /// model loses thread on multi-step tasks; above and Claude /
-  /// cloud Ollama prompt tokens balloon on hour-long sessions.
-  static const int _kHistoryKeepRecent = 40;
-
   /// Tool ids that count as "edited the workspace this turn" for the
   /// purposes of the auto-verify gate (see `_runGenerationLoop` →
   /// auto-verify). Kept in sync with the file-mutation tools in
@@ -505,6 +493,11 @@ class ChatController extends ChangeNotifier {
   /// model.
   final AgentTerminalBridge? agentTerminals;
 
+  /// Cross-session memory — facts the agent has learned that survive
+  /// across chat sessions. Loaded into the system prompt; written
+  /// via the `SAVE_MEMORY` tool. Optional so tests can omit it.
+  final MemoryService? _memoryService;
+
   ChatController({
     required this.ollama,
     required this.gemini,
@@ -518,8 +511,10 @@ class ChatController extends ChangeNotifier {
     this.skills,
     this.agentTerminals,
     ExternalToolLoader? toolLoader,
+    MemoryService? memoryService,
   }) : _recentEdits = recentEdits,
-       _toolLoader = toolLoader ?? ExternalToolLoader();
+       _toolLoader = toolLoader ?? ExternalToolLoader(),
+       _memoryService = memoryService;
 
   final ExternalToolLoader _toolLoader;
 
@@ -1215,11 +1210,17 @@ class ChatController extends ChangeNotifier {
     required List<PersistedMessage> droppedSpan,
     required int droppedCount,
     required String routedProvider,
+    ModelTierLevel tierLevel = ModelTierLevel.pro,
     CancellationToken? token,
   }) async {
     if (routedProvider == 'claude') return null;
 
-    final enabled = await prefs.getHistorySummaryEnabled();
+    final userEnabled = await prefs.getHistorySummaryEnabled();
+    // Auto-enable for sub-Pro tiers: smaller models have a tighter
+    // history window so the dropped span is larger and the summary
+    // matters more. The user toggle still wins — if they've explicitly
+    // enabled it for Pro that's fine too.
+    final enabled = userEnabled || tierLevel != ModelTierLevel.pro;
     if (!enabled) return null;
 
     final model = (await prefs.getToolCompressionModel()).trim();
@@ -3121,6 +3122,10 @@ class ChatController extends ChangeNotifier {
         'native=$useNativeTools',
       );
 
+      final memoryText = _memoryService != null
+          ? await _memoryService.load(workspacePath: workspacePath)
+          : '';
+
       final systemPrompt = SystemPromptBuilder.build(
         SystemPromptInputs(
           workspacePath: workspacePath,
@@ -3135,6 +3140,7 @@ class ChatController extends ChangeNotifier {
           effortIsNative: effortIsNative,
           useNativeTools: useNativeTools,
           providerLabel: _prettyProviderLabel(selectedProvider),
+          memory: memoryText,
         ),
       );
 
@@ -3142,7 +3148,7 @@ class ChatController extends ChangeNotifier {
         {'role': 'system', 'content': systemPrompt},
       ];
       // **Conversation history pruning.** When a long session crosses
-      // [_kHistoryKeepRecent] messages, we keep the first user
+      // [ModelTier.historyKeepRecent] messages, we keep the first user
       // message (the original ask is load-bearing context) plus the
       // last N, and replace the omitted middle with EITHER a
       // structured LLM-generated summary (opt-in via Settings → AI /
@@ -3164,17 +3170,18 @@ class ChatController extends ChangeNotifier {
       // placeholder keeps the prefix stable.
       final historyMessages = session.messages;
       Iterable<PersistedMessage> historyToSend;
-      if (historyMessages.length <= _kHistoryKeepRecent) {
+      final keepRecent = modelTier.historyKeepRecent;
+      if (historyMessages.length <= keepRecent) {
         historyToSend = historyMessages;
       } else {
         final first = historyMessages.first;
         final tail = historyMessages.sublist(
-          historyMessages.length - _kHistoryKeepRecent,
+          historyMessages.length - keepRecent,
         );
         final droppedCount = historyMessages.length - 1 - tail.length;
         final droppedSpan = historyMessages.sublist(
           1,
-          historyMessages.length - _kHistoryKeepRecent,
+          historyMessages.length - keepRecent,
         );
 
         final summaryText = await _maybeSummarizeHistory(
@@ -3182,6 +3189,7 @@ class ChatController extends ChangeNotifier {
           droppedSpan: droppedSpan,
           droppedCount: droppedCount,
           routedProvider: selectedProvider,
+          tierLevel: modelTier.level,
           token: cancelToken,
         );
 
@@ -3273,6 +3281,7 @@ class ChatController extends ChangeNotifier {
         // missing".
         webSearch: ollama.webSearch,
         webFetch: ollama.webFetch,
+        memoryService: _memoryService,
       );
       executor.markerNonce = turnMarkerNonce;
 
@@ -3506,6 +3515,16 @@ class ChatController extends ChangeNotifier {
       // happened in the same iteration — single-tool-per-response
       // mode (cutOnFirstTool) means each iteration almost always
       // has exactly one fire anyway.
+      //
+      // Pagination carve-out via `signatureSuffix`: tools whose
+      // pagination params live OUTSIDE regex group 1 (today only
+      // `READ_FILE`, where `:start-end` is in groups 2/3) populate
+      // a per-tool suffix in `tool_executor.dart` so 5 sequential
+      // page reads of the same file are 5 distinct signatures
+      // instead of one repeated stall. Tools that already inline
+      // pagination flags into group 1 (`SEARCH_TEXT :max=N`,
+      // `GIT_LOG :n=N`) need no help — different flag values
+      // already produce different `firstArg`.
       Set<String> prevIterSignatures = const <String>{};
       int unproductiveStreak = 0;
 
@@ -4170,7 +4189,9 @@ class ChatController extends ChangeNotifier {
         // will exit the loop once it crosses [maxUnproductiveStreak].
         final thisIterSignatures = <String>{
           for (var k = firedAtIterStart; k < firedAcrossTurn.length; k++)
-            '${firedAcrossTurn[k].id}:${firedAcrossTurn[k].firstArg}',
+            '${firedAcrossTurn[k].id}:'
+                '${firedAcrossTurn[k].firstArg}'
+                '${firedAcrossTurn[k].signatureSuffix}',
         };
         final productive = thisIterSignatures.any(
           (s) => !prevIterSignatures.contains(s),

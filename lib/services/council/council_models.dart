@@ -37,6 +37,12 @@ class CouncilEventType {
   static const agentDone = 'agent_done';
   static const agentError = 'agent_error';
 
+  // Stall detection — fired when an agent runner's stream has been
+  // silent beyond the configured threshold. The auto-nudge system
+  // injects a continuation prompt; this event surfaces the stall in the
+  // UI so the user can also manually ping the agent.
+  static const agentStalled = 'agent_stalled';
+
   // Task ledger (see council_task_ledger.dart for schema). Emitted on
   // every state-machine transition: planned -> dispatched -> running ->
   // done|failed|timeout|cancelled. Signal subscribes to render per-agent
@@ -61,6 +67,7 @@ class CouncilEventType {
   static const askedUser = 'asked_user';
   static const userReply = 'user_reply';
   static const userPingedOrchestrator = 'user_pinged_orchestrator';
+  static const userPingedAgent = 'user_pinged_agent';
   static const reported = 'reported';
   static const evaluatorStarted = 'evaluator_started';
   static const evaluatorDone = 'evaluator_done';

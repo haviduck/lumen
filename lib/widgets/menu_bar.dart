@@ -21,6 +21,7 @@ import 'manual_skill_dialog.dart';
 import 'ollama_cloud_key_prompt_dialog.dart';
 import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
+import 'timeline/timeline_dialog.dart';
 
 class DuckMenuBar extends StatelessWidget {
   const DuckMenuBar({super.key});
@@ -98,6 +99,11 @@ class DuckMenuBar extends StatelessWidget {
                     ),
                     _item(context, 'settings', S.menuSettings),
                     _item(context, 'lock', S.menuLockIde),
+                    _item(
+                      context,
+                      'lockOnStartup',
+                      '${S.menuLockOnStartup}${state.lockOnStartup ? '  ✓' : ''}',
+                    ),
                     _menuDivider,
                     _item(
                       context,
@@ -194,6 +200,18 @@ class DuckMenuBar extends StatelessWidget {
                       S.menuGlobalSearch,
                       'Ctrl+Shift+F',
                       enabled: actions.hasOverlays,
+                    ),
+                    _menuDivider,
+                    _item(
+                      context,
+                      'timeline',
+                      S.menuTimeline,
+                      enabled: state.currentDirectory != null,
+                    ),
+                    _item(
+                      context,
+                      'councilSessions',
+                      S.councilSessionsMenuItem,
                     ),
                     _menuDivider,
                     _itemWithShortcut(
@@ -580,6 +598,9 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
         showDialog(context: context, builder: (_) => const PinSetupDialog());
       }
       break;
+    case 'lockOnStartup':
+      await state.setLockOnStartup(!state.lockOnStartup);
+      break;
     case 'closeWorkspace':
       await state.closeWorkspace();
       break;
@@ -618,6 +639,13 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
       break;
     case 'globalSearch':
       actions.openGlobalSearch();
+      break;
+    case 'timeline':
+      if (!context.mounted) return;
+      await showTimelineDialog(context);
+      break;
+    case 'councilSessions':
+      state.openCouncilSessionsTab();
       break;
     case 'focusExplorer':
       actions.focusFileExplorer();

@@ -3,40 +3,31 @@ import 'dart:math' as math;
 
 import 'package:image/image.dart';
 
-/// Regenerate the Windows `.ico` from the dedicated **app-icon** PNG.
+/// Regenerate the Windows `.ico` from `assets/images/lumen_logo.png`.
 ///
-/// **There are two distinct logo PNGs in this project — don't mix them up:**
+/// The logo PNG is the single source-of-truth icon asset. It contains
+/// the dark rounded-square tile with the flame mark — fully opaque,
+/// no transparency issues on Windows.
 ///
-///   - `assets/images/lumen_logo.png` — the original line-art falcon
-///     used by the welcome screen, About dialog, and other places
-///     where it renders ≥48px. Beautiful at large sizes.
-///   - `assets/images/lumen_app_icon.png` — the SOLID-FILL icon
-///     designed specifically for OS use (taskbar, title bar,
-///     Alt-Tab). Has its own rounded-square background and a filled
-///     silhouette of the falcon so the mark survives 16px scaling.
-///
-/// The line-art version cannot be the OS icon because thin strokes
-/// anti-alias to invisibility at 16/20/24 px. See the knowledgebase
-/// `Native Windows title-bar icon` section for the full rationale.
+/// Any residual alpha (e.g. anti-aliased outer edges) is flattened
+/// onto a dark fill (#0B1120) before encoding so that Windows never
+/// composites against white in the title bar / taskbar / Alt-Tab.
 ///
 /// This script:
-///   1. Loads the dedicated icon source.
-///   2. Center-crops it to a square (the generator tolerates any
-///      input aspect ratio so we can swap source images without
-///      pre-cropping).
-///   3. Resizes into the standard ICO frame sizes
-///      (16/20/24/32/48/64/128/256). No per-frame padding tricks —
-///      the source already has the right negative space baked in.
-///   4. Writes a multi-frame ICO to `windows/runner/resources/app_icon.ico`.
+///   1. Loads the logo source.
+///   2. Flattens alpha onto the dark background colour.
+///   3. Center-crops to a square.
+///   4. Resizes into standard ICO frame sizes (16–256).
+///   5. Writes a multi-frame ICO to `windows/runner/resources/app_icon.ico`.
 ///
-/// Re-run after editing `lumen_app_icon.png`:
+/// Re-run after editing `lumen_logo.png`:
 ///   `dart run tools/generate_windows_icon.dart`
 void main() {
-  final sourceFile = File('assets/images/lumen_app_icon.png');
+  final sourceFile = File('assets/images/lumen_logo.png');
   if (!sourceFile.existsSync()) {
     throw StateError(
-      'App-icon source missing: ${sourceFile.path}.\n'
-      'Generate it (see knowledgebase) or restore from git.',
+      'Logo source missing: ${sourceFile.path}.\n'
+      'Restore from git or regenerate the asset.',
     );
   }
   final outFile = File('windows/runner/resources/app_icon.ico');
@@ -45,7 +36,9 @@ void main() {
   if (source == null) {
     throw StateError('Could not decode ${sourceFile.path}');
   }
-  final square = _centerCropSquare(source);
+
+  final flattened = _flattenAlpha(source);
+  final square = _centerCropSquare(flattened);
 
   final frames = <Image>[];
   for (final size in const [16, 20, 24, 32, 48, 64, 128, 256]) {
@@ -54,9 +47,6 @@ void main() {
         square,
         width: size,
         height: size,
-        // `cubic` preserves edge sharpness better than `average` at
-        // small sizes; the slight halo it produces is hidden by the
-        // rounded-square background.
         interpolation: Interpolation.cubic,
       ),
     );
@@ -68,14 +58,42 @@ void main() {
   }
   outFile.writeAsBytesSync(encodeIco(ico));
 
-  // Print a quick summary so the operator can confirm the new ICO
-  // landed without poking at the binary.
   final kb = (outFile.lengthSync() / 1024).toStringAsFixed(1);
   // ignore: avoid_print
   print(
     'Wrote ${outFile.path} (${kb}KB, ${frames.length} frames: '
     '${frames.map((f) => '${f.width}').join('/')}).',
   );
+}
+
+/// Composite every pixel over a solid dark background (#0B1120),
+/// eliminating any alpha channel. This prevents Windows from showing
+/// white where the ICO has transparent/semi-transparent pixels.
+Image _flattenAlpha(Image src) {
+  const bgR = 0x0B;
+  const bgG = 0x11;
+  const bgB = 0x20;
+
+  final out = Image(width: src.width, height: src.height);
+  for (int y = 0; y < src.height; y++) {
+    for (int x = 0; x < src.width; x++) {
+      final pixel = src.getPixel(x, y);
+      final a = pixel.a.toInt();
+      if (a == 255) {
+        out.setPixelRgba(x, y, pixel.r.toInt(), pixel.g.toInt(),
+            pixel.b.toInt(), 255);
+      } else if (a == 0) {
+        out.setPixelRgba(x, y, bgR, bgG, bgB, 255);
+      } else {
+        final af = a / 255.0;
+        final r = (pixel.r.toInt() * af + bgR * (1 - af)).round();
+        final g = (pixel.g.toInt() * af + bgG * (1 - af)).round();
+        final b = (pixel.b.toInt() * af + bgB * (1 - af)).round();
+        out.setPixelRgba(x, y, r, g, b, 255);
+      }
+    }
+  }
+  return out;
 }
 
 /// Center-crop [src] to a square using the smaller of the two

@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'agent_terminal_bridge.dart';
 import 'kb_service.dart';
 import 'line_break_style.dart';
+import 'memory_service.dart';
 import 'ollama_service.dart' show CancellationToken;
 import 'ripgrep_provisioner.dart';
 
@@ -115,6 +116,11 @@ class ToolInvocation {
   /// configuration error rather than crashing.
   final WebFetchFn? webFetch;
 
+  /// Optional cross-session memory service. Used by `SAVE_MEMORY`
+  /// to persist facts the agent learns. When null, the tool returns
+  /// a configuration error.
+  final MemoryService? memoryService;
+
   ToolInvocation({
     required this.match,
     required this.workspaceDir,
@@ -125,6 +131,7 @@ class ToolInvocation {
     this.agentTerminalLauncher,
     this.webSearch,
     this.webFetch,
+    this.memoryService,
   });
 }
 
@@ -2366,6 +2373,44 @@ class ToolRegistry {
           '<<<WEB_FETCH: https://example.com/article>>>',
       pattern: RegExp(r'<<<WEB_FETCH:\s*(.*?)\s*>>>'),
       execute: _executeWebFetch,
+    ),
+    AgentTool(
+      id: 'save_memory',
+      name: 'SAVE_MEMORY',
+      description:
+          'Persist a fact to cross-session memory so future chats start '
+          'warm. Use for user preferences, codebase patterns, past '
+          'decisions, and any knowledge worth remembering. Two scopes: '
+          '"workspace" (project-specific, stored in .lumen/memory.md) '
+          'and "global" (user-wide, stored in app support). Memory is '
+          'injected into every future turn\'s system prompt.',
+      syntaxExample:
+          '<<<SAVE_MEMORY: scope=workspace>>>\n'
+          'User prefers tabs over spaces; project uses 4-space indent.\n'
+          '<<<END_MEMORY>>>',
+      pattern: RegExp(
+        r'<<<SAVE_MEMORY:\s*scope=(workspace|global)(?:\s+replace=(true|false))?\s*>>>\s*\n([\s\S]*?)\n<<<END_MEMORY>>>',
+      ),
+      requiresApproval: true,
+      execute: (inv) async {
+        final scope = inv.match.group(1)!.trim();
+        final replaceRaw = inv.match.group(2)?.trim();
+        final replace = replaceRaw == 'true';
+        final fact = inv.match.group(3)?.trim() ?? '';
+        if (fact.isEmpty) {
+          return 'SAVE_MEMORY: Failed — empty fact body.';
+        }
+        final mem = inv.memoryService;
+        if (mem == null) {
+          return 'SAVE_MEMORY: Error — memory service not available.';
+        }
+        return mem.save(
+          fact: fact,
+          scope: scope == 'global' ? MemoryScope.global : MemoryScope.workspace,
+          workspacePath: inv.workspaceDir,
+          replace: replace,
+        );
+      },
     ),
   ];
 

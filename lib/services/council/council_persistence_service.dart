@@ -39,6 +39,76 @@ class CouncilReportEntry {
   String get fileName => p.basename(markdownPath);
 }
 
+/// Lightweight metadata extracted from a persisted session JSON without
+/// deserializing the full event/transcript payload.
+class CouncilSessionSummary {
+  final String filePath;
+  final String id;
+  final String title;
+  final String brief;
+  final String status;
+  final int roundIndex;
+  final DateTime startedAt;
+  final DateTime? finishedAt;
+  final List<String> agentNames;
+  final int eventCount;
+  final bool hasReport;
+
+  const CouncilSessionSummary({
+    required this.filePath,
+    required this.id,
+    required this.title,
+    required this.brief,
+    required this.status,
+    required this.roundIndex,
+    required this.startedAt,
+    this.finishedAt,
+    required this.agentNames,
+    required this.eventCount,
+    required this.hasReport,
+  });
+
+  Duration? get duration =>
+      finishedAt != null ? finishedAt!.difference(startedAt) : null;
+
+  static CouncilSessionSummary fromJson(
+    Map<String, dynamic> json,
+    String filePath,
+  ) {
+    final config =
+        (json['config'] as Map?)?.cast<String, dynamic>() ?? const {};
+    final agents = (config['agents'] as List?) ?? const [];
+    final agentNames = <String>[
+      if (config['orchestrator'] is Map)
+        (config['orchestrator'] as Map)['name'] as String? ?? 'Orchestrator',
+      for (final a in agents)
+        if (a is Map) a['name'] as String? ?? '',
+      if (config['finalEvaluator'] is Map)
+        (config['finalEvaluator'] as Map)['name'] as String? ?? 'Evaluator',
+    ];
+    final events = (json['events'] as List?) ?? const [];
+    final report = json['reportMarkdown'] as String? ?? '';
+    return CouncilSessionSummary(
+      filePath: filePath,
+      id: config['id'] as String? ?? p.basenameWithoutExtension(filePath),
+      title: (config['title'] as String?)?.trim().isNotEmpty == true
+          ? (config['title'] as String).trim()
+          : (config['brief'] as String? ?? '').trim(),
+      brief: config['brief'] as String? ?? '',
+      status: json['status'] as String? ?? 'idle',
+      roundIndex: (json['roundIndex'] as num?)?.toInt() ?? 0,
+      startedAt: DateTime.tryParse(json['startedAt'] as String? ?? '')
+              ?.toLocal() ??
+          DateTime.now(),
+      finishedAt:
+          DateTime.tryParse(json['finishedAt'] as String? ?? '')?.toLocal(),
+      agentNames: agentNames.where((n) => n.isNotEmpty).toList(),
+      eventCount: events.length,
+      hasReport: report.trim().isNotEmpty,
+    );
+  }
+}
+
 /// Persistence + retrieval for council artifacts.
 ///
 /// Two stores:
@@ -84,6 +154,37 @@ class CouncilPersistenceService {
     if (!await file.exists()) return null;
     final raw = await file.readAsString();
     return CouncilSession.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+  }
+
+  /// Lightweight summary for the sessions browser. Avoids deserializing
+  /// the full event / transcript payload — just enough for the list tile.
+  Future<List<CouncilSessionSummary>> listSessions() async {
+    final root = await _ensureSessionRoot();
+    final entries = <CouncilSessionSummary>[];
+    await for (final entity in root.list()) {
+      if (entity is! File) continue;
+      if (!entity.path.endsWith('.json')) continue;
+      try {
+        final raw = await entity.readAsString();
+        final json = jsonDecode(raw) as Map<String, dynamic>;
+        entries.add(CouncilSessionSummary.fromJson(json, entity.path));
+      } catch (_) {
+        // Single corrupt file must not blank the whole list.
+      }
+    }
+    entries.sort((a, b) => b.startedAt.compareTo(a.startedAt));
+    return entries;
+  }
+
+  /// Delete a persisted session file. Returns `true` on success.
+  Future<bool> deleteSession(String filePath) async {
+    try {
+      final f = File(filePath);
+      if (await f.exists()) await f.delete();
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   // ---------- Report library (browseable artifacts) ----------
