@@ -263,22 +263,42 @@ class S {
       'tool syntax better than thinking-only Ollama models.';
 
   // Iteration-cap footer surfaced when the agent loop exhausted its
-  // [ChatController.maxIters] budget without the model finishing on
-  // its own. Distinct from the empty-response strip (no chunks ever
-  // arrived) and the hallucination warning (claims without tools) —
-  // here the model DID produce output and DID call tools, it just
-  // didn't converge on "done" within the iteration budget. Common on
-  // weaker / smaller models that get stuck re-reading the same file
-  // or repeatedly trying a near-miss EDIT_FILE that keeps failing.
+  // [ChatController.maxIters] hard ceiling without the model finishing
+  // on its own. With stall-detection in place this is the rare case:
+  // the model has been firing genuinely new tool calls every iteration
+  // and just won't stop on its own (massive multi-component refactor,
+  // pathological "touch every file in the repo" prompt). Distinct
+  // from [chatStalledNoNewProgress] which surfaces when the model is
+  // looping on the same call.
   static String chatIterationCapHit(int cap) =>
-      '\n\n_(stopped — agent loop hit its $cap-iteration budget '
-      'without converging. The model produced output but didn\'t '
-      'finish the task on its own. Try a more specific follow-up '
-      '("just fix the import", "stop and summarise what you tried"), '
-      'or rewind via the message menu and re-prompt with a tighter '
-      'scope. Persistent loops here usually mean the model is fighting '
-      'a tool failure it can\'t recover from — switching to a stronger '
-      'model often resolves it.)_';
+      '\n\n_(stopped — agent loop hit its $cap-iteration hard ceiling '
+      'without converging. The model produced output and kept firing '
+      'new tool calls but didn\'t finish on its own. Try a more '
+      'specific follow-up ("just fix the import", "stop and summarise '
+      'what you tried"), or rewind via the message menu and re-prompt '
+      'with a tighter scope. Persistent runs that hit this ceiling '
+      'usually mean the prompt asked for too much in one turn — split '
+      'it up.)_';
+
+  // Stall-detector footer surfaced when the agent loop exited because
+  // [ChatController.maxUnproductiveStreak] consecutive iterations
+  // produced no new tool signature (model stuck repeating the same
+  // call, or producing prose-only iterations with no tool action).
+  // Distinct from [chatIterationCapHit] which is the absolute hard
+  // ceiling — this is the soft cap that protects users from "model
+  // fights a tool failure for 5 turns in a row" without clipping
+  // legitimate long linear-progress runs. Most common with smaller /
+  // quantised models that get stuck re-reading the same file or
+  // repeatedly trying a near-miss EDIT_FILE that keeps failing.
+  static String chatStalledNoNewProgress(int streak) =>
+      '\n\n_(stopped — agent loop stalled: $streak consecutive '
+      'iterations produced no new progress (same tool with same args, '
+      'or prose-only iterations with no tool call). The model produced '
+      'output but is stuck repeating itself, which usually means it\'s '
+      'fighting a tool failure it can\'t recover from. Try a more '
+      'specific follow-up ("just fix the import", "stop and summarise '
+      'what you tried"), rewind via the message menu and re-prompt '
+      'with a tighter scope, or switch to a stronger model.)_';
 
   // Empty-response strip — surfaces after a turn ends with no visible
   // content, no tool calls, no error. Common Ollama failure mode where

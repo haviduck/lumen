@@ -14,6 +14,7 @@ import '../../providers/media_controller.dart';
 import '../../providers/ssh_controller.dart';
 import '../../services/file_kind.dart';
 import '../../services/language_detector.dart';
+import '../../services/line_break_style.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/fast_popup_menu.dart';
@@ -677,6 +678,17 @@ class _EditorPaneState extends State<_EditorPane> {
   late final CodeScrollController _scrollController;
   String? _path;
   String? _languageId;
+  // The line-break style the active controller was constructed with.
+  // Tracked so [_ensureController] knows when to recreate: a CRLF
+  // file flipped to LF (e.g. after an agent tool wrote a normalized
+  // result back) needs a fresh controller because `CodeLineOptions`
+  // is `final` in `re_editor`. Without this matching, the controller
+  // returns text via `lineBreak.value` joins (default LF) which can
+  // never equal a CRLF source — and the listener at
+  // [_pushControllerTextToState] would then mark the buffer dirty
+  // every time the editor re-mounts. See `services/line_break_style.dart`
+  // for the detection logic.
+  LineBreakStyle? _lineBreak;
   bool _pushingText = false;
 
   @override
@@ -746,15 +758,30 @@ class _EditorPaneState extends State<_EditorPane> {
     final override = widget.appState.languageOverrideFor(widget.path);
     final detected = LanguageDetector.detect(widget.path, content);
     final langId = override ?? detected.id;
+    // Detect from the actual file content (not the path / language)
+    // so the controller's `text` getter joins lines with the SAME
+    // separator the file uses. Without this, `re_editor`'s default
+    // (`TextLineBreak.lf`) makes every CRLF file appear "dirty" the
+    // moment any controller mutation fires the listener — see the
+    // doc on [_lineBreak] above.
+    final detectedLineBreak = detectLineBreakStyle(content);
 
-    if (_path != widget.path || _languageId != langId || _controller == null) {
+    final mustRecreate =
+        _path != widget.path ||
+        _languageId != langId ||
+        _lineBreak != detectedLineBreak ||
+        _controller == null;
+    if (mustRecreate) {
       final old = _controller;
       if (old != null) {
         widget.appState.ideActions.unregisterEditor(old);
         old.removeListener(_pushControllerTextToState);
         old.dispose();
       }
-      _controller = CodeLineEditingController.fromText(content);
+      _controller = CodeLineEditingController.fromText(
+        content,
+        CodeLineOptions(lineBreak: _toReEditorLineBreak(detectedLineBreak)),
+      );
       _controller!.addListener(_pushControllerTextToState);
 
       // Re-create find controller with the new editing controller.
@@ -768,8 +795,23 @@ class _EditorPaneState extends State<_EditorPane> {
       }
       _path = widget.path;
       _languageId = langId;
+      _lineBreak = detectedLineBreak;
     } else if (!_pushingText && _controller!.text != content) {
       _controller!.text = content;
+    }
+  }
+
+  /// Bridge to `re_editor`'s `TextLineBreak`. Lives here (and not
+  /// inside [LineBreakStyle]) so the lower-level utility doesn't
+  /// have to import the Flutter editor package.
+  static TextLineBreak _toReEditorLineBreak(LineBreakStyle s) {
+    switch (s) {
+      case LineBreakStyle.crlf:
+        return TextLineBreak.crlf;
+      case LineBreakStyle.cr:
+        return TextLineBreak.cr;
+      case LineBreakStyle.lf:
+        return TextLineBreak.lf;
     }
   }
 

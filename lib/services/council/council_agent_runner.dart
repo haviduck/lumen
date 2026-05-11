@@ -1,6 +1,7 @@
 import '../anthropic_service.dart';
 import '../copilot_service.dart';
-import '../ollama_service.dart' show CancellationToken;
+import '../gemini_service.dart';
+import '../ollama_service.dart' show CancellationToken, OllamaService;
 import '../tool_executor.dart';
 import '../tools/native_tool_format.dart';
 import 'council_models.dart';
@@ -46,6 +47,8 @@ class CouncilAgentRunner {
     required this.agent,
     required this.anthropic,
     required this.copilot,
+    required this.gemini,
+    required this.ollama,
     required this.toolExecutor,
     required this.systemPrompt,
     required this.userPrompt,
@@ -58,6 +61,8 @@ class CouncilAgentRunner {
   final CouncilAgent agent;
   final AnthropicService anthropic;
   final CopilotService copilot;
+  final GeminiService gemini;
+  final OllamaService ollama;
   final ToolExecutor toolExecutor;
   final String systemPrompt;
   final String userPrompt;
@@ -256,30 +261,53 @@ class CouncilAgentRunner {
 
   Stream<String> _stream(List<Map<String, dynamic>> messages) {
     final split = _splitModel(agent.model);
-    if (split.provider == 'claude') {
-      return anthropic.generateChatStream(
-        messages,
-        model: split.rawModel,
-        token: token,
-        nativeToolIds: nativeToolIds,
-      );
+    switch (split.provider) {
+      case 'claude':
+        return anthropic.generateChatStream(
+          messages,
+          model: split.rawModel,
+          token: token,
+          nativeToolIds: nativeToolIds,
+        );
+      case 'copilot':
+        return copilot.generateChatStream(
+          messages,
+          model: split.rawModel,
+          token: token,
+          nativeToolIds: nativeToolIds,
+        );
+      case 'gemini':
+        return gemini.generateChatStream(
+          messages,
+          model: split.rawModel,
+          token: token,
+          nativeToolIds: nativeToolIds,
+        );
+      case 'ollama-cloud':
+        return ollama.generateChatStream(
+          messages,
+          model: split.rawModel,
+          token: token,
+          forceCloud: true,
+          nativeToolIds: nativeToolIds,
+        );
+      case 'ollama':
+        return ollama.generateChatStream(
+          messages,
+          model: split.rawModel,
+          token: token,
+          nativeToolIds: nativeToolIds,
+        );
+      case 'github':
+        return Stream<String>.value(
+          'GitHub Models was removed; please pick another model.',
+        );
+      default:
+        return Stream<String>.value(
+          'Council does not support model "${agent.model}". '
+          'Pick a claude / copilot / gemini / ollama / ollama-cloud model.',
+        );
     }
-    if (split.provider == 'copilot') {
-      return copilot.generateChatStream(
-        messages,
-        model: split.rawModel,
-        token: token,
-        nativeToolIds: nativeToolIds,
-      );
-    }
-    if (split.provider == 'github') {
-      return Stream<String>.value(
-        'GitHub Models was removed; please pick another model.',
-      );
-    }
-    return Stream<String>.value(
-      'Council requires a claude:* or copilot:* model.',
-    );
   }
 
   ({String provider, String rawModel}) _splitModel(String model) {

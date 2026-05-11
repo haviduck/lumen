@@ -198,8 +198,7 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
   @override
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
-    final models = appState.chat.availableModels.where(_isCouncilModel).toList()
-      ..sort();
+    final models = appState.chat.availableModels.toList()..sort();
     for (final agent in [..._agents, _orchestrator]) {
       agent.model ??= models.isEmpty ? null : models.first;
     }
@@ -389,12 +388,6 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
     } finally {
       if (mounted) setState(() => _lazyGenerating = false);
     }
-  }
-
-  bool _isCouncilModel(String model) {
-    if (model.startsWith('claude:')) return true;
-    if (!model.startsWith('copilot:')) return false;
-    return model.substring('copilot:'.length).toLowerCase().contains('claude');
   }
 
   Future<void> _ingestDroppedFile(String path) async {

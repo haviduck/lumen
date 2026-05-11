@@ -382,20 +382,49 @@ class ChatRevertOutcome {
 /// Owns chat sessions, message generation, tool execution, multimodal
 /// payloads, persistence, cancellation and approval prompts.
 class ChatController extends ChangeNotifier {
-  /// Hard cap on tool-use iterations per user request. Hoisted to a
-  /// class-level constant so the generation loop can enforce it from
-  /// a single source of truth. (We intentionally do NOT advertise this
-  /// number to the model anymore — telling the agent "you have 25
-  /// iterations" makes weaker models pad the work to fit the budget.
-  /// Better to let them stop when the task is done.)
+  /// Absolute ceiling on tool-use iterations per user request. Hoisted
+  /// to a class-level constant so the generation loop can enforce it
+  /// from a single source of truth. (We intentionally do NOT advertise
+  /// this number to the model — telling the agent "you have N
+  /// iterations" makes weaker models pad work to fit the budget rather
+  /// than stop when the task is done.)
   ///
-  /// Was 5. Raised to 25 because text-protocol single-tool-per-response
-  /// (every provider in this codebase) means a real "redesign this
-  /// component" task wants ~10–15 tool calls (recon → reads → edits →
-  /// VERIFY → fix → re-VERIFY). The cancel button + runaway-loop guard
-  /// + per-tool approval are the actual safety net; the iteration cap
-  /// is just a backstop for genuinely runaway models.
-  static const int maxIters = 25;
+  /// History:
+  ///   - was 5
+  ///   - raised to 25 once text-protocol single-tool-per-response made
+  ///     "redesign this component" tasks want ~10–15 tool calls
+  ///   - raised to 100 alongside [maxUnproductiveStreak] — the real
+  ///     gate is now stall-detection, not raw iteration count.
+  ///     Container debugging / multi-file refactors with single-tool
+  ///     dispatch routinely fire 30+ tools of pure linear progress
+  ///     (recon → reads → edits → build → ps → curl → logs → trace
+  ///     config → re-edit → rebuild → retest), and the old hard 25
+  ///     was clipping productive runs mid-fix.
+  ///
+  /// Safety net is layered: cancel button, per-tool approval,
+  /// in-iteration runaway guard (>80 markers / >12 RUN_CMDs aborts the
+  /// stream pre-execution), hallucination halt, and the
+  /// [maxUnproductiveStreak] stall-detector below. This constant is
+  /// the last-resort backstop — if it ever fires the model is doing
+  /// something genuinely pathological even by stall-detector standards.
+  static const int maxIters = 100;
+
+  /// Soft cap on the agent loop: when this many *consecutive*
+  /// iterations produce no genuinely new tool signature (id + first
+  /// arg) the loop exits with a clear "stalled" footer.
+  ///
+  /// Linear forward progress is unbounded — read A → edit A → read B
+  /// → run X → curl Y → … each fires a new (id, firstArg) and resets
+  /// the streak. Only actual stalls burn the budget: model repeatedly
+  /// calling the same tool with the same args, or producing prose-only
+  /// iterations with no tool call at all (auto-continue covers a few
+  /// of those, then this gate catches the rest).
+  ///
+  /// 5 is enough room for "model thinks → tries near-miss → gets
+  /// nudged → retries → succeeds" recovery patterns, but tight enough
+  /// that a genuinely stuck model surfaces within ~20–30 seconds
+  /// instead of grinding through the full hard cap.
+  static const int maxUnproductiveStreak = 5;
 
   /// How many recent messages to always send verbatim in the API
   /// payload. Beyond this, the middle of the conversation is replaced
@@ -3455,8 +3484,43 @@ class ChatController extends ChangeNotifier {
             }
           : null;
 
-      while (keepLooping && i < maxIters && !cancelToken.isCancelled) {
+      // ── Productivity / stall tracking ─────────────────────────
+      // Replaces the old "hard 25-iteration budget" with a streak
+      // detector. Each iteration we snapshot which (id, firstArg)
+      // tool signatures fired, compare against the previous
+      // iteration, and treat the iteration as **productive** when
+      // it introduced at least one signature the previous iteration
+      // didn't have. Productive iterations reset the streak.
+      // Unproductive iterations (no tool fired, OR every fired
+      // signature is a repeat of the previous iteration) tick the
+      // streak forward; once it hits [maxUnproductiveStreak] the
+      // outer while-loop exits via the streak gate instead of the
+      // raw iteration count.
+      //
+      // Why (id, firstArg) and not full args: `FiredTool.firstArg`
+      // captures the path / target identity for every file/run
+      // tool in the registry, which is the dimension that
+      // distinguishes "read foo" from "read bar" without us having
+      // to thread the entire arg map through. Edits to the same
+      // file count as repeats only when no other distinct fire
+      // happened in the same iteration — single-tool-per-response
+      // mode (cutOnFirstTool) means each iteration almost always
+      // has exactly one fire anyway.
+      Set<String> prevIterSignatures = const <String>{};
+      int unproductiveStreak = 0;
+
+      while (keepLooping &&
+          i < maxIters &&
+          unproductiveStreak < maxUnproductiveStreak &&
+          !cancelToken.isCancelled) {
         i++;
+        // Snapshot the cross-turn fired-tool count BEFORE this
+        // iteration's executor runs so the productivity check at
+        // the bottom of the loop body knows which entries in
+        // `firedAcrossTurn` belong to this iteration. Captures
+        // both the text-grammar pass and any synth auto-VERIFY
+        // fire that happens inside the iteration body.
+        final firedAtIterStart = firedAcrossTurn.length;
         firstToolEnd = null;
         hallucinationCutAt = null;
         hallucinationDetected = false;
@@ -4093,6 +4157,30 @@ class ChatController extends ChangeNotifier {
             keepLooping = false;
           }
         }
+
+        // ── Productivity / stall accounting (end of iteration) ──
+        // Build this iteration's tool signatures from the slice of
+        // `firedAcrossTurn` appended during this pass. Compare
+        // against the previous iteration: if at least one signature
+        // is genuinely new (different tool, or same tool with a
+        // different first-arg / target), the iteration counts as
+        // productive forward progress and the unproductive streak
+        // resets. Otherwise — repeated identical fire, or no fire
+        // at all — the streak ticks up and the outer while gate
+        // will exit the loop once it crosses [maxUnproductiveStreak].
+        final thisIterSignatures = <String>{
+          for (var k = firedAtIterStart; k < firedAcrossTurn.length; k++)
+            '${firedAcrossTurn[k].id}:${firedAcrossTurn[k].firstArg}',
+        };
+        final productive = thisIterSignatures.any(
+          (s) => !prevIterSignatures.contains(s),
+        );
+        if (productive) {
+          unproductiveStreak = 0;
+        } else {
+          unproductiveStreak += 1;
+        }
+        prevIterSignatures = thisIterSignatures;
       }
 
       // The live message IS the final message — no separate add at
@@ -4103,30 +4191,49 @@ class ChatController extends ChangeNotifier {
       throttleTimer?.cancel();
       throttleTimer = null;
 
-      // ── Iteration-cap footer ──────────────────────────────────
-      // The loop's `while` condition is
-      // `keepLooping && i < maxIters && !cancelToken.isCancelled`.
-      // When the loop exits because `i >= maxIters` (instead of a
-      // clean `keepLooping = false` on done or user cancellation)
-      // `keepLooping` is still true. Without a visible footer the
-      // user sees the chat just stop streaming mid-agentic-loop
-      // with NO indication that we hit the cap — historically the
-      // #1 "chat just dies" report. The footer pairs with the
-      // `[turn-timing]` debugPrint below for terminal-grep
-      // diagnosis. Runaway-guard / hallucination-halt paths can't
-      // reach this gate: runaway-guard `break`s on iter < maxIters
-      // and hallucination-halt sets `keepLooping = false`, so
-      // gating on `keepLooping && i >= maxIters` is sufficient
-      // and there's no need to negate them explicitly.
-      if (!cancelToken.isCancelled && keepLooping && i >= maxIters) {
-        aggregated += S.chatIterationCapHit(maxIters);
-        updateLive(aggregated, forceNotify: true);
-        debugPrint(
-          '[iteration-cap] sessionId=$sessionId '
-          'iters=$i model=$modelForTurn '
-          'autoContinues=$autoContinueCount '
-          'firedTools=${firedAcrossTurn.length}',
-        );
+      // ── Loop-exit footer ──────────────────────────────────────
+      // Two distinct "the loop exited but the model didn't say
+      // it was done" exit reasons, each with its own footer +
+      // debugPrint tag for terminal-grep diagnosis:
+      //
+      //   1. **stalled** — [unproductiveStreak] hit its cap.
+      //      Model is repeating the same call or producing
+      //      prose-only iterations. By far the most common
+      //      "chat just stopped" cause once the hard cap was
+      //      raised; the streak is what now closes the loop in
+      //      practice. Footer prose nudges the user toward a
+      //      tighter follow-up or a stronger model.
+      //
+      //   2. **hard-cap** — [i] hit [maxIters]. The model has
+      //      been making genuinely new tool fires every iteration
+      //      and just won't stop. Rare but possible on enormous
+      //      multi-component refactors; the footer text matches
+      //      the historical "iteration budget exhausted" message.
+      //
+      // Runaway-guard / hallucination-halt paths can't reach this
+      // gate: runaway-guard `break`s mid-iteration, and
+      // hallucination-halt sets `keepLooping = false`, so gating
+      // on `keepLooping && !cancelled` is sufficient.
+      if (!cancelToken.isCancelled && keepLooping) {
+        if (unproductiveStreak >= maxUnproductiveStreak) {
+          aggregated += S.chatStalledNoNewProgress(unproductiveStreak);
+          updateLive(aggregated, forceNotify: true);
+          debugPrint(
+            '[iteration-cap:stall] sessionId=$sessionId '
+            'iters=$i streak=$unproductiveStreak model=$modelForTurn '
+            'autoContinues=$autoContinueCount '
+            'firedTools=${firedAcrossTurn.length}',
+          );
+        } else if (i >= maxIters) {
+          aggregated += S.chatIterationCapHit(maxIters);
+          updateLive(aggregated, forceNotify: true);
+          debugPrint(
+            '[iteration-cap:hard] sessionId=$sessionId '
+            'iters=$i model=$modelForTurn '
+            'autoContinues=$autoContinueCount '
+            'firedTools=${firedAcrossTurn.length}',
+          );
+        }
       }
 
       // ── Hallucination halt warning ────────────────────────────

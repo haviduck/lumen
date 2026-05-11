@@ -468,6 +468,8 @@ class AppState extends ChangeNotifier {
     council = CouncilController(
       anthropic: _anthropicService,
       copilot: _copilotService,
+      gemini: _geminiService,
+      ollama: _ollamaService,
       persistence: _councilPersistence,
       isToolAutoApproved: (toolId, detail) {
         return chat.autoApprove || chat.autoApprovedTools.contains(toolId);

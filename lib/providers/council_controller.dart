@@ -12,12 +12,16 @@ import '../services/council/council_persistence_service.dart';
 import '../services/council/council_protocol.dart';
 import '../services/council/council_task_ledger.dart';
 import '../services/council/council_tool_lock.dart';
+import '../services/gemini_service.dart';
+import '../services/ollama_service.dart';
 import '../services/tool_executor.dart';
 
 class CouncilController extends ChangeNotifier {
   CouncilController({
     required this.anthropic,
     required this.copilot,
+    required this.gemini,
+    required this.ollama,
     required this.persistence,
     required this.isToolAutoApproved,
     this.onReportPersisted,
@@ -25,6 +29,8 @@ class CouncilController extends ChangeNotifier {
 
   final AnthropicService anthropic;
   final CopilotService copilot;
+  final GeminiService gemini;
+  final OllamaService ollama;
   final CouncilPersistenceService persistence;
   final bool Function(String toolId, String detail) isToolAutoApproved;
 
@@ -193,9 +199,27 @@ $brief
           'GitHub Models was removed; please pick another model.',
         );
       }
-      final raw = split.provider == 'claude'
-          ? await anthropic.generateChat(messages, model: split.rawModel)
-          : await copilot.generateChat(messages, model: split.rawModel);
+      final String raw;
+      switch (split.provider) {
+        case 'claude':
+          raw = await anthropic.generateChat(messages, model: split.rawModel);
+        case 'copilot':
+          raw = await copilot.generateChat(messages, model: split.rawModel);
+        case 'gemini':
+          raw = await gemini.generateChat(messages, model: split.rawModel);
+        case 'ollama-cloud':
+          raw = await ollama.generateChat(
+            messages,
+            model: split.rawModel,
+            forceCloud: true,
+          );
+        case 'ollama':
+          raw = await ollama.generateChat(messages, model: split.rawModel);
+        default:
+          throw StateError(
+            'Council propose-agents: unsupported provider "${split.provider}".',
+          );
+      }
       final parsed = _parseProposedAgents(raw, orchestrator.model);
       return parsed.length >= 2 ? parsed : fallback;
     } catch (_) {
@@ -372,6 +396,8 @@ $brief
       agent: session.config.orchestrator,
       anthropic: anthropic,
       copilot: copilot,
+      gemini: gemini,
+      ollama: ollama,
       toolExecutor: _toolExecutor(session.config.orchestrator, workspace),
       systemPrompt: CouncilProtocol.orchestratorSystemPrompt(session.config),
       userPrompt: userPrompt,
@@ -1141,6 +1167,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       agent: agent,
       anthropic: anthropic,
       copilot: copilot,
+      gemini: gemini,
+      ollama: ollama,
       toolExecutor: _toolExecutor(agent, workspace),
       systemPrompt: CouncilProtocol.agentSystemPrompt(
         config: session.config,
@@ -1616,6 +1644,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         agent: agent,
         anthropic: anthropic,
         copilot: copilot,
+        gemini: gemini,
+        ollama: ollama,
         toolExecutor: _toolExecutor(agent, workspace),
         systemPrompt: CouncilProtocol.poolReplyPrompt(
           config: session.config,
@@ -2193,6 +2223,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         agent: evaluator,
         anthropic: anthropic,
         copilot: copilot,
+        gemini: gemini,
+        ollama: ollama,
         toolExecutor: _toolExecutor(evaluator, workspace),
         systemPrompt: CouncilProtocol.finalEvaluatorSystemPrompt(
           config: session.config,

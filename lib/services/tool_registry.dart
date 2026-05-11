@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 
 import 'agent_terminal_bridge.dart';
 import 'kb_service.dart';
+import 'line_break_style.dart';
 import 'ollama_service.dart' show CancellationToken;
 import 'ripgrep_provisioner.dart';
 
@@ -650,6 +651,16 @@ class ToolRegistry {
             return 'EDIT_FILE $fileName: Error: file does not exist.';
           }
           var content = await f.readAsString();
+          // Capture the source file's line-ending style BEFORE any
+          // CRLF→LF normalisation below — we restore it at write
+          // time so a mid-edit normalisation never silently flips
+          // a CRLF file to LF on disk. Without this restore step
+          // every `EDIT_FILE` on a Windows-line-ended file would
+          // launder the whole file's line endings, which (a) shows
+          // up as massive churn in `git diff` and (b) trips the
+          // editor pane's dirty-state heuristic on every other open
+          // tab in the repo.
+          final originalLineBreak = detectLineBreakStyle(content);
           // Direct match first; fall back to CRLF-normalised content
           // since some editors / OSes write `\r\n` line endings the
           // model didn't include in its SEARCH block.
@@ -741,7 +752,13 @@ class ToolRegistry {
                 'region that actually differs from your REPLACE, '
                 'and try again.';
           }
-          await f.writeAsString(result);
+          // Re-encode to the file's original line-ending style.
+          // Two-pass coercion (normalize-to-LF then expand-to-target)
+          // is safe even when the model's REPLACE block carried a
+          // different style than the file body — the helper handles
+          // any mix without producing `\r\r\n` doubles.
+          final toWrite = coerceLineBreakStyle(result, originalLineBreak);
+          await f.writeAsString(toWrite);
           await KbService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
@@ -819,6 +836,13 @@ class ToolRegistry {
           // wants to land) and surface the spread (`first..last`) in
           // the success message so the model sees the full set.
           final originalContent = await f.readAsString();
+          // Snapshot the source file's line-ending style BEFORE any
+          // per-edit CRLF→LF fallback below could homogenise it. The
+          // final write coerces back to this style, so a MULTI_EDIT
+          // on a Windows-line-ended file never silently flips its
+          // line endings to LF (same fix EDIT_RANGE applies via
+          // `usesCrlf`, generalised to all three styles).
+          final originalLineBreak = detectLineBreakStyle(originalContent);
           var content = originalContent;
           final editStartLines = <int>[];
           for (var i = 0; i < edits.length; i++) {
@@ -864,7 +888,11 @@ class ToolRegistry {
                 'Re-read the file and pick edits that actually '
                 'change content.';
           }
-          await f.writeAsString(content);
+          // Restore the source file's original line endings so the
+          // write doesn't launder them. See [originalLineBreak]
+          // above for the rationale.
+          final toWrite = coerceLineBreakStyle(content, originalLineBreak);
+          await f.writeAsString(toWrite);
           await KbService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
@@ -1106,8 +1134,14 @@ class ToolRegistry {
           // already requires hitting disk for the end-of-file
           // sentinel byte, so the extra read is in the noise.
           int existingLines = 0;
+          // Default to LF for new / non-existent files. When the
+          // file already exists, detect its style so we don't
+          // produce a mixed-line-ending file by appending LF
+          // content onto a CRLF body. See [coerceLineBreakStyle].
+          var existingLineBreak = LineBreakStyle.lf;
           if (await f.exists()) {
             final existing = await f.readAsString();
+            existingLineBreak = detectLineBreakStyle(existing);
             existingLines = '\n'.allMatches(existing).length;
             // If the file doesn't end in a newline, the last line
             // isn't terminated, and our append-with-prepended-\n
@@ -1130,6 +1164,12 @@ class ToolRegistry {
               await raf.close();
             }
           }
+          // Coerce the appended bytes to the existing file's line-
+          // ending style. The leading `\n` we prepend above will be
+          // expanded to the matching style by the same coercion, so
+          // the join boundary stays clean. New files keep the
+          // model-supplied content as-is (LF default).
+          toWrite = coerceLineBreakStyle(toWrite, existingLineBreak);
           await f.writeAsString(toWrite, mode: FileMode.append);
           await KbService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
