@@ -40,6 +40,7 @@
 /// layer catches that case independently.
 library;
 
+import '../../services/deepseek_v4_handler.dart';
 import '../../services/reasoning_effort.dart';
 import '../../services/tool_registry.dart';
 
@@ -96,6 +97,15 @@ class SystemPromptInputs {
   /// model has a stable self-identifier across providers.
   final String providerLabel;
 
+  /// Provider-stripped raw model id (e.g. `claude-sonnet-4-6`,
+  /// `deepseek-v4-pro`, `gpt-5`). Used by model-family-specific
+  /// guardrails — currently only DeepSeek V4 — so the builder can
+  /// inject targeted directives without ballooning the prompt for
+  /// well-behaved models. Empty string when the caller doesn't have
+  /// a routed model (e.g. provider list is still loading on the
+  /// first frame).
+  final String rawModel;
+
   /// Pre-loaded cross-session memory (merged workspace + global).
   /// Empty string when no memory exists. Injected early in the
   /// prompt so the model starts every turn with accumulated context.
@@ -114,6 +124,7 @@ class SystemPromptInputs {
     required this.effortIsNative,
     required this.useNativeTools,
     required this.providerLabel,
+    this.rawModel = '',
     this.memory = '',
   });
 }
@@ -134,10 +145,24 @@ class SystemPromptBuilder {
       _effort(i),
       _tools(i),
       _howToWork(),
+      _modelGuardrail(i),
       _projectRules(i),
       _skills(i),
     ];
     return sections.where((s) => s.isNotEmpty).join('\n\n');
+  }
+
+  /// Per-model behavioural guardrails. Empty for well-behaved models;
+  /// injects an explicit abstention-permission + phantom-import ban
+  /// when the active model is DeepSeek V4. Lives BELOW `_howToWork`
+  /// because the general discipline rules should anchor first; the
+  /// guardrail is an OVERRIDE for a known failure mode, not a
+  /// replacement for the base policy.
+  static String _modelGuardrail(SystemPromptInputs i) {
+    if (DeepseekV4Handler.isDeepseekV4(i.rawModel)) {
+      return DeepseekV4Handler.antiHallucinationDirective().trim();
+    }
+    return '';
   }
 
   static String _identity() => '''You are Lumen, the AI coding assistant built into the Lumen IDE.

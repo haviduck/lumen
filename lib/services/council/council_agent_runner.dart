@@ -50,6 +50,21 @@ typedef CouncilToolCallback =
 /// a continuation prompt; return false to leave it alone.
 typedef StallCallback = bool Function(String agentId, int silentSeconds);
 
+/// Callback fired just before a tool call executes. Allows the controller
+/// to surface a structured "currently doing X" signal in the UI (file
+/// being read, file being edited, command being run, etc.) without
+/// piping raw model output into a speech bubble.
+///
+/// [agentId] is the runner's agent. [toolId] is the canonical tool name
+/// (e.g. `read_file`, `edit_file`, `run_cmd`). [arguments] is the raw
+/// arguments map from the native tool format — the controller decides
+/// which argument is the user-facing "primary" (path / pattern / cmd).
+typedef ToolFireCallback = void Function(
+  String agentId,
+  String toolId,
+  Map<String, dynamic> arguments,
+);
+
 class CouncilAgentRunner {
   CouncilAgentRunner({
     required this.agent,
@@ -66,6 +81,7 @@ class CouncilAgentRunner {
     this.userImages = const <String>[],
     this.onStall,
     this.stallTimeoutSeconds = 90,
+    this.onToolFire,
   });
 
   final CouncilAgent agent;
@@ -97,9 +113,16 @@ class CouncilAgentRunner {
   /// genuinely stuck Ollama / weaker models.
   final int stallTimeoutSeconds;
 
+  /// Fired the moment a native tool call is identified, BEFORE the tool
+  /// runs. Lets the controller emit `agentToolFire` so the activity
+  /// bubble can flash "Reading X" / "Editing Y" while the work happens
+  /// instead of waiting for the model to narrate.
+  final ToolFireCallback? onToolFire;
+
   Timer? _stallTimer;
   DateTime _lastChunkAt = DateTime.now();
   int _nudgeCount = 0;
+  bool _awaitingToolResult = false;
   static const int _maxAutoNudges = 3;
 
   /// Mid-session messages from the human to splice into the agent's
@@ -213,7 +236,10 @@ class CouncilAgentRunner {
 
       final visibleText = visible.toString();
       if (pendingTool == null) {
+        _awaitingToolResult = true;
         final pass = await toolExecutor.run(visibleText);
+        _awaitingToolResult = false;
+        _resetStallTimer();
         if (pass.hasToolCalls) {
           messages.add({'role': 'assistant', 'content': visibleText});
           messages.add({
@@ -232,9 +258,20 @@ class CouncilAgentRunner {
         name: tool.name,
         arguments: tool.arguments,
       );
+      // Surface the tool fire BEFORE running it so the activity bubble
+      // shows "Reading X" / "Editing Y" while the work is in flight,
+      // not after. Skip council protocol tools — those have their own
+      // dedicated event surfaces (dispatched / askedPool / askedUser /
+      // reported) that the UI already handles.
+      if (!CouncilProtocol.allCouncilToolIds.contains(tool.name)) {
+        onToolFire?.call(agent.id, tool.name, tool.arguments);
+      }
+      _awaitingToolResult = true;
       final toolResult = CouncilProtocol.allCouncilToolIds.contains(tool.name)
           ? await onCouncilTool(call)
           : await _runLumenTool(call);
+      _awaitingToolResult = false;
+      _resetStallTimer();
 
       messages.add({
         'role': 'assistant',
@@ -288,6 +325,10 @@ class CouncilAgentRunner {
       _cancelStallTimer();
       return;
     }
+    // Don't fire during tool execution — the model can't produce output
+    // while waiting for a tool result (especially council_wait which
+    // blocks for minutes). This is the expected state, not a stall.
+    if (_awaitingToolResult) return;
     final silentSecs = DateTime.now().difference(_lastChunkAt).inSeconds;
     if (silentSecs < stallTimeoutSeconds) return;
     if (_nudgeCount >= _maxAutoNudges) {

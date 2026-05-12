@@ -1,48 +1,69 @@
-import 'dart:async';
+/// Council Activity Bubbles Layer
+/// ===============================
+///
+/// Per-agent persistent activity card layered over the council stage.
+/// REPLACES the previous chunk-streamed snippet bubble system. The
+/// previous design treated speech bubbles like a chat transcript,
+/// truncated raw chunks to 200 chars, and produced unreadable
+/// snippets that fought with the agent card's own transcript well.
+///
+/// New model (2026-05 redesign):
+///   * Every active agent gets ONE persistent activity card anchored
+///     to its outward-facing card edge.
+///   * The card narrates the agent's life in first-person, driven by
+///     `agent.status`, the latest task ledger entry, and a transient
+///     event-flash overlay that surfaces newsworthy transitions
+///     (asking pool, pool replied, asked user, dispatched, done,
+///     error, stalled, pinged).
+///   * Streaming chunks ARE NOT shown verbatim. Instead, a typing
+///     indicator (3 fading dots + STREAMING badge) lights up when
+///     `agent_chunk` events arrive — the full streamed text lives in
+///     the agent inspector (click the agent card).
+///   * Errors are loud (red border, attention shake on first paint,
+///     extended flash linger).
+///   * Done bubbles linger ~9s and fade out so the user has a beat
+///     to register completion before the card disappears.
+///
+/// Public surface preserved:
+///   * [CouncilStageAnchors] — stage layout contract for other layers.
+///   * [BubbleKind] — legacy enum kept so callers (manual spawn paths,
+///     debug tooling) keep compiling. Mapped to [FlashKind] internally.
+///   * [BubbleController.spawn] — manual spawn API; routed into the
+///     activity layer as a custom flash for the target agent.
+///
+/// Z-order contract is unchanged:
+///   1. Backdrop  2. Traffic mesh  3. Activity bubbles  4. Agent cards
+///   5. Modal overlays.
+library;
+
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
+import '../../l10n/strings.dart';
 import '../../services/council/council_models.dart';
+import '../../services/council/council_task_ledger.dart';
 import '../../theme/app_colors.dart';
+import 'speech/activity_bubble_card.dart';
+import 'speech/activity_models.dart';
+
+// ════════════════════════════════════════════════════════════════
+// Stage anchors — unchanged from prior rev. Other layers (Drift's
+// successor, Mesh, Pentest attack lines) read this contract.
+// ════════════════════════════════════════════════════════════════
 
 /// Anchor positions + layout contract for the council canvas.
-///
-/// PUBLISHED CONTRACT (Stage Director → Drift, Mesh):
-///   * [rectOf]      — card rect for an agent id, stage-local coords.
-///   * [centerOf]    — card centroid for an agent id.
-///   * [topOf]       — top-edge midpoint of a card (legacy bubble anchor).
-///   * [outwardOf]   — unit vector pointing from stage center toward the
-///                     card centre. Drift uses this so bubbles drift
-///                     OUTWARD past the ring instead of stacking upward
-///                     into the header safe zone.
-///   * [safeZone]    — the rect inside which any UI may paint without
-///                     colliding with the header / footer chrome. Bubble
-///                     drift, traffic glow extents and any spawn FX must
-///                     clip to this rect.
-///   * [ringCenter]  — orchestrator focal point.
-///   * [ringRadii]   — Size(rx, ry) of the ellipse the agents sit on.
-///                     Mesh paints chords inside this; Drift can use it
-///                     to scale travel distance.
-///
-/// Z-ORDER CONTRACT (bottom → top):
-///   1. CouncilDiagonalBackdrop  (atmosphere, owns its own RepaintBoundary)
-///   2. CouncilTrafficLayer      (always-on ambient mesh + comms pulses)
-///   3. CouncilSpeechBubblesLayer (Drift — bubbles below cards, above mesh)
-///   4. Agent cards              (orchestrator + sectors)
-///   5. Modal overlays           (ping panel, user prompt, scrim)
 class CouncilStageAnchors extends ChangeNotifier {
   final Map<String, Rect> _rects = {};
   Rect _safeZone = Rect.zero;
   Offset _ringCenter = Offset.zero;
   Size _ringRadii = Size.zero;
 
-  /// Unmodifiable snapshot of all registered agent rects (id -> bounding box).
-  /// Used by the pentest attack-lines painter to locate agent origins.
   Map<String, Rect> get agentRects => Map.unmodifiable(_rects);
 
   Rect? rectOf(String id) => _rects[id];
+
   Offset? topOf(String id) {
     final r = _rects[id];
     if (r == null) return null;
@@ -51,8 +72,6 @@ class CouncilStageAnchors extends ChangeNotifier {
 
   Offset? centerOf(String id) => _rects[id]?.center;
 
-  /// Unit vector from the ring centre toward the agent's card centre.
-  /// Drift consumes this for outward bubble drift.
   Offset? outwardOf(String id) {
     final c = _rects[id]?.center;
     if (c == null) return null;
@@ -97,7 +116,12 @@ class CouncilStageAnchors extends ChangeNotifier {
   }
 }
 
-/// Semantic kind drives the eyebrow label / leading-rule accent only.
+// ════════════════════════════════════════════════════════════════
+// Legacy manual-spawn API — preserved for callers that inject
+// custom flashes (system announcements, debug tooling). Each spawn
+// becomes a flash overlay on the targeted agent's bubble.
+// ════════════════════════════════════════════════════════════════
+
 enum BubbleKind {
   speak,
   askPool,
@@ -109,14 +133,9 @@ enum BubbleKind {
   error,
 }
 
-/// Public spawn API for the orchestrator. The layer also auto-feeds
-/// itself from CouncilSession.events; this controller is a side-channel
-/// for callers that want to inject a bubble manually (e.g. system
-/// announcements, debug tooling).
 class BubbleController extends ChangeNotifier {
   final List<_SpawnRequest> _pending = [];
 
-  /// Push a new bubble request. The layer drains on its next frame.
   void spawn(
     String originId,
     String text, {
@@ -124,18 +143,18 @@ class BubbleController extends ChangeNotifier {
     BubbleKind kind = BubbleKind.speak,
   }) {
     if (originId.isEmpty || text.trim().isEmpty) return;
-    _pending.add(_SpawnRequest(
-      originId: originId,
-      text: text,
-      replyTo: replyTo,
-      kind: kind,
-    ));
+    _pending.add(_SpawnRequest(originId: originId, text: text, kind: kind));
     notifyListeners();
   }
 
-  List<_SpawnRequest> drain() {
+  /// Returns the queued spawn requests and clears the buffer. The
+  /// return type is intentionally `List<dynamic>` so callers outside
+  /// this library can treat each request as a tuple of `(originId,
+  /// text, kind)` without depending on the private spawn record.
+  /// In-library callers downcast.
+  List<Object> drain() {
     if (_pending.isEmpty) return const [];
-    final out = List<_SpawnRequest>.from(_pending);
+    final out = List<Object>.from(_pending);
     _pending.clear();
     return out;
   }
@@ -144,75 +163,43 @@ class BubbleController extends ChangeNotifier {
 class _SpawnRequest {
   final String originId;
   final String text;
-  final String? replyTo;
   final BubbleKind kind;
   _SpawnRequest({
     required this.originId,
     required this.text,
-    required this.replyTo,
     required this.kind,
   });
 }
 
-class _Bubble {
-  final int id;
-  final String originId;
-  final String? replyTo;
-  final String text;
-  final BubbleKind kind;
-  final int spawnedAtMs;
-  final int lifeMs;
-  final int zoomMs;
-  final int trailMs;
-  final int fadeInMs;
-  final int fadeOutMs;
-  // Outward unit vector captured at spawn (origin → away from ring).
-  Offset driftDir;
-  // Origin rect captured at spawn time so layout reflows mid-life
-  // don't yank the start point.
-  final Rect originRect;
-
-  _Bubble({
-    required this.id,
-    required this.originId,
-    required this.replyTo,
-    required this.text,
-    required this.kind,
-    required this.spawnedAtMs,
-    required this.lifeMs,
-    required this.zoomMs,
-    required this.trailMs,
-    required this.fadeInMs,
-    required this.fadeOutMs,
-    required this.driftDir,
-    required this.originRect,
-  });
-
-  bool get isReply => replyTo != null && replyTo!.isNotEmpty;
+FlashKind _legacyKindToFlash(BubbleKind k) {
+  switch (k) {
+    case BubbleKind.askPool:
+      return FlashKind.askPool;
+    case BubbleKind.askUser:
+      return FlashKind.askUser;
+    case BubbleKind.poolReply:
+      return FlashKind.poolReply;
+    case BubbleKind.userReply:
+      return FlashKind.userReply;
+    case BubbleKind.userPing:
+      return FlashKind.userPing;
+    case BubbleKind.done:
+      return FlashKind.done;
+    case BubbleKind.error:
+      return FlashKind.error;
+    case BubbleKind.speak:
+      return FlashKind.dispatch;
+  }
 }
 
-/// Drift-outward speech bubble layer.
-///
-/// Behaviour summary (full spec at the top of this file):
-///   * Spawns on the OUTWARD edge of the origin card and drifts radially
-///     past the ring. ease-out drift, ease-in fade.
-///   * Lifetime ≈ clamp(2.5s + 60ms × chars, 4s, 10s).
-///   * Overlap with any non-origin / non-target card dips opacity to
-///     ~0.22 ("passing under" feel). The parent Stack already paints
-///     this layer below the cards, so cards stay legible.
-///   * Reply choreography (replyTo set): zoom → trail → drift outward.
-///   * Single Ticker drives every bubble; reply trailing re-samples the
-///     target anchor every tick so it sticks during layout reflows.
-///   * Reduced motion: appears at outward edge, holds, fades.
+// ════════════════════════════════════════════════════════════════
+// Layer widget.
+// ════════════════════════════════════════════════════════════════
+
 class CouncilSpeechBubblesLayer extends StatefulWidget {
   final CouncilSession session;
   final CouncilStageAnchors anchors;
-
-  /// When true, evaluator chunks/done are suppressed (its surface is on
-  /// the LeftBlackboard).
   final bool evaluatorOnBlackboard;
-
-  /// Optional manual spawn channel.
   final BubbleController? controller;
 
   const CouncilSpeechBubblesLayer({
@@ -229,46 +216,29 @@ class CouncilSpeechBubblesLayer extends StatefulWidget {
 }
 
 class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
-    with SingleTickerProviderStateMixin {
-  // Lifetime envelope.
-  static const int _lifeMinMs = 4000;
-  static const int _lifeMaxMs = 10000;
-  static const int _lifeBaseMs = 2500;
-  static const int _lifeCharMs = 60;
+    with TickerProviderStateMixin {
+  /// One live state record per agent. Created lazily the first time
+  /// an agent goes non-idle or receives a flash.
+  final Map<String, AgentLiveState> _live = <String, AgentLiveState>{};
 
-  static const int _fadeInMs = 280;
-  static const int _fadeOutMs = 620;
-  static const int _replyZoomMs = 900;
-  static const int _replyTrailMs = 1200;
+  /// Number of events already consumed from the session bus. We pull
+  /// new events forward only — the layer never re-runs past events,
+  /// to avoid replaying flashes after a hot-reload / widget rebind.
+  int _processedEvents = 0;
 
-  static const Duration _coalesceIdle = Duration(milliseconds: 1500);
-  static const int _maxConcurrent = 14;
-  static const int _maxPerAgent = 3;
-  static const int _maxBubbleChars = 200;
+  DateTime? _mountedAt;
 
-  // (Drift / per-bubble width constants removed — bubbles now render in
-  // per-agent column layout; column width is the file-level
-  // `_columnWidth` constant declared at the bottom of this file.)
+  /// Shared breathing phase pumped to every bubble. One controller
+  /// is cheaper than N per-card controllers when the ring scales up.
+  late final AnimationController _breath;
 
-  final List<_Bubble> _bubbles = [];
+  /// Frame tick used to evict expired flashes / advance the done
+  /// linger window. We don't need a ticker per agent.
+  late final Ticker _ticker;
+
   BubbleController? _injected;
   late BubbleController _controller;
   bool _ownsController = false;
-
-  int _nextId = 1;
-  int _processedEvents = 0;
-  DateTime? _mountedAt;
-
-  final Map<String, StringBuffer> _chunkBuffers = {};
-  final Map<String, Timer> _chunkTimers = {};
-  final Map<String, bool> _agentSawChunks = {};
-  // Tracks the single "live" chunk-sourced bubble per agent. When new
-  // chunks arrive, the existing bubble is replaced rather than spawning
-  // a new one — ensures at most ONE streaming bubble per agent at any time.
-  final Map<String, int> _liveChunkBubbleIds = {};
-
-  late final Ticker _ticker;
-  int _nowMs = 0;
 
   @override
   void initState() {
@@ -276,7 +246,11 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     _mountedAt = DateTime.now();
     _processedEvents = widget.session.events.length;
     _bindController(widget.controller);
-    _ticker = createTicker(_onFrame)..start();
+    _breath = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    )..repeat();
+    _ticker = createTicker(_onTick)..start();
   }
 
   void _bindController(BubbleController? injected) {
@@ -288,9 +262,7 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
 
   void _unbindController() {
     _controller.removeListener(_drainController);
-    if (_ownsController) {
-      _controller.dispose();
-    }
+    if (_ownsController) _controller.dispose();
   }
 
   @override
@@ -306,34 +278,63 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
   @override
   void dispose() {
     _ticker.dispose();
-    for (final t in _chunkTimers.values) {
-      t.cancel();
-    }
+    _breath.dispose();
     _unbindController();
     super.dispose();
   }
 
-  void _onFrame(Duration elapsed) {
-    _nowMs = DateTime.now().millisecondsSinceEpoch;
-    final before = _bubbles.length;
-    _bubbles.removeWhere((b) => _nowMs - b.spawnedAtMs > b.lifeMs);
-    if (_bubbles.isNotEmpty || _bubbles.length != before) {
-      // While bubbles are alive every frame matters — they're moving.
-      setState(() {});
+  /// Frame loop. Responsibilities, all cheap:
+  ///   1. Evict expired flashes so the primary line returns to the
+  ///      composed status narration.
+  ///   2. Detect streaming-holdover edge (chunk → idle) once so the
+  ///      typing dots come down. We DON'T dirty every frame after
+  ///      the holdover — the breath AnimatedBuilder is already
+  ///      rebuilding the layer at frame rate while bubbles are
+  ///      visible, so this is a one-shot edge trigger guarded by
+  ///      `_streamingFlagged` per-agent.
+  void _onTick(Duration _) {
+    final now = DateTime.now();
+    var dirty = false;
+    for (final state in _live.values) {
+      final f = state.flash;
+      if (f != null && f.isExpired(now)) {
+        state.flash = null;
+        dirty = true;
+      }
+      if (state.lastChunkAt != null) {
+        final past = now.difference(state.lastChunkAt!) > kStreamingHoldover;
+        if (past && !_streamingExpiredFlagged.contains(state.agentId)) {
+          _streamingExpiredFlagged.add(state.agentId);
+          dirty = true;
+        } else if (!past && _streamingExpiredFlagged.contains(state.agentId)) {
+          _streamingExpiredFlagged.remove(state.agentId);
+        }
+      }
     }
+    if (dirty && mounted) setState(() {});
   }
+
+  /// Set of agent ids whose streaming-holdover lapse has already
+  /// produced a repaint. Cleared when a new chunk arrives.
+  final Set<String> _streamingExpiredFlagged = <String>{};
 
   void _drainController() {
     final pending = _controller.drain();
     if (pending.isEmpty) return;
-    for (final r in pending) {
-      _spawn(
-        agentId: r.originId,
-        text: r.text,
-        kind: r.kind,
-        replyTo: r.replyTo,
+    final now = DateTime.now();
+    for (final raw in pending) {
+      final r = raw as _SpawnRequest;
+      _ensureLive(r.originId);
+      final kind = _legacyKindToFlash(r.kind);
+      _live[r.originId]!.flash = ActivityFlash(
+        text: clampSnippet(r.text, kFlashSnippetMax),
+        kind: kind,
+        expiresAt: now.add(
+          kFlashDurations[kind] ?? const Duration(seconds: 5),
+        ),
       );
     }
+    setState(() {});
   }
 
   void _processNewEvents() {
@@ -341,8 +342,9 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     if (events.length <= _processedEvents) return;
     final fresh = events.sublist(_processedEvents);
     _processedEvents = events.length;
-
     final mountedAt = _mountedAt;
+    final now = DateTime.now();
+    var dirty = false;
     for (final e in fresh) {
       if (mountedAt != null &&
           e.createdAt.isBefore(
@@ -350,8 +352,59 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
           )) {
         continue;
       }
-      _handleEvent(e);
+      // Record streaming activity for the typing indicator.
+      if (e.type == CouncilEventType.agentChunk && e.fromAgentId.isNotEmpty) {
+        _ensureLive(e.fromAgentId);
+        _live[e.fromAgentId]!.lastChunkAt = e.createdAt;
+        _streamingExpiredFlagged.remove(e.fromAgentId);
+        dirty = true;
+      }
+      // Record done / error pivot points.
+      if (e.type == CouncilEventType.agentDone ||
+          e.type == CouncilEventType.evaluatorDone) {
+        _ensureLive(e.fromAgentId);
+        _live[e.fromAgentId]!.doneAt = e.createdAt;
+      }
+      if (e.type == CouncilEventType.agentError ||
+          e.type == CouncilEventType.agentStalled) {
+        _ensureLive(e.fromAgentId);
+        _live[e.fromAgentId]!.erroredAt = e.createdAt;
+      }
+      // Build a flash if the event maps to one.
+      final targets = _flashTargetsFor(e);
+      for (final id in targets) {
+        final flash = flashForEvent(
+          event: e,
+          selfAgentId: id,
+          now: now,
+        );
+        if (flash != null) {
+          _ensureLive(id);
+          _live[id]!.flash = flash;
+          dirty = true;
+        }
+      }
     }
+    if (dirty && mounted) setState(() {});
+  }
+
+  /// Which agents should receive a flash for a given event. Most
+  /// events fire on a single agent (`fromAgentId`), but a few (e.g.
+  /// dispatched) target the recipient too.
+  Iterable<String> _flashTargetsFor(CouncilEvent e) sync* {
+    if (e.fromAgentId.isNotEmpty) yield e.fromAgentId;
+    if (e.toAgentId.isNotEmpty && e.toAgentId != e.fromAgentId) {
+      yield e.toAgentId;
+    }
+  }
+
+  void _ensureLive(String id) {
+    final existing = _live[id];
+    if (existing != null) {
+      existing.firstActiveAt ??= DateTime.now();
+      return;
+    }
+    _live[id] = AgentLiveState(agentId: id)..firstActiveAt = DateTime.now();
   }
 
   bool _isEvaluatorMuted(String agentId) {
@@ -359,279 +412,98 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     return agentId == widget.session.config.finalEvaluator.id;
   }
 
-  void _handleEvent(CouncilEvent e) {
-    switch (e.type) {
-      case CouncilEventType.agentChunk:
-        if (_isEvaluatorMuted(e.fromAgentId)) break;
-        _accumulateChunk(e.fromAgentId, e.message);
-        break;
-      case CouncilEventType.askedPool:
-        _spawn(
-          agentId: e.fromAgentId,
-          text: e.message,
-          kind: BubbleKind.askPool,
-          replyTo: e.toAgentId.isNotEmpty ? e.toAgentId : null,
-        );
-        break;
-      case CouncilEventType.poolReply:
-        _spawn(
-          agentId: e.fromAgentId,
-          text: e.message,
-          kind: BubbleKind.poolReply,
-          replyTo: e.toAgentId.isNotEmpty ? e.toAgentId : null,
-        );
-        break;
-      case CouncilEventType.askedUser:
-        _spawn(
-          agentId: e.fromAgentId,
-          text: e.message,
-          kind: BubbleKind.askUser,
-        );
-        break;
-      case CouncilEventType.userReply:
-        final anchor = e.toAgentId.isNotEmpty ? e.toAgentId : e.fromAgentId;
-        if (anchor.isNotEmpty) {
-          _spawn(
-            agentId: anchor,
-            text: e.message,
-            kind: BubbleKind.userReply,
-          );
-        }
-        break;
-      case CouncilEventType.userPingedOrchestrator:
-        final anchor = e.toAgentId.isNotEmpty ? e.toAgentId : e.fromAgentId;
-        if (anchor.isNotEmpty) {
-          _spawn(
-            agentId: anchor,
-            text: e.message,
-            kind: BubbleKind.userPing,
-          );
-        }
-        break;
-      case CouncilEventType.agentDone:
-      case CouncilEventType.evaluatorDone:
-        if (_isEvaluatorMuted(e.fromAgentId)) break;
-        // Retire the live streaming bubble — the agent is done, so
-        // its final summary replaces whatever partial text was showing.
-        _retireLiveBubble(e.fromAgentId);
-        _flushChunkBuffer(e.fromAgentId);
-        // Show ONE final summary bubble regardless of whether we saw
-        // chunks — this is the consolidated "done" message.
-        if (e.message.trim().isNotEmpty) {
-          _spawn(
-            agentId: e.fromAgentId,
-            text: e.message,
-            kind: e.type == CouncilEventType.evaluatorDone
-                ? BubbleKind.done
-                : BubbleKind.done,
-          );
-        }
-        _agentSawChunks.remove(e.fromAgentId);
-        break;
-      case CouncilEventType.agentError:
-        _spawn(
-          agentId: e.fromAgentId,
-          text: e.message.isEmpty ? 'error' : e.message,
-          kind: BubbleKind.error,
-        );
-        break;
-      case CouncilEventType.agentStalled:
-        _spawn(
-          agentId: e.fromAgentId,
-          text: e.message.isEmpty ? 'stalled' : e.message,
-          kind: BubbleKind.error,
-        );
-        break;
-    }
-  }
-
-  void _accumulateChunk(String agentId, String delta) {
-    if (agentId.isEmpty) return;
-    _agentSawChunks[agentId] = true;
-    final buf = _chunkBuffers.putIfAbsent(agentId, () => StringBuffer());
-    buf.write(delta);
-    _chunkTimers[agentId]?.cancel();
-    // Longer coalesce window — chunks flow into the single live bubble
-    // rather than spawning many separate ones.
-    _chunkTimers[agentId] = Timer(_coalesceIdle, () {
-      _flushChunkBuffer(agentId);
-    });
-    // Still flush when the buffer gets large, but into the SAME live
-    // bubble so the user sees consolidated text, not a burst of widgets.
-    if (buf.length > 600) _flushChunkBuffer(agentId);
-  }
-
-  void _flushChunkBuffer(String agentId) {
-    final buf = _chunkBuffers[agentId];
-    if (buf == null || buf.isEmpty) return;
-    final text = buf.toString();
-    buf.clear();
-    _chunkTimers[agentId]?.cancel();
-    _chunkTimers.remove(agentId);
-    // Instead of spawning multiple bubbles, take the tail of the
-    // accumulated text and replace the existing live bubble. This
-    // guarantees at most ONE chunk-sourced bubble per agent.
-    final cleaned = text.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (cleaned.isEmpty) return;
-    final display = cleaned.length > _maxBubbleChars
-        ? cleaned.substring(cleaned.length - _maxBubbleChars)
-        : cleaned;
-    _replaceLiveBubble(agentId: agentId, text: display);
-  }
-
-
-  /// Replace the single live chunk-bubble for [agentId]. If one exists,
-  /// it is removed before spawning the replacement so the agent never
-  /// has more than one streaming bubble on screen at a time.
-  void _replaceLiveBubble({
-    required String agentId,
-    required String text,
-  }) {
-    final existingId = _liveChunkBubbleIds[agentId];
-    if (existingId != null) {
-      _bubbles.removeWhere((b) => b.id == existingId);
-    }
-    _spawn(
-      agentId: agentId,
-      text: text,
-      kind: BubbleKind.speak,
-      isLiveChunk: true,
-    );
-  }
-
-  /// Remove the live chunk bubble for an agent (e.g. when it finishes).
-  void _retireLiveBubble(String agentId) {
-    _liveChunkBubbleIds.remove(agentId);
-  }
-
-  void _spawn({
-    required String agentId,
-    required String text,
-    required BubbleKind kind,
-    String? replyTo,
-    bool isLiveChunk = false,
-  }) {
-    if (agentId.isEmpty) return;
-    final cleaned = _normalizeBubbleText(text);
-    if (cleaned.isEmpty) return;
-    final display = cleaned.length > _maxBubbleChars
-        ? '${cleaned.substring(0, _maxBubbleChars - 1)}…'
-        : cleaned;
-
-    final originRect = widget.anchors.rectOf(agentId);
-    if (originRect == null) {
-      // Layout hasn't published yet; defer one frame.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _spawn(agentId: agentId, text: text, kind: kind, replyTo: replyTo);
-      });
-      return;
-    }
-
-    // Consume the layout contract: outward unit vector from ring centre.
-    // Falls back to centroid-based direction if ring data isn't ready.
-    final outward = widget.anchors.outwardOf(agentId) ??
-        _fallbackOutward(originRect.center);
-
-    final lifeMs = (_lifeBaseMs + display.length * _lifeCharMs)
-        .clamp(_lifeMinMs, _lifeMaxMs);
-
-    final perAgent = _bubbles.where((b) => b.originId == agentId).toList();
-    while (perAgent.length >= _maxPerAgent) {
-      final oldest = perAgent.removeAt(0);
-      _bubbles.remove(oldest);
-    }
-    while (_bubbles.length >= _maxConcurrent) {
-      _bubbles.removeAt(0);
-    }
-
-    final bubbleId = _nextId++;
-    if (isLiveChunk) {
-      _liveChunkBubbleIds[agentId] = bubbleId;
-    }
-    setState(() {
-      _bubbles.add(_Bubble(
-        id: bubbleId,
-        originId: agentId,
-        replyTo: replyTo,
-        text: display,
-        kind: kind,
-        spawnedAtMs: DateTime.now().millisecondsSinceEpoch,
-        lifeMs: lifeMs,
-        zoomMs: _replyZoomMs,
-        trailMs: _replyTrailMs,
-        fadeInMs: _fadeInMs,
-        fadeOutMs: _fadeOutMs,
-        driftDir: outward,
-        originRect: originRect,
-      ));
-    });
-  }
-
-  String _normalizeBubbleText(String raw) {
-    final original = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (original.isEmpty) return '';
-    var text = original;
-    text = text.replaceFirst(
-      RegExp(r'^(task|task name|objective)\s*[:\-–]\s*', caseSensitive: false),
-      '',
-    );
-    text = text.replaceFirst(
-      RegExp(r'^[\"“][^\"”\n]{3,90}[\"”]\s*[:\-–]\s*'),
-      '',
-    );
-    text = text.trim();
-    return text.isEmpty ? original : text;
-  }
-
-  Offset _fallbackOutward(Offset cardCenter) {
-    final ringC = widget.anchors.ringCenter;
-    final v = cardCenter - ringC;
-    final len = v.distance;
-    if (len < 1) return const Offset(0, -1);
-    return Offset(v.dx / len, v.dy / len);
-  }
-
-  /// Test hook: simple count of visible bubble entries grouped by agent.
-  /// Layout is now deterministic (per-agent column anchored to the card),
-  /// so detailed rect debugging is no longer load-bearing.
+  /// Test hook — visible bubbles grouped by agent id. Replaces the
+  /// legacy count map; the new layer renders at most one bubble per
+  /// agent so the count is always 0 or 1.
   @visibleForTesting
   Map<String, int> debugBubbleCountsByAgent() {
+    final now = DateTime.now();
     final out = <String, int>{};
-    for (final b in _bubbles) {
-      out.update(b.originId, (v) => v + 1, ifAbsent: () => 1);
+    final cardRects = widget.anchors._rects;
+    for (final entry in _live.entries) {
+      if (!cardRects.containsKey(entry.key)) continue;
+      if (_isEvaluatorMuted(entry.key)) continue;
+      if (!_shouldRender(entry.key, entry.value, now)) continue;
+      out[entry.key] = 1;
     }
     return out;
+  }
+
+  bool _shouldRender(String id, AgentLiveState state, DateTime now) {
+    // Always render while an active flash is up.
+    if (state.flash != null && !state.flash!.isExpired(now)) return true;
+    final agent = widget.session.agentById(id);
+    if (agent == null) return false;
+    if (agent.status == CouncilAgentStatus.idle) {
+      // Linger after done so users see the completion before fade.
+      if (state.doneAt != null &&
+          now.difference(state.doneAt!) < kDoneLinger) {
+        return true;
+      }
+      return false;
+    }
+    // Any non-idle status = render.
+    return true;
   }
 
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: widget.anchors,
+      animation: Listenable.merge([widget.anchors, _breath]),
       builder: (context, _) {
+        final now = DateTime.now();
         final cardRects = widget.anchors._rects;
-        final groups = <String, List<_Bubble>>{};
-        for (final b in _bubbles) {
-          groups.putIfAbsent(b.originId, () => <_Bubble>[]).add(b);
-        }
-        // Newest first → renders closest to the agent card edge.
-        for (final list in groups.values) {
-          list.sort((a, b) => b.spawnedAtMs.compareTo(a.spawnedAtMs));
+        final candidates = <String, _BubbleCandidate>{};
+        for (final entry in _live.entries) {
+          final id = entry.key;
+          if (_isEvaluatorMuted(id)) continue;
+          if (!cardRects.containsKey(id)) continue;
+          if (!_shouldRender(id, entry.value, now)) continue;
+          final agent = widget.session.agentById(id);
+          if (agent == null) continue;
+          final task = _latestTaskFor(id);
+          final narration = narrateAgent(
+            agent: agent,
+            latestTask: task,
+            live: entry.value,
+            isOrchestrator: id == widget.session.config.orchestrator.id,
+            now: now,
+          );
+          candidates[id] = _BubbleCandidate(
+            agentId: id,
+            agentLabel: _agentLabel(agent),
+            cardRect: cardRects[id]!,
+            narration: narration,
+          );
         }
 
-        // Compute one collision-aware placement per agent column.
-        // Recomputed every frame the anchors notify, so resize and
-        // ring reflows automatically reposition bubbles. This is the
-        // "never overlap a panel" invariant — see _kBubblePanelMinGap.
-        final placements = <String, _BubblePlacement>{};
-        for (final entry in groups.entries) {
-          final cardRect = cardRects[entry.key];
-          if (cardRect == null) continue;
-          placements[entry.key] = _placeColumn(
-            agentId: entry.key,
-            cardRect: cardRect,
+        // Run collision-aware placement.
+        //
+        // Order matters: place the orchestrator's bubble FIRST so peer
+        // bubbles can treat it as a fixed exclusion zone. The conductor
+        // owns a dedicated bubble slot above (or below) its card; peers
+        // arc their bubbles outward from the boss's card.
+        final orchestratorId = widget.session.config.orchestrator.id;
+        final placements = <String, _Placement>{};
+        final orchestratorCand = candidates[orchestratorId];
+        if (orchestratorCand != null) {
+          placements[orchestratorId] = _placeColumn(
+            agentId: orchestratorId,
+            cardRect: orchestratorCand.cardRect,
             allRects: cardRects,
-            bubbleCount: entry.value.length,
+            orchestratorId: orchestratorId,
+            orchestratorBubble: null,
+          );
+        }
+        final orchestratorBubble = placements[orchestratorId]?.rect;
+        for (final cand in candidates.values) {
+          if (cand.agentId == orchestratorId) continue;
+          placements[cand.agentId] = _placeColumn(
+            agentId: cand.agentId,
+            cardRect: cand.cardRect,
+            allRects: cardRects,
+            orchestratorId: orchestratorId,
+            orchestratorBubble: orchestratorBubble,
           );
         }
 
@@ -639,11 +511,6 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
           child: Stack(
             clipBehavior: Clip.none,
             children: [
-              // Hairline leaders below bubbles so the bubble body
-              // visually overlaps the line endpoint instead of vice
-              // versa. Painted only for reflowed placements (i.e.
-              // when the bubble is not on its preferred side and the
-              // association needs reinforcing).
               Positioned.fill(
                 child: CustomPaint(
                   painter: _LeaderLinesPainter(
@@ -652,13 +519,11 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
                   ),
                 ),
               ),
-              for (final entry in groups.entries)
-                if (placements[entry.key] != null)
-                  _buildAgentColumn(
-                    agentId: entry.key,
-                    cardRect: cardRects[entry.key]!,
-                    bubbles: entry.value,
-                    placement: placements[entry.key]!,
+              for (final cand in candidates.values)
+                if (placements[cand.agentId] != null)
+                  _buildPositionedBubble(
+                    cand: cand,
+                    placement: placements[cand.agentId]!,
                   ),
             ],
           ),
@@ -667,113 +532,211 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
     );
   }
 
-  /// Pick a non-overlapping rect for an agent's bubble column.
-  ///
-  /// Algorithm (in order):
-  ///   1. Preferred side = outward direction of the card on the ring
-  ///      (right wing → right, left wing → left).
-  ///   2. Try preferred → opposite → above → below. Each candidate is
-  ///      offset from the panel edge by [_kBubblePanelMinGap] so the
-  ///      bubble bbox can NEVER touch the panel rect.
-  ///   3. A candidate is rejected if its rect (a) escapes the theater
-  ///      safe zone, or (b) overlaps any sibling panel rect inflated
-  ///      by [_kBubblePanelMinGap]. The orchestrator counts as a
-  ///      sibling so bubbles never cross the centre card.
-  ///   4. If every side fails, fall back to the preferred side and
-  ///      flag the placement reflowed=true so a leader line paints.
-  ///   5. Column height is content-bounded (per bubble estimate ×
-  ///      count) so the column rect doesn't claim an entire wing's
-  ///      worth of vertical space for collision purposes.
-  _BubblePlacement _placeColumn({
+  Widget _buildPositionedBubble({
+    required _BubbleCandidate cand,
+    required _Placement placement,
+  }) {
+    return Positioned(
+      key: ValueKey('council-bubble-${cand.agentId}'),
+      left: placement.rect.left,
+      top: placement.rect.top,
+      width: placement.rect.width,
+      child: ActivityBubbleCard(
+        key: ValueKey('activity-${cand.agentId}'),
+        narration: cand.narration,
+        agentLabel: cand.agentLabel,
+        side: _toBubbleSide(placement.side),
+        breathT: _breath.value,
+      ),
+    );
+  }
+
+  CouncilTask? _latestTaskFor(String agentId) {
+    CouncilTask? latest;
+    for (final t in widget.session.tasks) {
+      if (t.agentId != agentId) continue;
+      if (latest == null || t.updatedAt.isAfter(latest.updatedAt)) latest = t;
+    }
+    return latest;
+  }
+
+  String _agentLabel(CouncilAgent agent) {
+    final name = agent.name.trim();
+    if (name.isEmpty) {
+      return agent.id == widget.session.config.orchestrator.id
+          ? S.councilOrchestrator.toUpperCase()
+          : '';
+    }
+    return name.toUpperCase();
+  }
+
+  // ── Placement (collision-aware column layout) ──────────────────
+  //
+  // The new layer renders at most one bubble per agent, so column
+  // sizing is much simpler than the legacy stack-of-bubbles version.
+  // We keep the side-preference + reflow + safe-zone clamp from the
+  // old code so the bubble never overlaps a sibling card and the
+  // "never touches a panel rect" invariant holds (10px min gap).
+
+  _Placement _placeColumn({
     required String agentId,
     required Rect cardRect,
     required Map<String, Rect> allRects,
-    required int bubbleCount,
+    required String orchestratorId,
+    required Rect? orchestratorBubble,
   }) {
-    final outward = widget.anchors.outwardOf(agentId) ??
-        _fallbackOutward(cardRect.center);
     final safe = widget.anchors.safeZone;
-    final preferred = outward.dx >= 0 ? _BubbleSide.right : _BubbleSide.left;
-    final inUpperHalf = !safe.isEmpty
-        ? cardRect.center.dy <= safe.center.dy
-        : cardRect.center.dy <= widget.anchors.ringCenter.dy;
+    final orchestratorRect = allRects[orchestratorId];
 
-    final order = <_BubbleSide>[
-      preferred,
-      preferred == _BubbleSide.right ? _BubbleSide.left : _BubbleSide.right,
-      inUpperHalf ? _BubbleSide.below : _BubbleSide.above,
-      inUpperHalf ? _BubbleSide.above : _BubbleSide.below,
-    ];
+    // Conservative content estimate for collision; bubble paints at
+    // intrinsic height.
+    const estHeight = 130.0;
 
-    // Estimate column footprint from bubble count so collision testing
-    // doesn't reserve a whole wing's worth of vertical space.
-    final count = math.max(1, bubbleCount);
-    final estContent = count * _kEstBubbleHeight +
-        math.max(0, count - 1) * _columnGap;
-    final maxAvail = safe.isEmpty
-        ? 720.0
-        : math.max(120.0, safe.height - 24);
-    final estHeight = math.min(estContent, maxAvail);
+    // The orchestrator gets its own placement strategy: it's the
+    // conductor, not a peer. Its bubble belongs in the dead-center
+    // column above (or below) its card so it never competes with peer
+    // bubbles for outward real estate. Peers then treat both the
+    // orchestrator card AND its bubble as a hard exclusion zone.
+    if (agentId == orchestratorId) {
+      // Prefer above; fall back to below; only then sides (rare on a
+      // sane ring layout).
+      const order = <_Side>[
+        _Side.above,
+        _Side.below,
+        _Side.right,
+        _Side.left,
+      ];
+      for (final side in order) {
+        final rect = _candidateRect(cardRect, side, _columnWidth, estHeight);
+        if (!_safeContains(safe, rect)) continue;
+        if (_collidesWithSiblings(
+          rect,
+          allRects,
+          agentId,
+          orchestratorId: orchestratorId,
+        )) {
+          continue;
+        }
+        return _Placement(rect: rect, side: side, reflowed: side != _Side.above);
+      }
+      // Hard fallback: above, clamped.
+      var fallback =
+          _candidateRect(cardRect, _Side.above, _columnWidth, estHeight);
+      fallback = _clampToSafe(fallback, safe);
+      return _Placement(rect: fallback, side: _Side.above, reflowed: true);
+    }
+
+    // Peer agents — outward is "away from the orchestrator card",
+    // not "away from the ring center". Those are the same in a
+    // symmetric ellipse, but the orchestrator-relative framing is
+    // what the user actually reads on the stage ("the bubble points
+    // AWAY from the boss"). It also handles non-ring layouts (pentest
+    // formation, future custom shapes) without special-casing.
+    final away = _awayFromOrchestrator(
+      cardRect: cardRect,
+      orchestratorRect: orchestratorRect,
+      fallback: widget.anchors.outwardOf(agentId) ??
+          _fallbackOutward(cardRect.center),
+    );
+    final absDx = away.dx.abs();
+    final absDy = away.dy.abs();
+    // Pick the DOMINANT axis as preferred. A near-equal split (e.g.
+    // an agent at the 45° diagonal) prefers horizontal — bubbles are
+    // wider than they are tall, so a left/right placement uses the
+    // empty corner of the stage better than above/below.
+    final _Side preferred;
+    if (absDx >= absDy * 0.85) {
+      preferred = away.dx >= 0 ? _Side.right : _Side.left;
+    } else {
+      preferred = away.dy >= 0 ? _Side.below : _Side.above;
+    }
+
+    // Side ordering after the preferred side: prefer the perpendicular
+    // axis (so a right-side reflow goes above/below, NEVER straight
+    // across to left where it'd cross the orchestrator). Only fall
+    // back to the opposite of `preferred` if both perpendiculars fail.
+    final perp = (preferred == _Side.right || preferred == _Side.left)
+        ? <_Side>[_Side.above, _Side.below]
+        : <_Side>[_Side.right, _Side.left];
+    final opposite = _opposite(preferred);
+    final order = <_Side>[preferred, ...perp, opposite];
 
     for (final side in order) {
       final rect = _candidateRect(cardRect, side, _columnWidth, estHeight);
       if (!_safeContains(safe, rect)) continue;
-      if (_collidesWithSiblings(rect, allRects, agentId)) continue;
-      return _BubblePlacement(
+      if (_collidesWithSiblings(
+        rect,
+        allRects,
+        agentId,
+        orchestratorId: orchestratorId,
+        extraExclusion: orchestratorBubble,
+      )) {
+        continue;
+      }
+      return _Placement(
         rect: rect,
         side: side,
         reflowed: side != preferred,
       );
     }
 
-    // Fallback: preferred side, clamped into safeZone, leader line on.
+    // Fallback: preferred side, clamped, leader-line marker on.
     var fallback = _candidateRect(cardRect, preferred, _columnWidth, estHeight);
-    if (!safe.isEmpty) {
-      var l = fallback.left;
-      var t = fallback.top;
-      if (l < safe.left + 4) l = safe.left + 4;
-      if (l + fallback.width > safe.right - 4) {
-        l = safe.right - 4 - fallback.width;
-      }
-      if (t < safe.top + 4) t = safe.top + 4;
-      if (t + fallback.height > safe.bottom - 4) {
-        t = safe.bottom - 4 - fallback.height;
-      }
-      fallback = Rect.fromLTWH(l, t, fallback.width, fallback.height);
-    }
-    return _BubblePlacement(rect: fallback, side: preferred, reflowed: true);
+    fallback = _clampToSafe(fallback, safe);
+    return _Placement(rect: fallback, side: preferred, reflowed: true);
   }
 
-  Rect _candidateRect(Rect card, _BubbleSide side, double w, double h) {
+  Rect _clampToSafe(Rect r, Rect safe) {
+    if (safe.isEmpty) return r;
+    var l = r.left;
+    var t = r.top;
+    if (l < safe.left + 4) l = safe.left + 4;
+    if (l + r.width > safe.right - 4) l = safe.right - 4 - r.width;
+    if (t < safe.top + 4) t = safe.top + 4;
+    if (t + r.height > safe.bottom - 4) t = safe.bottom - 4 - r.height;
+    return Rect.fromLTWH(l, t, r.width, r.height);
+  }
+
+  Offset _awayFromOrchestrator({
+    required Rect cardRect,
+    required Rect? orchestratorRect,
+    required Offset fallback,
+  }) {
+    if (orchestratorRect == null) return fallback;
+    final dx = cardRect.center.dx - orchestratorRect.center.dx;
+    final dy = cardRect.center.dy - orchestratorRect.center.dy;
+    final len = math.sqrt(dx * dx + dy * dy);
+    if (len < 0.5) return fallback;
+    return Offset(dx / len, dy / len);
+  }
+
+  _Side _opposite(_Side s) {
+    switch (s) {
+      case _Side.right:
+        return _Side.left;
+      case _Side.left:
+        return _Side.right;
+      case _Side.above:
+        return _Side.below;
+      case _Side.below:
+        return _Side.above;
+    }
+  }
+
+  Rect _candidateRect(Rect card, _Side side, double w, double h) {
     switch (side) {
-      case _BubbleSide.right:
+      case _Side.right:
         return Rect.fromLTWH(
-          card.right + _kBubblePanelMinGap,
-          card.top,
-          w,
-          h,
-        );
-      case _BubbleSide.left:
+            card.right + _kPanelGap, card.top, w, h);
+      case _Side.left:
         return Rect.fromLTWH(
-          card.left - _kBubblePanelMinGap - w,
-          card.top,
-          w,
-          h,
-        );
-      case _BubbleSide.above:
+            card.left - _kPanelGap - w, card.top, w, h);
+      case _Side.above:
         return Rect.fromLTWH(
-          card.center.dx - w / 2,
-          card.top - _kBubblePanelMinGap - h,
-          w,
-          h,
-        );
-      case _BubbleSide.below:
+            card.center.dx - w / 2, card.top - _kPanelGap - h, w, h);
+      case _Side.below:
         return Rect.fromLTWH(
-          card.center.dx - w / 2,
-          card.bottom + _kBubblePanelMinGap,
-          w,
-          h,
-        );
+            card.center.dx - w / 2, card.bottom + _kPanelGap, w, h);
     }
   }
 
@@ -788,167 +751,107 @@ class _CouncilSpeechBubblesLayerState extends State<CouncilSpeechBubblesLayer>
   bool _collidesWithSiblings(
     Rect candidate,
     Map<String, Rect> allRects,
-    String selfId,
-  ) {
+    String selfId, {
+    required String orchestratorId,
+    Rect? extraExclusion,
+  }) {
     for (final e in allRects.entries) {
       if (e.key == selfId) continue;
-      final inflated = e.value.inflate(_kBubblePanelMinGap);
+      // The orchestrator gets a wider clearance — its card carries the
+      // most chrome and its bubble lives in the center column, so peer
+      // bubbles need to keep their distance to stop "bubble on top of
+      // conductor" overlap (the user's #2 complaint).
+      final gap = e.key == orchestratorId
+          ? _kOrchestratorClearance
+          : _kPanelGap;
+      final inflated = e.value.inflate(gap);
       if (candidate.overlaps(inflated)) return true;
+    }
+    if (extraExclusion != null &&
+        candidate.overlaps(extraExclusion.inflate(_kPanelGap))) {
+      return true;
     }
     return false;
   }
 
-  /// Per-agent commentary column, placed by [_placeColumn].
-  /// Newest entry sits closest to the card edge; older entries stack
-  /// away from it and fade out as they age.
-  Widget _buildAgentColumn({
-    required String agentId,
-    required Rect cardRect,
-    required List<_Bubble> bubbles,
-    required _BubblePlacement placement,
-  }) {
-    final rect = placement.rect;
-    final children = <Widget>[];
-    for (var i = 0; i < bubbles.length; i++) {
-      if (i > 0) children.add(const SizedBox(height: _columnGap));
-      children.add(_buildAgentBubble(bubbles[i]));
+  Offset _fallbackOutward(Offset cardCenter) {
+    final ringC = widget.anchors.ringCenter;
+    final v = cardCenter - ringC;
+    final len = v.distance;
+    if (len < 1) return const Offset(0, -1);
+    return Offset(v.dx / len, v.dy / len);
+  }
+
+  BubbleAnchorSide _toBubbleSide(_Side s) {
+    switch (s) {
+      case _Side.right:
+        return BubbleAnchorSide.right;
+      case _Side.left:
+        return BubbleAnchorSide.left;
+      case _Side.above:
+        return BubbleAnchorSide.above;
+      case _Side.below:
+        return BubbleAnchorSide.below;
     }
-
-    // Decide stack direction and cross-axis alignment per side so
-    // "newest closest to the card" holds regardless of which way we
-    // reflowed.
-    late final bool reverseChildren;
-    late final MainAxisAlignment mainAxis;
-    late final CrossAxisAlignment crossAxis;
-    switch (placement.side) {
-      case _BubbleSide.right:
-        reverseChildren = false;
-        mainAxis = MainAxisAlignment.start;
-        crossAxis = CrossAxisAlignment.start;
-        break;
-      case _BubbleSide.left:
-        reverseChildren = false;
-        mainAxis = MainAxisAlignment.start;
-        crossAxis = CrossAxisAlignment.end;
-        break;
-      case _BubbleSide.below:
-        reverseChildren = false;
-        mainAxis = MainAxisAlignment.start;
-        crossAxis = CrossAxisAlignment.center;
-        break;
-      case _BubbleSide.above:
-        // Newest at the bottom (nearest the card), older fade upward.
-        reverseChildren = true;
-        mainAxis = MainAxisAlignment.end;
-        crossAxis = CrossAxisAlignment.center;
-        break;
-    }
-
-    return Positioned(
-      key: ValueKey('council-col-$agentId'),
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      // Height is intentionally omitted — the Column sizes itself to
-      // its intrinsic height. The placement rect's height is a
-      // collision-detection budget only; clamping the Positioned to it
-      // caused multi-line bubble text to clip at the bottom.
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        mainAxisAlignment: mainAxis,
-        crossAxisAlignment: crossAxis,
-        children: reverseChildren
-            ? children.reversed.toList(growable: false)
-            : children,
-      ),
-    );
   }
-
-  Widget _buildAgentBubble(_Bubble b) {
-    final ageMs = _nowMs - b.spawnedAtMs;
-    final lifeMs = b.lifeMs;
-    final clamped = ageMs.clamp(0, lifeMs).toInt();
-
-    double opacity;
-    if (clamped < b.fadeInMs) {
-      opacity = _easeOutCubic(clamped / b.fadeInMs);
-    } else if (clamped > lifeMs - b.fadeOutMs) {
-      final t = (clamped - (lifeMs - b.fadeOutMs)) / b.fadeOutMs;
-      opacity = 1.0 - _easeInQuad(t.clamp(0.0, 1.0).toDouble());
-    } else {
-      opacity = 1.0;
-    }
-
-    return Opacity(
-      opacity: opacity,
-      child: SizedBox(
-        width: _columnWidth,
-        child: _BubbleText(
-          text: b.text,
-          kind: b.kind,
-          agentLabel: _agentLabel(b.originId),
-          softBackdrop: true,
-        ),
-      ),
-    );
-  }
-
-  String _agentLabel(String agentId) {
-    final a = widget.session.agentById(agentId);
-    if (a == null || a.name.trim().isEmpty) return '';
-    return a.name.trim().toUpperCase();
-  }
-
-  double _easeOutCubic(double t) {
-    final u = 1.0 - t;
-    return 1.0 - u * u * u;
-  }
-
-  double _easeInQuad(double t) => t * t;
 }
 
-const double _columnWidth = 280;
-const double _columnGap = 6;
+class _BubbleCandidate {
+  final String agentId;
+  final String agentLabel;
+  final Rect cardRect;
+  final AgentNarration narration;
+  const _BubbleCandidate({
+    required this.agentId,
+    required this.agentLabel,
+    required this.cardRect,
+    required this.narration,
+  });
+}
 
-/// Hard layout invariant: a speech-bubble column's bounding box must
-/// sit at least this many logical pixels away from EVERY agent panel
-/// rect (origin card included on its inside edge, all sibling cards
-/// fully). Never zero, never negative. If you tune this, keep it in
-/// the 8–12px band so bubbles read as "near the panel" without
-/// kissing it.
-const double _kBubblePanelMinGap = 10.0;
+// ════════════════════════════════════════════════════════════════
+// Placement constants & types.
+// ════════════════════════════════════════════════════════════════
 
-/// Per-bubble vertical estimate used only for collision sizing — the
-/// actual bubble paints at its measured intrinsic height. Accounts for
-/// multi-line consolidated live-bubbles (up to 200 chars wrapping at
-/// ~260px column width ≈ 4–5 text lines + eyebrow + padding).
-const double _kEstBubbleHeight = 120.0;
+const double _columnWidth = kActivityBubbleWidth;
 
-/// Which side of the owning panel a bubble column was placed on.
-enum _BubbleSide { right, left, above, below }
+/// Hard invariant: an activity bubble's bounding box must sit at
+/// least this many logical pixels away from every agent card rect
+/// (origin card included on its inside edge, all sibling cards
+/// fully). 10px keeps bubbles "near the panel" without touching it.
+const double _kPanelGap = 10.0;
 
-/// Result of the collision-aware placement pass. [reflowed] is true
-/// when the bubble could not sit on its preferred side and needed to
-/// be relocated; the leader-line painter uses this to draw a hairline
-/// connector reinforcing the bubble→panel association.
-class _BubblePlacement {
+/// Extra clearance reserved around the orchestrator card. The
+/// conductor is in the visual middle of the stage and carries its
+/// own bubble plus traffic spokes; peer bubbles need to stay further
+/// away or they read as "overlapping the boss". 32px is the sweet
+/// spot — close enough that the stage doesn't feel sparse, far
+/// enough that a peer bubble never paints onto the orchestrator's
+/// card chrome (border, halo, return-packet zone).
+const double _kOrchestratorClearance = 32.0;
+
+enum _Side { right, left, above, below }
+
+class _Placement {
   final Rect rect;
-  final _BubbleSide side;
+  final _Side side;
   final bool reflowed;
-  const _BubblePlacement({
+  const _Placement({
     required this.rect,
     required this.side,
     required this.reflowed,
   });
 }
 
-/// Hairline connector from a panel edge to its bubble column when the
-/// column is reflowed off the preferred side. Stays out of the way
-/// when the bubble is already adjacent to its panel — there's no
-/// value in re-labelling an obvious association.
+/// Hairline connector from a panel edge to its bubble when the
+/// bubble could not sit on its preferred side. The bubble's own
+/// speech-bubble tail handles the preferred-side case (the
+/// adjacency is obvious there). Reflowed cases need the extra
+/// connector so the user reads the bubble↔panel association at a
+/// glance even when the bubble is across the stage.
 class _LeaderLinesPainter extends CustomPainter {
   final Map<String, Rect> cardRects;
-  final Map<String, _BubblePlacement> placements;
+  final Map<String, _Placement> placements;
 
   _LeaderLinesPainter({
     required this.cardRects,
@@ -972,26 +875,24 @@ class _LeaderLinesPainter extends CustomPainter {
       late final Offset from;
       late final Offset to;
       switch (p.side) {
-        case _BubbleSide.right:
+        case _Side.right:
           from = Offset(card.right, card.center.dy);
           to = Offset(p.rect.left, p.rect.top + 18);
           break;
-        case _BubbleSide.left:
+        case _Side.left:
           from = Offset(card.left, card.center.dy);
           to = Offset(p.rect.right, p.rect.top + 18);
           break;
-        case _BubbleSide.above:
+        case _Side.above:
           from = Offset(card.center.dx, card.top);
           to = Offset(p.rect.center.dx, p.rect.bottom);
           break;
-        case _BubbleSide.below:
+        case _Side.below:
           from = Offset(card.center.dx, card.bottom);
           to = Offset(p.rect.center.dx, p.rect.top);
           break;
       }
       canvas.drawLine(from, to, paint);
-      // Subtle terminator dot at the bubble end so the eye knows
-      // which side the line "arrives" at.
       final dot = Paint()
         ..color = DuckColors.fgMuted.withValues(alpha: 0.45)
         ..style = PaintingStyle.fill;
@@ -1002,158 +903,5 @@ class _LeaderLinesPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _LeaderLinesPainter old) {
     return old.placements != placements || old.cardRects != cardRects;
-  }
-}
-
-/// Chromeless body. White (fgPrimary) text on the existing dark
-/// surface. Soft frosted scrim only when dipped beneath a card.
-class _BubbleText extends StatelessWidget {
-  final String text;
-  final BubbleKind kind;
-  final String agentLabel;
-
-  /// Show a soft frosted backdrop when the bubble is over a busy area
-  /// (currently engaged: while opacity-dipped beneath a card). Hard
-  /// pill is intentionally avoided.
-  final bool softBackdrop;
-
-  const _BubbleText({
-    required this.text,
-    required this.kind,
-    required this.agentLabel,
-    required this.softBackdrop,
-  });
-
-  Color get _accent {
-    return switch (kind) {
-      BubbleKind.speak => DuckColors.accentCyan,
-      BubbleKind.askPool => DuckColors.accentPurple,
-      BubbleKind.askUser => DuckColors.accentDuck,
-      BubbleKind.poolReply => DuckColors.accentMint,
-      BubbleKind.userReply => DuckColors.accentDuck,
-      BubbleKind.userPing => DuckColors.accentDuck,
-      BubbleKind.done => DuckColors.accentCyan,
-      BubbleKind.error => DuckColors.stateError,
-    };
-  }
-
-  String get _eyebrowKindLabel {
-    return switch (kind) {
-      BubbleKind.askPool => 'TO POOL',
-      BubbleKind.poolReply => 'POOL',
-      BubbleKind.askUser => 'ASKS YOU',
-      BubbleKind.userReply => 'YOU →',
-      BubbleKind.userPing => 'YOU →',
-      BubbleKind.done => 'DONE',
-      BubbleKind.error => 'ERROR',
-      BubbleKind.speak => '',
-    };
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final accent = _accent;
-    final kindLabel = _eyebrowKindLabel;
-    final hasEyebrow = agentLabel.isNotEmpty || kindLabel.isNotEmpty;
-
-    final body = ConstrainedBox(
-      // Hard width contract: the bubble's parent SizedBox is 280px
-      // (`_columnWidth`). The DecoratedBox below adds 10px padding on
-      // each side, so the body must not exceed 280 - 20 = 260. We keep
-      // a small safety margin so the hairline border doesn't pixel-clip
-      // on fractional DPR scales.
-      constraints: const BoxConstraints(maxWidth: 256),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (hasEyebrow)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 14,
-                    height: 1,
-                    color: accent.withValues(alpha: 0.85),
-                  ),
-                  const SizedBox(width: 6),
-                  if (agentLabel.isNotEmpty)
-                    Flexible(
-                      child: Text(
-                        agentLabel,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: accent.withValues(alpha: 0.98),
-                          fontSize: 10.4,
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: 0.75,
-                        ),
-                      ),
-                    ),
-                  if (kindLabel.isNotEmpty) ...[
-                    const SizedBox(width: 8),
-                    Flexible(
-                      child: Text(
-                        kindLabel,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: accent.withValues(alpha: 0.66),
-                          fontSize: 9.4,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.6,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          Text(
-            text,
-            softWrap: true,
-            style: const TextStyle(
-              color: DuckColors.fgPrimary,
-              fontSize: 13,
-              height: 1.38,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
-      ),
-    );
-
-    if (!softBackdrop) return body;
-    // Opaque dark-blue bubble surface. The user explicitly asked for
-    // a dark, opaque (alpha 1.0) fill that "fits" the modal palette —
-    // no translucent glass, no gradient bleed-through. We use the
-    // dedicated `councilBubbleBg` token (#0E1626) which sits a
-    // notch deeper than `councilSurface` so bubbles read as quoted
-    // utterances above the panels rather than another panel surface.
-    // Hairline `councilBorder` keeps the edge crisp at any DPR;
-    // `fgPrimary` (#D8DEE9) on this fill clears WCAG AA easily
-    // (contrast ≈ 11.6:1).
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: DuckColors.councilBubbleBg,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: DuckColors.councilBorder, width: 0.8),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x66000000),
-            blurRadius: 14,
-            spreadRadius: -2,
-            offset: Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-        child: body,
-      ),
-    );
   }
 }

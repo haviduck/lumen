@@ -43,6 +43,29 @@ class CouncilEventType {
   // UI so the user can also manually ping the agent.
   static const agentStalled = 'agent_stalled';
 
+  // Tool-fire signal — emitted just before an agent's tool call runs.
+  // Drives the per-agent activity bubble's "currently doing X" flash
+  // with structured signal (file path, command) instead of raw stream
+  // chunks. Data payload: { 'toolId': String, 'primaryArg': String? }.
+  static const agentToolFire = 'agent_tool_fire';
+
+  // Subtask protocol events. `agentSubtasksPlanned` fires when an
+  // agent declares its plan via `council_plan_subtasks`. Data:
+  // { 'taskId': String, 'subtasks': List<String> }. `agentSubtaskProgress`
+  // fires after each `council_subtask_progress` call. Data:
+  // { 'taskId': String, 'step': int, 'totalSteps': int, 'summary': String }.
+  // Both drive the per-card step indicator and the bubble's
+  // "Step K/N" narration without changing the per-task state machine.
+  static const agentSubtasksPlanned = 'agent_subtasks_planned';
+  static const agentSubtaskProgress = 'agent_subtask_progress';
+
+  // Mention tether — fired when an agent references a peer by name in
+  // their streaming transcript. Drives a transient tether in the
+  // discourse layer so "Maya cited Linus" reads as a real link, not
+  // just text. Data: { 'mentions': List<String> } — list of agent ids
+  // that were name-matched in the most recent chunk.
+  static const agentPeerMention = 'agent_peer_mention';
+
   // Task ledger (see council_task_ledger.dart for schema). Emitted on
   // every state-machine transition: planned -> dispatched -> running ->
   // done|failed|timeout|cancelled. Signal subscribes to render per-agent

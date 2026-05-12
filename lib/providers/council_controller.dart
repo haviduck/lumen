@@ -93,13 +93,10 @@ class CouncilController extends ChangeNotifier {
   final List<String> _queuedSynthesisPings = <String>[];
   int _orchestratorFailureStreak = 0;
   bool _orchestratorFailureEscalated = false;
-  // After this many silent nudges, escalate to the user. Lowered from
-  // 3 → 2 in 2026-05 — three retries felt like the council was running
-  // forever even when the work was clearly stuck, and the user had no
-  // way to see what was wrong until the last strike. Two retries is
-  // plenty for legit "model briefly lost focus" recoveries; anything
-  // beyond that, the user wants to know.
-  static const int _orchestratorFailureEscalationThreshold = 2;
+  // Escalation threshold: only surface to the user after many retries.
+  // The orchestrator often self-recovers silently — early escalation
+  // just creates noise. 20 retries is the "genuinely broken" signal.
+  static const int _orchestratorFailureEscalationThreshold = 20;
 
   /// True when the user is allowed to ping the orchestrator with a
   /// mid-session note. We allow this whenever the council is in a state
@@ -160,30 +157,37 @@ class CouncilController extends ChangeNotifier {
 
     final prompt =
         '''
-You are designing a compact expert council to tackle the user's brief below.
+You are designing a compact senior council to ship a real artifact for the brief below. The roster you produce will work in parallel under an orchestrator — choose specialists who genuinely complement each other, not a generic checklist.
 
 Return ONLY JSON. No markdown. Shape:
 {
   "agents": [
     {
-      "name": "short distinctive name",
+      "name": "short distinctive name pulled from the brief's domain",
       "role": "pentester|reviewer|researcher|architect|tester|writer|custom",
-      "customRole": "deep specialist remit; required when role is custom",
-      "mission": "what this agent must uncover or improve",
-      "rationale": "why this role is needed for THIS brief"
+      "customRole": "specific remit; required when role is custom",
+      "mission": "the concrete artifact this agent will produce",
+      "rationale": "what unique angle this agent owns for THIS brief"
     }
   ]
 }
 
-How to think about the team:
-- Read the user's brief carefully and design a roster that actually fits it. The user knows their own problem; your job is to translate that into the smallest team of complementary specialists who can ship a real artifact for what they asked.
-- Team size is 3–8. About $targetCount is a starting point — go smaller for tight focused asks, larger for ambitious product/platform/agentic-system work.
-- Pick sharp, complementary specialists. "Architect / Reviewer / Tester" alone is rarely the right roster for anything interesting.
-- Use the `custom` role when a built-in label would understate what the agent actually owns. Custom roles get a `customRole` describing the specific remit.
-- Every agent has a distinct mission and is capable of pushing back on at least one other agent.
-- Include a pentester / red-team role only when the brief is genuinely about security, attack surface, threat modeling, auth, secrets, exploitation, or hardening. Don't add one for "make this pretty" or "refactor this code".
-- Include a tester or QA-shaped role when implementation, debugging, or correctness validation matters.
-- Names are short, distinctive, and useful in a visual dashboard.
+Rules (the parser enforces several of these):
+1. SIZE — $targetCount is the target. 3–8 hard range. Smaller for tight focused asks; larger for ambitious product/platform work.
+
+2. NAMES come from the brief's own vocabulary. Read the brief, extract 3–5 domain nouns, seed the names from them. A brief about "redesign the dashboard onboarding flow" yields names like "Onboarding Choreographer", "Empty-State Stylist", "First-Run Telemetry" — NOT "Architect", "Reviewer", "Tester". Names are short, evocative, and tell the user what they own at a glance.
+
+3. MISSIONS name concrete artifacts. Each mission must name a specific deliverable: a file path, a document, a decision matrix, a diagram, a test suite, a fix list. "Investigate X" / "review Y" / "ensure quality" are NOT missions — they are anti-patterns. Bad: "ensure code quality". Good: "produce `docs/REVIEW.md` with a ranked findings table covering correctness, regression risk, and missing tests".
+
+4. COMPLEMENTARITY — no two agents own the same primary surface. If two agents both want the same file/system/decision, either merge them into one OR pick distinct sub-surfaces. Overlap = duplicate work and confused dispatch.
+
+5. CUSTOM role for anything specific. Built-in role labels (pentester / reviewer / researcher / architect / tester / writer) are coarse — when an agent's real remit is sharper, use `custom` and put the specific remit in `customRole`. Most ambitious briefs will be 50%+ custom roles.
+
+6. PENTESTER only when the brief is genuinely about security / attack surface / threat modeling / hardening / exploitation. Not for "make this pretty" or "refactor". Otherwise the role distorts the council.
+
+7. TESTER when implementation / debugging / correctness validation matters as a first-class concern.
+
+8. ADVERSARIAL FIT — every agent must be capable of meaningfully pushing back on at least one other. If you can't articulate which agent each one would push back against and why, the roster is too soft.
 
 User brief:
 $brief
@@ -423,6 +427,7 @@ $brief
       onCouncilTool: _handleOrchestratorTool,
       onStall: _onAgentStall,
       stallTimeoutSeconds: 90,
+      onToolFire: _onAgentToolFire,
     );
     _runners.add(runner);
     _orchestratorRunner = runner;
@@ -444,18 +449,21 @@ $brief
         return;
       }
 
-      final earlyFailureReason = _orchestratorEarlyExitReason(session);
-      if (earlyFailureReason != null) {
-        await _handleOrchestratorFailure(
-          session: session,
-          reason: earlyFailureReason,
-          draftReport: result.content,
-        );
-        return;
-      }
-
-      _resetOrchestratorFailureWatchdog();
-      await _finishWithReport(result.content);
+      // If we reach here, the orchestrator exited without calling
+      // council_report (which sets status to done/awaitingFollowup).
+      // This is ALWAYS an incomplete run — the orchestrator either:
+      //   - Got wait results and stopped without dispatching wave 2
+      //   - Produced synthesis text but forgot to call council_report
+      //   - Hit maxIterations without finishing
+      // In all cases: re-nudge. council_report is the only legitimate exit.
+      final earlyFailureReason = _orchestratorEarlyExitReason(session) ??
+          'Orchestrator exited without calling council_report. '
+          'Either dispatch follow-up work or finalize via council_report.';
+      await _handleOrchestratorFailure(
+        session: session,
+        reason: earlyFailureReason,
+        draftReport: result.content,
+      );
     } catch (e) {
       endThinking();
       await _handleOrchestratorFailure(
@@ -485,6 +493,27 @@ $brief
     return null;
   }
 
+  /// Detects transient API/network errors worth retrying after a delay.
+  static bool _isTransientError(String reason) {
+    final lower = reason.toLowerCase();
+    return lower.contains('500') ||
+        lower.contains('502') ||
+        lower.contains('503') ||
+        lower.contains('504') ||
+        lower.contains('internal server error') ||
+        lower.contains('bad gateway') ||
+        lower.contains('service unavailable') ||
+        lower.contains('gateway timeout') ||
+        lower.contains('connection reset') ||
+        lower.contains('connection refused') ||
+        lower.contains('connection closed') ||
+        lower.contains('socket') ||
+        lower.contains('timed out') ||
+        lower.contains('timeout') ||
+        lower.contains('econnrefused') ||
+        lower.contains('network');
+  }
+
   Future<void> _handleOrchestratorFailure({
     required CouncilSession session,
     required String reason,
@@ -493,6 +522,24 @@ $brief
     _orchestratorFailureStreak++;
     final strikes = _orchestratorFailureStreak;
     final orch = session.config.orchestrator;
+
+    // Backoff for transient API errors — don't hammer a downed service.
+    if (_isTransientError(reason)) {
+      final delaySecs = (strikes * 5).clamp(5, 30);
+      _event(
+        CouncilEventType.agentError,
+        fromAgentId: orch.id,
+        message: 'Transient error, retrying in ${delaySecs}s '
+            '(attempt $strikes)...',
+      );
+      notifyListeners();
+      await Future<void>.delayed(Duration(seconds: delaySecs));
+      // Bail if session was aborted/done while we waited.
+      if (session.status == CouncilStatus.done ||
+          session.status == CouncilStatus.aborted) {
+        return;
+      }
+    }
 
     // First/second strike: silently re-nudge orchestration with richer status.
     if (strikes < _orchestratorFailureEscalationThreshold) {
@@ -507,13 +554,18 @@ $brief
           : '\n\nLatest orchestrator prose (trimmed):\n'
                 '${draft.substring(0, cutoff)}';
       final note = '''
-Orchestrator watchdog nudge ($strikes/$_orchestratorFailureEscalationThreshold).
+SYSTEM: You exited without calling council_report. Resume now.
 
-Last failure signal:
-$reason
+Reason: $reason
 $draftSnippet
 
-Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue dispatching/synthesizing as needed.
+DEFAULT NEXT ACTION: call council_report with a complete markdown synthesis of the work that already returned.
+
+Only dispatch another wave if the original brief explicitly requires a phase you have NOT executed yet (e.g. design wave done → now implementation depending on the design output). Do NOT re-dispatch agents on work that already returned — the dispatch guard will reject identical re-runs.
+
+If a real blocker prevents synthesis, call council_ask_user with a concrete ship-partial / retry-narrower / abort choice. Don't ask process questions like "should I wait" or "ship as they come" — make that call yourself.
+
+You MUST call a tool. No prose-only output.
 ''';
       unawaited(_runOrchestrator(kickNote: note));
       return;
@@ -622,15 +674,25 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
   /// Stall callback shared by all agent runners. Fires when a runner's
   /// stream has been silent for its configured timeout. Returns true to
   /// auto-nudge the runner, false to leave it alone.
-  ///
-  /// Emits a `agentError`-level event so the UI shows the stall, and
-  /// nudges the runner with a continuation prompt. After 3 auto-nudges
-  /// the runner stops nudging and the user can ping manually.
   bool _onAgentStall(String agentId, int silentSeconds) {
     final session = _session;
     if (session == null) return false;
     if (session.status == CouncilStatus.aborted ||
         session.status == CouncilStatus.done) {
+      return false;
+    }
+    // Don't report stalls when the session is waiting for user input —
+    // the silence is expected and the agent isn't stuck.
+    if (session.status == CouncilStatus.awaitingUser ||
+        session.status == CouncilStatus.awaitingFollowup) {
+      return false;
+    }
+    // Don't report stalls for agents that are done or awaiting user.
+    final agent = session.agentById(agentId);
+    if (agent != null &&
+        (agent.status == CouncilAgentStatus.done ||
+         agent.status == CouncilAgentStatus.awaitingUser ||
+         agent.status == CouncilAgentStatus.idle)) {
       return false;
     }
     _event(
@@ -693,24 +755,47 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
 
     final buf = StringBuffer();
     if (kickNote.trim().isNotEmpty) {
-      buf
-        ..writeln(S.councilOrchestratorKickHeader)
-        ..writeln()
-        ..writeln(S.councilOrchestratorKickStatusHeading)
-        ..writeln(_orchestratorStatusDigest(session))
-        ..writeln();
-      final poolBlock = _orchestratorPoolDigest(session);
-      if (poolBlock.isNotEmpty) {
+      final isSystemNudge = kickNote.trimLeft().startsWith('SYSTEM:');
+      if (isSystemNudge) {
+        // System nudge — keep it tight and directive. Don't confuse
+        // weaker models with "previously-started session" framing.
         buf
-          ..writeln(S.councilOrchestratorKickPoolHeading)
-          ..writeln(poolBlock)
+          ..writeln(kickNote.trim())
+          ..writeln()
+          ..writeln('=== Current agent status ===')
+          ..writeln(_orchestratorStatusDigest(session));
+        // If agents are working, tell the model to wait for them.
+        final workingAgents = session.config.agents
+            .where((a) => a.status == CouncilAgentStatus.working)
+            .toList();
+        if (workingAgents.isNotEmpty) {
+          buf.writeln(
+            '\n${workingAgents.length} agent(s) are still working. '
+            'Call council_wait to collect their results, then dispatch '
+            'follow-up work or council_report.',
+          );
+        }
+      } else {
+        // User ping / resurrection — full context.
+        buf
+          ..writeln(S.councilOrchestratorKickHeader)
+          ..writeln()
+          ..writeln(S.councilOrchestratorKickStatusHeading)
+          ..writeln(_orchestratorStatusDigest(session))
           ..writeln();
+        final poolBlock = _orchestratorPoolDigest(session);
+        if (poolBlock.isNotEmpty) {
+          buf
+            ..writeln(S.councilOrchestratorKickPoolHeading)
+            ..writeln(poolBlock)
+            ..writeln();
+        }
+        buf
+          ..writeln(S.councilOrchestratorKickNoteHeading)
+          ..writeln(kickNote.trim())
+          ..writeln()
+          ..writeln(S.councilOrchestratorKickInstructions);
       }
-      buf
-        ..writeln(S.councilOrchestratorKickNoteHeading)
-        ..writeln(kickNote.trim())
-        ..writeln()
-        ..writeln(S.councilOrchestratorKickInstructions);
     }
 
     if (roundFollowup != null) {
@@ -788,11 +873,9 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
   /// No-op when the council is not in a ping-legal state (see
   /// [canPingOrchestrator]) or when the message + attachments are
   /// empty.
-  /// True when the user is allowed to ping a specific agent. Only
-  /// agents with a live runner (currently executing) can be pinged.
-  /// Also checks agent status — a runner may linger in [_runners]
-  /// after its [run()] loop exits, but the note queue would never
-  /// be drained so pinging it is a no-op black hole.
+  /// True when the user can ping a specific agent. Allowed as long as
+  /// the session is running — the note will either be injected into a
+  /// live runner OR routed through the orchestrator for re-dispatch.
   bool canPingAgent(String agentId) {
     final s = _session;
     if (s == null) return false;
@@ -801,20 +884,19 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     final agent = s.agentById(agentId);
     if (agent == null) return false;
-    if (agent.status == CouncilAgentStatus.done ||
-        agent.status == CouncilAgentStatus.error ||
-        agent.status == CouncilAgentStatus.idle) {
-      return false;
-    }
-    return _runners.any(
-      (r) => r.agent.id == agentId && !r.token.isCancelled,
-    );
+    // Don't allow pinging the orchestrator through this path.
+    if (agent.id == s.config.orchestrator.id) return false;
+    return true;
   }
 
-  /// Inject a mid-session note into a specific agent's runner. The
-  /// note is queued on the runner's message stream and picked up at
-  /// its next iteration boundary. No-op if the agent has no live
-  /// runner (use [canPingAgent] to check beforehand).
+  /// Inject a mid-session note targeted at a specific agent.
+  ///
+  /// Two paths:
+  /// 1. **Live runner** — note is queued directly on the agent's
+  ///    message stream (picked up at next iteration).
+  /// 2. **No live runner** — note is routed through the orchestrator
+  ///    as a directive to re-dispatch or address the agent. This is
+  ///    the common case since agent runners are short-lived.
   Future<void> pingAgent(
     String agentId,
     String note, {
@@ -826,12 +908,6 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final trimmed = note.trim();
     if (trimmed.isEmpty && images.isEmpty) return;
 
-    final runner = _runners.firstWhere(
-      (r) => r.agent.id == agentId && !r.token.isCancelled,
-      orElse: () => throw StateError('No live runner for $agentId'),
-    );
-
-    runner.addUserNote(trimmed, images: images);
     final eventMessage = images.isEmpty
         ? trimmed
         : '$trimmed [+${images.length} image(s) attached]';
@@ -840,8 +916,29 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       toAgentId: agentId,
       message: eventMessage,
     );
-    notifyListeners();
-    await _persist();
+
+    // Try direct injection into a live runner first.
+    final liveRunner = _runners.cast<CouncilAgentRunner?>().firstWhere(
+      (r) => r!.agent.id == agentId && !r.token.isCancelled,
+      orElse: () => null,
+    );
+    if (liveRunner != null) {
+      liveRunner.addUserNote(trimmed, images: images);
+      notifyListeners();
+      await _persist();
+      return;
+    }
+
+    // No live runner — route through the orchestrator so it can
+    // re-dispatch the agent with the user's note incorporated.
+    final agent = session.agentById(agentId);
+    final agentName = agent?.name ?? agentId;
+    final orchestratorNote =
+        'USER NOTE for $agentName: "$trimmed"\n\n'
+        'The user wants to direct this at $agentName specifically. '
+        'Re-dispatch $agentName with this note incorporated into their '
+        'task, or address it in your next synthesis.';
+    await pingOrchestrator(orchestratorNote, images: images);
   }
 
   Future<void> pingOrchestrator(
@@ -1191,11 +1288,137 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         return _askPool(agent, call);
       case CouncilProtocol.askUserToolId:
         return _askUser(agent.id, call);
+      case CouncilProtocol.planSubtasksToolId:
+        return _planSubtasks(agent, call);
+      case CouncilProtocol.subtaskProgressToolId:
+        return _subtaskProgress(agent, call);
       default:
         return Future.value(
           CouncilToolResult(feedback: 'Unknown Council tool: ${call.name}'),
         );
     }
+  }
+
+  /// Records an agent's declared subtask plan on the ledger and emits
+  /// `agentSubtasksPlanned` so the UI step indicator lights up. Doesn't
+  /// change the task state machine — subtasks are a sub-state below
+  /// `running`, not a replacement for it.
+  Future<CouncilToolResult> _planSubtasks(
+    CouncilAgent agent,
+    CouncilToolCall call,
+  ) async {
+    final raw = (call.arguments['subtasks'] as List?) ?? const [];
+    final items = raw
+        .whereType<String>()
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    if (items.isEmpty) {
+      return const CouncilToolResult(
+        feedback: 'No subtasks provided. List 2-8 concrete, '
+            'action-oriented steps.',
+      );
+    }
+    if (items.length > 8) {
+      return const CouncilToolResult(
+        feedback: 'Too many subtasks (>8). The UI step indicator caps '
+            'at 8 — merge related steps and call '
+            'council_plan_subtasks again with at most 8 entries.',
+      );
+    }
+    final task = ledger.latestForAgent(agent.id);
+    if (task == null) {
+      return const CouncilToolResult(
+        feedback: 'No active task on the ledger for this agent. Wait '
+            'for a dispatch before declaring subtasks.',
+      );
+    }
+    task
+      ..subtasks = List<String>.unmodifiable(items)
+      ..currentSubtaskIndex = 0
+      ..subtaskSummaries = const <String>[]
+      ..updatedAt = DateTime.now();
+    _event(
+      CouncilEventType.agentSubtasksPlanned,
+      fromAgentId: agent.id,
+      message: items.join(' | '),
+      data: {
+        'taskId': task.id,
+        'subtasks': List<String>.unmodifiable(items),
+      },
+    );
+    notifyListeners();
+    await _persist();
+    return CouncilToolResult(
+      feedback: 'Subtask plan recorded (${items.length} steps). Execute '
+          'them in order. After EACH step finishes, call '
+          'council_subtask_progress with the 1-based step number and a '
+          'one-line summary so the council sees real-time progress.',
+    );
+  }
+
+  Future<CouncilToolResult> _subtaskProgress(
+    CouncilAgent agent,
+    CouncilToolCall call,
+  ) async {
+    final step = (call.arguments['step'] as num?)?.toInt() ?? 0;
+    final summary = (call.arguments['summary'] as String? ?? '').trim();
+    if (step <= 0) {
+      return const CouncilToolResult(
+        feedback: 'step must be a 1-based positive integer.',
+      );
+    }
+    final task = ledger.latestForAgent(agent.id);
+    if (task == null) {
+      return const CouncilToolResult(
+        feedback: 'No active task on the ledger for this agent.',
+      );
+    }
+    if (task.subtasks.isEmpty) {
+      return const CouncilToolResult(
+        feedback: 'No subtask plan declared. Call council_plan_subtasks '
+            'first so the council knows the shape of your work.',
+      );
+    }
+    if (step > task.subtasks.length) {
+      return CouncilToolResult(
+        feedback: 'step $step exceeds the declared '
+            '${task.subtasks.length}-step plan. If the plan grew, call '
+            'council_plan_subtasks again with the full revised list.',
+      );
+    }
+    // Clamp forward so an out-of-order progress call (skipped step,
+    // re-fired completion) keeps the indicator monotonically advancing.
+    task.currentSubtaskIndex =
+        task.currentSubtaskIndex < step ? step : task.currentSubtaskIndex;
+    final summaries = List<String>.from(task.subtaskSummaries);
+    while (summaries.length < step) {
+      summaries.add('');
+    }
+    summaries[step - 1] = summary;
+    task
+      ..subtaskSummaries = List<String>.unmodifiable(summaries)
+      ..updatedAt = DateTime.now();
+    _event(
+      CouncilEventType.agentSubtaskProgress,
+      fromAgentId: agent.id,
+      message: summary,
+      data: {
+        'taskId': task.id,
+        'step': step,
+        'totalSteps': task.subtasks.length,
+        'summary': summary,
+        'label': task.subtasks[step - 1],
+      },
+    );
+    notifyListeners();
+    await _persist();
+    final nextStep = step + 1;
+    final more = nextStep <= task.subtasks.length;
+    return CouncilToolResult(
+      feedback: 'Step $step/${task.subtasks.length} recorded. '
+          '${more ? "Continue with step $nextStep: ${task.subtasks[nextStep - 1]}" : "All declared subtasks complete — wrap up and return the deliverable."}',
+    );
   }
 
   /// Block until every in-flight parallel dispatch completes, then return
@@ -1242,8 +1465,21 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       buf.writeln();
     }
     buf.writeln(
-      'Proceed to synthesize findings and produce the final report '
-      'via council_report, or dispatch a follow-up wave if gaps remain.',
+      'The results above are the agents\' DELIVERABLES — not progress reports, '
+      'not "still working" updates. This is what they produced for the brief.\n\n'
+      'DEFAULT NEXT ACTION: call council_report with a markdown synthesis of '
+      'these results. The brief is satisfied unless a specific phase is '
+      'demonstrably still missing.\n\n'
+      'Only dispatch another wave if the brief explicitly requires a phase '
+      'you have NOT yet executed (e.g. design wave done → now an implementation '
+      'wave that depends on the design output). Do NOT re-dispatch agents on '
+      'work that already returned — the dispatch guard will reject re-runs of '
+      'essentially identical tasks.\n\n'
+      'If work came back incomplete (errored / blocked / refused), call '
+      'council_ask_user with a concrete ship-partial / retry-narrower / abort '
+      'choice. Don\'t ask process questions like "should I wait" or "ship as '
+      'they come" — make that call yourself.\n\n'
+      'You MUST call a tool. Do not exit without council_report or council_dispatch.',
     );
 
     return CouncilToolResult(feedback: buf.toString());
@@ -1277,6 +1513,21 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     if (task.trim().isEmpty) {
       return const CouncilToolResult(feedback: 'Dispatch task was empty.');
+    }
+
+    // Refire prevention. Sub-Pro models love to re-dispatch essentially
+    // identical work after a wait digest because "make progress" reads as
+    // an easier next move than synthesis. The guard catches that pattern
+    // structurally so the bug can't recur regardless of how the model
+    // reasoned its way to the duplicate dispatch.
+    final dedupRefusal = _duplicateTaskRefusal(
+      agentId: agentId,
+      agentName: agent.name,
+      task: task,
+    );
+    if (dedupRefusal != null) {
+      _emitDispatchGuardTripped(dedupRefusal);
+      return CouncilToolResult(feedback: dedupRefusal);
     }
 
     _event(
@@ -1340,16 +1591,22 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     if (parallel) {
       _dispatches.add(future);
       unawaited(future);
+      final inFlight = _dispatches.length;
       return CouncilToolResult(
         feedback:
-            'Started ${agent.name} on: $task\n\nContinue coordinating the Council. If this work may benefit from another role, dispatch a companion task or have the agent use council_ask_pool before final synthesis.',
+            'Dispatched ${agent.name} (parallel). $inFlight task(s) now in flight.\n\n'
+            'NEXT: Either dispatch more parallel tasks, or call council_wait '
+            'to block until all $inFlight in-flight task(s) complete. '
+            'Do NOT call council_report or council_ask_user while tasks are in flight.',
       );
     }
 
     await future;
+    final summary = _summariseTranscript(agent.transcript);
     return CouncilToolResult(
       feedback:
-          '${agent.name} finished this task.\n\n${agent.transcript}\n\nBefore final report, consider whether another agent should challenge or verify these findings through a pool question or follow-up dispatch.',
+          '${agent.name} completed the task.\n\nResult summary: $summary\n\n'
+          'NEXT: Dispatch more work, or call council_report if ALL tasks are done.',
     );
   }
 
@@ -1380,29 +1637,61 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     _emitThinkingStarted(agent);
     notifyListeners();
 
-    final reviewerDirectives = _serialisedReviewerDirectivesFor(agent);
-    final runner = CouncilAgentRunner(
-      agent: agent,
-      anthropic: anthropic,
-      copilot: copilot,
-      gemini: gemini,
-      ollama: ollama,
-      toolExecutor: _toolExecutor(agent, workspace),
-      systemPrompt: CouncilProtocol.agentSystemPrompt(
-        config: session.config,
+    const maxRetries = 3;
+    CouncilRunResult? result;
+    for (var attempt = 1; attempt <= maxRetries; attempt++) {
+      final reviewerDirectives = _serialisedReviewerDirectivesFor(agent);
+      final runner = CouncilAgentRunner(
         agent: agent,
-        task: task,
-        reviewerDirectives: reviewerDirectives,
-      ),
-      userPrompt: task,
-      nativeToolIds: {...CouncilProtocol.agentToolIds, ...agent.enabledTools},
-      onChunk: (chunk) => _appendTranscript(agent, chunk),
-      onCouncilTool: (call) => _handleAgentTool(agent, call),
-      onStall: _onAgentStall,
-      stallTimeoutSeconds: 90,
-    );
-    _runners.add(runner);
-    final result = await runner.run();
+        anthropic: anthropic,
+        copilot: copilot,
+        gemini: gemini,
+        ollama: ollama,
+        toolExecutor: _toolExecutor(agent, workspace),
+        systemPrompt: CouncilProtocol.agentSystemPrompt(
+          config: session.config,
+          agent: agent,
+          task: task,
+          reviewerDirectives: reviewerDirectives,
+        ),
+        userPrompt: task,
+        nativeToolIds: {...CouncilProtocol.agentToolIds, ...agent.enabledTools},
+        onChunk: (chunk) => _appendTranscript(agent, chunk),
+        onCouncilTool: (call) => _handleAgentTool(agent, call),
+        onStall: _onAgentStall,
+        stallTimeoutSeconds: 90,
+        onToolFire: _onAgentToolFire,
+      );
+      _runners.add(runner);
+      try {
+        result = await runner.run();
+        break; // Success — exit retry loop.
+      } catch (e) {
+        if (attempt < maxRetries && _isTransientError('$e')) {
+          final delaySecs = attempt * 5;
+          _event(
+            CouncilEventType.agentError,
+            fromAgentId: agent.id,
+            message: 'Transient error, retrying in ${delaySecs}s '
+                '(attempt $attempt/$maxRetries)...',
+          );
+          notifyListeners();
+          agent.transcript = '';
+          await Future<void>.delayed(Duration(seconds: delaySecs));
+          if (session.status == CouncilStatus.done ||
+              session.status == CouncilStatus.aborted) {
+            _emitThinkingEnded(agent);
+            return;
+          }
+          continue;
+        }
+        rethrow; // Non-transient or exhausted retries — let catchError handle it.
+      }
+    }
+    if (result == null) {
+      _emitThinkingEnded(agent);
+      return;
+    }
     if (result.cancelled) {
       _emitThinkingEnded(agent);
       _safeLedgerTransition(
@@ -1930,6 +2219,32 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     CouncilToolCall call,
   ) async {
     final question = call.arguments['question'] as String? ?? '';
+
+    // Process-question intercept. The orchestrator on weak models loves to
+    // ask "should I wait or ship as they come?" / "should I dispatch now?"
+    // / "should I write the report?" — per protocol these are calls the
+    // orchestrator owns, not user decisions. Auto-respond with the
+    // canonical answer so the run doesn't park on a modal the user
+    // shouldn't have to see in the first place. Gated on isOrchestrator
+    // so genuine agent-side "I'm blocked" asks still reach the user.
+    final isOrchestrator = _session != null &&
+        fromAgentId == _session!.config.orchestrator.id;
+    if (isOrchestrator) {
+      final canonicalAnswer = _canonicalProcessAnswer(question);
+      if (canonicalAnswer != null) {
+        _event(
+          CouncilEventType.askedUser,
+          fromAgentId: fromAgentId,
+          message: '[auto-answered process question]: $question',
+          data: const {'intercepted': true},
+        );
+        return CouncilToolResult(
+          feedback: 'AUTO-ANSWERED (the user should not be asked process '
+              'questions — you own these decisions):\n\n$canonicalAnswer',
+        );
+      }
+    }
+
     final entry = CouncilQuestion(
       id: 'user_${++_questionSeq}',
       fromAgentId: fromAgentId,
@@ -2431,9 +2746,12 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
               reason: lastFailReason ?? 'output too sparse',
               draftReport: draftReport,
             )
-          : 'Evaluate the Council now and produce the final report. '
-              'You MUST output the complete structured report — not a '
-              'preamble, not a one-liner. Begin the report immediately.';
+          : 'OUTPUT THE REPORT NOW. Your very first line of output must be '
+              'the ```council_followup JSON block (Part 1), immediately '
+              'followed by the markdown report (Part 2). '
+              'Do NOT narrate, plan, or think out loud. Do NOT write '
+              '"Let me review..." or "I\'ll start by..." — those are not '
+              'the report. Start with ```council_followup on line 1.';
 
       // Reset transcript on retry so we don't fold prior attempts together.
       if (isRetry) {
@@ -2457,9 +2775,35 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         onCouncilTool: (_) async => const CouncilToolResult(
           feedback: 'The final evaluator should produce prose only.',
         ),
+        onToolFire: _onAgentToolFire,
       );
       _runners.add(runner);
-      final result = await runner.run(maxIterations: 4);
+      CouncilRunResult result;
+      try {
+        result = await runner.run(maxIterations: 4);
+      } catch (e) {
+        if (_isTransientError('$e') && attempt < maxAttempts) {
+          final delaySecs = attempt * 5;
+          _event(
+            CouncilEventType.agentError,
+            fromAgentId: evaluator.id,
+            message: 'Transient error, retrying in ${delaySecs}s...',
+          );
+          notifyListeners();
+          await Future<void>.delayed(Duration(seconds: delaySecs));
+          lastFailReason = 'transient API error: $e';
+          evaluator.transcript = '';
+          continue;
+        }
+        _emitThinkingEnded(evaluator);
+        evaluator.status = CouncilAgentStatus.error;
+        _event(
+          CouncilEventType.evaluatorDone,
+          fromAgentId: evaluator.id,
+          message: draftReport,
+        );
+        return draftReport;
+      }
 
       if (result.cancelled) {
         _emitThinkingEnded(evaluator);
@@ -2527,36 +2871,46 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
   /// Quality gate for evaluator output. Returns null when output is
   /// substantial enough to ship as a report, or a failure reason string
   /// when the evaluator phoned it in.
-  ///
-  /// Heuristics (any one trips):
-  /// - Empty or near-empty (< 200 chars).
-  /// - No section headings (no `##` markers).
-  /// - Output is shorter than 600 chars AND contains hedging phrases
-  ///   like "let me verify", "i need to", "i'll start by" without
-  ///   actually producing the report content.
   static String? _evaluatorOutputFailureReason(String output) {
     final trimmed = output.trim();
     if (trimmed.length < 200) {
       return 'output too short (${trimmed.length} chars; minimum 200)';
     }
-    if (!trimmed.contains('##')) {
-      return 'no markdown section headings found';
+    // Must have at least 2 section headings to be a real report.
+    final headingCount = RegExp(r'^#{1,3} ', multiLine: true)
+        .allMatches(trimmed)
+        .length;
+    if (headingCount < 2) {
+      return 'no report structure (found $headingCount headings; need ≥2)';
     }
-    if (trimmed.length < 600) {
-      final lower = trimmed.toLowerCase();
-      const hedges = [
-        'let me verify',
-        'let me start by',
-        'i need to verify',
-        'i\'ll start',
-        'i will start',
-        'let me first',
-        'i\'ll begin',
-      ];
-      if (hedges.any(lower.contains)) {
-        return 'hedging preamble without report body '
-            '(${trimmed.length} chars)';
-      }
+    // Hedging/narration detection — regardless of length. If the first
+    // 300 chars are narration ("let me...", "I'll...") without starting
+    // the actual report format, it's a failed attempt.
+    final first300 = trimmed.substring(
+      0, trimmed.length < 300 ? trimmed.length : 300,
+    ).toLowerCase();
+    const hedges = [
+      'let me verify',
+      'let me start',
+      'let me review',
+      'let me carefully',
+      'let me first',
+      'let me analyze',
+      'let me examine',
+      'i need to verify',
+      'i need to review',
+      'i\'ll start',
+      'i will start',
+      'i\'ll begin',
+      'i\'ll review',
+      'i\'ll analyze',
+      'the user wants me to',
+      'i should produce',
+      'i need to produce',
+    ];
+    if (hedges.any(first300.contains) &&
+        !first300.contains('```council_followup')) {
+      return 'narration/preamble instead of report (starts with hedging)';
     }
     return null;
   }
@@ -2572,25 +2926,30 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         ? previousOutput.substring(0, 300)
         : previousOutput;
     return '''
-WATCHDOG RETRY $attempt/3.
+WATCHDOG RETRY $attempt/3 — REJECTED: $reason.
 
-Your previous attempt was REJECTED. Reason: $reason.
-
-Previous output (first 300 chars):
+Your previous output started with:
 """
 $preview
 """
 
-This is unacceptable. The user is waiting for a complete pentest report. You have ALL the data you need in the draft below — findings, agent transcripts, severity assessments. Your job is NOT to re-investigate. Your job is to PRODUCE THE REPORT NOW.
+That is NOT a report. That is narration. You were programmatically rejected.
 
-Strict requirements for this attempt:
-1. Begin output with `# ` (markdown H1 title) — no preamble, no "let me", no "I need to".
-2. Include EVERY section heading from the report template: Executive Summary, Target & Scope, Attack Tree, Findings (with subsections per severity), Exploit Chains, Agent Attack Log, What Changed Because Agents Conspired, Remediation Priority Matrix, Open Attack Vectors.
-3. Findings table MUST contain every finding from the draft. If you can't verify one, mark `verified? = no` with a reason — do NOT delete it.
-4. Output must be at least 1500 characters. The draft you were given is already well-structured; you are ENRICHING it with verification, chains, and remediation, not summarizing it.
-5. Output the report directly — no meta commentary, no "here is the report:", no fenced markdown wrapper.
+MANDATORY FORMAT — your output must start EXACTLY like this:
+```council_followup
+{"round": 2, "reviewer_summary": "...", "directives": [...], "must_not_redo": [...]}
+```
 
-Produce the full report now. No preamble.
+Immediately followed by the full markdown report (Part 2) starting with a # heading.
+
+Rules:
+1. FIRST LINE of output = ```council_followup — no text before it.
+2. Part 2 must fill EVERY section from the report template in your system prompt.
+3. Include ALL findings from the draft. Mark unverified ones `verified? = no`.
+4. Output must be at least 1500 characters total.
+5. NO narration, NO "let me", NO "I will", NO meta-commentary.
+
+The draft report and agent transcripts are in your system prompt. You have everything. Produce the deliverable NOW.
 ''';
   }
 
@@ -2614,14 +2973,350 @@ Produce the full report now. No preamble.
       fromAgentId: agent.id,
       message: clean,
     );
+    _detectAndEmitPeerMentions(agent, clean);
     notifyListeners();
   }
+
+  /// Scan a freshly streamed chunk for peer-agent name references and
+  /// emit one `agentPeerMention` event per unique peer found. The
+  /// discourse layer subscribes to these to draw a short-lived
+  /// "mention tether" arc from the speaker to the mentioned peer.
+  ///
+  /// Design notes:
+  ///   • Per-(speaker, peer) debounce window so a long transcript
+  ///     that mentions the same peer 10 times in one chunk doesn't
+  ///     spam the stage. We re-fire only after [_peerMentionCooldown]
+  ///     so an organic re-reference still surfaces.
+  ///   • Match is on word-boundary `\bName\b`, case-insensitive. The
+  ///     orchestrator and the speaker themselves are excluded — we
+  ///     don't want a card-to-itself tether, and the orchestrator
+  ///     gets its own visualisation via the traffic layer.
+  ///   • Empty or short (<3 char) names are skipped so we don't
+  ///     match noise like a stray "Q".
+  void _detectAndEmitPeerMentions(CouncilAgent speaker, String chunk) {
+    final session = _session;
+    if (session == null) return;
+    final orchestratorId = session.config.orchestrator.id;
+    final now = DateTime.now();
+    final foundIds = <String>{};
+    final lower = chunk.toLowerCase();
+    for (final candidate in session.config.agents) {
+      if (candidate.id == speaker.id) continue;
+      if (candidate.id == orchestratorId) continue;
+      final name = candidate.name.trim();
+      if (name.length < 3) continue;
+      final pattern = RegExp(
+        r'\b' + RegExp.escape(name.toLowerCase()) + r'\b',
+      );
+      if (pattern.hasMatch(lower)) {
+        foundIds.add(candidate.id);
+      }
+    }
+    if (foundIds.isEmpty) return;
+
+    final speakerCooldowns = _peerMentionLastFired.putIfAbsent(
+      speaker.id,
+      () => <String, DateTime>{},
+    );
+    final fresh = <String>[];
+    for (final id in foundIds) {
+      final last = speakerCooldowns[id];
+      if (last != null && now.difference(last) < _peerMentionCooldown) continue;
+      speakerCooldowns[id] = now;
+      fresh.add(id);
+    }
+    if (fresh.isEmpty) return;
+    _event(
+      CouncilEventType.agentPeerMention,
+      fromAgentId: speaker.id,
+      data: {'mentions': fresh},
+    );
+  }
+
+  /// Per-speaker → per-peer last-emission timestamp. Bounded by the
+  /// agent roster (≤ a handful of entries), no need to age out.
+  final Map<String, Map<String, DateTime>> _peerMentionLastFired = {};
+  static const Duration _peerMentionCooldown = Duration(seconds: 6);
 
   String _cleanTranscriptChunk(String chunk) {
     return chunk.replaceAll(
       RegExp(r'<!--\s*LUMEN_THINK_(START|END)\s*-->', caseSensitive: false),
       '',
     );
+  }
+
+  /// Refire guard. Returns a refusal string when [task] is essentially a
+  /// re-dispatch of work [agentId] already completed in this session, else
+  /// null. Uses Jaccard similarity over normalized word sets — cheap,
+  /// deterministic, no model call. The 0.78 threshold catches genuine
+  /// duplicates ("redo the auth audit") while letting through legitimate
+  /// follow-ups that share vocabulary with the prior task ("now implement
+  /// the auth fixes you proposed").
+  ///
+  /// Lives here, not in the ledger, because the message refers to the
+  /// agent's actual transcript (so the orchestrator gets the prior result
+  /// inline and can synthesize from it instead of re-running the work).
+  String? _duplicateTaskRefusal({
+    required String agentId,
+    required String agentName,
+    required String task,
+  }) {
+    final ledgerInstance = _ledger;
+    if (ledgerInstance == null) return null;
+    final priorDone = ledgerInstance.tasks
+        .where((t) => t.agentId == agentId && t.state == CouncilTaskState.done)
+        .toList();
+    if (priorDone.isEmpty) return null;
+
+    CouncilTask? bestMatch;
+    var bestScore = 0.0;
+    for (final prior in priorDone) {
+      final score = _taskSimilarity(prior.task, task);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = prior;
+      }
+    }
+    const threshold = 0.78;
+    if (bestScore < threshold || bestMatch == null) return null;
+
+    final agent = _session?.agentById(agentId);
+    final priorTranscript = (agent?.transcript ?? '').trim();
+    final priorSummary = priorTranscript.isEmpty
+        ? '(no transcript captured for the prior run — check the inspector)'
+        : _summariseTranscript(priorTranscript);
+
+    return 'BLOCKED — refire of completed work.\n\n'
+        '$agentName already completed an essentially identical task in this '
+        'session (similarity ${(bestScore * 100).toInt()}%).\n\n'
+        'PRIOR TASK BRIEF:\n${bestMatch.task}\n\n'
+        'PRIOR RESULT (summary):\n$priorSummary\n\n'
+        'Do NOT re-run this. Pick one:\n'
+        '• Call council_report and synthesize the existing results above.\n'
+        '• Dispatch GENUINELY NEW work — a different surface, a follow-up '
+        'phase, an explicit refinement. Rephrase the task so the novelty is '
+        'unambiguous (don\'t just paraphrase the original brief).\n'
+        '• If you think the prior result is wrong, route a council_ask_pool '
+        'question to a peer to challenge it — don\'t silently redo the work.';
+  }
+
+  /// Jaccard similarity over normalized word sets. Symmetric, in [0..1].
+  /// Empty inputs (or all-stopword inputs) return 0.
+  double _taskSimilarity(String a, String b) {
+    final wordsA = _normalizedTaskWords(a);
+    final wordsB = _normalizedTaskWords(b);
+    if (wordsA.isEmpty || wordsB.isEmpty) return 0.0;
+    final intersection = wordsA.intersection(wordsB).length;
+    final union = wordsA.union(wordsB).length;
+    return union == 0 ? 0.0 : intersection / union;
+  }
+
+  /// Tokenize a task brief into a normalized comparable word set. Lowercased,
+  /// punctuation/whitespace split, common English stopwords filtered, very
+  /// short tokens (< 2 chars) dropped so that connectives don't dominate
+  /// the similarity score. Keeps `/`, `.`, `_`, `-` inside tokens so file
+  /// paths like `lib/foo/bar.dart` survive as a single signal-rich token.
+  static final Set<String> _kTaskStopwords = {
+    'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
+    'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been',
+    'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+    'should', 'could', 'may', 'might', 'must', 'shall', 'can', 'this', 'that',
+    'these', 'those', 'first', 'then', 'also', 'please', 'your', 'you', 'it',
+    'its', 'we', 'our', 'us', 'they', 'their', 'them', 'so', 'if', 'when',
+    'where', 'which', 'while', 'into', 'onto', 'out', 'over', 'under', 'than',
+    'task', 'agent', 'work', 'use', 'make', 'create', 'add', 'apply', 'now',
+    'next', 'before', 'after', 'within', 'across', 'between',
+  };
+
+  Set<String> _normalizedTaskWords(String task) {
+    final lower = task.toLowerCase();
+    return lower
+        .split(RegExp(r'[^a-z0-9_./\-]+'))
+        .where((w) => w.length > 1 && !_kTaskStopwords.contains(w))
+        .toSet();
+  }
+
+  /// Detects orchestrator process-questions and returns the canonical
+  /// answer the orchestrator should have produced itself. Returns null
+  /// when the question is a legitimate user-facing ask (intent,
+  /// credentials, risk acceptance, reviewer-blocker decisions).
+  ///
+  /// We over-favor returning null here — false negatives just mean the
+  /// user sees a modal they could have skipped, which is recoverable.
+  /// False positives would silently swallow a real user-input prompt,
+  /// which is much worse.
+  static String? _canonicalProcessAnswer(String question) {
+    final q = question.toLowerCase();
+    final hasQuestionMark = q.contains('?');
+    if (!hasQuestionMark) return null;
+
+    // Ship-as-they-come vs wait-for-all.
+    final shipsAsCome = q.contains('ship') &&
+        (q.contains('as they') ||
+            q.contains('as it') ||
+            q.contains('come in') ||
+            q.contains('incrementally') ||
+            q.contains('one by one'));
+    final waitForAll = q.contains('wait') &&
+        (q.contains('all') || q.contains('finish') || q.contains('done'));
+    final seqVsPar = q.contains('sequential') && q.contains('parallel');
+    if (shipsAsCome || waitForAll || seqVsPar) {
+      return 'Default: dispatch independent threads in parallel, then call '
+          'council_wait for the wave. Synthesize once every agent has '
+          'returned, not incrementally as each one finishes. This is the '
+          'canonical flow — proceed without asking.';
+    }
+
+    // "Should I dispatch / dispatch now / dispatch next".
+    if (q.contains('dispatch') &&
+        (q.contains('should i') ||
+            q.contains('shall i') ||
+            q.contains('do i') ||
+            q.contains('now') ||
+            q.contains('next'))) {
+      return 'Yes. Identify the independent threads in the brief and '
+          'dispatch them in parallel via council_dispatch. You own '
+          'dispatch decisions — do not ask permission.';
+    }
+
+    // "Should I write/ship/finalize the report".
+    if (q.contains('report') &&
+        (q.contains('should i') ||
+            q.contains('shall i') ||
+            q.contains('do i') ||
+            q.contains('write') ||
+            q.contains('finalize') ||
+            q.contains('ship')) &&
+        !q.contains('round two') &&
+        !q.contains('round 2')) {
+      return 'Yes. Call council_report with the markdown synthesis of the '
+          'work that has returned. The user does not need to confirm — '
+          'when all dispatched work has come back, reporting is the '
+          'default next action.';
+    }
+
+    // "How should I organize / approach / structure the work".
+    if ((q.contains('how should i') ||
+            q.contains('what approach') ||
+            q.contains('which approach') ||
+            q.contains('how do i organize') ||
+            q.contains('how to organize')) &&
+        !q.contains('credential') &&
+        !q.contains('risk') &&
+        !q.contains('access')) {
+      return 'Pick the most natural shape for the brief. Independent threads '
+          'run parallel (council_dispatch with parallel=true, then '
+          'council_wait); dependent threads run sequential. The orchestrator '
+          'owns this call — that is the job.';
+    }
+
+    // "Is this ok" / "look ok" / "proceed" style permission asks.
+    if ((q.contains('is this ok') ||
+            q.contains('looks ok') ||
+            q.contains('look good') ||
+            q.contains('look ok') ||
+            q.contains('any objection') ||
+            q.contains('any concerns') ||
+            q.contains('any thoughts') ||
+            q.contains('continue') ||
+            q.contains('proceed')) &&
+        !q.contains('risk') &&
+        !q.contains('destructive') &&
+        !q.contains('delete') &&
+        !q.contains('credential') &&
+        !q.contains('production')) {
+      return 'Yes, proceed. Don\'t ask for permission on non-destructive, '
+          'non-risk-acceptance, non-credential moves — make the call and '
+          'continue. The user is reading the final report, not approving '
+          'each step.';
+    }
+
+    return null;
+  }
+
+  /// Emit an `agentToolFire` event for the activity bubble layer. Wired
+  /// to `CouncilAgentRunner.onToolFire` so the moment a tool is identified
+  /// (read_file / edit_file / run_cmd / ...) the bubble flashes the
+  /// structured "currently doing X" signal — file path, command, etc.
+  /// Replaces the prior model of leaking raw stream chunks as bubble text.
+  ///
+  /// We deliberately skip emitting for council protocol tools (dispatch /
+  /// wait / ask_pool / ask_user / report) — those have dedicated event
+  /// surfaces (`dispatched`, `askedPool`, `askedUser`, `reported`) that
+  /// the bubble layer already handles. The runner already gates the
+  /// callback for non-council tools.
+  void _onAgentToolFire(
+    String agentId,
+    String toolId,
+    Map<String, dynamic> arguments,
+  ) {
+    final primary = _primaryToolArg(toolId, arguments);
+    final data = <String, dynamic>{'toolId': toolId};
+    if (primary != null) data['primaryArg'] = primary;
+    _event(
+      CouncilEventType.agentToolFire,
+      fromAgentId: agentId,
+      message: primary == null ? toolId : '$toolId: $primary',
+      data: data,
+    );
+  }
+
+  /// Extract the user-facing "primary" argument for a tool — the bit that
+  /// goes into the speech bubble flash so the user reads "Reading
+  /// `lib/foo.dart`" instead of just "read_file". Returns null when the
+  /// tool has no useful primary arg (e.g. `git_status` takes none).
+  static String? _primaryToolArg(String toolId, Map<String, dynamic> args) {
+    String? str(String key) {
+      final v = args[key];
+      if (v is String && v.trim().isNotEmpty) return v.trim();
+      return null;
+    }
+
+    switch (toolId) {
+      case 'read_file':
+      case 'create_file':
+      case 'append_file':
+      case 'edit_file':
+      case 'multi_edit':
+      case 'edit_range':
+      case 'list_dir':
+      case 'tree':
+        return str('path') ?? str('directory');
+      case 'move_file':
+      case 'copy_file':
+        return str('source') ?? str('path') ?? str('from');
+      case 'delete_file':
+        return str('path');
+      case 'find_file':
+      case 'glob':
+        return str('pattern') ?? str('name') ?? str('query');
+      case 'search_text':
+        return str('query') ?? str('pattern');
+      case 'run_cmd':
+      case 'verify':
+        return str('cmd') ?? str('command');
+      case 'check_url':
+      case 'web_fetch':
+        return str('url');
+      case 'web_search':
+        return str('query');
+      case 'git_diff':
+      case 'git_log':
+      case 'git_blame':
+        return str('path');
+      case 'git_status':
+        return null;
+      case 'save_memory':
+        return str('scope');
+      default:
+        // Best-effort fallback so new tools land with some signal.
+        return str('path') ??
+            str('cmd') ??
+            str('command') ??
+            str('query') ??
+            str('pattern') ??
+            str('url');
+    }
   }
 
   /// Cheap, in-band summary for `agent_done.summary`. Pool consensus: do NOT

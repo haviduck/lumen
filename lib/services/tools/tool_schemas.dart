@@ -794,6 +794,69 @@ class ToolSchemas {
       },
     ),
     ToolSchema(
+      id: 'council_plan_subtasks',
+      name: 'COUNCIL_PLAN_SUBTASKS',
+      description:
+          'Declare the ordered steps you will execute for the current '
+          'task. Call this ONCE at the start of any non-trivial work so '
+          'the council UI can render real-time progress. 2-8 concrete, '
+          'action-oriented steps. Skip for one-shot mechanical tasks.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'subtasks': {
+            'type': 'array',
+            'description':
+                'Ordered list of 2-8 concrete subtasks. Each is a short, '
+                'action-oriented label.',
+            'items': {'type': _stringSchema},
+          },
+        },
+        'required': ['subtasks'],
+      },
+      toGroups: (args) => [
+        ((args['subtasks'] as List?) ?? const [])
+            .whereType<String>()
+            .join('||'),
+      ],
+      toRawText: (args) {
+        final subs = ((args['subtasks'] as List?) ?? const [])
+            .whereType<String>()
+            .toList();
+        final body = subs.map((s) => '- $s').join('\n');
+        return '<<<COUNCIL_PLAN_SUBTASKS>>>\n$body\n<<<END_COUNCIL>>>';
+      },
+    ),
+    ToolSchema(
+      id: 'council_subtask_progress',
+      name: 'COUNCIL_SUBTASK_PROGRESS',
+      description:
+          'Mark a subtask as just completed. Call this IMMEDIATELY after '
+          'finishing each step from your plan so the council UI advances '
+          'in real time. step is 1-based; summary is one short sentence '
+          'on what shipped from that step.',
+      inputSchema: {
+        'type': _objectSchema,
+        'properties': {
+          'step': {
+            'type': 'integer',
+            'description':
+                'The 1-based index of the subtask you just completed.',
+          },
+          'summary': _strProp(
+              'One-line summary of what landed from that step.'),
+        },
+        'required': ['step', 'summary'],
+      },
+      toGroups: (args) => [
+        '${args['step']}',
+        (args['summary'] as String?) ?? '',
+      ],
+      toRawText: (args) =>
+          '<<<COUNCIL_SUBTASK_PROGRESS: ${args['step']}>>>\n'
+          '${args['summary'] ?? ''}\n<<<END_COUNCIL>>>',
+    ),
+    ToolSchema(
       id: 'council_ask_user',
       name: 'COUNCIL_ASK_USER',
       description:

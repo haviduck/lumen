@@ -1487,7 +1487,7 @@ class _FileExplorerState extends State<FileExplorer> {
                               _focusNode.requestFocus();
                               _selectPath(dir.path);
                             },
-                            onSecondaryTapDown: (details) {
+                            onSecondaryTapUp: (details) {
                               _showEmptyAreaMenu(
                                 context,
                                 appState,

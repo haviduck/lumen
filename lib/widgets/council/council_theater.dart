@@ -13,6 +13,7 @@ import 'council_agent_inspector.dart';
 import 'council_agent_sector.dart';
 import 'council_backdrop.dart';
 import 'council_blackboard.dart';
+import 'council_discourse_layer.dart';
 import 'council_finished_overlay.dart';
 import 'council_header_bar.dart';
 import 'council_orchestrator_ping_panel.dart';
@@ -619,6 +620,20 @@ class _CouncilStage extends StatelessWidget {
                             pulse: pulse,
                             anchors: anchors,
                             network: network,
+                          ),
+                        ),
+                      ),
+                      // Discourse layer — animated peer-to-peer tethers
+                      // during pool exchanges. Stacked ABOVE the traffic
+                      // mesh so conversation arcs read as a distinct
+                      // signal from orchestrator-dispatch packets.
+                      Positioned.fill(
+                        child: RepaintBoundary(
+                          child: CouncilDiscourseLayer(
+                            events: session.events,
+                            pulse: pulse,
+                            anchors: anchors,
+                            orchestratorId: session.config.orchestrator.id,
                           ),
                         ),
                       ),

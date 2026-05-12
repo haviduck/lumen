@@ -107,6 +107,22 @@ class CouncilTask {
   int attempts;
   final int maxAttempts;
 
+  /// Ordered list of subtasks the agent declared up-front via
+  /// `council_plan_subtasks`. Empty means the agent is treating the
+  /// task as a single mechanical step (no progress meter rendered).
+  List<String> subtasks;
+
+  /// Highest 1-based subtask index marked complete via
+  /// `council_subtask_progress`. `0` means "plan declared but nothing
+  /// finished yet". When this equals `subtasks.length` the agent has
+  /// shipped every step it planned.
+  int currentSubtaskIndex;
+
+  /// Parallel to [subtasks]; one short summary per completed step
+  /// (empty string for not-yet-completed slots). Powers the bubble's
+  /// "Just did: …" secondary line and the inspector's history.
+  List<String> subtaskSummaries;
+
   CouncilTask({
     required this.id,
     required this.agentId,
@@ -122,8 +138,13 @@ class CouncilTask {
     this.nextIntendedAction,
     this.attempts = 0,
     this.maxAttempts = 2,
+    List<String>? subtasks,
+    this.currentSubtaskIndex = 0,
+    List<String>? subtaskSummaries,
   })  : createdAt = createdAt ?? DateTime.now(),
-        updatedAt = updatedAt ?? DateTime.now();
+        updatedAt = updatedAt ?? DateTime.now(),
+        subtasks = List<String>.from(subtasks ?? const []),
+        subtaskSummaries = List<String>.from(subtaskSummaries ?? const []);
 
   bool get isTerminal => kTerminalTaskStates.contains(state);
 
@@ -142,6 +163,9 @@ class CouncilTask {
         'maxAttempts': maxAttempts,
         'createdAt': createdAt.toIso8601String(),
         'updatedAt': updatedAt.toIso8601String(),
+        if (subtasks.isNotEmpty) 'subtasks': subtasks,
+        if (currentSubtaskIndex > 0) 'currentSubtaskIndex': currentSubtaskIndex,
+        if (subtaskSummaries.isNotEmpty) 'subtaskSummaries': subtaskSummaries,
       };
 
   static CouncilTask fromJson(Map<String, dynamic> json) {
@@ -169,6 +193,15 @@ class CouncilTask {
       maxAttempts: (json['maxAttempts'] as num?)?.toInt() ?? 2,
       createdAt: DateTime.tryParse(json['createdAt'] as String? ?? ''),
       updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? ''),
+      subtasks: ((json['subtasks'] as List?) ?? const <dynamic>[])
+          .whereType<String>()
+          .toList(),
+      currentSubtaskIndex:
+          (json['currentSubtaskIndex'] as num?)?.toInt() ?? 0,
+      subtaskSummaries:
+          ((json['subtaskSummaries'] as List?) ?? const <dynamic>[])
+              .whereType<String>()
+              .toList(),
     );
   }
 }

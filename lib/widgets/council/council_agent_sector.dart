@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -40,6 +41,26 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
   CouncilAgentStatus? _lastStatus;
   late final AnimationController _doneFlash;
 
+  /// Continuous-forward ticker (no reverse) used to drive the per-card
+  /// bobbing and the orchestrator halo rotation. Distinct from `_idle`,
+  /// which bounces 0→1→0 for the breathing border alpha — bobbing
+  /// needs monotonic phase so the sine doesn't snap at the bounce.
+  late final AnimationController _bob;
+
+  /// One-shot micro-pulse fired when the agent's tool-fire event lands.
+  /// 480ms easeOutCubic, drives a quick scale + accent flash so the
+  /// eye snaps to the card actually executing work. Decoupled from
+  /// `_doneFlash` so a tool fire mid-task doesn't compete with the
+  /// final "I'm done" burst.
+  late final AnimationController _toolPulse;
+
+  /// Per-agent phase offset for the bob — deterministic from agent.id
+  /// hash so two cards never bob in lockstep, but the same card has a
+  /// stable rhythm across rebuilds.
+  late final double _bobPhase;
+
+  StreamSubscription<CouncilEvent>? _eventSub;
+
   @override
   void initState() {
     super.initState();
@@ -66,9 +87,53 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     )..repeat(reverse: true);
     _doneFlash = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 900),
+      duration: const Duration(milliseconds: 1600),
     );
+    _bob = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 4200),
+    )..repeat();
+    _toolPulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 480),
+    );
+    _bobPhase = _phaseForId(widget.agent.id);
     _lastStatus = widget.agent.status;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _bindEvents();
+    });
+  }
+
+  void _bindEvents() {
+    final controller = context.read<AppState>().council;
+    _eventSub?.cancel();
+    _eventSub = controller.events.listen((event) {
+      if (!mounted) return;
+      // Filter for events that affect THIS agent's card. Cheaper than
+      // routing through a global broker — Flutter's stream subscription
+      // overhead is negligible compared to the per-card painters.
+      if (event.fromAgentId != widget.agent.id) return;
+      switch (event.type) {
+        case CouncilEventType.agentToolFire:
+        case CouncilEventType.agentSubtaskProgress:
+          _toolPulse.forward(from: 0);
+        default:
+          break;
+      }
+    });
+  }
+
+  /// Stable 0..1 phase from agent id. Same algorithm as the rest of
+  /// the codebase uses for hash-derived rhythm signatures — FNV-1a
+  /// over UTF-16 then divide.
+  double _phaseForId(String id) {
+    var h = 2166136261;
+    for (var i = 0; i < id.length; i++) {
+      h = (h ^ id.codeUnitAt(i)) & 0xFFFFFFFF;
+      h = (h * 16777619) & 0xFFFFFFFF;
+    }
+    return (h % 1000) / 1000.0;
   }
 
   @override
@@ -85,9 +150,12 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
 
   @override
   void dispose() {
+    _eventSub?.cancel();
     _arrive.dispose();
     _idle.dispose();
     _doneFlash.dispose();
+    _bob.dispose();
+    _toolPulse.dispose();
     super.dispose();
   }
 
@@ -104,7 +172,8 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     final errored = agent.status == CouncilAgentStatus.error;
 
     return AnimatedBuilder(
-      animation: Listenable.merge([_arrive, _idle, _doneFlash]),
+      animation:
+          Listenable.merge([_arrive, _idle, _doneFlash, _bob, _toolPulse]),
       builder: (context, _) {
         // Pulsating-inwards spawn:
         //   scale  : 1.32 → 1.00  (settles INWARD; easeOutCubic)
@@ -113,8 +182,43 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
         //            painted around the card and pulled inward.
         final raw = _arrive.value.clamp(0.0, 1.0);
         final eased = Curves.easeOutCubic.transform(raw);
-        final scale = 1.32 - 0.32 * eased;
+        final arriveScale = 1.32 - 0.32 * eased;
         final fadeIn = Curves.easeOutCubic.transform(raw);
+
+        // ── Bobbing ───────────────────────────────────────────────
+        // Continuous sine over `_bob.value` (0..1, no reverse) with a
+        // per-agent phase offset so the ring breathes asynchronously.
+        // Amplitude scales with the agent's status — active cards
+        // bob harder so the eye reads them as alive; idle cards stay
+        // nearly still so the ring doesn't feel jittery.
+        final isActive =
+            agent.status == CouncilAgentStatus.working ||
+            agent.status == CouncilAgentStatus.askingPool ||
+            agent.status == CouncilAgentStatus.replying ||
+            agent.status == CouncilAgentStatus.awaitingUser;
+        // Orchestrator bobs less — it's the conductor, the steady
+        // center the user's eye returns to. Peers do the dancing.
+        final bobAmpBase = isOrchestrator
+            ? 1.2
+            : (isActive ? 3.4 : 1.4);
+        final bobOffsetY = math.sin(
+              (_bob.value + _bobPhase) * math.pi * 2,
+            ) *
+            bobAmpBase;
+
+        // ── Tool-fire micro-pulse ────────────────────────────────
+        // 480ms easeOut. Card gives a quick 1.0 → 1.03 → 1.0 scale
+        // burst and an accent flash so the eye snaps to wherever
+        // real work is firing right now.
+        final tpRaw = _toolPulse.value;
+        final pulseScale = tpRaw == 0
+            ? 1.0
+            : 1.0 + math.sin(tpRaw * math.pi) * 0.034;
+        final pulseAccentBoost =
+            tpRaw == 0 ? 0.0 : math.sin(tpRaw * math.pi) * 0.55;
+
+        // Composed scale: arrival × tool-pulse.
+        final scale = arriveScale * pulseScale;
         // Accent ramp re-tokenised to Nord (`accentCyan` #88C0D0) so
         // the card reads as part of the IDE chrome family instead of
         // the saturated `councilAccent` blue, which the user flagged
@@ -134,42 +238,90 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
 
         return Opacity(
           opacity: fadeIn,
-          child: Transform.scale(
-            scale: scale,
-            child: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                // Pulsating-inwards arrival ring — starts ~80px outside
-                // the card and contracts to the card edge as the card
-                // settles.  Replaces the old expand-outward ring which
-                // read as "exploding" rather than "materializing".
-                if (raw < 1.0)
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: CustomPaint(
-                        painter: _ArrivalRingPainter(
-                          progress: raw,
-                          accent: accent,
+          child: Transform.translate(
+            offset: Offset(0, bobOffsetY),
+            child: Transform.scale(
+              scale: scale,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  // Pulsating-inwards arrival ring — starts ~80px outside
+                  // the card and contracts to the card edge as the card
+                  // settles.  Replaces the old expand-outward ring which
+                  // read as "exploding" rather than "materializing".
+                  if (raw < 1.0)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          painter: _ArrivalRingPainter(
+                            progress: raw,
+                            accent: accent,
+                          ),
                         ),
                       ),
                     ),
+                  // Orchestrator-only rotating halo — a slow conic
+                  // gradient stroke that reads as "this is the
+                  // conductor" without being noisy. Drawn UNDER the
+                  // card so the card's own border doesn't compete.
+                  if (isOrchestrator)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          painter: _OrchestratorHaloPainter(
+                            angle: _bob.value * math.pi * 2,
+                            accent: accent,
+                            // Halo gets brighter when work is in flight,
+                            // dims when the council is idle.
+                            intensity: isActive ? 1.0 : 0.55,
+                          ),
+                        ),
+                      ),
+                    ),
+                  // Done-burst — an expanding ring that emanates from
+                  // the card edge when an agent transitions to done.
+                  // Replaces the deliberately-dropped "green halo"
+                  // with a more muscular one-shot the user can't
+                  // miss. Cyan/mint blend keeps the IDE accent
+                  // palette, no green border.
+                  if (_doneFlash.value > 0)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          painter: _DoneBurstPainter(
+                            progress: _doneFlash.value,
+                            accent: DuckColors.accentMint,
+                          ),
+                        ),
+                      ),
+                    ),
+                  _buildCard(
+                    active: active,
+                    done: done,
+                    errored: errored,
+                    isOrchestrator: isOrchestrator,
+                    accent: accent,
+                    idleT: _idle.value,
+                    desat: desat,
+                    pulseAccentBoost: pulseAccentBoost,
                   ),
-                // Done celebration ring — intentionally REMOVED.
-                // The previous _DoneRingPainter painted a stroked rrect at
-                // DuckColors.stateOk α 0.7 around the card on completion.
-                // That was the "ugly green border" the user flagged. The
-                // check-circle icon in the title row is now the only done
-                // affordance — no halo, no painter.
-                _buildCard(
-                  active: active,
-                  done: done,
-                  errored: errored,
-                  isOrchestrator: isOrchestrator,
-                  accent: accent,
-                  idleT: _idle.value,
-                  desat: desat,
-                ),
-              ],
+                  // Tool-fire glow — a soft accent wash that pulses
+                  // ON TOP of the card during the brief micro-pulse.
+                  // Paints OVER the card chrome so it actually
+                  // brightens the surface, but ignores hit-testing.
+                  if (pulseAccentBoost > 0.01)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          painter: _ToolPulseGlowPainter(
+                            intensity: pulseAccentBoost,
+                            accent: accent,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
             ),
           ),
         );
@@ -185,6 +337,7 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     required Color accent,
     required double idleT,
     required double desat,
+    double pulseAccentBoost = 0.0,
   }) {
     final agent = widget.agent;
     // Stronger card presence (Stage Director spec):
@@ -196,14 +349,20 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     //   • Rim light (active + orchestrator): bright top-edge highlight
     //     via a 1px inner gradient stroke — sells the depth.
     //   • Layered shadow: a wide soft shadow + a tight contact shadow.
-    final ambientGlow = active ? 0.10 + 0.05 * idleT : 0.035;
+    // Tool-pulse spikes both the ambient glow and the accent stroke
+    // so the card visibly brightens while a tool is mid-flight. The
+    // boost decays with `_toolPulse`'s sine envelope so it never
+    // sticks.
+    final ambientGlow =
+        (active ? 0.10 + 0.05 * idleT : 0.035) + 0.10 * pulseAccentBoost;
     final accentStrokeAlpha = errored
         ? 0.65
-        : isOrchestrator
-        ? 0.42 + 0.16 * idleT
-        : active
-        ? 0.30 + 0.14 * idleT
-        : 0.12; // always-on subtle accent
+        : (isOrchestrator
+                  ? 0.42 + 0.16 * idleT
+                  : active
+                  ? 0.30 + 0.14 * idleT
+                  : 0.12) +
+              0.20 * pulseAccentBoost;
     final borderColor = errored
         ? DuckColors.stateError.withValues(alpha: 0.72)
         : accent.withValues(alpha: accentStrokeAlpha);
@@ -370,6 +529,15 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
                 letterSpacing: 0.1,
               ),
             ),
+            // Subtask step indicator — only renders when the agent has
+            // declared a plan via `council_plan_subtasks`. Collapsed
+            // height when empty so the card layout stays stable across
+            // tasks with / without subtask plans.
+            _SubtaskStepIndicator(
+              agentId: agent.id,
+              accent: accent,
+              idleT: idleT,
+            ),
             const SizedBox(height: 10),
             _AgentStatusBlock(
               agent: agent,
@@ -465,6 +633,175 @@ class _ArrivalRingPainter extends CustomPainter {
 // around each card on completion, which read as the "ugly green
 // border" the user flagged. Done state is now communicated solely by
 // the check-circle icon in the title row.
+
+/// Done-burst painter: one-shot expanding ring that emanates outward
+/// from the card edge when an agent transitions to [CouncilAgentStatus.done].
+/// Replaces the dropped green halo with a single sweep of the IDE
+/// accent (mint by default — passed in as `accent`) so the user
+/// gets a clear "shipped!" beat without a persistent border.
+///
+/// The animation runs once per transition (controlled by
+/// `_doneFlash` in the parent state) and self-clears.
+class _DoneBurstPainter extends CustomPainter {
+  final double progress;
+  final Color accent;
+
+  _DoneBurstPainter({required this.progress, required this.accent});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final t = progress.clamp(0.0, 1.0);
+    if (t <= 0) return;
+    // Two overlapping easings — fast scale-out, slower fade — so the
+    // ring feels like it's *thrown* outward rather than smoothly
+    // tweened.
+    final eased = Curves.easeOutCubic.transform(t);
+    final fadeT = Curves.easeOutQuart.transform(t);
+    final outset = 28.0 * eased;
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6 + 1.4 * (1 - t)
+      ..color = accent.withValues(alpha: (1 - fadeT) * 0.72)
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, 3 + 4 * eased);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(
+          -outset,
+          -outset,
+          size.width + outset * 2,
+          size.height + outset * 2,
+        ),
+        Radius.circular(20 + outset * 0.35),
+      ),
+      paint,
+    );
+    // Inner sheen — bright at t≈0 then fades quickly. Sells the
+    // "ping" without competing with the outer ring.
+    if (t < 0.55) {
+      final s = 1.0 - (t / 0.55);
+      final inner = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.9 + 1.1 * s
+        ..color = accent.withValues(alpha: 0.55 * s);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(0, 0, size.width, size.height).deflate(1.5),
+          const Radius.circular(16),
+        ),
+        inner,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DoneBurstPainter oldDelegate) =>
+      oldDelegate.progress != progress || oldDelegate.accent != accent;
+}
+
+/// Orchestrator-only rotating halo. Paints a soft conic-gradient ring
+/// around the orchestrator card so the user can always read "this
+/// one's the conductor" at a glance, even before any work has
+/// kicked off.
+///
+/// * `angle` — radians, advances monotonically; we paint a single
+///   ~120° hot-arc that rotates around the card.
+/// * `intensity` — 0..1, dimmed when the council is idle so the
+///   halo doesn't strobe over a quiet stage.
+class _OrchestratorHaloPainter extends CustomPainter {
+  final double angle;
+  final Color accent;
+  final double intensity;
+
+  _OrchestratorHaloPainter({
+    required this.angle,
+    required this.accent,
+    required this.intensity,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (intensity <= 0) return;
+    const outset = 6.0;
+    final rect = Rect.fromLTWH(
+      -outset,
+      -outset,
+      size.width + outset * 2,
+      size.height + outset * 2,
+    );
+    final center = rect.center;
+    // Conic sweep gradient — implemented via SweepGradient. The
+    // sweep is rotated by `angle` and the alpha falls off rapidly
+    // so we get a comet-tail arc instead of a flat ring.
+    final shader = SweepGradient(
+      center: Alignment.center,
+      startAngle: 0,
+      endAngle: math.pi * 2,
+      transform: GradientRotation(angle),
+      colors: [
+        accent.withValues(alpha: 0.0),
+        accent.withValues(alpha: 0.38 * intensity),
+        accent.withValues(alpha: 0.72 * intensity),
+        accent.withValues(alpha: 0.18 * intensity),
+        accent.withValues(alpha: 0.0),
+      ],
+      stops: const [0.0, 0.18, 0.30, 0.46, 1.0],
+    ).createShader(Rect.fromCircle(center: center, radius: rect.longestSide));
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.4 + 1.0 * intensity
+      ..shader = shader
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2.4);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, const Radius.circular(22)),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _OrchestratorHaloPainter oldDelegate) =>
+      oldDelegate.angle != angle ||
+      oldDelegate.intensity != intensity ||
+      oldDelegate.accent != accent;
+}
+
+/// Tool-fire glow painter. Soft accent wash painted ON TOP of the
+/// card during the brief micro-pulse fired by [_toolPulse] in the
+/// parent state. Quickly fades back to zero — combined with the
+/// `pulseAccentBoost` lift inside `_buildCard`, the card visibly
+/// flashes the moment a tool dispatches.
+class _ToolPulseGlowPainter extends CustomPainter {
+  final double intensity;
+  final Color accent;
+
+  _ToolPulseGlowPainter({required this.intensity, required this.accent});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (intensity <= 0) return;
+    final rrect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(0, 0, size.width, size.height),
+      const Radius.circular(16),
+    );
+    // Inner overlay — picks up the accent and tints the whole card
+    // surface. Low alpha + a slight blur so it reads as a light
+    // wash rather than a solid fill.
+    final paint = Paint()
+      ..color = accent.withValues(alpha: 0.16 * intensity)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2.0);
+    canvas.drawRRect(rrect, paint);
+    // Tight edge stroke — pops the rim hot for the duration of the
+    // pulse.
+    final stroke = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2
+      ..color = accent.withValues(alpha: 0.55 * intensity);
+    canvas.drawRRect(rrect.deflate(0.6), stroke);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ToolPulseGlowPainter oldDelegate) =>
+      oldDelegate.intensity != intensity || oldDelegate.accent != accent;
+}
 
 class _TranscriptWell extends StatelessWidget {
   final String agentId;
@@ -998,6 +1335,136 @@ class _AgentStatusBlock extends StatelessWidget {
 
   String _clip(String s, int max) =>
       s.length <= max ? s : '${s.substring(0, max)}…';
+}
+
+/// Per-card horizontal step indicator driven by the live ledger's
+/// `subtasks` + `currentSubtaskIndex` for the agent's latest task.
+///
+/// Renders as N dots (max 8) on a single line plus a "Step K/N" pill.
+/// Completed steps glow accent; the in-progress step pulses with the
+/// shared `idleT` phase so the eye picks out where the work is right
+/// now. Returns a zero-height `SizedBox` when no plan is declared so
+/// cards without subtasks keep their original layout exactly.
+class _SubtaskStepIndicator extends StatelessWidget {
+  final String agentId;
+  final Color accent;
+  final double idleT;
+
+  const _SubtaskStepIndicator({
+    required this.agentId,
+    required this.accent,
+    required this.idleT,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final session = context
+        .select<AppState, CouncilSession?>((s) => s.council.session);
+    final task = _latestTaskFor(session, agentId);
+    final subtasks = task?.subtasks ?? const <String>[];
+    if (subtasks.isEmpty) return const SizedBox.shrink();
+    final total = subtasks.length;
+    final doneRaw = task?.currentSubtaskIndex ?? 0;
+    final done = doneRaw.clamp(0, total);
+    final inProgressIdx = done >= total ? -1 : done; // 0-based
+    final pulseAlpha = 0.55 + 0.45 * idleT;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          // Dot row. Capped at 8 because that's the protocol cap and
+          // because more than 8 dots starts to compress the card.
+          for (var i = 0; i < total && i < 8; i++) ...[
+            _StepDot(
+              filled: i < done,
+              pulsing: i == inProgressIdx,
+              accent: accent,
+              pulseAlpha: pulseAlpha,
+            ),
+            if (i < total - 1 && i < 7) const SizedBox(width: 4),
+          ],
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              S.councilStepIndicatorLabel(
+                done >= total ? total : done + 1,
+                total,
+              ),
+              maxLines: 1,
+              softWrap: false,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: accent.withValues(alpha: 0.92),
+                fontSize: 9.6,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.7,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  CouncilTask? _latestTaskFor(CouncilSession? session, String id) {
+    if (session == null) return null;
+    CouncilTask? latest;
+    for (final t in session.tasks) {
+      if (t.agentId != id) continue;
+      if (latest == null || t.updatedAt.isAfter(latest.updatedAt)) {
+        latest = t;
+      }
+    }
+    return latest;
+  }
+}
+
+class _StepDot extends StatelessWidget {
+  final bool filled;
+  final bool pulsing;
+  final Color accent;
+  final double pulseAlpha;
+
+  const _StepDot({
+    required this.filled,
+    required this.pulsing,
+    required this.accent,
+    required this.pulseAlpha,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final base = filled
+        ? accent.withValues(alpha: 0.92)
+        : accent.withValues(alpha: 0.18);
+    final size = pulsing ? 9.0 : 7.0;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: pulsing
+            ? Color.lerp(base, Colors.white, 0.18 * pulseAlpha)
+            : base,
+        borderRadius: BorderRadius.circular(size / 2),
+        boxShadow: pulsing
+            ? [
+                BoxShadow(
+                  color: accent.withValues(alpha: 0.45 * pulseAlpha),
+                  blurRadius: 5,
+                ),
+              ]
+            : null,
+        border: filled
+            ? null
+            : Border.all(
+                color: accent.withValues(alpha: 0.45),
+                width: 0.7,
+              ),
+      ),
+    );
+  }
 }
 
 class _ActivityHintData {

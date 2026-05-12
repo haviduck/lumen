@@ -109,12 +109,47 @@ class _CouncilSessionsBrowserState extends State<CouncilSessionsBrowser> {
   }
 
   Widget _buildListPane() {
+    final appState = context.watch<AppState>();
+    final hasLiveSession = appState.council.session != null;
     return Column(
       children: [
         _buildListHeader(),
         const Divider(height: 1, color: DuckColors.border),
+        if (hasLiveSession) _buildLiveSessionBanner(appState),
         Expanded(child: _buildSessionList()),
       ],
+    );
+  }
+
+  Widget _buildLiveSessionBanner(AppState appState) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0x1800E5FF),
+        border: Border(
+          bottom: BorderSide(color: DuckColors.border),
+        ),
+      ),
+      child: OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: DuckColors.accentCyan,
+          side: const BorderSide(color: DuckColors.accentCyan, width: 1),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+          ),
+        ),
+        icon: const Icon(Icons.visibility_outlined, size: 16),
+        label: const Text(
+          S.councilOpenLiveSession,
+          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+        ),
+        onPressed: () {
+          appState.council.showTheater();
+          appState.openCouncilTheaterTab();
+        },
+      ),
     );
   }
 

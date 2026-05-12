@@ -18,6 +18,7 @@ import '../services/model_capabilities.dart';
 import '../services/ollama_service.dart';
 import '../services/preferences_service.dart';
 import '../services/provider_error.dart';
+import '../services/deepseek_v4_handler.dart';
 import '../services/reasoning_effort.dart';
 import '../services/rules_service.dart';
 import '../services/timeline_recorder.dart';
@@ -1421,6 +1422,28 @@ class ChatController extends ChangeNotifier {
           'it or switch to a model from an enabled provider.';
       return;
     }
+    // DeepSeek V4 thinking payload (`{thinking: …, reasoning_effort: …}`).
+    // Routed to `options` on Ollama so Ollama Cloud's V4 host can lift
+    // it onto its OpenAI-compatible upstream request. We don't yet know
+    // exactly which fields Ollama Cloud will surface on V4 — sending
+    // both via `options` is the safe forward-compatible bet because
+    // Ollama silently drops unknown option keys. Built per-turn so a
+    // model swap mid-session doesn't carry stale thinking config.
+    Map<String, dynamic>? deepseekV4Options;
+    if (DeepseekV4Handler.isDeepseekV4(rawModel)) {
+      // Coding vs general — heuristic, but solid in practice: any turn
+      // that ships with native tools enabled OR is wired against the
+      // workspace toolset is "coding work". The handler's general/coding
+      // distinction only changes `budget_tokens`, not correctness.
+      final taskKind = (nativeToolIds != null && nativeToolIds.isNotEmpty)
+          ? DeepseekV4TaskKind.coding
+          : DeepseekV4TaskKind.general;
+      deepseekV4Options = DeepseekV4Handler.thinkingPayload(
+        effort: effort ?? ReasoningEffort.standard,
+        taskKind: taskKind,
+        rawModel: rawModel,
+      );
+    }
     switch (provider) {
       case 'gemini':
         yield* gemini.generateChatStream(
@@ -1458,18 +1481,24 @@ class ChatController extends ChangeNotifier {
           token: token,
           forceCloud: true,
           nativeToolIds: nativeToolIds,
+          options: deepseekV4Options,
         );
         return;
       case 'ollama':
       default:
-        // Ollama has no native reasoning param; the prompt-suffix
+        // Ollama has no general native reasoning param; the prompt-suffix
         // fallback for [effort] is injected by `sendMessage` directly
-        // into the system prompt before this is called.
+        // into the system prompt before this is called. DeepSeek V4
+        // (when locally hosted via Ollama on a beast machine) is the
+        // ONE exception — its `thinking` knob is a model-level param,
+        // not a provider-level one, so we forward `deepseekV4Options`
+        // even on the local route.
         yield* ollama.generateChatStream(
           messages,
           model: rawModel,
           token: token,
           nativeToolIds: nativeToolIds,
+          options: deepseekV4Options,
         );
         return;
     }
@@ -3069,10 +3098,37 @@ class ChatController extends ChangeNotifier {
       // pill being invisible to the user means they didn't actively
       // ask for it on this turn.
       final (selectedProvider, selectedRawModel) = _splitModel(modelForTurn);
-      final ReasoningEffort? effort =
-          (selectedProvider == 'ollama' || selectedProvider == 'ollama-cloud')
-          ? null
-          : session.reasoningEffort;
+      // ── DeepSeek V4 floor ────────────────────────────────────────
+      // V4's Non-Think mode is documented unusable for coding
+      // (LiveCodeBench: 93.5% → 56.8%). The handler coerces an
+      // explicit "Off" to "Standard" so a stale pill from a previous
+      // session can't accidentally ship Non-Think on a V4 turn. We
+      // also OVERRIDE the Ollama-side null-out below, because V4
+      // takes a real `thinking` knob even when transported through
+      // Ollama Cloud and the prompt-suffix-suppression rationale
+      // (the "we don't pass reasoning options for Ollama" comment
+      // above) doesn't apply to a model with a real per-request
+      // knob.
+      final isDeepseekV4Turn =
+          DeepseekV4Handler.isDeepseekV4(selectedRawModel);
+      ReasoningEffort? effort;
+      if (isDeepseekV4Turn) {
+        final coerced =
+            DeepseekV4Handler.coercedEffort(session.reasoningEffort);
+        if (DeepseekV4Handler.floorCoerced(session.reasoningEffort)) {
+          debugPrint(
+            '[deepseek-v4] pill was Off; coercing to Standard '
+            '(Think High). Non-Think mode is unusable for coding on '
+            'this model family.',
+          );
+        }
+        effort = coerced;
+      } else if (selectedProvider == 'ollama' ||
+          selectedProvider == 'ollama-cloud') {
+        effort = null;
+      } else {
+        effort = session.reasoningEffort;
+      }
       // When `effort == null` the prompt-suffix path early-returns
       // regardless of `effortIsNative`; we still pass the real value
       // through for non-Ollama providers so the docstring's contract
@@ -3140,6 +3196,7 @@ class ChatController extends ChangeNotifier {
           effortIsNative: effortIsNative,
           useNativeTools: useNativeTools,
           providerLabel: _prettyProviderLabel(selectedProvider),
+          rawModel: selectedRawModel,
           memory: memoryText,
         ),
       );

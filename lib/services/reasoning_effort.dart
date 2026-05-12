@@ -40,6 +40,21 @@
 /// The composer pill picks the right mechanism automatically — see
 /// [ReasoningEffortHelper.modelSupportsNative] and
 /// [ReasoningEffortHelper.promptDirectiveFor].
+///
+/// **DeepSeek V4 carve-out.** The V4 family (`deepseek-v4-pro`,
+/// `deepseek-v4-flash`) is an OpenAI-wire-compatible model whose
+/// *default* (Non-Think) mode is catastrophic for coding — LiveCodeBench
+/// drops from 93.5% in Think Max to 56.8% in Non-Think — and which
+/// confabulates ~94% of the time when uncertain. The handler in
+/// `deepseek_v4_handler.dart` enforces a Think-High floor regardless
+/// of which provider transports the model. `modelSupportsNative`
+/// returns true for it on any provider so the prompt-suffix fallback
+/// is suppressed (V4 has a real `thinking` API knob; the suffix would
+/// double-incentivise verbosity on an already-verbose model).
+library;
+
+import 'deepseek_v4_handler.dart';
+
 enum ReasoningEffort { off, standard, deep }
 
 /// Stable serialisation tokens for persistence. Don't rename — these
@@ -73,6 +88,12 @@ class ReasoningEffortHelper {
     required String provider,
     required String rawModel,
   }) {
+    // Provider-agnostic carve-out: DeepSeek V4 (any transport —
+    // direct API, Ollama Cloud proxy, future rehosts) always has a
+    // real `thinking` knob and we route it through the dedicated
+    // handler. Suppress the prompt-suffix fallback so we don't
+    // double-tax this model's already-verbose preamble tendency.
+    if (DeepseekV4Handler.isDeepseekV4(rawModel)) return true;
     final lower = rawModel.toLowerCase();
     switch (provider) {
       case 'claude':

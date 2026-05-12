@@ -1,18 +1,23 @@
 // Static-source guard: speech bubble background must be opaque.
-// Rationale: Requirement #5 demands speech bubble backgrounds with
-// opacity = 1.0 so text is readable over any canvas content. Today the
-// source uses `DuckColors.bgDeepest.withValues(alpha: 0.30)` for the
-// bubble fill (council_speech_bubbles.dart, ~line 875) — that's the
-// regression we're locking out.
+// Rationale: speech bubble backgrounds need opacity = 1.0 so the
+// narration text stays readable over the council canvas (traffic
+// mesh, backdrop atmosphere, agent transcript wells). The previous
+// regression was `DuckColors.bgDeepest.withValues(alpha: 0.30)` as
+// the bubble fill — this test locks that and any other translucent
+// fill out of the bubble surface.
 //
-// Strategy: parse council_speech_bubbles.dart and forbid translucent
-// alpha values inside the contiguous block that builds the main bubble
-// surface (the BoxDecoration / gradient feeding the bubble container).
-// We bound the scan to marker comments ("// BUBBLE_BG_BEGIN") and
-// ("// BUBBLE_BG_END") that the doers MUST add around the bubble's
-// background decoration. Without the markers the test fails — that
-// failure forces the doers to declare which lines are the bubble bg,
-// which is itself the contract.
+// 2026-05 redesign moved the visual surface to
+// `activity_bubble_card.dart` (the per-agent activity card that
+// replaced the old streamed-snippet bubbles). The markers stayed
+// with the actual DecoratedBox that paints the bubble fill.
+//
+// Strategy: parse activity_bubble_card.dart and forbid translucent
+// alpha values inside the contiguous block that builds the main
+// bubble surface. We bound the scan to marker comments
+// ("// BUBBLE_BG_BEGIN") and ("// BUBBLE_BG_END") that MUST wrap
+// the bubble's DecoratedBox. Without the markers the test fails —
+// that failure forces the doers to declare which lines are the
+// bubble bg, which is itself the contract.
 //
 // Run: `flutter test test/widgets/council/council_speech_bubble_opacity_test.dart`
 import 'dart:io';
@@ -20,7 +25,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  const path = 'lib/widgets/council/council_speech_bubbles.dart';
+  const path = 'lib/widgets/council/speech/activity_bubble_card.dart';
   const beginMarker = '// BUBBLE_BG_BEGIN';
   const endMarker = '// BUBBLE_BG_END';
 

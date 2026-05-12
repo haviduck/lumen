@@ -2129,6 +2129,8 @@ class S {
 
   // Council Sessions browser
   static const String councilSessionsMenuItem = 'Council Sessions';
+  static const String councilTheaterMenuItem = 'Council Theater';
+  static const String councilOpenLiveSession = 'View Live Session';
   static const String councilSessionsTitle = 'Council Sessions';
   static const String councilSessionsEmpty =
       'No council sessions recorded yet.\n'
@@ -2243,9 +2245,9 @@ class S {
   static const String councilAutoNudgeRecovered =
       'Orchestrator recovered automatically.';
   static const String councilOrchestratorKickHeader =
-      'You are continuing a previously-started Council session. The user '
-      'has sent a follow-up note that you must address. Treat the note as '
-      'a directive, not a suggestion.';
+      'The user has sent a mid-session note. This is the SAME session '
+      'you are already running — not a new one. Address the note as a '
+      'directive and act immediately.';
   static const String councilOrchestratorKickStatusHeading =
       '=== Status digest ===';
   static const String councilOrchestratorKickPoolHeading =
@@ -2254,10 +2256,12 @@ class S {
       '=== User\'s note ===';
   static const String councilOrchestratorKickInstructions =
       '=== What to do ===\n'
-      'Decide based on the note: continue waiting (call no tool, just '
-      'restate where things stand), dispatch follow-ups, ask the user '
-      'with council_ask_user, or call council_report. Do not silently '
-      'ignore the note.';
+      'Act on the note immediately. Your options:\n'
+      '• If agents are still working → call council_wait to collect results.\n'
+      '• If work is done → call council_report.\n'
+      '• If the note changes direction → dispatch new work via council_dispatch.\n'
+      'Do NOT summarize the situation back to the user. Do NOT ask '
+      'permission to proceed. Act.';
   static String councilOrchestratorFailureEscalationQuestion(int strikes) =>
       'Orchestrator failed to continue the run $strikes times while work was still in progress. '
       'Choose what to do next: keep trying automatically, ship partial as failed run, or abort.';
@@ -2375,6 +2379,82 @@ class S {
   static String councilFinishedRound(int n) => 'Round $n';
   static String councilInspectorTaskAttempts(int current, int max) =>
       'attempt $current/$max';
+
+  // --- Council activity bubbles (per-agent live narration layer) ---
+  // Each agent in the ring has a persistent activity card that narrates
+  // what it is doing in first person. Strings below feed the primary
+  // status line + transient event flashes; click the agent card for the
+  // full transcript / inspector view.
+  static const String councilActivityTapToInspect = 'tap to inspect';
+  static const String councilActivityStreaming = 'streaming';
+  static const String councilActivityQueued = 'Queued. Waiting for my turn.';
+  static const String councilActivityThinking = 'Thinking through it.';
+  static const String councilActivityWorking = 'Working on it.';
+  static const String councilActivityReplying = 'Drafting my reply.';
+  static const String councilActivitySynthesizing = 'Synthesizing the council\'s findings.';
+  static const String councilActivityAwaitingUser = 'I need your input to continue.';
+  static const String councilActivityAwaitingPool = 'Waiting on the pool to weigh in.';
+  static const String councilActivityAskingPool = 'Asking the pool for a sanity check.';
+  static const String councilActivityDispatching = 'Dispatching tasks to the team.';
+  static const String councilActivityCoordinating = 'Coordinating the team.';
+  static const String councilActivityDone = 'Done — findings logged.';
+  static const String councilActivityAborted = 'Aborted.';
+  static const String councilActivityStalled = 'Stalled. Re-nudging…';
+  static const String councilActivityIdle = 'Idle.';
+  // Primary line prefixes — used to compose narration when a structured
+  // task ledger entry is available. Kept short so the line still fits
+  // the column at ~256px wide.
+  static String councilActivityWorkingOn(String task) => 'Working on: $task';
+  static String councilActivityNextUp(String action) => 'Next: $action';
+  static String councilActivityWaitingOn(String reason) => 'Waiting on $reason.';
+  static String councilActivityStuck(String error) => 'Stuck: $error';
+  // Transient event flash labels — overlay the primary line for ~6s
+  // when something newsworthy happens. Quoted text comes from the
+  // event payload (clamped before display).
+  static String councilFlashAskedPool(String q) => 'Asking the pool: "$q"';
+  static String councilFlashPoolReply(String reply) => 'Pool reply: $reply';
+  static String councilFlashAskedUser(String q) => 'I need you: $q';
+  static String councilFlashUserReply(String r) => 'You replied: $r';
+  static String councilFlashUserPing(String p) => 'You pinged me: $p';
+  static const String councilFlashDispatchSelf = 'Got my orders. Going in.';
+  static String councilFlashDispatchOut(String agent) => 'Dispatching to $agent.';
+  static const String councilFlashFinished = 'Finished. Tap to read.';
+  static String councilFlashError(String e) => 'Error: $e';
+  static const String councilFlashStalled = 'Stalled — re-nudging.';
+  // Tool-fire flashes — surface what the agent is doing right now as
+  // structured signal (file path, command) instead of raw stream text.
+  // Triggered by `CouncilEventType.agentToolFire`; the bubble layer
+  // routes by tool kind to one of these labels.
+  static String councilFlashReading(String path) => 'Reading $path';
+  static String councilFlashEditing(String path) => 'Editing $path';
+  static String councilFlashWriting(String path) => 'Writing $path';
+  static String councilFlashExploring(String path) => 'Exploring $path';
+  static String councilFlashSearching(String pattern) => 'Searching for $pattern';
+  static String councilFlashRunning(String cmd) => 'Running $cmd';
+  static const String councilFlashWebSearch = 'Searching the web';
+  static String councilFlashWebFetch(String url) => 'Fetching $url';
+  static const String councilFlashGitInspect = 'Checking git state';
+  static String councilFlashUsingTool(String tool) => 'Using $tool';
+
+  // Subtask protocol — flashes + bubble narration for the
+  // `council_plan_subtasks` / `council_subtask_progress` tools that
+  // let agents stream step-by-step progress through a multi-step
+  // task. Drives the per-card step indicator and the bubble's
+  // "Step K/N" primary line.
+  static String councilFlashSubtasksPlanned(int total) =>
+      total == 1
+          ? 'Planned 1 step.'
+          : 'Planned $total steps.';
+  static String councilFlashSubtaskDone(int step, int total, String summary) =>
+      summary.isEmpty
+          ? 'Step $step of $total done.'
+          : 'Step $step/$total: $summary';
+  static String councilActivityStepOf(int step, int total, String label) =>
+      'Step $step/$total: $label';
+  static String councilActivityJustDid(String summary) => 'Just did: $summary';
+  static String councilStepIndicatorLabel(int step, int total) =>
+      'Step $step / $total';
+  static const String councilStepIndicatorPlanned = 'Plan pending';
 
   // --- Pentest / security-test mode ---
   static const String councilPentestGoalLabel = 'TARGET';
