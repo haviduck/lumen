@@ -17,6 +17,7 @@ import '../../services/timeline_models.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/bright_icon_button.dart';
+import '../common/ctrl_wheel_zoom.dart';
 import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
 import '../common/fast_popup_menu.dart';
@@ -1313,6 +1314,22 @@ class _FileExplorerState extends State<FileExplorer> {
 
   @override
   Widget build(BuildContext context) {
+    final fontScale = context.select<AppState, double>(
+      (s) => s.fileExplorerFontScale,
+    );
+    return MediaQuery(
+      data: MediaQuery.of(context).copyWith(
+        textScaler: TextScaler.linear(fontScale),
+      ),
+      child: CtrlWheelZoom(
+        onZoom: (dir) =>
+            context.read<AppState>().bumpFileExplorerFontScale(dir),
+        child: _buildShell(context),
+      ),
+    );
+  }
+
+  Widget _buildShell(BuildContext context) {
     return Shortcuts(
       shortcuts: const <ShortcutActivator, Intent>{
         SingleActivator(LogicalKeyboardKey.keyC, control: true):

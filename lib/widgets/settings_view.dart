@@ -11,6 +11,7 @@ import '../theme/app_theme.dart';
 import 'agent_skills/agent_skills_list.dart';
 import 'common/duck_toast.dart';
 import 'editor/editor_themes.dart';
+import 'editor/theme_preview.dart';
 import 'manual_skill_dialog.dart';
 import 'ai_chat/model_management_panel.dart';
 import 'remote_access/remote_access_panel.dart';
@@ -158,6 +159,16 @@ class _SettingsViewState extends State<SettingsView> {
 
   @override
   void dispose() {
+    // Clear any in-flight theme preview so closing Settings without
+    // Save reverts the open editor to its persisted theme. Safe even
+    // when no preview is set — the setter is a no-op in that case.
+    try {
+      context.read<AppState>().setPreviewEditorTheme(null);
+    } catch (_) {
+      // context may already be deactivated mid-dispose on some teardown
+      // paths; the preview is non-persisted so dropping the clear is
+      // harmless in that case.
+    }
     _ollamaEndpointCtrl.dispose();
     _ollamaApiKeyCtrl.dispose();
     _geminiKeyCtrl.dispose();
@@ -787,7 +798,7 @@ class _SettingsViewState extends State<SettingsView> {
         const SizedBox(height: 16),
         _settingRow(
           label: S.settingsTheme,
-          description: 'Color theme for the code editor.',
+          description: S.settingsThemeDesc,
           child: SizedBox(
             width: 220,
             child: DropdownButtonFormField<String>(
@@ -809,8 +820,44 @@ class _SettingsViewState extends State<SettingsView> {
                     ),
                   )
                   .toList(),
-              onChanged: (v) =>
-                  setState(() => _editorTheme = v ?? _editorTheme),
+              onChanged: (v) {
+                if (v == null) return;
+                setState(() => _editorTheme = v);
+                // Push the candidate to AppState so the open editor +
+                // the preview block below repaint with it immediately.
+                // The persisted theme only flips on Save; closing
+                // Settings without Save reverts (see dispose).
+                context.read<AppState>().setPreviewEditorTheme(v);
+              },
+            ),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            S.settingsThemePreviewLabel,
+            style: const TextStyle(
+              fontSize: 11,
+              letterSpacing: 1.0,
+              fontWeight: FontWeight.w600,
+              color: DuckColors.fgSubtle,
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: ThemePreviewBlock(themeId: _editorTheme),
+        ),
+        const SizedBox(height: 6),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            S.settingsThemePreviewHint,
+            style: const TextStyle(
+              fontSize: 11,
+              color: DuckColors.fgMuted,
             ),
           ),
         ),

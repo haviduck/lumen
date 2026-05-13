@@ -28,6 +28,13 @@ class PreferencesService {
   static const String _kEditorFontSize = 'editor.fontSize';
   static const String _kEditorTabSize = 'editor.tabSize';
   static const String _kEditorWordWrap = 'editor.wordWrap';
+  // Per-pane text-scale multipliers. The editor uses a concrete px font
+  // size (`_kEditorFontSize` above) because re_editor expects one; the
+  // explorer / chat panes are scaled via `MediaQuery.textScaler` so the
+  // Ctrl+wheel handler can adjust either without rewriting every
+  // `TextStyle` underneath.
+  static const String _kFileExplorerFontScale = 'fileExplorer.fontScale';
+  static const String _kAiChatFontScale = 'aiChat.fontScale';
   static const String _kViewMode = 'view.mode';
   static const String _kLockPinHash = 'lock.pinHash';
   static const String _kLockOnStartup = 'lock.onStartup';
@@ -399,6 +406,16 @@ class PreferencesService {
       (await _p).getBool(_kEditorWordWrap) ?? false;
   Future<void> setWordWrap(bool v) async =>
       (await _p).setBool(_kEditorWordWrap, v);
+
+  Future<double> getFileExplorerFontScale() async =>
+      (await _p).getDouble(_kFileExplorerFontScale) ?? 1.0;
+  Future<void> setFileExplorerFontScale(double v) async =>
+      (await _p).setDouble(_kFileExplorerFontScale, v);
+
+  Future<double> getAiChatFontScale() async =>
+      (await _p).getDouble(_kAiChatFontScale) ?? 1.0;
+  Future<void> setAiChatFontScale(double v) async =>
+      (await _p).setDouble(_kAiChatFontScale, v);
 
   Future<String> getViewMode() async =>
       (await _p).getString(_kViewMode) ?? 'normal';

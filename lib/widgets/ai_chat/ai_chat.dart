@@ -23,6 +23,7 @@ import '../../services/chat_persistence_service.dart';
 import '../../services/reasoning_effort.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import '../common/ctrl_wheel_zoom.dart';
 import '../common/duck_glass.dart';
 import '../common/duck_toast.dart';
 import '../common/image_lightbox.dart';
@@ -39,6 +40,7 @@ import 'slash_commands/slash_command.dart';
 import 'slash_commands/slash_command_picker.dart';
 import 'chat_composer.dart';
 import 'chip_text_editing_controller.dart';
+import 'model_picker_popover.dart';
 import 'ollama_reachability_strip.dart';
 import 'stall_warning.dart';
 
@@ -512,101 +514,113 @@ class _AiChatState extends State<AiChat> {
           value: appState.chat,
           child: Consumer<ChatController>(
             builder: (context, chat, _) {
-              return DuckGlass(
-                border: const Border(
-                  left: BorderSide(color: DuckColors.glassSeam, width: 0.5),
+              return MediaQuery(
+                data: MediaQuery.of(context).copyWith(
+                  textScaler: TextScaler.linear(appState.aiChatFontScale),
                 ),
-                child: Column(
-                  children: [
-                    // Watch-media renders here whenever the
-                    // EFFECTIVE placement is `chat`. That's true
-                    // either because the user explicitly chose
-                    // chat-placement, OR because SSH/Teams is
-                    // currently occupying the side stack and watch
-                    // has been forced to the chat panel (see
-                    // `SidePanesColumn.watchForcedToChat` for the
-                    // rule). The two cases produce the same visual
-                    // — the user just sees their video in the
-                    // chat panel — so we don't differentiate.
-                    Consumer2<MediaController, SshController>(
-                      builder: (context, media, ssh, _) {
-                        if (!media.hasMedia) {
-                          return const SizedBox.shrink();
-                        }
-                        final forced = SidePanesColumn.watchForcedToChat(
-                          ssh: ssh,
-                          media: media,
-                        );
-                        final renderHere =
-                            media.placement == MediaPlacement.chat || forced;
-                        if (!renderHere) return const SizedBox.shrink();
-                        return _buildChatMediaPanel(media);
-                      },
-                    ),
-                    ChatTabStrip(chat: chat),
-                    // When every chat tab is closed there's no
-                    // session to type into — rendering the
-                    // composer below an empty message list reads
-                    // as broken. Replace the entire body with a
-                    // centered "No chat open" placeholder + a
-                    // primary "New chat" button + the model
-                    // picker. The user lands somewhere actionable
-                    // instead of staring at a stranded text box.
-                    if (chat.openTabs.isEmpty)
-                      Expanded(
-                        child: _EmptyChatPlaceholder(
-                          chat: chat,
-                          onNewChat: () => chat.newSession(
-                            workspacePath: appState.currentDirectory,
-                          ),
-                        ),
-                      )
-                    else ...[
-                      Expanded(child: _buildMessageList(chat)),
-                      // Empty-response strip — surfaces after a
-                      // turn ends with no visible content / tools
-                      // / errors. Distinct from the stall strip
-                      // (stall = mid-stream silence; empty =
-                      // post-completion). Two buttons: Continue
-                      // (re-prompts the model) and Dismiss.
-                      EmptyResponseStrip(controller: chat),
-                      // Pending approval strip — docked above the
-                      // input, like Cursor's "Run command? [yes/no]"
-                      // strip. Only renders when the controller has
-                      // a pending request. Stays compact (single
-                      // row by default; expandable to show full
-                      // multi-line commands).
-                      if (chat.pendingApproval != null)
-                        ApprovalStrip(
-                          controller: chat,
-                          approval: chat.pendingApproval!,
-                        ),
-                      // Audit banner — when the most recent silent
-                      // approval is fresh (≤30s), surface a tiny
-                      // "X auto-approved by Y" strip so the user
-                      // sees what just bypassed the gate.
-                      _buildSilentApprovalBanner(chat),
-                      // Queued-prompts strip — only renders when
-                      // the user has typed follow-ups while the
-                      // current generation was still in flight.
-                      QueuedPromptsStrip(controller: chat),
-                      // Pending file/folder/code/terminal references
-                      // now render as inline chips inside the
-                      // composer's `TextField` itself (chip schema:
-                      // `lib/services/chat_chip.dart`). The strip is
-                      // only used for image attachments these days —
-                      // images can't be inlined into a text run.
-                      if (chat.pendingImages.isNotEmpty)
-                        _buildAttachmentStrip(chat),
-                      _buildInput(appState, chat),
-                    ],
-                  ],
+                child: CtrlWheelZoom(
+                  onZoom: (dir) => appState.bumpAiChatFontScale(dir),
+                  child: _buildChatBody(context, appState, chat),
                 ),
               );
             },
           ),
         );
       },
+    );
+  }
+
+  Widget _buildChatBody(
+    BuildContext context,
+    AppState appState,
+    ChatController chat,
+  ) {
+    return DuckGlass(
+      border: const Border(
+        left: BorderSide(color: DuckColors.glassSeam, width: 0.5),
+      ),
+      child: Column(
+        children: [
+          // Watch-media renders here whenever the EFFECTIVE
+          // placement is `chat`. That's true either because the
+          // user explicitly chose chat-placement, OR because
+          // SSH/Teams is currently occupying the side stack and
+          // watch has been forced to the chat panel (see
+          // `SidePanesColumn.watchForcedToChat` for the rule).
+          // The two cases produce the same visual — the user
+          // just sees their video in the chat panel — so we
+          // don't differentiate.
+          Consumer2<MediaController, SshController>(
+            builder: (context, media, ssh, _) {
+              if (!media.hasMedia) {
+                return const SizedBox.shrink();
+              }
+              final forced = SidePanesColumn.watchForcedToChat(
+                ssh: ssh,
+                media: media,
+              );
+              final renderHere =
+                  media.placement == MediaPlacement.chat || forced;
+              if (!renderHere) return const SizedBox.shrink();
+              return _buildChatMediaPanel(media);
+            },
+          ),
+          ChatTabStrip(chat: chat),
+          // When every chat tab is closed there's no session to
+          // type into — rendering the composer below an empty
+          // message list reads as broken. Replace the entire body
+          // with a centered "No chat open" placeholder + a
+          // primary "New chat" button + the model picker. The
+          // user lands somewhere actionable instead of staring at
+          // a stranded text box.
+          if (chat.openTabs.isEmpty)
+            Expanded(
+              child: _EmptyChatPlaceholder(
+                chat: chat,
+                onNewChat: () => chat.newSession(
+                  workspacePath: appState.currentDirectory,
+                ),
+              ),
+            )
+          else ...[
+            Expanded(child: _buildMessageList(chat)),
+            // Empty-response strip — surfaces after a turn ends
+            // with no visible content / tools / errors. Distinct
+            // from the stall strip (stall = mid-stream silence;
+            // empty = post-completion). Two buttons: Continue
+            // (re-prompts the model) and Dismiss.
+            EmptyResponseStrip(controller: chat),
+            // Pending approval strip — docked above the input,
+            // like Cursor's "Run command? [yes/no]" strip. Only
+            // renders when the controller has a pending request.
+            // Stays compact (single row by default; expandable to
+            // show full multi-line commands).
+            if (chat.pendingApproval != null)
+              ApprovalStrip(
+                controller: chat,
+                approval: chat.pendingApproval!,
+              ),
+            // Audit banner — when the most recent silent approval
+            // is fresh (<=30s), surface a tiny "X auto-approved
+            // by Y" strip so the user sees what just bypassed the
+            // gate.
+            _buildSilentApprovalBanner(chat),
+            // Queued-prompts strip — only renders when the user
+            // has typed follow-ups while the current generation
+            // was still in flight.
+            QueuedPromptsStrip(controller: chat),
+            // Pending file/folder/code/terminal references now
+            // render as inline chips inside the composer's
+            // `TextField` itself (chip schema:
+            // `lib/services/chat_chip.dart`). The strip is only
+            // used for image attachments these days — images
+            // can't be inlined into a text run.
+            if (chat.pendingImages.isNotEmpty)
+              _buildAttachmentStrip(chat),
+            _buildInput(appState, chat),
+          ],
+        ],
+      ),
     );
   }
 
@@ -2525,10 +2539,22 @@ class _MiniSwitch extends StatelessWidget {
   }
 }
 
-class _ModelPicker extends StatelessWidget {
+class _ModelPicker extends StatefulWidget {
   final ChatController chat;
 
   const _ModelPicker({required this.chat});
+
+  @override
+  State<_ModelPicker> createState() => _ModelPickerState();
+}
+
+class _ModelPickerState extends State<_ModelPicker> {
+  /// Anchor for the popover. `LayerLink` is more accurate than a
+  /// `GlobalKey` + `findRenderObject` round-trip because it keeps the
+  /// popover in sync if the chip animates (e.g. when the bottom bar
+  /// re-lays-out on theme change or window resize).
+  final LayerLink _link = LayerLink();
+  bool _open = false;
 
   /// Strip the `provider:` prefix so the badge displays only the
   /// model name. Underlying `chat.selectedModel` keeps the full
@@ -2542,9 +2568,51 @@ class _ModelPicker extends StatelessWidget {
     return fullId.substring(idx + 1);
   }
 
+  Future<void> _openPopover() async {
+    final chat = widget.chat;
+    setState(() => _open = true);
+    final result = await showModelPickerPopover(
+      context: context,
+      link: _link,
+      selectedModel: chat.selectedModel,
+      enabledModels: chat.pickerModels,
+      allModels: chat.availableModels,
+    );
+    if (!mounted) return;
+    setState(() => _open = false);
+    switch (result) {
+      case ModelPickerPicked(model: final m):
+        chat.setModel(m);
+      case ModelPickerRefresh():
+        // Power-user escape hatch: re-poll every enabled provider
+        // without forcing the user through Settings → Save. Mirrors
+        // the legacy "Refresh models" menu entry; toast confirms the
+        // post-refresh count so the user sees the action stuck.
+        await chat.reloadModels();
+        if (!mounted) return;
+        final count = chat.pickerModels.length;
+        showDuckToast(
+          context,
+          S.chatModelRefreshedToast.replaceFirst('%d', count.toString()),
+        );
+      case ModelPickerManage():
+        if (!mounted) return;
+        final chosen = await showDialog<String>(
+          context: context,
+          barrierDismissible: false,
+          barrierColor: Colors.black.withValues(alpha: 0.45),
+          builder: (_) => _ModelSelectionPanel(chat: chat),
+        );
+        if (chosen != null && mounted) chat.setModel(chosen);
+      case ModelPickerDismissed():
+        // No-op — popover was dismissed without picking.
+        break;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final key = GlobalKey();
+    final chat = widget.chat;
     // Always show the TRUE _selectedModel — never silently swap to
     // `availableModels.first` when stale. The previous version did,
     // which masked the real bug behind the "Ollama selected but
@@ -2571,170 +2639,61 @@ class _ModelPicker extends StatelessWidget {
         final maxWidth = constraints.hasBoundedWidth
             ? constraints.maxWidth.clamp(80.0, 160.0)
             : 160.0;
-        return Tooltip(
-          message: tooltipMessage,
-          child: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: InkWell(
-              key: key,
-              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-              onTap: () async {
-                final box =
-                    key.currentContext?.findRenderObject() as RenderBox?;
-                if (box == null) return;
-                final overlay =
-                    Overlay.of(context).context.findRenderObject() as RenderBox;
-                final pos = box.localToGlobal(Offset.zero, ancestor: overlay);
-                final picked = await showMenu<String>(
-                  context: context,
-                  color: DuckColors.bgRaised,
-                  elevation: 12,
-                  position: RelativeRect.fromLTRB(
-                    pos.dx,
-                    pos.dy - 8,
-                    overlay.size.width - pos.dx - box.size.width,
-                    overlay.size.height - pos.dy,
+        return CompositedTransformTarget(
+          link: _link,
+          child: Tooltip(
+            message: tooltipMessage,
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                onTap: _openPopover,
+                child: AnimatedContainer(
+                  duration: DuckMotion.instant,
+                  constraints: BoxConstraints(maxWidth: maxWidth),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
                   ),
-                  items: [
-                    if (chat.pickerModels.isEmpty)
-                      const PopupMenuItem<String>(
-                        enabled: false,
+                  decoration: BoxDecoration(
+                    color: _open
+                        ? DuckColors.bgRaisedHi
+                        : DuckColors.bgDeeper,
+                    borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                    border: Border.all(
+                      color: _open
+                          ? DuckColors.accentCyan.withValues(alpha: 0.55)
+                          : DuckColors.border,
+                      width: 0.5,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.memory,
+                        size: 11,
+                        color: DuckColors.fgMuted,
+                      ),
+                      const SizedBox(width: 5),
+                      Flexible(
                         child: Text(
-                          S.chatNoModels,
-                          style: TextStyle(fontSize: 12),
-                        ),
-                      )
-                    else
-                      for (final m in chat.pickerModels)
-                        PopupMenuItem<String>(
-                          value: m,
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.check_circle_outline,
-                                size: 14,
-                                color: DuckColors.accentMint,
-                              ),
-                              const SizedBox(width: 8),
-                              Flexible(
-                                child: Text(
-                                  m,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: m == chat.selectedModel
-                                        ? FontWeight.w700
-                                        : FontWeight.w400,
-                                    color: m == chat.selectedModel
-                                        ? DuckColors.fgPrimary
-                                        : DuckColors.fgMuted,
-                                  ),
-                                ),
-                              ),
-                            ],
+                          model,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 10.5,
+                            color: DuckColors.fgPrimary,
                           ),
                         ),
-                    const PopupMenuDivider(),
-                    const PopupMenuItem<String>(
-                      value: '__refresh__',
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.refresh,
-                            size: 14,
-                            color: DuckColors.accentCyan,
-                          ),
-                          SizedBox(width: 8),
-                          Text(
-                            S.chatModelRefresh,
-                            style: TextStyle(fontSize: 12),
-                          ),
-                        ],
                       ),
-                    ),
-                    const PopupMenuItem<String>(
-                      value: '__all__',
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.tune,
-                            size: 14,
-                            color: DuckColors.accentCyan,
-                          ),
-                          SizedBox(width: 8),
-                          Text(
-                            S.chatModelViewAll,
-                            style: TextStyle(fontSize: 12),
-                          ),
-                        ],
+                      const SizedBox(width: 4),
+                      Icon(
+                        _open ? Icons.expand_less : Icons.expand_more,
+                        size: 12,
+                        color: DuckColors.fgMuted,
                       ),
-                    ),
-                  ],
-                );
-                if (picked == '__all__') {
-                  if (!context.mounted) return;
-                  final chosen = await showDialog<String>(
-                    context: context,
-                    barrierDismissible: false,
-                    barrierColor: Colors.black.withValues(alpha: 0.45),
-                    builder: (_) => _ModelSelectionPanel(chat: chat),
-                  );
-                  if (chosen != null) chat.setModel(chosen);
-                } else if (picked == '__refresh__') {
-                  // Power-user escape hatch: pull models again
-                  // without going through Settings → Save. Useful
-                  // after `ollama pull` / `ollama signin` outside
-                  // the app. Toast confirms the new picker size so
-                  // the user knows the refresh actually did
-                  // something.
-                  await chat.reloadModels();
-                  if (!context.mounted) return;
-                  final count = chat.pickerModels.length;
-                  showDuckToast(
-                    context,
-                    S.chatModelRefreshedToast.replaceFirst(
-                      '%d',
-                      count.toString(),
-                    ),
-                  );
-                } else if (picked != null) {
-                  chat.setModel(picked);
-                }
-              },
-              child: Container(
-                constraints: BoxConstraints(maxWidth: maxWidth),
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: DuckColors.bgDeeper,
-                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                  border: Border.all(color: DuckColors.border, width: 0.5),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(
-                      Icons.memory,
-                      size: 11,
-                      color: DuckColors.fgMuted,
-                    ),
-                    const SizedBox(width: 5),
-                    Flexible(
-                      child: Text(
-                        model,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 10.5,
-                          color: DuckColors.fgPrimary,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    const Icon(
-                      Icons.expand_more,
-                      size: 12,
-                      color: DuckColors.fgMuted,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),

@@ -16,6 +16,7 @@ import '../../services/language_detector.dart';
 import '../../services/line_break_style.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import '../common/ctrl_wheel_zoom.dart';
 import '../common/fast_popup_menu.dart';
 import '../menu_bar.dart';
 import '../process_manager/process_manager_view.dart';
@@ -867,7 +868,9 @@ class _EditorPaneState extends State<_EditorPane> {
 
     if (mode == null) return null;
 
-    final themeMap = EditorThemes.resolve(widget.appState.editorTheme);
+    final themeMap = EditorThemes.resolve(
+      widget.appState.effectiveEditorTheme,
+    );
 
     return CodeHighlightTheme(
       languages: {langId: CodeHighlightThemeMode(mode: mode)},
@@ -890,12 +893,14 @@ class _EditorPaneState extends State<_EditorPane> {
   @override
   Widget build(BuildContext context) {
     _ensureController();
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onTapDown: (_) => widget.onFocus(),
-      child: widget.showingPreview
-          ? MarkdownPreview(text: widget.appState.fileContentFor(widget.path))
-          : CodeAutocomplete(
+    return CtrlWheelZoom(
+      onZoom: (dir) => widget.appState.bumpEditorFontSize(dir),
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapDown: (_) => widget.onFocus(),
+        child: widget.showingPreview
+            ? MarkdownPreview(text: widget.appState.fileContentFor(widget.path))
+            : CodeAutocomplete(
               viewBuilder: (context, notifier, onSelected) {
                 return EditorAutocompleteList(
                   notifier: notifier,
@@ -1028,6 +1033,7 @@ class _EditorPaneState extends State<_EditorPane> {
                 ),
               ),
             ),
+      ),
     );
   }
 }

@@ -109,6 +109,7 @@ class CouncilController extends ChangeNotifier {
   static const int _orchestratorMaxIterations = 60;
   static const int _agentMaxIterations = 30;
   static const int _evaluatorMaxIterations = 6;
+  static const int _discoveryContextMaxChars = 2000;
   // Tool-fire surfaces tracked by the structural quality-gate auto-check.
   // Any agent firing one of these tools (with a write-side effect) counts
   // as "artifacts produced" without the orchestrator having to assert it.
@@ -265,6 +266,22 @@ $brief
   void hideTheater() {
     _theaterVisible = false;
     notifyListeners();
+  }
+
+  @visibleForTesting
+  void attachSessionForTest(
+    CouncilSession session, {
+    String workspacePath = 'test-workspace',
+  }) {
+    _session = session;
+    _workspacePath = workspacePath;
+    _ledger = CouncilTaskLedger(onTransition: _onLedgerTransition);
+    _taskIdByDispatchKey.clear();
+  }
+
+  @visibleForTesting
+  Future<CouncilToolResult> declarePhaseForTest(CouncilToolCall call) {
+    return _declarePhase(call);
   }
 
   Future<void> abort() async {
@@ -431,8 +448,7 @@ $brief
     // follow-up) gets the brief's image attachments folded into the
     // initial user turn. Resurrection / round-two re-entries reuse the
     // session's existing context and must not re-paste images.
-    final isFreshStart =
-        kickNote.trim().isEmpty && roundFollowup == null;
+    final isFreshStart = kickNote.trim().isEmpty && roundFollowup == null;
     final initialImages = isFreshStart
         ? List<String>.from(session.config.briefImages)
         : const <String>[];
@@ -463,8 +479,11 @@ $brief
       thinkingEnded = true;
       _emitThinkingEnded(session.config.orchestrator);
     }
+
     try {
-      final result = await runner.run(maxIterations: _orchestratorMaxIterations);
+      final result = await runner.run(
+        maxIterations: _orchestratorMaxIterations,
+      );
       endThinking();
       if (result.cancelled) return;
       if (session.status == CouncilStatus.done ||
@@ -481,9 +500,10 @@ $brief
       //   - Produced synthesis text but forgot to call council_report
       //   - Hit maxIterations without finishing
       // In all cases: re-nudge. council_report is the only legitimate exit.
-      final earlyFailureReason = _orchestratorEarlyExitReason(session) ??
+      final earlyFailureReason =
+          _orchestratorEarlyExitReason(session) ??
           'Orchestrator exited without calling council_report. '
-          'Either dispatch follow-up work or finalize via council_report.';
+              'Either dispatch follow-up work or finalize via council_report.';
       await _handleOrchestratorFailure(
         session: session,
         reason: earlyFailureReason,
@@ -554,7 +574,8 @@ $brief
       _event(
         CouncilEventType.agentError,
         fromAgentId: orch.id,
-        message: 'Transient error, retrying in ${delaySecs}s '
+        message:
+            'Transient error, retrying in ${delaySecs}s '
             '(attempt $strikes)...',
       );
       notifyListeners();
@@ -578,7 +599,8 @@ $brief
           ? ''
           : '\n\nLatest orchestrator prose (trimmed):\n'
                 '${draft.substring(0, cutoff)}';
-      final note = '''
+      final note =
+          '''
 SYSTEM: You exited without calling council_report. Resume now.
 
 Reason: $reason
@@ -630,11 +652,13 @@ You MUST call a tool. No prose-only output.
     // Background: attempt an auto-nudge restart while the user reads
     // the modal. If it succeeds the session moves to working/done and
     // we dismiss the pending question so the modal disappears.
-    unawaited(_autoNudgeWhileAskingUser(
-      askFuture: askFuture,
-      reason: reason,
-      draftReport: draftReport,
-    ));
+    unawaited(
+      _autoNudgeWhileAskingUser(
+        askFuture: askFuture,
+        reason: reason,
+        draftReport: draftReport,
+      ),
+    );
   }
 
   /// Runs alongside the user-facing escalation modal. Kicks the
@@ -655,7 +679,8 @@ You MUST call a tool. No prose-only output.
         ? ''
         : '\n\nLatest orchestrator prose (trimmed):\n'
               '${draft.substring(0, cutoff)}';
-    final note = '''
+    final note =
+        '''
 Auto-recovery nudge (user has been prompted but orchestrator should try to self-recover).
 
 Last failure signal:
@@ -716,8 +741,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final agent = session.agentById(agentId);
     if (agent != null &&
         (agent.status == CouncilAgentStatus.done ||
-         agent.status == CouncilAgentStatus.awaitingUser ||
-         agent.status == CouncilAgentStatus.idle)) {
+            agent.status == CouncilAgentStatus.awaitingUser ||
+            agent.status == CouncilAgentStatus.idle)) {
       return false;
     }
     _event(
@@ -769,9 +794,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         buf
           ..writeln()
           ..writeln()
-          ..writeln(
-            '<attached-doc filename="${doc.name}" size="${doc.size}">',
-          )
+          ..writeln('<attached-doc filename="${doc.name}" size="${doc.size}">')
           ..writeln(doc.content)
           ..writeln('</attached-doc>');
       }
@@ -1326,15 +1349,22 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final phase = _parsePhase(raw);
     if (phase == null) {
       return CouncilToolResult(
-        feedback: 'Unknown phase: "$raw". Legal phases: ${CouncilPhase.values.map((p) => p.name).join(', ')}.',
+        feedback:
+            'Unknown phase: "$raw". Legal phases: ${CouncilPhase.values.map((p) => p.name).join(', ')}.',
       );
     }
     final previous = session.currentPhase;
+    if (previous == CouncilPhase.discovery &&
+        phase != CouncilPhase.discovery &&
+        session.discoveryContext.trim().isEmpty) {
+      session.discoveryContext = discoveryContextFromTranscriptForTest(
+        session.config.orchestrator.transcript,
+      );
+    }
     session.currentPhase = phase;
-    session.phaseHistory.add(CouncilPhaseEntry(
-      phase: phase,
-      rationale: rationale,
-    ));
+    session.phaseHistory.add(
+      CouncilPhaseEntry(phase: phase, rationale: rationale),
+    );
     // Structural quality-gate check: phases covered.
     final phaseSet = session.phaseHistory.map((p) => p.phase).toSet();
     session.qualityGate.enoughPhasesCovered = phaseSet.length >= 3;
@@ -1351,9 +1381,17 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     );
     notifyListeners();
     await _persist();
-    return CouncilToolResult(
-      feedback: _phaseGuidance(phase, session),
-    );
+    return CouncilToolResult(feedback: _phaseGuidance(phase, session));
+  }
+
+  @visibleForTesting
+  static String discoveryContextFromTranscriptForTest(
+    String transcript, {
+    int maxChars = _discoveryContextMaxChars,
+  }) {
+    final trimmed = transcript.trim();
+    if (trimmed.length <= maxChars) return trimmed;
+    return trimmed.substring(trimmed.length - maxChars).trimLeft();
   }
 
   /// Handles a `council_quality_check` invocation.
@@ -1391,12 +1429,12 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     // Apply any resolutions the orchestrator declared in this call.
     // Resolutions are sticky — once resolved, an attack stays resolved
     // until a new critique replaces it (which we don't do today).
-    final resolvedIds = ((call.arguments['resolved_critic_ids'] as List?) ??
-            const [])
-        .whereType<String>()
-        .map((s) => s.trim())
-        .where((s) => s.isNotEmpty)
-        .toSet();
+    final resolvedIds =
+        ((call.arguments['resolved_critic_ids'] as List?) ?? const [])
+            .whereType<String>()
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .toSet();
     final currentCritique = session.critique;
     if (resolvedIds.isNotEmpty && currentCritique != null) {
       for (final atk in currentCritique.attacks) {
@@ -1410,20 +1448,22 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final critique = session.critique;
     gate
       ..artifactsProduced =
-          (call.arguments['artifacts_produced'] == true) || _hasArtifactsProduced(session)
+          (call.arguments['artifacts_produced'] == true) ||
+          _hasArtifactsProduced(session)
       // Adversarial review is structurally true once the Critic has run
       // and produced at least one attack. The orchestrator's own claim is
       // ignored — the controller owns this gate.
-      ..adversarialReviewDone =
-          critique != null && critique.attacks.isNotEmpty
+      ..adversarialReviewDone = critique != null && critique.attacks.isNotEmpty
       ..claimsGrounded = call.arguments['claims_grounded'] == true
       ..userAsksResolved =
-          (call.arguments['user_asks_resolved'] == true) && _allUserAsksResolved(session)
+          (call.arguments['user_asks_resolved'] == true) &&
+          _allUserAsksResolved(session)
       // `risksNamed` requires that the orchestrator has acknowledged every
       // blocker/major Critic attack (resolved or accepted). The orchestrator
       // can still self-assert it, but if the critique has open blockers,
       // we override to false — the user must see those addressed.
-      ..risksNamed = (call.arguments['risks_named'] == true) &&
+      ..risksNamed =
+          (call.arguments['risks_named'] == true) &&
           (critique == null || critique.allBlockingResolved)
       // Phase coverage is structural — recompute from history.
       ..enoughPhasesCovered =
@@ -1569,12 +1609,14 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           CouncilCriticAttack(
             id: 'C-degraded',
             target: 'Critic infrastructure',
-            attack: 'The Adversarial Critic could not complete its pass '
+            attack:
+                'The Adversarial Critic could not complete its pass '
                 '($e). The council shipped without external adversarial '
                 'review. Re-run with a working Critic model before trusting '
                 'the result.',
             severity: 'major',
-            acceptance: 'Re-run the council with a Critic model that '
+            acceptance:
+                'Re-run the council with a Critic model that '
                 'responds. Until then, this is an open risk.',
           ),
         ],
@@ -1584,10 +1626,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         CouncilEventType.criticCompleted,
         fromAgentId: session.config.finalEvaluator.id,
         message: critique.summary,
-        data: {
-          ...critique.toJson(),
-          'degraded': true,
-        },
+        data: {...critique.toJson(), 'degraded': true},
       );
       notifyListeners();
       await _persist();
@@ -1649,21 +1688,27 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       ..writeln(session.config.brief)
       ..writeln()
       ..writeln('## Phases declared')
-      ..writeln(session.phaseHistory.isEmpty
-          ? '(none — orchestrator never called council_phase)'
-          : session.phaseHistory
-              .map((p) => '- ${p.phase.name}: ${p.rationale}')
-              .join('\n'))
+      ..writeln(
+        session.phaseHistory.isEmpty
+            ? '(none — orchestrator never called council_phase)'
+            : session.phaseHistory
+                  .map((p) => '- ${p.phase.name}: ${p.rationale}')
+                  .join('\n'),
+      )
       ..writeln()
       ..writeln('## Current phase: ${session.currentPhase.name}')
       ..writeln()
       ..writeln('## Quality gate self-assertion (orchestrator-asserted)')
       ..writeln('- artifactsProduced: ${session.qualityGate.artifactsProduced}')
-      ..writeln('- adversarialReviewDone: ${session.qualityGate.adversarialReviewDone}')
+      ..writeln(
+        '- adversarialReviewDone: ${session.qualityGate.adversarialReviewDone}',
+      )
       ..writeln('- claimsGrounded: ${session.qualityGate.claimsGrounded}')
       ..writeln('- userAsksResolved: ${session.qualityGate.userAsksResolved}')
       ..writeln('- risksNamed: ${session.qualityGate.risksNamed}')
-      ..writeln('- enoughPhasesCovered: ${session.qualityGate.enoughPhasesCovered}')
+      ..writeln(
+        '- enoughPhasesCovered: ${session.qualityGate.enoughPhasesCovered}',
+      )
       ..writeln('- orchestrator summary: ${session.qualityGate.summary}')
       ..writeln()
       ..writeln('## Ledger')
@@ -1689,7 +1734,9 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           ? transcript.substring(transcript.length - 1200)
           : transcript;
       buf
-        ..writeln('### ${agent.name} (${CouncilProtocol.roleInstruction(agent).split('.').first})')
+        ..writeln(
+          '### ${agent.name} (${CouncilProtocol.roleInstruction(agent).split('.').first})',
+        )
         ..writeln(tail)
         ..writeln();
     }
@@ -1717,7 +1764,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           CouncilCriticAttack(
             id: 'C-parse',
             target: 'Critic output',
-            attack: 'The Critic did not return parseable JSON. Raw output '
+            attack:
+                'The Critic did not return parseable JSON. Raw output '
                 'prefix: "${raw.substring(0, raw.length > 200 ? 200 : raw.length)}".',
             severity: 'major',
             acceptance: 'Re-run with a more JSON-disciplined Critic model.',
@@ -1726,25 +1774,31 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       );
     }
     try {
-      final parsed = jsonDecode(raw.substring(start, end + 1))
-          as Map<String, dynamic>;
+      final parsed =
+          jsonDecode(raw.substring(start, end + 1)) as Map<String, dynamic>;
       final attacks = ((parsed['attacks'] as List?) ?? const [])
           .whereType<Map>()
           .map((m) {
-        final d = m.cast<String, dynamic>();
-        return CouncilCriticAttack(
-          id: (d['id'] as String?)?.trim().isNotEmpty == true
-              ? d['id'] as String
-              : 'C-${DateTime.now().microsecondsSinceEpoch}',
-          target: (d['target'] as String? ?? '').trim(),
-          attack: (d['attack'] as String? ?? '').trim(),
-          severity: (d['severity'] as String? ?? 'minor').trim().toLowerCase(),
-          acceptance: (d['acceptance'] as String? ?? '').trim(),
-        );
-      }).where((a) => a.target.isNotEmpty && a.attack.isNotEmpty).toList();
+            final d = m.cast<String, dynamic>();
+            return CouncilCriticAttack(
+              id: (d['id'] as String?)?.trim().isNotEmpty == true
+                  ? d['id'] as String
+                  : 'C-${DateTime.now().microsecondsSinceEpoch}',
+              target: (d['target'] as String? ?? '').trim(),
+              attack: (d['attack'] as String? ?? '').trim(),
+              severity: (d['severity'] as String? ?? 'minor')
+                  .trim()
+                  .toLowerCase(),
+              acceptance: (d['acceptance'] as String? ?? '').trim(),
+            );
+          })
+          .where((a) => a.target.isNotEmpty && a.attack.isNotEmpty)
+          .toList();
       final summary = (parsed['summary'] as String? ?? '').trim();
       return CouncilCritique(
-        summary: summary.isEmpty ? 'Critic produced ${attacks.length} attacks.' : summary,
+        summary: summary.isEmpty
+            ? 'Critic produced ${attacks.length} attacks.'
+            : summary,
         attacks: attacks,
       );
     } catch (e) {
@@ -1756,7 +1810,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
             target: 'Critic output',
             attack: 'The Critic returned JSON that failed to parse: $e',
             severity: 'major',
-            acceptance: 'Re-run the council with a Critic model that '
+            acceptance:
+                'Re-run the council with a Critic model that '
                 'produces clean JSON.',
           ),
         ],
@@ -1817,7 +1872,10 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     return switch (lower) {
       'design' || 'plan' || 'planning' => CouncilPhase.architecture,
-      'implement' || 'implementation' || 'code' || 'coding' => CouncilPhase.build,
+      'implement' ||
+      'implementation' ||
+      'code' ||
+      'coding' => CouncilPhase.build,
       'audit' || 'critique' || 'attack' => CouncilPhase.review,
       'harden' || 'fix' || 'fixing' => CouncilPhase.polish,
       'final' || 'finalize' || 'wrap' => CouncilPhase.ship,
@@ -1833,33 +1891,33 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     return switch (phase) {
       CouncilPhase.discovery =>
         'Phase: DISCOVERY. Dispatch agents to read the project tree and the '
-        'specific files / surfaces the brief touches. No edits yet — output '
-        'is grounding notes. After agents return, transition to architecture.',
+            'specific files / surfaces the brief touches. No edits yet — output '
+            'is grounding notes. After agents return, transition to architecture.',
       CouncilPhase.architecture =>
         'Phase: ARCHITECTURE. Dispatch decision work. Each agent owns one '
-        'decision artifact (design doc, decision matrix, trade-off table). '
-        'Surface DISAGREEMENT — do not paper over conflicting agent opinions. '
-        'After agents return, transition to build.',
+            'decision artifact (design doc, decision matrix, trade-off table). '
+            'Surface DISAGREEMENT — do not paper over conflicting agent opinions. '
+            'After agents return, transition to build.',
       CouncilPhase.build =>
         'Phase: BUILD. Dispatch implementation. Each agent OWNS specific files. '
-        'Briefs name the file path + the change ("edit `lib/foo.dart` to add the '
-        'new route"). No more "design" tasks — only execution. After build '
-        'completes, transition to review (do NOT skip).',
+            'Briefs name the file path + the change ("edit `lib/foo.dart` to add the '
+            'new route"). No more "design" tasks — only execution. After build '
+            'completes, transition to review (do NOT skip).',
       CouncilPhase.review =>
         'Phase: REVIEW. Adversarial. Dispatch reviewers to ATTACK the build '
-        'artifacts — find weak claims, missing tests, unproven assumptions, '
-        'untested paths. Use pool challenges between agents for falsifiable '
-        'cross-checks. After review, transition to polish if findings exist '
-        'or directly to ship if review found nothing concrete (rare).',
+            'artifacts — find weak claims, missing tests, unproven assumptions, '
+            'untested paths. Use pool challenges between agents for falsifiable '
+            'cross-checks. After review, transition to polish if findings exist '
+            'or directly to ship if review found nothing concrete (rare).',
       CouncilPhase.polish =>
         '${reviewedYet ? '' : 'WARNING: you entered polish without a review phase. Findings will be theoretical. Consider going back to review.\n\n'}'
-        'Phase: POLISH. Address every blocker/major review finding. Each '
-        'finding gets an owner who produces the concrete fix artifact. After '
-        'fixes land, transition to ship and run the quality gate.',
+            'Phase: POLISH. Address every blocker/major review finding. Each '
+            'finding gets an owner who produces the concrete fix artifact. After '
+            'fixes land, transition to ship and run the quality gate.',
       CouncilPhase.ship =>
         '${builtYet && reviewedYet ? '' : 'WARNING: you entered ship without build+review. This is malpractice on a non-trivial brief.\n\n'}'
-        'Phase: SHIP. Run council_quality_check to assert all six gates. '
-        'Once every gate is PASS, call council_report with the final markdown.',
+            'Phase: SHIP. Run council_quality_check to assert all six gates. '
+            'Once every gate is PASS, call council_report with the final markdown.',
     };
   }
 
@@ -1899,13 +1957,15 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         .toList();
     if (items.isEmpty) {
       return const CouncilToolResult(
-        feedback: 'No subtasks provided. List 2-8 concrete, '
+        feedback:
+            'No subtasks provided. List 2-8 concrete, '
             'action-oriented steps.',
       );
     }
     if (items.length > 8) {
       return const CouncilToolResult(
-        feedback: 'Too many subtasks (>8). The UI step indicator caps '
+        feedback:
+            'Too many subtasks (>8). The UI step indicator caps '
             'at 8 — merge related steps and call '
             'council_plan_subtasks again with at most 8 entries.',
       );
@@ -1913,7 +1973,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final task = ledger.latestForAgent(agent.id);
     if (task == null) {
       return const CouncilToolResult(
-        feedback: 'No active task on the ledger for this agent. Wait '
+        feedback:
+            'No active task on the ledger for this agent. Wait '
             'for a dispatch before declaring subtasks.',
       );
     }
@@ -1926,15 +1987,13 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       CouncilEventType.agentSubtasksPlanned,
       fromAgentId: agent.id,
       message: items.join(' | '),
-      data: {
-        'taskId': task.id,
-        'subtasks': List<String>.unmodifiable(items),
-      },
+      data: {'taskId': task.id, 'subtasks': List<String>.unmodifiable(items)},
     );
     notifyListeners();
     await _persist();
     return CouncilToolResult(
-      feedback: 'Subtask plan recorded (${items.length} steps). Execute '
+      feedback:
+          'Subtask plan recorded (${items.length} steps). Execute '
           'them in order. After EACH step finishes, call '
           'council_subtask_progress with the 1-based step number and a '
           'one-line summary so the council sees real-time progress.',
@@ -1960,21 +2019,24 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     if (task.subtasks.isEmpty) {
       return const CouncilToolResult(
-        feedback: 'No subtask plan declared. Call council_plan_subtasks '
+        feedback:
+            'No subtask plan declared. Call council_plan_subtasks '
             'first so the council knows the shape of your work.',
       );
     }
     if (step > task.subtasks.length) {
       return CouncilToolResult(
-        feedback: 'step $step exceeds the declared '
+        feedback:
+            'step $step exceeds the declared '
             '${task.subtasks.length}-step plan. If the plan grew, call '
             'council_plan_subtasks again with the full revised list.',
       );
     }
     // Clamp forward so an out-of-order progress call (skipped step,
     // re-fired completion) keeps the indicator monotonically advancing.
-    task.currentSubtaskIndex =
-        task.currentSubtaskIndex < step ? step : task.currentSubtaskIndex;
+    task.currentSubtaskIndex = task.currentSubtaskIndex < step
+        ? step
+        : task.currentSubtaskIndex;
     final summaries = List<String>.from(task.subtaskSummaries);
     while (summaries.length < step) {
       summaries.add('');
@@ -2000,7 +2062,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final nextStep = step + 1;
     final more = nextStep <= task.subtasks.length;
     return CouncilToolResult(
-      feedback: 'Step $step/${task.subtasks.length} recorded. '
+      feedback:
+          'Step $step/${task.subtasks.length} recorded. '
           '${more ? "Continue with step $nextStep: ${task.subtasks[nextStep - 1]}" : "All declared subtasks complete — wrap up and return the deliverable."}',
     );
   }
@@ -2015,7 +2078,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     if (_dispatches.isEmpty) {
       return const CouncilToolResult(
-        feedback: 'No parallel dispatches in flight. '
+        feedback:
+            'No parallel dispatches in flight. '
             'Continue with synthesis or report.',
       );
     }
@@ -2023,9 +2087,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     session.status = CouncilStatus.working;
     notifyListeners();
 
-    await Future.wait(
-      _dispatches.map((f) => f.catchError((_) {})),
-    );
+    await Future.wait(_dispatches.map((f) => f.catchError((_) {})));
     _dispatches.clear();
 
     final buf = StringBuffer();
@@ -2115,6 +2177,14 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     if (task.trim().isEmpty) {
       return const CouncilToolResult(feedback: 'Dispatch task was empty.');
+    }
+    final discoveryRefusal = discoveryDispatchRefusalForTest(
+      session: session,
+      parallel: parallel,
+    );
+    if (discoveryRefusal != null) {
+      _emitDispatchGuardTripped(discoveryRefusal);
+      return CouncilToolResult(feedback: discoveryRefusal);
     }
 
     // Refire prevention. Sub-Pro models love to re-dispatch essentially
@@ -2212,6 +2282,35 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     );
   }
 
+  @visibleForTesting
+  static String? discoveryDispatchRefusalForTest({
+    required CouncilSession session,
+    required bool parallel,
+  }) {
+    if (session.currentPhase != CouncilPhase.discovery) return null;
+    if (parallel) {
+      return 'Discovery is orchestrator-owned now: parallel discovery waves '
+          'are blocked because they make agents re-read the same files. '
+          'Do the grounding yourself, then call council_phase with '
+          'phase="architecture" before dispatching the first team wave.';
+    }
+    if (_hasDispatchSinceLastPhaseDeclaration(session)) {
+      return 'Discovery allows at most one sequential scout dispatch. '
+          'Capture what you learned, call council_phase with '
+          'phase="architecture", then dispatch agents with concrete '
+          'architecture/build tasks.';
+    }
+    return null;
+  }
+
+  static bool _hasDispatchSinceLastPhaseDeclaration(CouncilSession session) {
+    for (final event in session.events.reversed) {
+      if (event.type == CouncilEventType.dispatched) return true;
+      if (event.type == CouncilEventType.phaseDeclared) return false;
+    }
+    return false;
+  }
+
   Future<void> _runWithDispatchSlot(Future<void> Function() run) async {
     while (_activeDispatches >= 3) {
       await Future<void>.delayed(const Duration(milliseconds: 120));
@@ -2255,6 +2354,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           agent: agent,
           task: task,
           reviewerDirectives: reviewerDirectives,
+          discoveryContext: session.discoveryContext,
         ),
         userPrompt: task,
         nativeToolIds: {...CouncilProtocol.agentToolIds, ...agent.enabledTools},
@@ -2274,7 +2374,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           _event(
             CouncilEventType.agentError,
             fromAgentId: agent.id,
-            message: 'Transient error, retrying in ${delaySecs}s '
+            message:
+                'Transient error, retrying in ${delaySecs}s '
                 '(attempt $attempt/$maxRetries)...',
           );
           notifyListeners();
@@ -2305,10 +2406,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     _emitThinkingEnded(agent);
     final summary = _summariseTranscript(agent.transcript);
-    _safeLedgerTransition(
-      taskId,
-      CouncilTaskState.done,
-    );
+    _safeLedgerTransition(taskId, CouncilTaskState.done);
     _event(
       CouncilEventType.agentDone,
       fromAgentId: agent.id,
@@ -2365,14 +2463,18 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     buf.writeln('## Final Evaluator Verification');
     buf.writeln();
     if (evalTrimmed.isEmpty) {
-      buf.writeln('_The final evaluator did not produce verification output. '
-          'The findings above are taken directly from the agents and have '
-          'not been independently cross-checked._');
+      buf.writeln(
+        '_The final evaluator did not produce verification output. '
+        'The findings above are taken directly from the agents and have '
+        'not been independently cross-checked._',
+      );
     } else if (evalTrimmed.length < 200) {
       // Evaluator phoned it in. Show what it said but flag it.
-      buf.writeln('_The final evaluator produced minimal verification. '
-          'Findings above are agent-reported and not cross-checked by the '
-          'evaluator._');
+      buf.writeln(
+        '_The final evaluator produced minimal verification. '
+        'Findings above are agent-reported and not cross-checked by the '
+        'evaluator._',
+      );
       buf.writeln();
       buf.writeln('**Evaluator note:**');
       buf.writeln();
@@ -2407,15 +2509,27 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     buf.writeln('## Executive Summary');
     buf.writeln();
     final findings = session.pentestFindings;
-    final critical = findings.where((f) => f.severity == PentestSeverity.critical).length;
-    final major = findings.where((f) => f.severity == PentestSeverity.major).length;
-    final minor = findings.where((f) => f.severity == PentestSeverity.minor).length;
-    final info = findings.where((f) => f.severity == PentestSeverity.info).length;
-    buf.writeln('- ${findings.length} findings total: '
-        '$critical critical, $major major, $minor minor, $info informational.');
+    final critical = findings
+        .where((f) => f.severity == PentestSeverity.critical)
+        .length;
+    final major = findings
+        .where((f) => f.severity == PentestSeverity.major)
+        .length;
+    final minor = findings
+        .where((f) => f.severity == PentestSeverity.minor)
+        .length;
+    final info = findings
+        .where((f) => f.severity == PentestSeverity.info)
+        .length;
+    buf.writeln(
+      '- ${findings.length} findings total: '
+      '$critical critical, $major major, $minor minor, $info informational.',
+    );
     buf.writeln('- ${session.config.agents.length} agents dispatched.');
     if (orchestratorDraft.length > 100) {
-      buf.writeln('- Orchestrator notes: ${_summariseTranscript(orchestratorDraft)}');
+      buf.writeln(
+        '- Orchestrator notes: ${_summariseTranscript(orchestratorDraft)}',
+      );
     }
     buf.writeln();
 
@@ -2460,7 +2574,9 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
                 .map((t) => t.task)
                 .join('; '));
       final agentFindings = findings.where((f) => f.agentId == agent.id);
-      buf.writeln('### ${agent.name} (${CouncilProtocol.roleInstruction(agent).split('.').first})');
+      buf.writeln(
+        '### ${agent.name} (${CouncilProtocol.roleInstruction(agent).split('.').first})',
+      );
       buf.writeln();
       buf.writeln('**Task:** $task');
       buf.writeln();
@@ -2490,7 +2606,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         final asker = session.agentById(q.fromAgentId)?.name ?? q.fromAgentId;
         buf.writeln('- **$asker** asked: ${q.question}');
         for (final r in q.replies) {
-          final responder = session.agentById(r.fromAgentId)?.name ?? r.fromAgentId;
+          final responder =
+              session.agentById(r.fromAgentId)?.name ?? r.fromAgentId;
           buf.writeln('  - **$responder**: ${r.answer}');
         }
       }
@@ -2523,12 +2640,15 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     // Open vectors
     buf.writeln('## Open Attack Vectors (untested)');
     buf.writeln();
-    buf.writeln('(Evaluator: identify vectors that were planned but not tested within session budget.)');
+    buf.writeln(
+      '(Evaluator: identify vectors that were planned but not tested within session budget.)',
+    );
     buf.writeln();
 
     // Append orchestrator's original draft as appendix
     if (orchestratorDraft.trim().isNotEmpty &&
-        orchestratorDraft != '# Council Report\n\nNo final report was produced.') {
+        orchestratorDraft !=
+            '# Council Report\n\nNo final report was produced.') {
       buf.writeln('## Appendix — Orchestrator Draft');
       buf.writeln();
       buf.writeln(orchestratorDraft.trim());
@@ -2682,11 +2802,12 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       );
     }
     final rawTargets = call.arguments['targets'];
-    final requestedTargets = (rawTargets is List ? rawTargets : const <dynamic>[])
-        .whereType<String>()
-        .map((id) => id.trim())
-        .where((id) => id.isNotEmpty)
-        .toList();
+    final requestedTargets =
+        (rawTargets is List ? rawTargets : const <dynamic>[])
+            .whereType<String>()
+            .map((id) => id.trim())
+            .where((id) => id.isNotEmpty)
+            .toList();
     final responders = _selectPoolResponders(
       session: session,
       asker: asker,
@@ -2829,8 +2950,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     // canonical answer so the run doesn't park on a modal the user
     // shouldn't have to see in the first place. Gated on isOrchestrator
     // so genuine agent-side "I'm blocked" asks still reach the user.
-    final isOrchestrator = _session != null &&
-        fromAgentId == _session!.config.orchestrator.id;
+    final isOrchestrator =
+        _session != null && fromAgentId == _session!.config.orchestrator.id;
     if (isOrchestrator) {
       final canonicalAnswer = _canonicalProcessAnswer(question);
       if (canonicalAnswer != null) {
@@ -2841,7 +2962,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           data: const {'intercepted': true},
         );
         return CouncilToolResult(
-          feedback: 'AUTO-ANSWERED (the user should not be asked process '
+          feedback:
+              'AUTO-ANSWERED (the user should not be asked process '
               'questions — you own these decisions):\n\n$canonicalAnswer',
         );
       }
@@ -3154,7 +3276,10 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     );
     final match = pattern.firstMatch(raw);
     if (match == null) {
-      return (markdown: raw.trim().isEmpty ? fallback : raw.trim(), followupJson: '');
+      return (
+        markdown: raw.trim().isEmpty ? fallback : raw.trim(),
+        followupJson: '',
+      );
     }
     final body = match.group(1)?.trim() ?? '';
     final markdown = (raw.substring(0, match.start) + raw.substring(match.end))
@@ -3182,7 +3307,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     try {
       final parsed = jsonDecode(raw) as Map<String, dynamic>;
-      final summary = (parsed['reviewer_summary'] as String?)?.trim().isNotEmpty == true
+      final summary =
+          (parsed['reviewer_summary'] as String?)?.trim().isNotEmpty == true
           ? (parsed['reviewer_summary'] as String).trim()
           : (parsed['summary'] as String?)?.trim() ?? summaryFallback;
       final directives = (parsed['directives'] as List?) ?? const [];
@@ -3194,17 +3320,22 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         final id = (d['id'] as String?) ?? 'W${weaknesses.length + 1}';
         final severity = (d['severity'] as String?) ?? 'minor';
         final area = (d['kind'] as String?) ?? (d['area'] as String?) ?? '';
-        final desc = (d['detail'] as String?) ?? (d['description'] as String?) ?? '';
+        final desc =
+            (d['detail'] as String?) ?? (d['description'] as String?) ?? '';
         final summaryLine = (d['summary'] as String?) ?? desc;
-        weaknesses.add(CouncilWeakness(
-          id: id,
-          severity: severity,
-          area: area,
-          description: desc,
-        ));
+        weaknesses.add(
+          CouncilWeakness(
+            id: id,
+            severity: severity,
+            area: area,
+            description: desc,
+          ),
+        );
         final target = (d['target_role'] as String?) ?? '';
         if (target.isNotEmpty && desc.isNotEmpty) {
-          perAgent.putIfAbsent(target, () => <String>[]).add('[$id] $summaryLine');
+          perAgent
+              .putIfAbsent(target, () => <String>[])
+              .add('[$id] $summaryLine');
         }
         if (summaryLine.isNotEmpty) {
           addendumBuf.writeln('- [$id | $severity] $summaryLine');
@@ -3261,7 +3392,8 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       'regress',
       'edge case',
     ].any(q.contains);
-    final hasSurface = q.contains('`') ||
+    final hasSurface =
+        q.contains('`') ||
         q.contains('/') ||
         q.contains('_') ||
         q.contains('.') ||
@@ -3294,9 +3426,11 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       return selected.take(_maxPoolTargetsPerQuestion).toList(growable: false);
     }
 
-    final ranked = [...siblings]..sort(
-      (a, b) => _poolRolePriority(a.role).compareTo(_poolRolePriority(b.role)),
-    );
+    final ranked = [...siblings]
+      ..sort(
+        (a, b) =>
+            _poolRolePriority(a.role).compareTo(_poolRolePriority(b.role)),
+      );
     return ranked.take(_maxPoolTargetsPerQuestion).toList(growable: false);
   }
 
@@ -3349,11 +3483,11 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
               draftReport: draftReport,
             )
           : 'OUTPUT THE REPORT NOW. Your very first line of output must be '
-              'the ```council_followup JSON block (Part 1), immediately '
-              'followed by the markdown report (Part 2). '
-              'Do NOT narrate, plan, or think out loud. Do NOT write '
-              '"Let me review..." or "I\'ll start by..." — those are not '
-              'the report. Start with ```council_followup on line 1.';
+                'the ```council_followup JSON block (Part 1), immediately '
+                'followed by the markdown report (Part 2). '
+                'Do NOT narrate, plan, or think out loud. Do NOT write '
+                '"Let me review..." or "I\'ll start by..." — those are not '
+                'the report. Start with ```council_followup on line 1.';
 
       // Reset transcript on retry so we don't fold prior attempts together.
       if (isRetry) {
@@ -3479,18 +3613,19 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       return 'output too short (${trimmed.length} chars; minimum 200)';
     }
     // Must have at least 2 section headings to be a real report.
-    final headingCount = RegExp(r'^#{1,3} ', multiLine: true)
-        .allMatches(trimmed)
-        .length;
+    final headingCount = RegExp(
+      r'^#{1,3} ',
+      multiLine: true,
+    ).allMatches(trimmed).length;
     if (headingCount < 2) {
       return 'no report structure (found $headingCount headings; need ≥2)';
     }
     // Hedging/narration detection — regardless of length. If the first
     // 300 chars are narration ("let me...", "I'll...") without starting
     // the actual report format, it's a failed attempt.
-    final first300 = trimmed.substring(
-      0, trimmed.length < 300 ? trimmed.length : 300,
-    ).toLowerCase();
+    final first300 = trimmed
+        .substring(0, trimmed.length < 300 ? trimmed.length : 300)
+        .toLowerCase();
     const hedges = [
       'let me verify',
       'let me start',
@@ -3570,11 +3705,7 @@ The draft report and agent transcripts are in your system prompt. You have every
     final clean = _cleanTranscriptChunk(chunk);
     if (clean.isEmpty) return;
     agent.transcript += clean;
-    _event(
-      CouncilEventType.agentChunk,
-      fromAgentId: agent.id,
-      message: clean,
-    );
+    _event(CouncilEventType.agentChunk, fromAgentId: agent.id, message: clean);
     _detectAndEmitPeerMentions(agent, clean);
     notifyListeners();
   }
@@ -3607,9 +3738,7 @@ The draft report and agent transcripts are in your system prompt. You have every
       if (candidate.id == orchestratorId) continue;
       final name = candidate.name.trim();
       if (name.length < 3) continue;
-      final pattern = RegExp(
-        r'\b' + RegExp.escape(name.toLowerCase()) + r'\b',
-      );
+      final pattern = RegExp(r'\b' + RegExp.escape(name.toLowerCase()) + r'\b');
       if (pattern.hasMatch(lower)) {
         foundIds.add(candidate.id);
       }
@@ -3727,7 +3856,15 @@ The draft report and agent transcripts are in your system prompt. You have every
     required String fresh,
   }) {
     const phaseVerbs = <Set<String>>[
-      {'discover', 'discovery', 'map', 'read', 'understand', 'explore', 'survey'},
+      {
+        'discover',
+        'discovery',
+        'map',
+        'read',
+        'understand',
+        'explore',
+        'survey',
+      },
       {'design', 'plan', 'architect', 'sketch', 'decide', 'propose'},
       {'build', 'implement', 'create', 'write', 'add', 'wire', 'ship'},
       {'review', 'audit', 'attack', 'critique', 'challenge', 'verify', 'test'},
@@ -3741,6 +3878,7 @@ The draft report and agent transcripts are in your system prompt. You have every
       }
       return result;
     }
+
     final priorPhases = phasesPresent(prior);
     final freshPhases = phasesPresent(fresh);
     if (priorPhases.isEmpty || freshPhases.isEmpty) return false;
@@ -3766,15 +3904,89 @@ The draft report and agent transcripts are in your system prompt. You have every
   /// the similarity score. Keeps `/`, `.`, `_`, `-` inside tokens so file
   /// paths like `lib/foo/bar.dart` survive as a single signal-rich token.
   static final Set<String> _kTaskStopwords = {
-    'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
-    'with', 'by', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been',
-    'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-    'should', 'could', 'may', 'might', 'must', 'shall', 'can', 'this', 'that',
-    'these', 'those', 'first', 'then', 'also', 'please', 'your', 'you', 'it',
-    'its', 'we', 'our', 'us', 'they', 'their', 'them', 'so', 'if', 'when',
-    'where', 'which', 'while', 'into', 'onto', 'out', 'over', 'under', 'than',
-    'task', 'agent', 'work', 'use', 'make', 'create', 'add', 'apply', 'now',
-    'next', 'before', 'after', 'within', 'across', 'between',
+    'a',
+    'an',
+    'the',
+    'and',
+    'or',
+    'but',
+    'in',
+    'on',
+    'at',
+    'to',
+    'for',
+    'of',
+    'with',
+    'by',
+    'from',
+    'as',
+    'is',
+    'are',
+    'was',
+    'were',
+    'be',
+    'been',
+    'being',
+    'have',
+    'has',
+    'had',
+    'do',
+    'does',
+    'did',
+    'will',
+    'would',
+    'should',
+    'could',
+    'may',
+    'might',
+    'must',
+    'shall',
+    'can',
+    'this',
+    'that',
+    'these',
+    'those',
+    'first',
+    'then',
+    'also',
+    'please',
+    'your',
+    'you',
+    'it',
+    'its',
+    'we',
+    'our',
+    'us',
+    'they',
+    'their',
+    'them',
+    'so',
+    'if',
+    'when',
+    'where',
+    'which',
+    'while',
+    'into',
+    'onto',
+    'out',
+    'over',
+    'under',
+    'than',
+    'task',
+    'agent',
+    'work',
+    'use',
+    'make',
+    'create',
+    'add',
+    'apply',
+    'now',
+    'next',
+    'before',
+    'after',
+    'within',
+    'across',
+    'between',
   };
 
   Set<String> _normalizedTaskWords(String task) {
@@ -3802,13 +4014,15 @@ The draft report and agent transcripts are in your system prompt. You have every
     // Ship-as-they-come vs wait-for-all. Same canonical answer (wait, then
     // synthesize once everyone returns) — that part of the doctrine
     // didn't change.
-    final shipsAsCome = q.contains('ship') &&
+    final shipsAsCome =
+        q.contains('ship') &&
         (q.contains('as they') ||
             q.contains('as it') ||
             q.contains('come in') ||
             q.contains('incrementally') ||
             q.contains('one by one'));
-    final waitForAll = q.contains('wait') &&
+    final waitForAll =
+        q.contains('wait') &&
         (q.contains('all') || q.contains('finish') || q.contains('done'));
     final seqVsPar = q.contains('sequential') && q.contains('parallel');
     if (shipsAsCome || waitForAll || seqVsPar) {
@@ -4006,7 +4220,9 @@ The draft report and agent transcripts are in your system prompt. You have every
     if (t.length <= cap) return t;
     final tail = t.substring(t.length - cap);
     final firstNl = tail.indexOf('\n');
-    return (firstNl > 0 && firstNl < cap ~/ 4) ? tail.substring(firstNl + 1) : tail;
+    return (firstNl > 0 && firstNl < cap ~/ 4)
+        ? tail.substring(firstNl + 1)
+        : tail;
   }
 
   String _serialisedReviewerDirectivesFor(CouncilAgent agent) {
@@ -4020,27 +4236,31 @@ The draft report and agent transcripts are in your system prompt. You have every
       return '';
     }
     final buf = StringBuffer()
-      ..writeln(jsonEncode({
-        'round': session.roundIndex + 1,
-        'reviewer_summary': followup.summary,
-        'directives': followup.weaknesses
-            .where(
-              (w) =>
-                  followup.perAgentTasks[agent.id]?.any(
-                    (t) => t.contains(w.id),
-                  ) ??
-                  false,
-            )
-            .map((w) => {
+      ..writeln(
+        jsonEncode({
+          'round': session.roundIndex + 1,
+          'reviewer_summary': followup.summary,
+          'directives': followup.weaknesses
+              .where(
+                (w) =>
+                    followup.perAgentTasks[agent.id]?.any(
+                      (t) => t.contains(w.id),
+                    ) ??
+                    false,
+              )
+              .map(
+                (w) => {
                   'id': w.id,
                   'severity': w.severity,
                   'kind': w.area,
                   'detail': w.description,
                   'target_role': agent.id,
-                })
-            .toList(),
-        'must_not_redo': const <String>[],
-      }))
+                },
+              )
+              .toList(),
+          'must_not_redo': const <String>[],
+        }),
+      )
       ..writeln()
       ..writeln(followup.rebriefAddendum);
     return buf.toString();
@@ -4209,11 +4429,7 @@ The draft report and agent transcripts are in your system prompt. You have every
     // already render agentError as a red badge.
     final orchId = _session?.config.orchestrator.id ?? '';
     if (orchId.isNotEmpty) {
-      _event(
-        CouncilEventType.agentError,
-        fromAgentId: orchId,
-        message: reason,
-      );
+      _event(CouncilEventType.agentError, fromAgentId: orchId, message: reason);
     }
   }
 

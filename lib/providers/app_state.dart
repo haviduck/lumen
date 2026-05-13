@@ -352,9 +352,24 @@ class AppState extends ChangeNotifier {
   // by `PreferencesService.getEditorTheme` so existing users see the
   // upgrade — anyone who actively chose a different theme is left alone.
   String _editorTheme = 'lumen-midnight';
+  // Non-persisted preview override for the editor theme. Settings panel
+  // sets this on dropdown change so the open editor (and the inline
+  // theme preview block) repaint immediately with the candidate theme
+  // before the user commits with Save. Cleared on Save and on Settings
+  // tab dispose so closing the panel without saving reverts cleanly.
+  String? _previewEditorTheme;
   double _editorFontSize = 13.5;
   int _editorTabSize = 2;
   bool _wordWrap = false;
+
+  // Per-panel UI font scale. Mouse Ctrl+wheel inside each panel bumps
+  // its scale (file explorer, AI chat) so the user can dial readability
+  // without touching the global IDE settings. Editor uses
+  // `_editorFontSize` directly (re_editor needs a concrete px value),
+  // not a multiplier — kept as one knob so existing prefs / Settings UI
+  // round-trip. Clamps live in the bump* methods.
+  double _fileExplorerFontScale = 1.0;
+  double _aiChatFontScale = 1.0;
 
   // View / lock
   DuckViewMode _viewMode = DuckViewMode.normal;
@@ -432,9 +447,22 @@ class AppState extends ChangeNotifier {
   bool isProviderEnabled(String p) => _enabledProviders.contains(p);
 
   String get editorTheme => _editorTheme;
+  String? get previewEditorTheme => _previewEditorTheme;
+  /// What the editor + theme preview block actually paint with: the
+  /// transient preview if Settings has one set, else the persisted
+  /// theme.
+  String get effectiveEditorTheme => _previewEditorTheme ?? _editorTheme;
   double get editorFontSize => _editorFontSize;
   int get editorTabSize => _editorTabSize;
   bool get wordWrap => _wordWrap;
+  double get fileExplorerFontScale => _fileExplorerFontScale;
+  double get aiChatFontScale => _aiChatFontScale;
+
+  static const double _minPaneFontScale = 0.7;
+  static const double _maxPaneFontScale = 1.8;
+  static const double _paneFontScaleStep = 0.05;
+  static const double _minEditorFontSize = 8.0;
+  static const double _maxEditorFontSize = 32.0;
 
   DuckViewMode get viewMode => _viewMode;
   bool get isLocked => _isLocked;
@@ -614,6 +642,8 @@ class AppState extends ChangeNotifier {
     _editorFontSize = await prefs.getEditorFontSize();
     _editorTabSize = await prefs.getEditorTabSize();
     _wordWrap = await prefs.getWordWrap();
+    _fileExplorerFontScale = await prefs.getFileExplorerFontScale();
+    _aiChatFontScale = await prefs.getAiChatFontScale();
     final view = await prefs.getViewMode();
     _viewMode = DuckViewMode.values.firstWhere(
       (v) => v.name == view,
@@ -819,6 +849,82 @@ class AppState extends ChangeNotifier {
       _wordWrap = wordWrap;
       await prefs.setWordWrap(wordWrap);
     }
+    // Persisting a new theme implicitly commits the preview — keep
+    // them in lockstep so the editor doesn't briefly paint with a
+    // stale preview after Save completes.
+    if (theme != null) {
+      _previewEditorTheme = null;
+    }
+    notifyListeners();
+  }
+
+  /// Set (or clear, with `null`) the transient editor-theme preview.
+  /// The Settings → Theme dropdown calls this on every change so the
+  /// active editor — and the inline preview block in the panel — switch
+  /// instantly while the user shops around. Not persisted; cleared on
+  /// Save (see [updateEditorSettings]) and on the Settings tab dispose.
+  void setPreviewEditorTheme(String? id) {
+    if (_previewEditorTheme == id) return;
+    _previewEditorTheme = id;
+    notifyListeners();
+  }
+
+  /// Direct setter for the file-explorer text scale (Ctrl+wheel inside
+  /// the explorer pane). Step is `_paneFontScaleStep`; bounds clamp at
+  /// `_minPaneFontScale`..`_maxPaneFontScale` so a manic scroll burst
+  /// can't shrink the panel to one pixel or balloon past readable.
+  Future<void> bumpFileExplorerFontScale(int dir) async {
+    final next = (_fileExplorerFontScale + dir * _paneFontScaleStep)
+        .clamp(_minPaneFontScale, _maxPaneFontScale);
+    if ((next - _fileExplorerFontScale).abs() < 0.001) return;
+    _fileExplorerFontScale = next;
+    await prefs.setFileExplorerFontScale(next);
+    notifyListeners();
+  }
+
+  Future<void> resetFileExplorerFontScale() async {
+    if ((_fileExplorerFontScale - 1.0).abs() < 0.001) return;
+    _fileExplorerFontScale = 1.0;
+    await prefs.setFileExplorerFontScale(1.0);
+    notifyListeners();
+  }
+
+  Future<void> bumpAiChatFontScale(int dir) async {
+    final next = (_aiChatFontScale + dir * _paneFontScaleStep)
+        .clamp(_minPaneFontScale, _maxPaneFontScale);
+    if ((next - _aiChatFontScale).abs() < 0.001) return;
+    _aiChatFontScale = next;
+    await prefs.setAiChatFontScale(next);
+    notifyListeners();
+  }
+
+  Future<void> resetAiChatFontScale() async {
+    if ((_aiChatFontScale - 1.0).abs() < 0.001) return;
+    _aiChatFontScale = 1.0;
+    await prefs.setAiChatFontScale(1.0);
+    notifyListeners();
+  }
+
+  /// Ctrl+wheel inside the code editor bumps `editorFontSize` directly
+  /// (re_editor needs a concrete px size). Step is 1 px; clamp is
+  /// `_minEditorFontSize`..`_maxEditorFontSize`. Returns silently when
+  /// already at a bound so the user doesn't see a spurious rebuild on
+  /// the 50th wheel tick.
+  Future<void> bumpEditorFontSize(int dir) async {
+    final next = (_editorFontSize + dir).clamp(
+      _minEditorFontSize,
+      _maxEditorFontSize,
+    );
+    if ((next - _editorFontSize).abs() < 0.001) return;
+    _editorFontSize = next;
+    await prefs.setEditorFontSize(next);
+    notifyListeners();
+  }
+
+  Future<void> resetEditorFontSize() async {
+    if ((_editorFontSize - 13.5).abs() < 0.001) return;
+    _editorFontSize = 13.5;
+    await prefs.setEditorFontSize(13.5);
     notifyListeners();
   }
 

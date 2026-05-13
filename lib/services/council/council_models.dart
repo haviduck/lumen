@@ -27,14 +27,7 @@ enum CouncilStatus {
 /// `review` → adversarial cross-check; agents attack each other's work.
 /// `polish` → address review findings, add docs/tests, harden.
 /// `ship` → final synthesis; report is now legal.
-enum CouncilPhase {
-  discovery,
-  architecture,
-  build,
-  review,
-  polish,
-  ship,
-}
+enum CouncilPhase { discovery, architecture, build, review, polish, ship }
 
 /// One declared phase transition in a session. The orchestrator emits one
 /// of these every time it calls `council_phase`. Persisted on the session
@@ -52,17 +45,19 @@ class CouncilPhaseEntry {
   }) : declaredAt = declaredAt ?? DateTime.now();
 
   Map<String, dynamic> toJson() => {
-        'phase': phase.name,
-        'rationale': rationale,
-        'declaredAt': declaredAt.toIso8601String(),
-      };
+    'phase': phase.name,
+    'rationale': rationale,
+    'declaredAt': declaredAt.toIso8601String(),
+  };
 
   static CouncilPhaseEntry fromJson(Map<String, dynamic> json) {
     return CouncilPhaseEntry(
-      phase: _enumByName(CouncilPhase.values, json['phase'] as String?) ??
+      phase:
+          _enumByName(CouncilPhase.values, json['phase'] as String?) ??
           CouncilPhase.discovery,
       rationale: json['rationale'] as String? ?? '',
-      declaredAt: DateTime.tryParse(json['declaredAt'] as String? ?? '') ??
+      declaredAt:
+          DateTime.tryParse(json['declaredAt'] as String? ?? '') ??
           DateTime.now(),
     );
   }
@@ -146,16 +141,16 @@ class CouncilQualityGate {
   }
 
   Map<String, dynamic> toJson() => {
-        'artifactsProduced': artifactsProduced,
-        'adversarialReviewDone': adversarialReviewDone,
-        'claimsGrounded': claimsGrounded,
-        'userAsksResolved': userAsksResolved,
-        'risksNamed': risksNamed,
-        'enoughPhasesCovered': enoughPhasesCovered,
-        'summary': summary,
-        if (checkedAt != null) 'checkedAt': checkedAt!.toIso8601String(),
-        'attempts': attempts,
-      };
+    'artifactsProduced': artifactsProduced,
+    'adversarialReviewDone': adversarialReviewDone,
+    'claimsGrounded': claimsGrounded,
+    'userAsksResolved': userAsksResolved,
+    'risksNamed': risksNamed,
+    'enoughPhasesCovered': enoughPhasesCovered,
+    'summary': summary,
+    if (checkedAt != null) 'checkedAt': checkedAt!.toIso8601String(),
+    'attempts': attempts,
+  };
 
   static CouncilQualityGate fromJson(Map<String, dynamic> json) {
     return CouncilQualityGate(
@@ -285,9 +280,11 @@ class CouncilEventType {
   /// Emitted once when pentest mode detects the goal target from the brief
   /// or orchestrator's first dispatch. Data: { 'goal': '<description>' }.
   static const pentestGoalIdentified = 'pentest_goal_identified';
+
   /// Emitted when an agent reports a finding that constitutes an "attack"
   /// on the goal. Data: { 'finding': '<summary>', 'severity': 'critical|major|minor' }.
   static const pentestAttackLanded = 'pentest_attack_landed';
+
   /// Emitted when agents enter the planning / conspiring phase before
   /// dispatching attack waves. Agents visually huddle.
   static const pentestConspiring = 'pentest_conspiring';
@@ -366,7 +363,8 @@ class ReviewerFollowup {
   };
 
   static ReviewerFollowup fromJson(Map<String, dynamic> json) {
-    final tasksRaw = (json['perAgentTasks'] as Map?)?.cast<String, dynamic>() ??
+    final tasksRaw =
+        (json['perAgentTasks'] as Map?)?.cast<String, dynamic>() ??
         const <String, dynamic>{};
     final tasks = <String, List<String>>{};
     tasksRaw.forEach((k, v) {
@@ -510,16 +508,16 @@ class CouncilBriefDoc {
   });
 
   Map<String, dynamic> toJson() => {
-        'name': name,
-        'size': size,
-        'content': content,
-      };
+    'name': name,
+    'size': size,
+    'content': content,
+  };
 
   static CouncilBriefDoc fromJson(Map<String, dynamic> json) => CouncilBriefDoc(
-        name: json['name'] as String? ?? '',
-        size: (json['size'] as num?)?.toInt() ?? 0,
-        content: json['content'] as String? ?? '',
-      );
+    name: json['name'] as String? ?? '',
+    size: (json['size'] as num?)?.toInt() ?? 0,
+    content: json['content'] as String? ?? '',
+  );
 }
 
 class CouncilConfig {
@@ -530,12 +528,14 @@ class CouncilConfig {
   final List<CouncilAgent> agents;
   final CouncilAgent finalEvaluator;
   final DateTime createdAt;
+
   /// Base64-encoded JPEG images attached to the brief by the user
   /// (clipboard paste or image-file picker in the Convene modal).
   /// Forwarded to the orchestrator's first user turn as `images` —
   /// vision-capable providers (Anthropic, Gemini, Ollama) decode them
   /// into proper vision blocks; text-only providers silently drop them.
   final List<String> briefImages;
+
   /// Document attachments (md / txt / code / small PDF text) attached
   /// to the brief. Content is folded into the orchestrator's user
   /// prompt as labeled `<attached-doc>` blocks so every provider sees
@@ -552,18 +552,18 @@ class CouncilConfig {
     DateTime? createdAt,
     List<String> briefImages = const <String>[],
     List<CouncilBriefDoc> briefDocs = const <CouncilBriefDoc>[],
-  })  : agents = List.unmodifiable(agents),
-        briefImages = List.unmodifiable(briefImages),
-        briefDocs = List.unmodifiable(briefDocs),
-        finalEvaluator =
-            finalEvaluator ??
-            CouncilAgent(
-              id: 'final_evaluator',
-              name: S.councilFinalEvaluator,
-              role: RolePreset.reviewer,
-              model: orchestrator.model,
-            ),
-        createdAt = createdAt ?? DateTime.now();
+  }) : agents = List.unmodifiable(agents),
+       briefImages = List.unmodifiable(briefImages),
+       briefDocs = List.unmodifiable(briefDocs),
+       finalEvaluator =
+           finalEvaluator ??
+           CouncilAgent(
+             id: 'final_evaluator',
+             name: S.councilFinalEvaluator,
+             role: RolePreset.reviewer,
+             model: orchestrator.model,
+           ),
+       createdAt = createdAt ?? DateTime.now();
 
   List<CouncilAgent> get allAgents => [orchestrator, ...agents, finalEvaluator];
 
@@ -694,17 +694,22 @@ class CouncilPoolReply {
 /// accepts each (by surfacing it under "Open Risks" in the final report).
 class CouncilCriticAttack {
   final String id;
+
   /// The specific claim, file, decision, or absence under attack. Quoted
   /// verbatim from the council transcript wherever possible.
   final String target;
+
   /// The challenge itself — what is wrong, missing, or unproven.
   final String attack;
+
   /// Severity drives visual urgency and gate behavior. Blocker findings
   /// block the gate even when every other check passes.
   final String severity;
+
   /// What artifact / evidence / answer would resolve this attack. The
   /// orchestrator uses this as the acceptance criterion for follow-up.
   final String acceptance;
+
   /// Set true once the orchestrator declares this attack addressed or
   /// accepted-as-risk in a subsequent quality check call.
   bool resolved;
@@ -722,13 +727,13 @@ class CouncilCriticAttack {
   bool get isMajor => severity.toLowerCase() == 'major';
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'target': target,
-        'attack': attack,
-        'severity': severity,
-        'acceptance': acceptance,
-        'resolved': resolved,
-      };
+    'id': id,
+    'target': target,
+    'attack': attack,
+    'severity': severity,
+    'acceptance': acceptance,
+    'resolved': resolved,
+  };
 
   static CouncilCriticAttack fromJson(Map<String, dynamic> json) {
     return CouncilCriticAttack(
@@ -750,6 +755,7 @@ class CouncilCritique {
   final DateTime runAt;
   final String summary;
   final List<CouncilCriticAttack> attacks;
+
   /// True once the orchestrator has declared every blocker + major attack
   /// resolved (or explicitly accepted them via "Open Risks"). The gate's
   /// `adversarialReviewDone` flag stays true once the Critic has run, but
@@ -761,8 +767,8 @@ class CouncilCritique {
     this.summary = '',
     List<CouncilCriticAttack>? attacks,
     this.acknowledged = false,
-  })  : runAt = runAt ?? DateTime.now(),
-        attacks = List<CouncilCriticAttack>.from(attacks ?? const []);
+  }) : runAt = runAt ?? DateTime.now(),
+       attacks = List<CouncilCriticAttack>.from(attacks ?? const []);
 
   int get blockerCount => attacks.where((a) => a.isBlocker).length;
   int get majorCount => attacks.where((a) => a.isMajor).length;
@@ -773,15 +779,16 @@ class CouncilCritique {
       attacks.where((a) => a.isBlocker || a.isMajor).every((a) => a.resolved);
 
   Map<String, dynamic> toJson() => {
-        'runAt': runAt.toIso8601String(),
-        'summary': summary,
-        'attacks': attacks.map((a) => a.toJson()).toList(),
-        'acknowledged': acknowledged,
-      };
+    'runAt': runAt.toIso8601String(),
+    'summary': summary,
+    'attacks': attacks.map((a) => a.toJson()).toList(),
+    'acknowledged': acknowledged,
+  };
 
   static CouncilCritique fromJson(Map<String, dynamic> json) {
     return CouncilCritique(
-      runAt: DateTime.tryParse(json['runAt'] as String? ?? '') ?? DateTime.now(),
+      runAt:
+          DateTime.tryParse(json['runAt'] as String? ?? '') ?? DateTime.now(),
       summary: json['summary'] as String? ?? '',
       attacks: ((json['attacks'] as List?) ?? const [])
           .whereType<Map>()
@@ -824,7 +831,9 @@ class PentestFinding {
         (s) => s.name == json['severity'],
         orElse: () => PentestSeverity.info,
       ),
-      timestamp: DateTime.tryParse(json['timestamp'] as String? ?? '') ?? DateTime.now(),
+      timestamp:
+          DateTime.tryParse(json['timestamp'] as String? ?? '') ??
+          DateTime.now(),
     );
   }
 }
@@ -885,6 +894,11 @@ class CouncilSession {
   /// exists with at least one attack.
   CouncilCritique? critique;
 
+  /// Orchestrator-owned grounding captured when the run leaves discovery.
+  /// Later agent prompts receive this digest so they do not re-read the same
+  /// project surface before starting their narrower slice.
+  String discoveryContext;
+
   CouncilSession({
     required this.config,
     String? runId,
@@ -904,8 +918,10 @@ class CouncilSession {
     List<CouncilPhaseEntry>? phaseHistory,
     CouncilQualityGate? qualityGate,
     this.critique,
-  }) : runId = runId ??
-            '${config.id}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
+    this.discoveryContext = '',
+  }) : runId =
+           runId ??
+           '${config.id}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
        startedAt = startedAt ?? DateTime.now(),
        events = List<CouncilEvent>.from(events ?? const []),
        poolQuestions = List<CouncilQuestion>.from(poolQuestions ?? const []),
@@ -956,6 +972,7 @@ class CouncilSession {
       'phaseHistory': phaseHistory.map((p) => p.toJson()).toList(),
     'qualityGate': qualityGate.toJson(),
     if (critique != null) 'critique': critique!.toJson(),
+    if (discoveryContext.isNotEmpty) 'discoveryContext': discoveryContext,
     if (pentestGoal.isNotEmpty) 'pentestGoal': pentestGoal,
     if (pentestFindings.isNotEmpty)
       'pentestFindings': pentestFindings.map((f) => f.toJson()).toList(),
@@ -1003,7 +1020,7 @@ class CouncilSession {
       pentestGoal: json['pentestGoal'] as String? ?? '',
       currentPhase:
           _enumByName(CouncilPhase.values, json['currentPhase'] as String?) ??
-              CouncilPhase.discovery,
+          CouncilPhase.discovery,
       phaseHistory: ((json['phaseHistory'] as List?) ?? const [])
           .whereType<Map>()
           .map((p) => CouncilPhaseEntry.fromJson(p.cast<String, dynamic>()))
@@ -1018,6 +1035,7 @@ class CouncilSession {
               (json['critique'] as Map).cast<String, dynamic>(),
             )
           : null,
+      discoveryContext: json['discoveryContext'] as String? ?? '',
     );
     final findings = ((json['pentestFindings'] as List?) ?? const [])
         .whereType<Map>()

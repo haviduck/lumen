@@ -69,6 +69,8 @@ secrets.json
 .pub/
 /build/
 /coverage/
+website/.next/
+website/node_modules/
 
 # Symbolication related
 app.*.symbols

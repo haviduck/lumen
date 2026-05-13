@@ -1010,6 +1010,27 @@ class S {
   static const String chatModelDisableAll = 'Disable all';
   static const String chatNoModels = 'No models available';
 
+  // ── Inline model-picker popover (composer chevron) ──
+  //
+  // The popover replaces the legacy `showMenu` flat list with a
+  // searchable, provider-grouped surface anchored to the model chip.
+  // Strings live next to the existing chat-model bundle so localisers
+  // see the whole picker vocabulary in one place.
+  static const String chatModelPopoverTitle = 'Select model';
+  static const String chatModelSearchHint = 'Search models';
+  static const String chatModelNoMatches = 'No models match';
+  static const String chatModelNoMatchesHint =
+      'Try a different query, or reset the provider filter.';
+  static const String chatModelFilterAll = 'All';
+  static const String chatModelClearSearch = 'Clear search';
+  static const String chatModelKeyboardHint =
+      '\u2191\u2193 navigate  \u00B7  Enter select  \u00B7  Esc close';
+  static const String chatModelManageAll = 'Manage all models';
+  static const String chatModelCapabilityVision = 'Vision';
+  static const String chatModelCapabilityReasoning = 'Reasoning';
+  static String chatModelCountLabel(int count) =>
+      count == 1 ? '1 model' : '$count models';
+
   static const String chatOpenAiSettings = 'Open AI / Chat settings';
   static const String chatEditMessage = 'Edit Message';
   static const String chatDeleteMessage = 'Delete Message';
@@ -1196,6 +1217,14 @@ class S {
   static const String settingsAutoApproveDesc =
       'Skip the confirmation dialog when the agent runs shell commands.';
   static const String settingsTheme = 'Editor Theme';
+  static const String settingsThemeDesc =
+      'Syntax-highlighting palette for the code editor. The preview '
+      'below updates live as you pick — save to keep it.';
+  static const String settingsThemePreviewLabel = 'PREVIEW';
+  static const String settingsThemePreviewHint =
+      'Live preview reverts if you leave Settings without saving. '
+      'Tip: Ctrl + mouse-wheel inside the file explorer, code editor '
+      'and AI chat resizes their text on the fly.';
   static const String settingsFontSize = 'Editor Font Size';
   static const String settingsTabSize = 'Tab Size';
   static const String settingsWordWrap = 'Word Wrap';

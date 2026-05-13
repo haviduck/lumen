@@ -1,0 +1,138 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body {
+    background-color: theme("colors.bg.deepest");
+    color: theme("colors.fg.DEFAULT");
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Selection in the IDE accent for cohesion. */
+  ::selection {
+    background-color: rgba(136, 192, 208, 0.35);
+    color: theme("colors.fg.DEFAULT");
+  }
+
+  /* Anchor jumps shouldn't slam against the sticky nav. */
+  html {
+    scroll-padding-top: 80px;
+  }
+
+  hr {
+    border-color: theme("colors.edge.seam");
+  }
+}
+
+@layer components {
+  /* Global page container — used across pages. */
+  .page-x {
+    @apply mx-auto w-full max-w-page px-6 sm:px-8;
+  }
+
+  /* Section padding — used across pages. */
+  .section-y {
+    @apply py-20 sm:py-28;
+  }
+
+  /* Eyebrow label — small, mono, muted, used above section titles. */
+  .eyebrow {
+    @apply font-mono text-xs uppercase tracking-[0.18em] text-fg-muted;
+  }
+
+  /* Glass card — chrome surface inspired by DuckGlass. */
+  .glass {
+    background: linear-gradient(
+      180deg,
+      rgba(30, 33, 39, 0.72) 0%,
+      rgba(25, 28, 34, 0.72) 100%
+    );
+    border: 1px solid theme("colors.edge.hi");
+    box-shadow: theme("boxShadow.glass");
+    backdrop-filter: blur(20px) saturate(120%);
+    -webkit-backdrop-filter: blur(20px) saturate(120%);
+  }
+
+  /* Pill — small inline label. */
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-edge-hi bg-bg-raised/60 px-2.5 py-1 font-mono text-[11px] uppercase tracking-[0.16em] text-fg-muted;
+  }
+
+  /* Button — primary. Subtle, not screaming. */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-accent-cyan/40 bg-accent-cyan/15 px-4 py-2.5 text-sm font-medium text-accent-cyan transition-colors hover:bg-accent-cyan/25 hover:border-accent-cyan/60 focus:outline-none focus:ring-2 focus:ring-accent-cyan/50;
+  }
+
+  /* Button — secondary / ghost. */
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-edge-hi bg-bg-raised/50 px-4 py-2.5 text-sm font-medium text-fg transition-colors hover:bg-bg-raisedHi hover:border-fg-muted/40 focus:outline-none focus:ring-2 focus:ring-fg-muted/40;
+  }
+
+  /* Inline code style — used in prose. */
+  .icode {
+    @apply font-mono text-[0.875em] text-accent-cyan bg-bg-raised border border-edge-hi rounded px-1.5 py-0.5;
+  }
+
+  /* Prose block — for /docs page. Reset + Lumen-styled. */
+  .prose-lumen {
+    @apply max-w-prose text-fg/90 leading-relaxed;
+  }
+  .prose-lumen h2 {
+    @apply mt-16 mb-4 text-h2 font-semibold text-fg;
+  }
+  .prose-lumen h3 {
+    @apply mt-10 mb-3 text-h3 font-semibold text-fg;
+  }
+  .prose-lumen p {
+    @apply my-4 text-fg/85;
+  }
+  .prose-lumen ul {
+    @apply my-4 space-y-2 pl-5 list-disc marker:text-fg-subtle;
+  }
+  .prose-lumen ol {
+    @apply my-4 space-y-2 pl-5 list-decimal marker:text-fg-subtle;
+  }
+  .prose-lumen li {
+    @apply text-fg/85;
+  }
+  .prose-lumen a {
+    @apply text-accent-cyan underline decoration-accent-cyan/30 underline-offset-4 hover:decoration-accent-cyan;
+  }
+  .prose-lumen strong {
+    @apply text-fg font-semibold;
+  }
+  .prose-lumen code:not(pre code) {
+    @apply icode;
+  }
+  .prose-lumen pre {
+    @apply my-6 overflow-x-auto rounded-md border border-edge-hi bg-bg-deeper p-4 text-sm leading-relaxed font-mono text-fg/85;
+  }
+  .prose-lumen blockquote {
+    @apply my-6 border-l-2 border-accent-purple/60 bg-bg-raised/40 px-4 py-2 text-fg-muted italic;
+  }
+}
+
+@layer utilities {
+  /* Hairline borders that read on dark. */
+  .hairline-t {
+    border-top: 1px solid theme("colors.edge.hi");
+  }
+  .hairline-b {
+    border-bottom: 1px solid theme("colors.edge.hi");
+  }
+
+  /* Used by the hero — subtle scanline-y grid. */
+  .grid-bg {
+    background-image: theme("backgroundImage.grid-faint");
+    background-size: 56px 56px;
+    background-position: center top;
+  }
+}

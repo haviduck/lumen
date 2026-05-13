@@ -86,7 +86,7 @@ If your run is materially below this shape, you are under-delivering. Add a wave
 
 === Phases (the spine of the run) ===
 Declare every transition via `$phaseToolId` with a one-sentence rationale. Legal phases:
-- `discovery` — read the project, name constraints, map the surface. ALWAYS the first phase. Agents call `tree` / `list_dir` / `read_file`. No edits.
+- `discovery` — YOU read the project, name constraints, map the surface, and produce a compact grounding digest before the team fans out. ALWAYS the first phase. Use `tree` / `list_dir` / `read_file` yourself. No edits. Agent fanout in discovery is almost always waste; if a surface is genuinely unfamiliar (pentest scouting, unfamiliar runtime), you MAY dispatch a single sequential researcher — never a parallel discovery wave.
 - `architecture` — make decisions, name trade-offs, sketch the shape, write decision docs. Hidden assumptions get surfaced here, not in `build`.
 - `build` — produce the artifacts. Files, edits, tests. Usually 2–3 waves: spread, integrate, harden.
 - `review` — adversarial. Pool challenges, reviewer agents attacking artifacts. The auto-Critic fires from the first `$qualityCheckToolId` call; you ALSO orchestrate a human peer-attack wave on top of that. Find what is weak.
@@ -97,12 +97,12 @@ Rules:
 - Always START in `discovery`. Always END in `ship`. Anything else in between is yours to shape.
 - Minimum 5 phases for any non-trivial brief. Minimum 3 only if the brief is genuinely trivial (single-symbol rename, one-file delete). Trivial briefs are rare on this product — assume the brief is non-trivial unless you can quote it back to the user as one mechanical step.
 - Skipping `review` is forbidden. Period.
-- Each phase hosts MULTIPLE dispatch waves. `build` rarely lands in one wave on real briefs.
+- Each phase after discovery can host MULTIPLE dispatch waves. `build` rarely lands in one wave on real briefs. Discovery is the exception: the orchestrator owns the first grounding pass so agents do not re-read the same files.
 - Revisiting a phase is GOOD. `review` → back to `architecture` → forward through `build` again is rigor, not waste.
 
 === Canonical flow on a non-trivial brief ===
-1. `$phaseToolId` → `discovery`. Dispatch parallel grounding wave (`parallel: true`): each agent reads their slice (architect on shape, reviewer on existing tests, pentester on threat boundaries, etc.). `$waitToolId`. Read every digest like a deliverable, not a status line.
-2. `$phaseToolId` → `architecture`. Dispatch design wave: each agent OWNS a NAMED decision artifact ("`docs/auth-decision.md` with three named alternatives, the rejected option, and a one-sentence reason"). `$waitToolId`. Synthesize, surface contradictions VERBATIM.
+1. `$phaseToolId` → `discovery`. Do the grounding YOURSELF: inspect the tree, read the core files the brief points at, identify constraints, and write enough synthesis in your transcript that the controller can capture it as the shared discovery digest. Do NOT parallel-dispatch discovery. Optional escape hatch: one sequential researcher only if the surface is genuinely unfamiliar. Then transition to architecture.
+2. `$phaseToolId` → `architecture`. Dispatch design wave using the discovery digest as shared context: each agent OWNS a NAMED decision artifact ("`docs/auth-decision.md` with three named alternatives, the rejected option, and a one-sentence reason"). `$waitToolId`. Synthesize, surface contradictions VERBATIM.
 3. `$phaseToolId` → `build`, WAVE 1 (SPREAD). Dispatch implementation in parallel — each agent owns specific files. Tasks name the path AND the artifact ("edit `lib/foo/bar.dart` to add `X`, write `test/foo/bar_test.dart` covering Y").
 4. `$waitToolId`. Audit what landed. Anything missing or hand-waved → re-dispatch the same agent with a sharper, narrower brief.
 5. WAVE 2 (INTEGRATE). Connect the spread work; resolve interfaces between agent surfaces; fill the gaps the spread wave revealed.
@@ -184,6 +184,7 @@ ${config.brief}
     required CouncilAgent agent,
     required String task,
     String? reviewerDirectives,
+    String? discoveryContext,
   }) {
     final ctf = _ctfDoctrineFor(config.brief);
     // Roster of OTHER agents on the council. Self excluded so the model
@@ -216,6 +217,18 @@ $reviewerDirectives
 Touch only the surfaces named in the directives. If a directive is wrong, say so and produce counter-evidence — don't silently skip it. A directive without a corresponding artifact is incomplete, not done.
 '''
         : '';
+    final discoveryBlock =
+        (discoveryContext != null && discoveryContext.trim().isNotEmpty)
+        ? '''
+
+=== Orchestrator's discovery digest ===
+The orchestrator already performed the first grounding pass and captured this digest for the team:
+
+${discoveryContext.trim()}
+
+Treat this as shared ground truth. Read deeper only when your assigned slice requires it. Do NOT re-read files or re-map surfaces that are already grounded here unless you need fresh evidence for a specific claim.
+'''
+        : '';
     final peerWord = peerCount <= 1 ? 'peer' : 'peers';
 
     return '''
@@ -223,6 +236,7 @@ You are ${agent.name}, senior specialist on Lumen's Council, working alongside $
 
 Role:
 ${roleInstruction(agent)}
+$discoveryBlock
 $peerBlock
 
 === Why you are here ===
@@ -253,7 +267,7 @@ For any task that is more than one mechanical step (almost every task you will g
 Skip the plan only for genuinely single-step mechanical work (delete one file, rename one symbol).
 
 === Grounding (mandatory first move) ===
-Before proposing, designing, or changing ANYTHING: `tree` or `list_dir` first, then `read_file` the surfaces you will touch. Your training data is generic; this project is specific. Hallucinating components that do not exist is the single worst failure mode — ground every claim in a file you read THIS session.
+Before proposing, designing, or changing ANYTHING: ground the claim in project-specific evidence. If the orchestrator's discovery digest already names the surface, use it as your map and read only the narrower files you must verify for this task. If the digest is absent or does not cover your slice, `tree` or `list_dir` first, then `read_file` the surfaces you will touch. Your training data is generic; this project is specific. Hallucinating components that do not exist is the single worst failure mode — ground every claim in a file read THIS session or in the shared discovery digest.
 
 - WEAK: "the auth flow uses JWT".
 - STRONG: "`lib/services/auth.dart:42` constructs the JWT via `JwtBuilder.build(...)` and signs it with the env var `JWT_SECRET` (read on line 11)".
@@ -970,10 +984,7 @@ class CouncilToolSchemas {
           'return a digest of each agent\'s status and transcript tail. '
           'Call this after dispatching a parallel wave so you can '
           'synthesize their results before reporting.',
-      inputSchema: {
-        'type': 'object',
-        'properties': <String, dynamic>{},
-      },
+      inputSchema: {'type': 'object', 'properties': <String, dynamic>{}},
       toGroups: (args) => const ['wait'],
       toRawText: (args) => '<<<COUNCIL_WAIT>>>',
     ),
@@ -1060,9 +1071,9 @@ class CouncilToolSchemas {
         'required': ['subtasks'],
       },
       toGroups: (args) => [
-        ((args['subtasks'] as List?) ?? const [])
-            .whereType<String>()
-            .join('||'),
+        ((args['subtasks'] as List?) ?? const []).whereType<String>().join(
+          '||',
+        ),
       ],
       toRawText: (args) {
         final subs = ((args['subtasks'] as List?) ?? const [])
@@ -1088,21 +1099,18 @@ class CouncilToolSchemas {
         'properties': {
           'step': {
             'type': 'integer',
-            'description': 'The 1-based index of the subtask you just '
+            'description':
+                'The 1-based index of the subtask you just '
                 'completed.',
           },
           'summary': {
             'type': 'string',
-            'description':
-                'One-line summary of what landed from that step.',
+            'description': 'One-line summary of what landed from that step.',
           },
         },
         'required': ['step', 'summary'],
       },
-      toGroups: (args) => [
-        '${args['step']}',
-        args['summary'] as String? ?? '',
-      ],
+      toGroups: (args) => ['${args['step']}', args['summary'] as String? ?? ''],
       toRawText: (args) =>
           '<<<COUNCIL_SUBTASK_PROGRESS: ${args['step']}>>>\n'
           '${args['summary'] ?? ''}\n<<<END_COUNCIL>>>',
