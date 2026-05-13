@@ -135,4 +135,84 @@
     background-size: 56px 56px;
     background-position: center top;
   }
+
+  /* Live indicator — subtle pulse + halo. Used on the hero pill dot to
+     signal the site isn't a screenshot. */
+  .pulse-dot {
+    position: relative;
+  }
+  .pulse-dot::before {
+    content: "";
+    position: absolute;
+    inset: -3px;
+    border-radius: 9999px;
+    background: currentColor;
+    opacity: 0.4;
+    animation: pulse-halo 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+  @keyframes pulse-halo {
+    0% { transform: scale(0.6); opacity: 0.55; }
+    70% { transform: scale(2); opacity: 0; }
+    100% { transform: scale(2); opacity: 0; }
+  }
+
+  /* Blinking caret — IDE flavour at the end of the hero headline. */
+  .caret {
+    display: inline-block;
+    width: 0.55em;
+    height: 0.95em;
+    margin-left: 0.12em;
+    background: theme("colors.accent.cyan");
+    border-radius: 1px;
+    transform: translateY(0.08em);
+    animation: caret-blink 1.15s steps(1, end) infinite;
+  }
+  @keyframes caret-blink {
+    0%, 50% { opacity: 1; }
+    50.01%, 100% { opacity: 0; }
+  }
+
+  /* Section motif — thin gradient hairline with a small accent diamond in
+     the middle. Used between major sections to add visual rhythm without
+     adding mass. */
+  .section-motif {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    margin: 0;
+  }
+  .section-motif::before,
+  .section-motif::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(
+      to right,
+      transparent,
+      theme("colors.edge.hi") 50%,
+      transparent
+    );
+    max-width: 320px;
+  }
+  .section-motif > .motif-mark {
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    margin: 0 14px;
+    transform: rotate(45deg);
+    border: 1px solid theme("colors.edge.hi");
+    background: theme("colors.accent.cyan");
+    opacity: 0.5;
+  }
+
+  /* Subtle ambient drift for hero backdrop layers — far slower than user
+     can consciously track, but enough to make the page feel alive. */
+  .drift-slow {
+    animation: drift 22s ease-in-out infinite alternate;
+  }
+  @keyframes drift {
+    from { transform: translate3d(-1.5%, 0, 0); }
+    to   { transform: translate3d(1.5%, 0.5%, 0); }
+  }
 }

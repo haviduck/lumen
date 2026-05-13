@@ -53,6 +53,16 @@ class ModelPickerDismissed extends ModelPickerResult {
 /// filter chips can show "5/12" (enabled-vs-total) rather than just
 /// the curated count.
 ///
+/// [anchorRect] is the chip's global (screen-coordinate) rectangle
+/// at open-time. When provided, the popover uses it to decide which
+/// side of the chip to extend toward: anchoring to the chip's LEFT
+/// edge by default (popover extends rightward), but flipping to the
+/// chip's RIGHT edge (popover extends leftward) when the rightward
+/// anchor would push the popover off the right edge of the window.
+/// This is the failsafe for narrow chat sidebars — the popover is
+/// wider than a sidebar dragged below ~440 px, and without the flip
+/// it would visibly clip / overflow into nothing.
+///
 /// Returns a non-null result describing what the user did.
 Future<ModelPickerResult> showModelPickerPopover({
   required BuildContext context,
@@ -60,6 +70,7 @@ Future<ModelPickerResult> showModelPickerPopover({
   required String selectedModel,
   required List<String> enabledModels,
   required List<String> allModels,
+  Rect? anchorRect,
 }) {
   final overlay = Overlay.of(context, rootOverlay: true);
   final completer = Completer<ModelPickerResult>();
@@ -70,6 +81,7 @@ Future<ModelPickerResult> showModelPickerPopover({
       selectedModel: selectedModel,
       enabledModels: enabledModels,
       allModels: allModels,
+      anchorRect: anchorRect,
       onResult: (result) {
         if (!completer.isCompleted) completer.complete(result);
         entry.remove();
@@ -89,6 +101,7 @@ class _ModelPickerOverlay extends StatefulWidget {
   final String selectedModel;
   final List<String> enabledModels;
   final List<String> allModels;
+  final Rect? anchorRect;
   final ValueChanged<ModelPickerResult> onResult;
 
   const _ModelPickerOverlay({
@@ -96,6 +109,7 @@ class _ModelPickerOverlay extends StatefulWidget {
     required this.selectedModel,
     required this.enabledModels,
     required this.allModels,
+    required this.anchorRect,
     required this.onResult,
   });
 
@@ -350,109 +364,146 @@ class _ModelPickerOverlayState extends State<_ModelPickerOverlay>
     final visible = _flatRows.whereType<_ModelEntry>().length;
     final searching = _search.text.trim().isNotEmpty;
 
-    return AnimatedBuilder(
-      animation: _enter,
-      builder: (context, child) {
-        final t = Curves.easeOutCubic.transform(_enter.value);
-        return Stack(
-          children: [
-            // Scrim — opaque so outside taps dismiss without leaking
-            // through to whatever sits beneath. Important: with
-            // `translucent`, a tap on the picker chip itself would
-            // both dismiss the popover AND re-fire the chip's onTap
-            // (reopening it), producing a frame-flicker. Opaque
-            // absorbs the gesture; the user's next click triggers
-            // whatever they meant to click.
-            Positioned.fill(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => widget.onResult(const ModelPickerDismissed()),
-              ),
-            ),
-            Positioned(
-              width: _kWidth,
-              child: CompositedTransformFollower(
-                link: widget.link,
-                showWhenUnlinked: false,
-                // Open upward — composer chip lives at the bottom of
-                // the chat panel; popping above keeps it from being
-                // clipped by the panel's lower edge. The 8px gap
-                // mirrors the wizard's anchor offset.
-                targetAnchor: Alignment.topLeft,
-                followerAnchor: Alignment.bottomLeft,
-                offset: const Offset(0, -8),
-                child: Opacity(
-                  opacity: t,
-                  child: Transform.translate(
-                    offset: Offset(0, (1 - t) * 6),
-                    child: child,
+    // Decide which side of the chip the popover should extend toward.
+    // The popover is a fixed _kWidth wide; with the chip anchored at
+    // its LEFT edge the popover grows rightward. In the chat sidebar
+    // the chip lives near the panel's left edge, so when the sidebar
+    // is narrower than _kWidth the popover overflows into the right
+    // side of the window (and gets clipped against the screen edge
+    // since the chat panel is itself the rightmost surface in the
+    // IDE shell). Flipping to the chip's RIGHT edge (popover grows
+    // leftward) lets the popover spill over the workbench instead.
+    //
+    // The decision uses the chip's screen rect captured at open-time
+    // (anchorRect) + the overlay's own size as a proxy for window
+    // size — overlays cover the whole IDE shell, so the LayoutBuilder
+    // here gets the window dimensions.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final overlayWidth = constraints.hasBoundedWidth
+            ? constraints.maxWidth
+            : MediaQuery.of(context).size.width;
+        const edgeMargin = 8.0;
+        final anchor = widget.anchorRect;
+        final flipRight = anchor != null &&
+            (anchor.left + _kWidth) > (overlayWidth - edgeMargin);
+        final targetAnchor =
+            flipRight ? Alignment.topRight : Alignment.topLeft;
+        final followerAnchor =
+            flipRight ? Alignment.bottomRight : Alignment.bottomLeft;
+
+        return AnimatedBuilder(
+          animation: _enter,
+          builder: (context, child) {
+            final t = Curves.easeOutCubic.transform(_enter.value);
+            return Stack(
+              children: [
+                // Scrim — opaque so outside taps dismiss without leaking
+                // through to whatever sits beneath. Important: with
+                // `translucent`, a tap on the picker chip itself would
+                // both dismiss the popover AND re-fire the chip's onTap
+                // (reopening it), producing a frame-flicker. Opaque
+                // absorbs the gesture; the user's next click triggers
+                // whatever they meant to click.
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () =>
+                        widget.onResult(const ModelPickerDismissed()),
                   ),
                 ),
+                Positioned(
+                  width: _kWidth,
+                  child: CompositedTransformFollower(
+                    link: widget.link,
+                    showWhenUnlinked: false,
+                    // Open upward — composer chip lives at the bottom
+                    // of the chat panel; popping above keeps it from
+                    // being clipped by the panel's lower edge. The
+                    // 8px gap mirrors the wizard's anchor offset.
+                    // Horizontal alignment flips between
+                    // top/bottom-Left and top/bottom-Right based on
+                    // available space (see flipRight above).
+                    targetAnchor: targetAnchor,
+                    followerAnchor: followerAnchor,
+                    offset: const Offset(0, -8),
+                    child: Opacity(
+                      opacity: t,
+                      child: Transform.translate(
+                        offset: Offset(0, (1 - t) * 6),
+                        child: child,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+          child: _Surface(
+            // Glassy raised panel; matches the agent quick picker's
+            // shadow stack so the two pickers feel like siblings.
+            child: Focus(
+              autofocus: false,
+              onKeyEvent: _onKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _Header(
+                    totalEnabled: totalEnabled,
+                    searching: searching,
+                    visible: visible,
+                    onManage: () =>
+                        widget.onResult(const ModelPickerManage()),
+                    onRefresh: () =>
+                        widget.onResult(const ModelPickerRefresh()),
+                  ),
+                  _SearchField(
+                    controller: _search,
+                    focusNode: _searchFocus,
+                    onChanged: _onSearchChanged,
+                    onSubmit: () {
+                      final row = _highlight < _flatRows.length
+                          ? _flatRows[_highlight]
+                          : null;
+                      if (row is _ModelEntry) {
+                        widget.onResult(ModelPickerPicked(row.model));
+                      }
+                    },
+                    onEscape: () =>
+                        widget.onResult(const ModelPickerDismissed()),
+                  ),
+                  if (providers.length > 1)
+                    _ProviderChipBar(
+                      providers: providers,
+                      selected: _providerFilter,
+                      totalEnabled: totalEnabled,
+                      enabledCountFor: _enabledCountFor,
+                      totalCountFor: _totalCountFor,
+                      onPick: _pickProvider,
+                    ),
+                  Focus(
+                    focusNode: _listFocus,
+                    child: _Body(
+                      rows: _flatRows,
+                      highlight: _highlight,
+                      selected: widget.selectedModel,
+                      scroll: _scroll,
+                      maxHeight: _kMaxBodyHeight,
+                      onPick: (m) =>
+                          widget.onResult(ModelPickerPicked(m)),
+                      onHover: (i) => setState(() => _highlight = i),
+                    ),
+                  ),
+                  const SizedBox(
+                    height: _kFooterHeight,
+                    child: _Footer(),
+                  ),
+                ],
               ),
             ),
-          ],
+          ),
         );
       },
-      child: _Surface(
-        // Glassy raised panel; matches the agent quick picker's
-        // shadow stack so the two pickers feel like siblings.
-        child: Focus(
-          autofocus: false,
-          onKeyEvent: _onKey,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _Header(
-                totalEnabled: totalEnabled,
-                searching: searching,
-                visible: visible,
-                onManage: () => widget.onResult(const ModelPickerManage()),
-                onRefresh: () => widget.onResult(const ModelPickerRefresh()),
-              ),
-              _SearchField(
-                controller: _search,
-                focusNode: _searchFocus,
-                onChanged: _onSearchChanged,
-                onSubmit: () {
-                  final row = _highlight < _flatRows.length
-                      ? _flatRows[_highlight]
-                      : null;
-                  if (row is _ModelEntry) {
-                    widget.onResult(ModelPickerPicked(row.model));
-                  }
-                },
-                onEscape: () =>
-                    widget.onResult(const ModelPickerDismissed()),
-              ),
-              if (providers.length > 1)
-                _ProviderChipBar(
-                  providers: providers,
-                  selected: _providerFilter,
-                  totalEnabled: totalEnabled,
-                  enabledCountFor: _enabledCountFor,
-                  totalCountFor: _totalCountFor,
-                  onPick: _pickProvider,
-                ),
-              Focus(
-                focusNode: _listFocus,
-                child: _Body(
-                  rows: _flatRows,
-                  highlight: _highlight,
-                  selected: widget.selectedModel,
-                  scroll: _scroll,
-                  maxHeight: _kMaxBodyHeight,
-                  onPick: (m) => widget.onResult(ModelPickerPicked(m)),
-                  onHover: (i) => setState(() => _highlight = i),
-                ),
-              ),
-              const SizedBox(
-                height: _kFooterHeight,
-                child: _Footer(),
-              ),
-            ],
-          ),
-        ),
-      ),
     );
   }
 }

@@ -6,20 +6,29 @@ export function Hero() {
   const installer = PRODUCT.installerAssetName(PRODUCT.LATEST_VERSION);
   return (
     <section className="relative overflow-hidden">
-      {/* Backdrop halo + faint grid */}
-      <div className="pointer-events-none absolute inset-0 bg-halo-cyan opacity-80" aria-hidden />
+      {/* Backdrop layers — halo drifts slowly, grid stays anchored. */}
+      <div className="pointer-events-none absolute inset-0 bg-halo-cyan opacity-80 drift-slow" aria-hidden />
       <div className="pointer-events-none absolute inset-0 grid-bg [mask-image:radial-gradient(closest-side,black,transparent_80%)]" aria-hidden />
+      {/* Second halo, offset, slower, for parallax-y depth. */}
+      <div
+        className="pointer-events-none absolute -top-32 right-0 size-[36rem] rounded-full opacity-30 blur-3xl"
+        style={{
+          background:
+            "radial-gradient(closest-side, rgba(180, 142, 173, 0.5), transparent 70%)",
+        }}
+        aria-hidden
+      />
 
       <div className="relative page-x pt-24 pb-16 sm:pt-32 sm:pb-24">
         <div className="flex flex-col items-start gap-6">
           <span className="pill">
-            <span className="size-1.5 rounded-full bg-accent-cyan" />
+            <span className="pulse-dot inline-block size-1.5 rounded-full bg-accent-cyan text-accent-cyan" />
             v{PRODUCT.LATEST_VERSION} · Windows · free &amp; open source
           </span>
 
           <h1 className="text-hero font-semibold text-fg max-w-4xl">
             An IDE that doesn{"\u2019"}t pretend the rest of your{" "}
-            <span className="text-accent-cyan">desktop</span> doesn{"\u2019"}t exist.
+            <span className="text-accent-cyan">desktop</span> doesn{"\u2019"}t exist.<span className="caret" aria-hidden />
           </h1>
 
           <p className="text-lg sm:text-xl text-fg-muted max-w-2xl leading-relaxed">

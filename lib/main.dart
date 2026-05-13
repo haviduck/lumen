@@ -442,7 +442,14 @@ class _LayoutForMode extends StatefulWidget {
 }
 
 class _LayoutForModeState extends State<_LayoutForMode> {
-  static const double _chatOptimalWidth = 340;
+  // Default chat sidebar width. Bumped from 340 → 420 px so the model
+  // picker popover (440 px wide, see `model_picker_popover.dart`)
+  // fits inside the sidebar's horizontal span almost entirely out of
+  // the box. If the user drags the sidebar narrower than the popover
+  // width, the picker now flips its horizontal anchor to extend to
+  // the LEFT of the chip instead of overflowing the right edge of
+  // the window — see `_ModelPickerOverlayState.build`.
+  static const double _chatOptimalWidth = 420;
   static const double _chatMinWidth = 260;
   static const double _chatSnapThreshold = 24;
   // Floor on the (Editor + Terminal) workbench column. Without

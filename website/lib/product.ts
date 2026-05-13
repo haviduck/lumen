@@ -8,6 +8,9 @@ export const PRODUCT = {
     "An IDE that doesn't pretend the rest of your desktop doesn't exist.",
   shortDescription:
     "Editor, terminal, file explorer, agent chat, SSH, Teams, and YouTube/Twitch — one window, everything where you left it.",
+  // Public production URL. Update here when you move to a custom domain.
+  // Used by metadataBase + OG card absolute URLs.
+  siteUrl: "https://lumen-mu-seven.vercel.app",
   github: "https://github.com/haviduck/lumen",
   releases: "https://github.com/haviduck/lumen/releases",
   issues: "https://github.com/haviduck/lumen/issues",

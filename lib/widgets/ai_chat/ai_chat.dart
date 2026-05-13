@@ -2571,12 +2571,26 @@ class _ModelPickerState extends State<_ModelPicker> {
   Future<void> _openPopover() async {
     final chat = widget.chat;
     setState(() => _open = true);
+    // Snapshot the chip's screen rect at open-time so the popover
+    // can decide whether to extend rightward (default — anchored at
+    // chip's left edge) or flip and extend leftward (anchored at
+    // chip's right edge) when the chat sidebar is narrower than the
+    // popover. Without this the popover overflows the right edge of
+    // the window on a user-narrowed sidebar. See
+    // `model_picker_popover.dart` for the flip logic.
+    final renderBox = context.findRenderObject() as RenderBox?;
+    Rect? anchorRect;
+    if (renderBox != null && renderBox.hasSize && renderBox.attached) {
+      final topLeft = renderBox.localToGlobal(Offset.zero);
+      anchorRect = topLeft & renderBox.size;
+    }
     final result = await showModelPickerPopover(
       context: context,
       link: _link,
       selectedModel: chat.selectedModel,
       enabledModels: chat.pickerModels,
       allModels: chat.availableModels,
+      anchorRect: anchorRect,
     );
     if (!mounted) return;
     setState(() => _open = false);

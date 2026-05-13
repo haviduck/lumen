@@ -3,7 +3,7 @@ import { PRODUCT } from "@/lib/product";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://lumen.dev"),
+  metadataBase: new URL(PRODUCT.siteUrl),
   title: {
     default: `${PRODUCT.name} — ${PRODUCT.tagline}`,
     template: `%s · ${PRODUCT.name}`,
@@ -27,7 +27,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: `${PRODUCT.name} — ${PRODUCT.tagline}`,
     description: PRODUCT.shortDescription,
-    url: "https://lumen.dev",
+    url: PRODUCT.siteUrl,
     siteName: PRODUCT.name,
     type: "website",
   },
