@@ -17,9 +17,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:duckoff/l10n/strings.dart';
-import 'package:duckoff/services/council/council_models.dart';
-import 'package:duckoff/widgets/council/council_phase_transition_overlay.dart';
+import 'package:lumen/l10n/strings.dart';
+import 'package:lumen/services/council/council_models.dart';
+import 'package:lumen/widgets/council/council_phase_transition_overlay.dart';
 
 CouncilAgent _mkAgent(String id, String name, {RolePreset? role}) =>
     CouncilAgent(

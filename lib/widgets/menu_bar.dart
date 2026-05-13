@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
@@ -22,6 +23,9 @@ import 'ollama_cloud_key_prompt_dialog.dart';
 import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
 import 'timeline/timeline_dialog.dart';
+import 'update_banner_pill.dart';
+import 'update_dialog.dart';
+import 'window_chrome/window_controls.dart';
 
 class DuckMenuBar extends StatelessWidget {
   const DuckMenuBar({super.key});
@@ -33,11 +37,13 @@ class DuckMenuBar extends StatelessWidget {
 
     return DuckGlass(
       tint: const Color(0xE614171D), // bgDeepest at ~90% — darkest surface
-      // Subtle 0.5px hairlines on top AND bottom: top reads as the seam
-      // between the native Windows title bar and our chrome; bottom seams
-      // the menu bar to the workbench below.
+      // The ribbon doubles as the window's title bar (the OS caption is
+      // hidden — see `WindowChrome.bootstrap`). Only the bottom hairline
+      // remains: it seams the bar to the workbench below. The previous
+      // top hairline was the seam against the native title bar; with
+      // that bar gone, the seam would read as a stray line at the
+      // very edge of the window.
       border: const Border(
-        top: BorderSide(color: DuckColors.glassSeam, width: 0.5),
         bottom: BorderSide(color: DuckColors.glassSeam, width: 0.5),
       ),
       child: SizedBox(
@@ -47,6 +53,24 @@ class DuckMenuBar extends StatelessWidget {
         height: 30,
         child: Row(
           children: [
+            // Lumen mark — sits flush against the left edge of the
+            // window (the OS caption is gone, so this is the first
+            // visible chrome). Reads as branding + a visual anchor for
+            // the menu items that follow. Same logo asset the welcome
+            // panel + about dialog use, scaled down to 18 px so the
+            // mark feels equivalent to a Cursor / VS Code title-bar
+            // glyph rather than a hero element.
+            const Padding(
+              padding: EdgeInsets.fromLTRB(10, 0, 4, 0),
+              child: SizedBox(
+                width: 18,
+                height: 18,
+                child: Image(
+                  image: AssetImage('assets/images/lumen_logo.png'),
+                  filterQuality: FilterQuality.high,
+                ),
+              ),
+            ),
             UnconstrainedBox(
               constrainedAxis: Axis.vertical,
               alignment: Alignment.centerLeft,
@@ -181,17 +205,16 @@ class DuckMenuBar extends StatelessWidget {
                     ),
                   ]),
                   _submenu(context, S.menuView, [
+                    // The old separate "Command Palette" + "Quick Open
+                    // File…" entries were replaced by a single unified
+                    // search. Both `Ctrl+P` and `Ctrl+Shift+P` route
+                    // here so existing muscle memory still works; the
+                    // menu surfaces the primary shortcut.
                     _itemWithShortcut(
                       context,
-                      'commandPalette',
-                      S.menuCommandPalette,
-                      'Ctrl+Shift+P',
-                      enabled: actions.hasOverlays,
-                    ),
-                    _item(
-                      context,
-                      'quickOpen',
-                      S.menuQuickOpen,
+                      'unifiedSearch',
+                      S.menuUnifiedSearch,
+                      'Ctrl+P',
                       enabled: actions.hasOverlays,
                     ),
                     _itemWithShortcut(
@@ -266,19 +289,58 @@ class DuckMenuBar extends StatelessWidget {
                     _item(context, 'rulesGlobal', S.menuEditGlobalRules),
                   ]),
                   _submenu(context, S.menuHelp, [
+                    _item(
+                      context,
+                      'checkForUpdates',
+                      S.menuCheckForUpdates,
+                    ),
+                    _item(context, 'welcomeSetup', S.menuWelcomeSetup),
+                    _menuDivider,
                     _item(context, 'about', S.menuAbout),
                   ]),
                 ],
               ),
             ),
 
-            const Spacer(),
+            // The empty space between the menu items and the right
+            // cluster doubles as the window-drag surface. Replaces the
+            // native title bar entirely — drag-anywhere-empty is the
+            // Cursor / VS Code convention. `DragToMoveArea` also wires
+            // double-click-to-toggle-maximize for free. We split the
+            // drag region into two halves flanking the search pill so
+            // the bar is draggable on either side of the centered
+            // pill, same way Cursor / VS Code position theirs.
+            Expanded(
+              child: DragToMoveArea(
+                child: Container(
+                  color: Colors.transparent,
+                  height: 30,
+                ),
+              ),
+            ),
+            const _TitleBarSearchPill(),
+            Expanded(
+              child: DragToMoveArea(
+                child: Container(
+                  color: Colors.transparent,
+                  height: 30,
+                ),
+              ),
+            ),
 
+            // Update banner pill — only paints when there's an
+            // actionable update (newer release than this build AND not
+            // skipped by the user) or when a download / install is in
+            // flight. Sits between the drag region and the chat
+            // toggle so it doesn't fight with the centered search
+            // pill or the window controls.
+            const UpdateBannerPill(),
+            const SizedBox(width: 4),
             // AI-chat sidebar toggle — always visible regardless of
             // whether the chat panel is currently shown or hidden.
             // Single static icon; tooltip is the only contextual
-            // signal. Sits LEFT of the settings cog because it's a
-            // workspace-layout control, settings is configuration.
+            // signal. Sits LEFT of the window controls because it's a
+            // workspace-layout control, not window chrome.
             // `view_sidebar_outlined` (two-column layout glyph)
             // reads as "controls a side panel"; an earlier
             // iteration used `chat_outlined` (a chat-bubble icon)
@@ -289,7 +351,11 @@ class DuckMenuBar extends StatelessWidget {
               tooltip: S.menuBarToggleChat,
               onTap: () => state.toggleChatHidden(),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 6),
+            // Caption cluster — minimize / maximize-restore / close.
+            // Slots flush against the right edge so the close button
+            // is anchored where the muscle memory expects it.
+            const LumenWindowControls(),
           ],
         ),
       ),
@@ -510,6 +576,135 @@ Future<void> _openRecentProject(BuildContext context, String path) async {
   await state.setDirectory(path);
 }
 
+/// Cursor-style centered title-bar pill — left-hand search glyph,
+/// workspace name in the middle, keyboard hint on the right. Click
+/// opens Quick Open (the file-name fuzzy finder); the same shortcut
+/// (`Ctrl+P`) is shown as a passive hint so muscle memory has a
+/// surface to learn against.
+///
+/// The pill watches `AppState.currentDirectory` for the label and
+/// `IdeActions.hasOverlays` to enable/disable. When no workspace is
+/// loaded (welcome screen — note the welcome screen doesn't actually
+/// mount `DuckMenuBar`, but defensively we render a "Search…" hint),
+/// the label falls back to a generic prompt.
+class _TitleBarSearchPill extends StatefulWidget {
+  const _TitleBarSearchPill();
+
+  @override
+  State<_TitleBarSearchPill> createState() => _TitleBarSearchPillState();
+}
+
+class _TitleBarSearchPillState extends State<_TitleBarSearchPill> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final actions = state.ideActions;
+    final enabled = actions.hasOverlays;
+
+    // Workspace label — folder basename when a workspace is open,
+    // generic search hint otherwise. Kept short so the pill doesn't
+    // need to grow with deep paths.
+    final dir = state.currentDirectory;
+    final label = dir == null
+        ? S.titleBarSearchHint
+        : dir.split(RegExp(r'[\\/]')).last;
+
+    return Tooltip(
+      message: S.titleBarSearchTooltip,
+      child: MouseRegion(
+        cursor: enabled
+            ? SystemMouseCursors.click
+            : SystemMouseCursors.basic,
+        onEnter: (_) {
+          if (enabled) setState(() => _hover = true);
+        },
+        onExit: (_) {
+          if (_hover) setState(() => _hover = false);
+        },
+        child: GestureDetector(
+          onTap: enabled ? () => actions.openUnifiedSearch() : null,
+          child: AnimatedContainer(
+            duration: DuckMotion.fast,
+            curve: DuckMotion.standard,
+            constraints: const BoxConstraints(
+              minWidth: 320,
+              maxWidth: 720,
+            ),
+            height: 22,
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            decoration: BoxDecoration(
+              color: _hover
+                  ? DuckColors.bgRaisedHi.withValues(alpha: 0.85)
+                  : DuckColors.bgRaised.withValues(alpha: 0.65),
+              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+              border: Border.all(
+                color: _hover
+                    ? DuckColors.accentCyan.withValues(alpha: 0.35)
+                    : DuckColors.glassSeam,
+                width: 0.5,
+              ),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.search,
+                  size: 12,
+                  color: _hover ? DuckColors.fgPrimary : DuckColors.fgSubtle,
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      color: enabled
+                          ? (_hover
+                                ? DuckColors.fgPrimary
+                                : DuckColors.fgMuted)
+                          : DuckColors.fgFaint,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 1,
+                  ),
+                  decoration: BoxDecoration(
+                    color: DuckColors.bgChip.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(3),
+                    border: Border.all(
+                      color: DuckColors.glassSeam,
+                      width: 0.5,
+                    ),
+                  ),
+                  child: const Text(
+                    S.titleBarSearchShortcut,
+                    style: TextStyle(
+                      fontSize: 9.5,
+                      color: DuckColors.fgSubtle,
+                      fontFeatures: [FontFeature.tabularFigures()],
+                      height: 1.1,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 Future<void> handleMenuAction(BuildContext context, String action) async {
   final state = context.read<AppState>();
   final actions = state.ideActions;
@@ -631,11 +826,14 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
     case 'toggleWordWrap':
       await state.updateEditorSettings(wordWrap: !state.wordWrap);
       break;
+    case 'unifiedSearch':
     case 'commandPalette':
-      actions.openCommandPalette();
-      break;
     case 'quickOpen':
-      actions.openQuickOpen();
+      // All three legacy action ids route to the unified search now.
+      // The retained aliases let existing menu items / shortcut maps /
+      // command-catalog entries keep working without a coordinated
+      // rewrite — see the alias section in `ide_actions.dart`.
+      actions.openUnifiedSearch();
       break;
     case 'globalSearch':
       actions.openGlobalSearch();
@@ -688,6 +886,25 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
     case 'about':
       if (!context.mounted) return;
       showDialog(context: context, builder: (_) => const about.AboutDialog());
+      break;
+    case 'checkForUpdates':
+      if (!context.mounted) return;
+      await showUpdateDialog(context);
+      break;
+    case 'welcomeSetup':
+      // Re-entry point for the first-run Ollama / provider setup
+      // dialog. Same flow as the welcome-screen guard fires on a
+      // brand-new install; lives under Help so a user who skipped
+      // initial setup can revisit it any time without having to
+      // close the workspace.
+      if (!context.mounted) return;
+      await showOllamaSetupDialog(context);
+      if (!context.mounted) return;
+      // Cloud-key prompt follows the daemon prompt, mirroring the
+      // wizard's order. Only fires if no key is already configured.
+      if (state.ollamaApiKey.trim().isEmpty) {
+        await showOllamaCloudKeyPromptDialog(context);
+      }
       break;
     // Watch-media URL prompt — dispatched from the file explorer
     // activity-bar's media icon. Kept reachable via the action

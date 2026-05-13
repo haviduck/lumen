@@ -31,7 +31,7 @@
 // Run: `flutter test test/services/tool_executor_failure_detection_test.dart`
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:duckoff/services/tool_executor.dart';
+import 'package:lumen/services/tool_executor.dart';
 
 void main() {
   group('ToolExecutor.looksLikeFailure — successes that must NOT be flagged',

@@ -16,6 +16,7 @@ import 'services/language_detector.dart';
 import 'services/preferences_service.dart';
 import 'services/recent_edits_tracker.dart';
 import 'services/ssh/ssh_remote_file_service.dart';
+import 'services/update_service.dart';
 import 'services/webview_environment.dart';
 import 'services/window_chrome.dart';
 import 'services/work_session_tracker.dart';
@@ -83,6 +84,16 @@ Future<void> main() async {
         // probe widget below feeds it pointer/keyboard/focus events.
         ChangeNotifierProvider(
           create: (_) => WorkSessionTracker(PreferencesService())..init(),
+        ),
+        // UpdateService — polls GitHub Releases on a 12h debounce,
+        // surfaces a banner pill in the menu bar and a dialog under
+        // Help → Check for Updates when a newer release lands. The
+        // init() call kicks a first check 30s after construction so
+        // it doesn't compete with first-frame work. Auto-update is
+        // Windows-only today; on other hosts the service stays alive
+        // (so UI binds don't crash) but the network call is gated.
+        ChangeNotifierProvider(
+          create: (_) => UpdateService(PreferencesService())..init(),
         ),
       ],
       child: const _SshAppStateBridge(
@@ -358,8 +369,15 @@ class _GlobalShortcuts extends StatelessWidget {
         const _MenuIntent('globalSearch'),
     const SingleActivator(LogicalKeyboardKey.keyH, control: true):
         const _MenuIntent('findReplace'),
+    // Both Ctrl+P (Cursor / VS Code Quick Open) and Ctrl+Shift+P
+    // (Command Palette) open the unified search now — files, commands,
+    // and settings live in one bucket. Keeping both bindings means
+    // existing muscle memory routes to the right surface; the title-
+    // bar pill in `menu_bar.dart` advertises Ctrl+P as the primary.
+    const SingleActivator(LogicalKeyboardKey.keyP, control: true):
+        const _MenuIntent('unifiedSearch'),
     const SingleActivator(LogicalKeyboardKey.keyP, control: true, shift: true):
-        const _MenuIntent('commandPalette'),
+        const _MenuIntent('unifiedSearch'),
     const SingleActivator(LogicalKeyboardKey.keyN, control: true, shift: true):
         const _MenuIntent('newWindow'),
     const SingleActivator(LogicalKeyboardKey.keyN, control: true):

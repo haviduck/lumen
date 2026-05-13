@@ -20,16 +20,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:duckoff/services/council/council_models.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_architect.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_custom.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_orchestrator.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_pentester.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_researcher.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_reviewer.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_tester.dart';
-import 'package:duckoff/widgets/council/role_signatures/role_signature_writer.dart';
+import 'package:lumen/services/council/council_models.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_architect.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_custom.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_orchestrator.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_pentester.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_researcher.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_reviewer.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_tester.dart';
+import 'package:lumen/widgets/council/role_signatures/role_signature_writer.dart';
 
 void main() {
   CustomPainter make(RolePreset role, {bool isOrchestrator = false}) {

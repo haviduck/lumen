@@ -28,7 +28,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:duckoff/widgets/council/council_backdrop.dart';
+import 'package:lumen/widgets/council/council_backdrop.dart';
 
 Widget _wrap({required Widget child}) {
   return MediaQuery(

@@ -96,6 +96,8 @@ class S {
   static const String menuQuickOpen = 'Quick Open File…';
   static const String menuGlobalSearch = 'Search in Files…';
   static const String menuAbout = 'About Lumen';
+  static const String menuCheckForUpdates = 'Check for Updates…';
+  static const String menuWelcomeSetup = 'Setup Wizard…';
   static const String menuFileExplorerHint =
       'Use right-click in the file explorer.';
   static const String menuBarSearchTooltip = 'Search files';
@@ -103,6 +105,38 @@ class S {
   static const String explorerOpenTeams = 'Open Microsoft Teams';
   static const String explorerMediaHub = 'Media and Teams';
   static const String menuBarToggleChat = 'Toggle AI chat panel';
+
+  // Custom title-bar window-control tooltips. Lumen draws its own
+  // caption ribbon (see `lib/widgets/window_chrome/`) — these strings
+  // are surfaced as tooltips on the minimize / maximize / restore /
+  // close buttons inside the menu bar (IDE shell) and the title strip
+  // (welcome screen).
+  static const String windowMinimize = 'Minimize';
+  static const String windowMaximize = 'Maximize';
+  static const String windowRestore = 'Restore';
+  static const String windowClose = 'Close';
+
+  // Title-bar centered search pill (Cursor-style). Clicking opens
+  // the unified search overlay (files + commands + settings); the
+  // shortcut hint is rendered as a passive chip on the right side of
+  // the pill so users learn the muscle memory.
+  static const String titleBarSearchHint = 'Search Lumen…';
+  static const String titleBarSearchTooltip =
+      'Search files, commands, settings (Ctrl+P)';
+  static const String titleBarSearchShortcut = 'Ctrl+P';
+
+  // Unified search overlay. Replaces the separate Quick Open and
+  // Command Palette UX with one entry point that bucket-sorts
+  // results: Commands → Settings → Files.
+  static const String unifiedSearchHint =
+      'Search files, commands, settings…';
+  static const String unifiedSearchEmptyHint =
+      'Type to search files, commands, and settings.';
+  static const String unifiedSearchNoResults = 'No matches.';
+  static const String unifiedSearchSectionCommands = 'COMMANDS';
+  static const String unifiedSearchSectionSettings = 'SETTINGS';
+  static const String unifiedSearchSectionFiles = 'FILES';
+  static const String menuUnifiedSearch = 'Search…';
 
   // Unsaved-changes confirm prompts (dirty tab close).
   // Single-tab variant — `displayName` is the basename for named
@@ -426,11 +460,17 @@ class S {
   // `ollama` CLI is installed and the local API is reachable, and
   // walks the user through download/run/pull/signin if anything is
   // missing.
-  static const String ollamaSetupTitle = 'Set up Ollama for local LLMs';
+  static const String ollamaSetupTitle = 'Pick your AI provider';
+  // First sentence explicitly says "or skip to cloud" so the user
+  // understands Ollama isn't required. The second sentence sets up
+  // the value: chat + utility features (summaries, skill gen) all
+  // route through whatever provider you configure.
   static const String ollamaSetupBody =
-      'Ollama runs open-weights models locally on your machine — '
-      'private, offline, no API key. Lumen can use it as a chat '
-      'provider alongside any cloud providers you add later.';
+      'Lumen\u2019s chat, chat summarization, and skill generation '
+      'all need at least one LLM provider. The easiest local path is '
+      'Ollama (private, offline, no API key) \u2014 or skip this and '
+      'we\u2019ll walk you through Gemini / Claude / GitHub Copilot '
+      'on the next screen.';
   static const String ollamaSetupChecking = 'Checking for Ollama…';
   static const String ollamaSetupCheck = 'Check for Ollama';
   static const String ollamaSetupRetry = 'Retry check';
@@ -2626,4 +2666,86 @@ class S {
       'though.';
   static const String wellbeingGoodLuck = 'Good luck out there.';
   static const String wellbeingClose = 'Dismiss';
+
+  // --- Auto-update (Help \u2192 Check for Updates) ---
+  // The update dialog is reused for the full lifecycle: idle / checking
+  // / available / downloading / ready / installing / error. Keep these
+  // strings short and humane — the dialog is small (560 px) and a
+  // user with a working build doesn't need a paragraph of marketing.
+  static const String updateDialogTitle = 'Lumen Updates';
+  static const String updateUpToDateTitle = 'You\u2019re on the latest version';
+  static String updateUpToDateBodyFmt(String v) =>
+      'Lumen $v is the most recent release.';
+  static String updateUnsupportedBodyFmt(String v) =>
+      'Auto-update is Windows-only for now. You are running $v \u2014 the '
+      'latest releases are still on the GitHub Releases page.';
+  static String updateCheckingFmt(String v) =>
+      'Checking GitHub Releases\u2026 (you\u2019re on $v)';
+  static const String updateLastCheckNever = 'No prior check on record.';
+  static String updateLastCheckFmt(String when) => 'Last checked $when.';
+  static const String updateRecheck = 'Check again';
+  static String updateAvailableTitleFmt(String v) => 'Lumen $v is available';
+  static String updateCurrentVsNextFmt(String cur, String next) =>
+      'You\u2019re on $cur. Latest is $next.';
+  static const String updateSkipVersion = 'Skip this version';
+  static const String updateLater = 'Later';
+  static const String updateInstallNow = 'Download and Install';
+  static const String updateRestartAndInstall = 'Restart and Install';
+  static const String updateDownloadingTitle = 'Downloading update\u2026';
+  static String updateDownloadingPctFmt(String pct) => '$pct% complete.';
+  static String updateDownloadingPctSizeFmt(String pct, String mb) =>
+      '$pct% of $mb MB complete.';
+  static const String updateDownloadingHint =
+      'You can keep working \u2014 the installer won\u2019t run until you '
+      'click Restart and Install.';
+  static String updateReadyTitleFmt(String v) => 'Update $v ready';
+  static const String updateReadyBody =
+      'Lumen will close, the installer will run silently, and Lumen will '
+      'reopen automatically. Save any pending work first.';
+  static const String updateInstallingTitle = 'Installing update\u2026';
+  static const String updateInstallingBody =
+      'Lumen is closing so the installer can swap files. The new version '
+      'will launch automatically when install finishes.';
+  static const String updateErrorTitle = 'Update failed';
+  static const String updateErrorGeneric =
+      'Could not complete the update. You can try again or download the '
+      'installer manually from the releases page.';
+  static const String updateRetry = 'Retry';
+  static const String updateNoReleaseNotes =
+      'No release notes provided for this version.';
+  // SmartScreen warning shown alongside the install button until
+  // the binaries are code-signed. Drop this when signing lands.
+  static const String updateSmartScreenWarning =
+      'Lumen isn\u2019t code-signed yet \u2014 Windows may show a '
+      '\u201Cprotected your PC\u201D screen. Click \u201CMore info\u201D '
+      '\u2192 \u201CRun anyway\u201D to proceed.';
+  static const String updateOpenReleasesPage =
+      'Open the releases page on GitHub';
+  static const String updateCopyLink = 'Copy link';
+  static const String updateLinkCopied = 'Link copied to clipboard.';
+  static const String updateClosingLumen =
+      'Closing Lumen to apply the update\u2026';
+  // Banner pill (sits in the menu bar between menu items and drag region).
+  static const String updateBannerAvailable = 'Update available';
+  static String updateBannerAvailableFmt(String v) => 'Update \u2192 $v';
+  static const String updateBannerDownloading = 'Downloading update\u2026';
+  static const String updateBannerReady = 'Update ready';
+  static const String updateBannerInstalling = 'Installing\u2026';
+  static const String updateBannerTooltip =
+      'A newer Lumen release is available. Click to review.';
+
+  // --- Ollama reachability strip (above chat composer) ---
+  // Surfaces inline when the selected chat model is `ollama:*` and
+  // the local daemon is not responding. Three affordances: open the
+  // setup dialog, switch model (handled by the picker right above
+  // the strip), or hide for the session. Strings stay short — the
+  // strip sits inside the chat sidebar at 260\u2013380 px wide.
+  static const String ollamaReachableBannerTitle =
+      'Ollama isn\u2019t running';
+  static String ollamaReachableBannerBodyFmt(String model) =>
+      'You picked $model but the local Ollama daemon isn\u2019t '
+      'responding. Start it, or switch to a cloud model in the picker '
+      'above.';
+  static const String ollamaReachableBannerOpenSetup = 'Open setup';
+  static const String ollamaReachableBannerDismiss = 'Hide for this session';
 }

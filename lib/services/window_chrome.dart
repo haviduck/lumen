@@ -72,6 +72,19 @@ class WindowChrome {
       // the first-show timing; we only configure size + position
       // + min ahead of that reveal so the window appears at the
       // correct welcome footprint immediately, no resize jank.
+      //
+      // Hide the OS title bar so we can paint our own. The custom
+      // ribbon (menu items + drag region + min/max/close) lives in
+      // `DuckMenuBar` for the IDE shell and in `LumenWindowTitleStrip`
+      // for the welcome panel. Resize borders (WS_THICKFRAME) are
+      // preserved by `TitleBarStyle.hidden` — only the caption
+      // (title text + native buttons) goes away. This is the same
+      // pattern Cursor / VS Code / Zed use to merge the title bar
+      // with the menu bar and save ~30 px of vertical chrome.
+      await windowManager.setTitleBarStyle(
+        TitleBarStyle.hidden,
+        windowButtonVisibility: false,
+      );
       await windowManager.setMinimumSize(minWindowSize);
       await windowManager.setSize(welcomeSize);
       await windowManager.center();
@@ -133,10 +146,13 @@ class WindowChrome {
     }
   }
 
-  /// Closes the application window. Used by the welcome screen's
-  /// close (X) affordance — the welcome screen has no native title
-  /// bar in this layout to call its own close button, so the panel
-  /// owns the close action.
+  /// Closes the application window. Routes through `windowManager.close()`
+  /// so `AppCloseGuard` (which owns `setPreventClose(true)`) can
+  /// intercept and run the unsaved-changes prompt before destroy.
+  ///
+  /// Kept as a public helper for programmatic close paths; the user-
+  /// facing X in the custom title bar (`LumenWindowControls`) calls
+  /// `windowManager.close()` directly to keep the click path tight.
   static Future<void> close() async {
     if (_isSupported && _initialized) {
       try {

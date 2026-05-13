@@ -22,6 +22,22 @@ should always follow. Bullet points or short paragraphs work well.
 
 ## Don't
 - 
+
+<!-- LUMEN_KNOWLEDGEBASE_RULE -->
+## Knowledgebase (cross-chat memory)
+
+Every Lumen workspace has a shared knowledgebase at
+`.agents/knowledgebase.md` — the canonical place agents store and read
+durable project knowledge across chat sessions. Lumen reads it into your
+system prompt automatically when it exists, and surfaces a dedicated
+editor under the synthetic `__knowledge_base__` tab.
+
+**At the start of every chat**: read it if it exists. Treat it as
+authoritative project memory.
+
+**After non-trivial work**: append/edit it with anything a future chat
+session would benefit from — architecture decisions, gotchas, file
+locations. Keep it concise and scannable. Remove stale entries.
 ''';
 
   static const String _workspaceDefaultStub = '''# Lumen Workspace Rules
@@ -68,16 +84,19 @@ practical, and specific to this project.
       '''<!-- LUMEN_KNOWLEDGEBASE_RULE -->
 ## Knowledgebase (cross-chat memory)
 
-A shared knowledgebase lives at `.agents/knowledgebase/`. It is the only
-persistent memory between separate chat sessions in this workspace.
+A shared knowledgebase lives at `.agents/knowledgebase.md`. It is the only
+persistent memory between separate chat sessions in this workspace. Lumen
+exposes it to you automatically (read into your system prompt on every
+turn) and offers a dedicated editor under the synthetic
+`__knowledge_base__` tab. Treat it as authoritative project memory.
 
 **At the start of every chat:**
-- Read `.agents/knowledgebase/` if it exists. Use it as context for the
+- Read `.agents/knowledgebase.md` if it exists. Use it as context for the
   current session — it describes architecture, conventions, recent changes,
   and things that previous sessions learned the hard way.
 
 **After completing non-trivial work:**
-- Update `.agents/knowledgebase/` with anything a future chat session would
+- Update `.agents/knowledgebase.md` with anything a future chat session would
   benefit from knowing: new patterns introduced, architectural decisions made,
   pitfalls discovered, conventions established, or important file locations.
 - Keep it concise and scannable (bullets, short sections). Remove stale entries
@@ -94,6 +113,13 @@ to the workspace.
   /// rules.md from before the move.
   static const String _legacyKnowledgebasePath = '.lumen/knowledgebase.md';
   static const String _canonicalKnowledgebasePath = '.agents/knowledgebase.md';
+
+  /// Older versions of [_knowledgebaseRuleBlock] referenced
+  /// `.agents/knowledgebase/` (looks like a directory). The canonical
+  /// store is a single markdown file at `.agents/knowledgebase.md`, so
+  /// the trailing slash made LLMs `read_file` on a directory and fail
+  /// the first call. We rewrite it on every workspace open.
+  static const String _wrongFormatKnowledgebasePath = '.agents/knowledgebase/';
 
   /// Workspace stub for brand-new workspaces — same body as
   /// [_workspaceDefaultStub] plus the knowledgebase rule so the
@@ -181,26 +207,40 @@ to the workspace.
     }
   }
 
-  /// One-shot rewrite: replaces literal `.lumen/knowledgebase.md`
-  /// occurrences in a workspace's rules.md with `.agents/knowledgebase.md`.
+  /// One-shot rewrite: replaces stale knowledgebase path references in
+  /// a workspace's rules.md with the canonical `.agents/knowledgebase.md`.
+  /// Handles two historical forms:
+  ///   - `.lumen/knowledgebase.md` (pre-`.agents/` move)
+  ///   - `.agents/knowledgebase/` (typo in early rule block — looks like
+  ///     a directory and breaks the agent's first read)
   /// Returns true on a meaningful rewrite. Skips silently when the
-  /// file doesn't exist or contains no legacy references.
+  /// file doesn't exist or contains no stale references.
   static Future<bool> migrateLegacyKnowledgebasePath(
       String workspacePath) async {
     try {
       final f = LumenWorkspaceConfig.rulesFile(workspacePath);
       if (!await f.exists()) return false;
       final text = await f.readAsString();
-      if (!text.contains(_legacyKnowledgebasePath)) return false;
-      final rewritten = text.replaceAll(
-        _legacyKnowledgebasePath,
-        _canonicalKnowledgebasePath,
-      );
+      final hasLegacy = text.contains(_legacyKnowledgebasePath);
+      final hasWrongFormat = text.contains(_wrongFormatKnowledgebasePath);
+      if (!hasLegacy && !hasWrongFormat) return false;
+      var rewritten = text;
+      if (hasLegacy) {
+        rewritten = rewritten.replaceAll(
+          _legacyKnowledgebasePath,
+          _canonicalKnowledgebasePath,
+        );
+      }
+      if (hasWrongFormat) {
+        rewritten = rewritten.replaceAll(
+          _wrongFormatKnowledgebasePath,
+          _canonicalKnowledgebasePath,
+        );
+      }
       if (rewritten == text) return false;
       await f.writeAsString(rewritten);
       debugPrint(
-        'RulesService: rewrote $_legacyKnowledgebasePath → '
-        '$_canonicalKnowledgebasePath in ${f.path}',
+        'RulesService: rewrote stale knowledgebase path(s) in ${f.path}',
       );
       return true;
     } catch (e) {

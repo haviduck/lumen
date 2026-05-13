@@ -15,8 +15,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
-import 'package:duckoff/providers/app_state.dart';
-import 'package:duckoff/widgets/council/council_stage_lighting.dart';
+import 'package:lumen/providers/app_state.dart';
+import 'package:lumen/widgets/council/council_stage_lighting.dart';
 
 Widget _wrap({required AppState app}) {
   return MediaQuery(

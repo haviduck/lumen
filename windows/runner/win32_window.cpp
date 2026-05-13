@@ -301,25 +301,18 @@ void Win32Window::OnDestroy() {
 }
 
 void Win32Window::UpdateTheme(HWND const window) {
-  // Always force dark mode for Lumen's dark-midnight aesthetic.
+  // Always force dark mode for Lumen's dark-midnight aesthetic. This
+  // still has a visible effect even with the native caption hidden:
+  // the OS uses the immersive-dark hint for the resize-border shading
+  // and any briefly-visible caption fragments during animation.
   BOOL enable_dark_mode = TRUE;
   DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
                         &enable_dark_mode, sizeof(enable_dark_mode));
 
-  // Set the caption/title bar color to match our bgDeepest (#14171D).
-  // DWMWA_CAPTION_COLOR = 35 (Windows 11 22000+). COLORREF is BGR.
-  #ifndef DWMWA_CAPTION_COLOR
-  #define DWMWA_CAPTION_COLOR 35
-  #endif
-  COLORREF caption_color = 0x001D1714;  // BGR of #14171D
-  DwmSetWindowAttribute(window, DWMWA_CAPTION_COLOR,
-                        &caption_color, sizeof(caption_color));
-
-  // Also set the title bar text color to match fgMuted (#7B88A1).
-  #ifndef DWMWA_TEXT_COLOR
-  #define DWMWA_TEXT_COLOR 36
-  #endif
-  COLORREF text_color = 0x00A1887B;  // BGR of #7B88A1
-  DwmSetWindowAttribute(window, DWMWA_TEXT_COLOR,
-                        &text_color, sizeof(text_color));
+  // The previous `DWMWA_CAPTION_COLOR` / `DWMWA_TEXT_COLOR` tints were
+  // for the native title bar; with `TitleBarStyle.hidden` applied on
+  // the Dart side, those attributes target chrome that no longer
+  // paints. Removed to keep the surface contract honest — Lumen's
+  // caption is now `DuckMenuBar` (IDE shell) + `LumenWindowTitleStrip`
+  // (welcome screen).
 }

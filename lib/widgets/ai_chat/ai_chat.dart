@@ -39,6 +39,7 @@ import 'slash_commands/slash_command.dart';
 import 'slash_commands/slash_command_picker.dart';
 import 'chat_composer.dart';
 import 'chip_text_editing_controller.dart';
+import 'ollama_reachability_strip.dart';
 import 'stall_warning.dart';
 
 class AiChat extends StatefulWidget {
@@ -1308,23 +1309,32 @@ class _AiChatState extends State<AiChat> {
   Widget _buildComposerBox(ChatController chat, VoidCallback send) {
     return CompositedTransformTarget(
       link: _slash.layerLink,
-      child: AnimatedContainer(
-        duration: DuckMotion.fast,
-        curve: DuckMotion.standard,
-        decoration: BoxDecoration(
-          color: DuckColors.bgChip,
-          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-          border: Border.all(
-            color: _referenceDragOver
-                ? DuckColors.accentMint
-                : chat.isGenerating
-                ? DuckColors.accentCyan
-                : DuckColors.border,
-          ),
-          boxShadow: chat.isGenerating || _referenceDragOver
-              ? DuckTheme.shadowGlow
-              : null,
-        ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Inline banner that appears when the user picked an
+          // `ollama:*` model but the local daemon isn't responding.
+          // Self-gated; renders as `SizedBox.shrink` when the
+          // condition isn't met, so it costs nothing for cloud users.
+          const OllamaReachabilityStrip(),
+          AnimatedContainer(
+            duration: DuckMotion.fast,
+            curve: DuckMotion.standard,
+            decoration: BoxDecoration(
+              color: DuckColors.bgChip,
+              borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+              border: Border.all(
+                color: _referenceDragOver
+                    ? DuckColors.accentMint
+                    : chat.isGenerating
+                    ? DuckColors.accentCyan
+                    : DuckColors.border,
+              ),
+              boxShadow: chat.isGenerating || _referenceDragOver
+                  ? DuckTheme.shadowGlow
+                  : null,
+            ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1493,6 +1503,8 @@ class _AiChatState extends State<AiChat> {
             ),
           ],
         ),
+      ),
+        ],
       ),
     );
   }

@@ -9,7 +9,7 @@
 //
 // Run: `flutter test test/council/council_critique_test.dart`
 import 'package:flutter_test/flutter_test.dart';
-import 'package:duckoff/services/council/council_models.dart';
+import 'package:lumen/services/council/council_models.dart';
 
 void main() {
   group('CouncilCriticAttack', () {

@@ -211,6 +211,91 @@ class CommandCatalog {
         category: 'Help',
         run: (ctx) => handleMenuAction(ctx, 'about'),
       ),
+
+      // Settings categories — each opens the in-editor Settings tab
+      // focused on a specific panel. The `category: 'Settings'` tag
+      // makes them group together in the unified search and the
+      // `Open Settings:` prefix means typing the panel name (e.g.
+      // "theme", "ssh", "rules") jumps straight to it.
+      IdeCommand(
+        id: 'settings.general',
+        title: 'Open Settings: ${S.settingsCatGeneral}',
+        icon: Icons.tune,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(),
+      ),
+      IdeCommand(
+        id: 'settings.editor',
+        title: 'Open Settings: ${S.settingsCatEditor}',
+        icon: Icons.edit_note,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'editor'),
+      ),
+      IdeCommand(
+        id: 'settings.theme',
+        title: 'Open Settings: ${S.settingsCatTheme}',
+        icon: Icons.palette_outlined,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'theme'),
+      ),
+      IdeCommand(
+        id: 'settings.terminal',
+        title: 'Open Settings: ${S.settingsCatTerminal}',
+        icon: Icons.terminal,
+        category: 'Settings',
+        run: (ctx) =>
+            ctx.read<AppState>().openSettingsTab(category: 'terminal'),
+      ),
+      IdeCommand(
+        id: 'settings.ai',
+        title: 'Open Settings: ${S.settingsCatAI}',
+        icon: Icons.auto_awesome_outlined,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'aiChat'),
+      ),
+      IdeCommand(
+        id: 'settings.models',
+        title: 'Open Settings: ${S.settingsCatModelManagement}',
+        icon: Icons.memory,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'models'),
+      ),
+      IdeCommand(
+        id: 'settings.rules',
+        title: 'Open Settings: ${S.settingsCatRules}',
+        icon: Icons.rule,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'rules'),
+      ),
+      IdeCommand(
+        id: 'settings.remoteAccess',
+        title: 'Open Settings: ${S.settingsCatRemoteAccess}',
+        icon: Icons.cell_tower,
+        category: 'Settings',
+        run: (ctx) =>
+            ctx.read<AppState>().openSettingsTab(category: 'remoteAccess'),
+      ),
+      IdeCommand(
+        id: 'settings.ssh',
+        title: 'Open Settings: ${S.settingsCatSsh}',
+        icon: Icons.lan_outlined,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'ssh'),
+      ),
+      IdeCommand(
+        id: 'settings.tools',
+        title: 'Open Settings: ${S.settingsCatTools}',
+        icon: Icons.extension_outlined,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'tools'),
+      ),
+      IdeCommand(
+        id: 'settings.keys',
+        title: 'Open Settings: ${S.settingsCatKeys}',
+        icon: Icons.keyboard_outlined,
+        category: 'Settings',
+        run: (ctx) => ctx.read<AppState>().openSettingsTab(category: 'keys'),
+      ),
     ];
   }
 }

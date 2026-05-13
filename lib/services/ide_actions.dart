@@ -121,36 +121,47 @@ class IdeActions extends ChangeNotifier {
     await cb(graceWindow);
   }
 
-  // ---- overlay panels (command palette / quick open / global search) ----
+  // ---- overlay panels (unified search / global search) ----
   // Registered by the overlay host widget that lives once at the IDE shell
   // level. Set to null when no workspace is open.
-  VoidCallback? _openCommandPalette;
-  VoidCallback? _openQuickOpen;
+  //
+  // The legacy `openCommandPalette` and `openQuickOpen` callbacks are
+  // preserved as ALIASES for `openUnifiedSearch` — every old call site
+  // (menu items, View > Quick Open, View > Command Palette, the
+  // `Ctrl+Shift+P` shortcut) now opens the unified search instead of
+  // the separated palettes. The host registers all three to the same
+  // unified-search launcher; the alias methods are kept on the action
+  // bridge so call-site refactors aren't required.
+  VoidCallback? _openUnifiedSearch;
   VoidCallback? _openGlobalSearch;
 
-  bool get hasOverlays => _openCommandPalette != null;
+  bool get hasOverlays => _openUnifiedSearch != null;
 
   void registerOverlayActions({
-    required VoidCallback openCommandPalette,
-    required VoidCallback openQuickOpen,
+    required VoidCallback openUnifiedSearch,
     required VoidCallback openGlobalSearch,
   }) {
-    _openCommandPalette = openCommandPalette;
-    _openQuickOpen = openQuickOpen;
+    _openUnifiedSearch = openUnifiedSearch;
     _openGlobalSearch = openGlobalSearch;
     notifyListeners();
   }
 
   void unregisterOverlayActions() {
-    _openCommandPalette = null;
-    _openQuickOpen = null;
+    _openUnifiedSearch = null;
     _openGlobalSearch = null;
     notifyListeners();
   }
 
-  void openCommandPalette() => _openCommandPalette?.call();
-  void openQuickOpen() => _openQuickOpen?.call();
+  void openUnifiedSearch() => _openUnifiedSearch?.call();
   void openGlobalSearch() => _openGlobalSearch?.call();
+
+  // Backwards-compat shims — both now route to the unified search.
+  // The old command-palette / quick-open UX is gone; the unified
+  // search subsumes them. Don't remove these aliases without auditing
+  // call sites: `command_catalog.dart`, the menu bar, and the
+  // `_GlobalShortcuts` map in `main.dart` all still reference them.
+  void openCommandPalette() => _openUnifiedSearch?.call();
+  void openQuickOpen() => _openUnifiedSearch?.call();
 
   // ---- file explorer ----
   // Registered by `FileExplorer` while it's mounted. Lets the menu

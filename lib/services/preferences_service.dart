@@ -680,4 +680,33 @@ class PreferencesService {
       (await _p).getBool(_kRemoteAccessBindAll) ?? false;
   Future<void> setRemoteAccessBindAll(bool v) async =>
       (await _p).setBool(_kRemoteAccessBindAll, v);
+
+  // --- Auto-update (lib/services/update_service.dart) ---
+  // We persist two tiny things across runs so the in-app update flow
+  // doesn't pester the user:
+  //   * `update.lastCheck` — UTC millis. Throttles the background
+  //     poll to once per ~12 h (see `UpdateService._checkInterval`).
+  //   * `update.skippedVersion` — the version string the user said
+  //     "skip this one" for. Newer versions still surface; this is
+  //     not a global "stop nagging me" switch.
+  // Auto-update is Windows-only today, so on non-Windows hosts these
+  // are no-ops in practice (the service short-circuits before reading
+  // them). The keys themselves are platform-neutral; if/when the
+  // installer ships for other platforms we can flip the gate without
+  // a prefs migration.
+  static const String _kUpdateLastCheck = 'update.lastCheck';
+  static const String _kUpdateSkippedVersion = 'update.skippedVersion';
+
+  Future<int?> getUpdateLastCheck() async =>
+      (await _p).getInt(_kUpdateLastCheck);
+  Future<void> setUpdateLastCheck(int millisUtc) async =>
+      (await _p).setInt(_kUpdateLastCheck, millisUtc);
+
+  Future<String?> getUpdateSkippedVersion() async {
+    final v = (await _p).getString(_kUpdateSkippedVersion);
+    return (v == null || v.isEmpty) ? null : v;
+  }
+
+  Future<void> setUpdateSkippedVersion(String version) async =>
+      (await _p).setString(_kUpdateSkippedVersion, version);
 }

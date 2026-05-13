@@ -23,8 +23,8 @@
 // fast service test pass.
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:duckoff/services/deepseek_v4_handler.dart';
-import 'package:duckoff/services/reasoning_effort.dart';
+import 'package:lumen/services/deepseek_v4_handler.dart';
+import 'package:lumen/services/reasoning_effort.dart';
 
 void main() {
   group('DeepseekV4Handler.isDeepseekV4', () {

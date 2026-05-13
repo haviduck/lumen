@@ -1,5 +1,5 @@
-name: duckoff
-description: "A new Flutter project."
+name: lumen
+description: "Lumen — Flutter desktop IDE with integrated AI agent, editor, terminal, and SSH."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -16,7 +16,12 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.11+11
+#
+# IMPORTANT: bump BOTH the version and build number together. The
+# UpdateService compares the `version` string against the GitHub tag
+# (e.g. `v1.0.12` vs. `1.0.12`); the build number is what Windows
+# resource compilation pins into `lumen.exe`'s version info.
+version: 1.0.13+13
 
 environment:
   sdk: ^3.11.0
@@ -105,6 +110,14 @@ dependencies:
   # libsecret on Linux. The vault metadata (host, user, port, label)
   # rides in shared_preferences as JSON; only the secrets ride here.
   flutter_secure_storage: ^9.2.2
+  # Reads the running app's version + build from the platform layer
+  # (Windows resource info / macOS Info.plist / Linux .desktop). Used
+  # by `lib/services/update_service.dart` to compare against the
+  # latest GitHub release tag. We could parse it out of pubspec at
+  # build time via build flavors, but package_info_plus is the
+  # one-line answer and the plugin is tiny (a couple of platform
+  # channel calls, no heavy native code).
+  package_info_plus: ^9.0.0
 
 dev_dependencies:
   flutter_test:

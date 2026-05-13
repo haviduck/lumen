@@ -4,14 +4,13 @@ import 'package:provider/provider.dart';
 
 import '../l10n/strings.dart';
 import '../providers/app_state.dart';
-import '../services/window_chrome.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
-import 'common/ambient_background.dart';
 import 'llm_providers_setup_dialog.dart';
 import 'ollama_cloud_key_prompt_dialog.dart';
 import 'ollama_setup_dialog.dart';
 import 'skill_generator_dialog.dart';
+import 'window_chrome/lumen_window_title_strip.dart';
 
 class WelcomeScreen extends StatelessWidget {
   const WelcomeScreen({super.key});
@@ -153,141 +152,95 @@ class WelcomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
 
-    // The native window is sized to the welcome panel (see
-    // `services/window_chrome.dart`), so the welcome screen IS the
-    // window — no maximised void around a tiny centred card. The
-    // ambient gradient still paints behind the panel for visual
-    // depth at this scale (cheap; one radial gradient).
+    // Welcome panel as a self-contained splash: the entire window IS
+    // the card. No outer padding, no ambient bezel showing through —
+    // an earlier iteration mounted the card inside a `Stack` with
+    // `AmbientBackground` + 12 px padding, which left a visible dark
+    // border around the rounded card. Windows 11's DWM auto-rounds
+    // the window corners for us; the card surface fills the entire
+    // window so the user sees the splash and nothing else.
+    //
+    // The title strip (drag + min/max/close) is the FIRST row of the
+    // card so the OS-caption replacement still rides at the top edge
+    // of the visible surface.
     return Scaffold(
       backgroundColor: Colors.transparent,
-      body: Stack(
-        children: [
-          const Positioned.fill(child: AmbientBackground(intensity: 1.0)),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: _WelcomeCardSurface(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      Image.asset(
-                        'assets/images/lumen_logo.png',
-                        width: 44,
-                        height: 44,
-                        filterQuality: FilterQuality.high,
-                      ),
-                      const SizedBox(width: 10),
-                      const Expanded(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              S.appName,
-                              style: TextStyle(
-                                fontSize: 36,
-                                height: 0.95,
-                                fontWeight: FontWeight.w200,
-                                letterSpacing: 4,
-                                color: DuckColors.pearlWhite,
-                              ),
-                            ),
-                            SizedBox(height: 6),
-                            Text(
-                              S.tagline,
-                              style: TextStyle(
-                                color: DuckColors.fgMuted,
-                                fontSize: 11,
-                                letterSpacing: 1.2,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                          ],
+      body: _WelcomeCardSurface(
+        child: Column(
+          mainAxisSize: MainAxisSize.max,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const LumenWindowTitleStrip(),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(28, 16, 22, 22),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Image.asset(
+                          'assets/images/lumen_logo.png',
+                          width: 44,
+                          height: 44,
+                          filterQuality: FilterQuality.high,
                         ),
-                      ),
-                      const _WelcomeCloseButton(),
-                    ],
-                  ),
-                  const SizedBox(height: 22),
-                  const Text(S.welcomeStart, style: DuckTheme.titleS),
-                  const SizedBox(height: 10),
-                  _Action(
-                    icon: Icons.folder_open,
-                    label: S.openFolder,
-                    onTap: () => _openFolder(context),
-                  ),
-                  const SizedBox(height: 4),
-                  _Action(
-                    icon: Icons.create_new_folder,
-                    label: S.newProject,
-                    onTap: () => _createNewProject(context),
-                  ),
-                  const SizedBox(height: 16),
-                  Flexible(
-                    child: _RecentWorkspacesPanel(appState: appState),
-                  ),
-                ],
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                S.appName,
+                                style: TextStyle(
+                                  fontSize: 36,
+                                  height: 0.95,
+                                  fontWeight: FontWeight.w200,
+                                  letterSpacing: 4,
+                                  color: DuckColors.pearlWhite,
+                                ),
+                              ),
+                              SizedBox(height: 6),
+                              Text(
+                                S.tagline,
+                                style: TextStyle(
+                                  color: DuckColors.fgMuted,
+                                  fontSize: 11,
+                                  letterSpacing: 1.2,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 22),
+                    const Text(S.welcomeStart, style: DuckTheme.titleS),
+                    const SizedBox(height: 10),
+                    _Action(
+                      icon: Icons.folder_open,
+                      label: S.openFolder,
+                      onTap: () => _openFolder(context),
+                    ),
+                    const SizedBox(height: 4),
+                    _Action(
+                      icon: Icons.create_new_folder,
+                      label: S.newProject,
+                      onTap: () => _createNewProject(context),
+                    ),
+                    const SizedBox(height: 16),
+                    Flexible(
+                      child: _RecentWorkspacesPanel(appState: appState),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// Close (X) affordance on the welcome panel. The OS-level title bar
-/// still has its own minimize/close, but at the small panel size the
-/// in-card button is more discoverable and gives the welcome screen a
-/// dialog-like feel. Routes through `WindowChrome.close()` so we
-/// degrade gracefully on hosts where `window_manager` isn't available.
-class _WelcomeCloseButton extends StatefulWidget {
-  const _WelcomeCloseButton();
-
-  @override
-  State<_WelcomeCloseButton> createState() => _WelcomeCloseButtonState();
-}
-
-class _WelcomeCloseButtonState extends State<_WelcomeCloseButton> {
-  bool _hover = false;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: S.welcomeClose,
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => _hover = true),
-        onExit: (_) => setState(() => _hover = false),
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => WindowChrome.close(),
-          child: AnimatedContainer(
-            duration: DuckMotion.fast,
-            width: 26,
-            height: 26,
-            decoration: BoxDecoration(
-              color: _hover
-                  ? DuckColors.stateError.withValues(alpha: 0.18)
-                  : Colors.transparent,
-              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-              border: Border.all(
-                color: _hover
-                    ? DuckColors.stateError.withValues(alpha: 0.45)
-                    : DuckColors.glassSeam,
-                width: 0.5,
-              ),
-            ),
-            alignment: Alignment.center,
-            child: Icon(
-              Icons.close,
-              size: 14,
-              color: _hover ? DuckColors.stateError : DuckColors.fgMuted,
-            ),
-          ),
+          ],
         ),
       ),
     );
@@ -295,9 +248,12 @@ class _WelcomeCloseButtonState extends State<_WelcomeCloseButton> {
 }
 
 /// Single card surface that hosts the welcome content. The native
-/// window is sized to roughly this card's footprint
-/// (`WindowChrome.welcomeSize`), so this widget is the entire visible
-/// surface of Lumen during welcome.
+/// window is sized to this card's footprint (`WindowChrome.welcomeSize`)
+/// and Windows 11's DWM auto-rounds the window corners, so the surface
+/// here is the entire visible splash — no outer bezel, no rounded-card-
+/// inside-rectangular-window leak. Background uses `bgDeepest` to match
+/// the IDE shell's `DuckMenuBar` tint so the welcome→workspace
+/// transition feels continuous.
 class _WelcomeCardSurface extends StatelessWidget {
   final Widget child;
 
@@ -306,17 +262,8 @@ class _WelcomeCardSurface extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(28, 22, 22, 22),
-        decoration: BoxDecoration(
-          color: DuckColors.bgGlassHi,
-          borderRadius: BorderRadius.circular(DuckTheme.radiusL),
-          border: Border.all(color: DuckColors.glassEdgeHi, width: 0.5),
-          boxShadow: DuckTheme.shadowSoft,
-        ),
-        child: child,
-      ),
+      color: const Color(0xFF14171D), // bgDeepest — matches title-bar tint
+      child: child,
     );
   }
 }

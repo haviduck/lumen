@@ -7,15 +7,20 @@ import '../../services/file_index.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/duck_glass.dart';
-import 'command_palette.dart';
 import 'global_search.dart';
-import 'quick_open.dart';
+import 'unified_search.dart';
 
-/// Mounts modal overlays (Command Palette, Quick Open File, Global Search)
-/// once at the IDE shell level and exposes "open me" callbacks via
-/// [IdeActions]. The actual overlays live as siblings of the regular IDE
-/// chrome — they are rendered when their flag is on, and the host owns
-/// the `FileIndex` so the work to walk the workspace happens once.
+/// Mounts modal overlays (Unified Search, Global Search) once at the IDE
+/// shell level and exposes "open me" callbacks via [IdeActions]. The
+/// actual overlays live as siblings of the regular IDE chrome — they
+/// are rendered when their flag is on, and the host owns the
+/// `FileIndex` so the work to walk the workspace happens once.
+///
+/// The legacy `command_palette.dart` + `quick_open.dart` overlays are
+/// no longer mounted here — they were superseded by `UnifiedSearch`,
+/// which buckets files + commands + settings into one entry point.
+/// The source files are intentionally retained for reference but every
+/// user-facing entry point routes through the unified search.
 class OverlayHost extends StatefulWidget {
   final Widget child;
   const OverlayHost({super.key, required this.child});
@@ -24,7 +29,7 @@ class OverlayHost extends StatefulWidget {
   State<OverlayHost> createState() => _OverlayHostState();
 }
 
-enum _ActiveOverlay { none, commandPalette, quickOpen, globalSearch }
+enum _ActiveOverlay { none, unifiedSearch, globalSearch }
 
 class _OverlayHostState extends State<OverlayHost>
     with SingleTickerProviderStateMixin {
@@ -42,8 +47,7 @@ class _OverlayHostState extends State<OverlayHost>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       context.read<AppState>().ideActions.registerOverlayActions(
-            openCommandPalette: () => _open(_ActiveOverlay.commandPalette),
-            openQuickOpen: () => _open(_ActiveOverlay.quickOpen),
+            openUnifiedSearch: () => _open(_ActiveOverlay.unifiedSearch),
             openGlobalSearch: () => _open(_ActiveOverlay.globalSearch),
           );
     });
@@ -105,8 +109,7 @@ class _OverlayHostState extends State<OverlayHost>
 
   Widget _buildOverlay() {
     final overlay = switch (_active) {
-      _ActiveOverlay.commandPalette => CommandPalette(onClose: _close),
-      _ActiveOverlay.quickOpen => QuickOpen(
+      _ActiveOverlay.unifiedSearch => UnifiedSearch(
           index: _index!,
           onClose: _close,
         ),

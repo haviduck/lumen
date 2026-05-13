@@ -21,9 +21,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
-import 'package:duckoff/providers/app_state.dart';
-import 'package:duckoff/services/council/council_models.dart';
-import 'package:duckoff/widgets/council/speech/agent_voice_panel.dart';
+import 'package:lumen/providers/app_state.dart';
+import 'package:lumen/services/council/council_models.dart';
+import 'package:lumen/widgets/council/speech/agent_voice_panel.dart';
 
 CouncilAgent _mkAgent(String id, String name) => CouncilAgent(
       id: id,
