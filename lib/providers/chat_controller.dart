@@ -876,8 +876,7 @@ class ChatController extends ChangeNotifier {
   /// For terminal/code-range/doc chips the structured payload is
   /// emitted at send time via [ChatChip.renderForModel].
   void addPendingChip(ChatChip chip) {
-    if ((chip.kind == ChatChipKind.file ||
-            chip.kind == ChatChipKind.folder) &&
+    if ((chip.kind == ChatChipKind.file || chip.kind == ChatChipKind.folder) &&
         chip.path.isNotEmpty) {
       // Mirror into existing references list — but skip the legacy
       // string-token composer insertion path (chips replace it).
@@ -2155,21 +2154,32 @@ class ChatController extends ChangeNotifier {
     final removed = session.messages.sublist(index);
     final messageIds = <String>{};
     final legacyIds = <String>{};
+    final turnIds = <String>{};
     for (final m in removed) {
       if (m.role != 'assistant') continue;
       messageIds.add(m.id);
-      legacyIds.add('${session.id}@${m.timestamp.microsecondsSinceEpoch}');
+      final legacy = '${session.id}@${m.timestamp.microsecondsSinceEpoch}';
+      legacyIds.add(legacy);
+      if (timeline != null) {
+        turnIds.addAll(
+          timeline.turnIdsForMessage(m.id, legacyMessageId: legacy),
+        );
+      }
     }
 
     // Restore file changes. Empty set is fine — the timeline returns
     // an "ok: false, no changes" result we just translate into a
     // chat-only revert message.
     TimelineBulkRestoreResult? timelineResult;
-    if (timeline != null && (messageIds.isNotEmpty || legacyIds.isNotEmpty)) {
-      timelineResult = await timeline.restoreMessagesChanges(
-        messageIds,
-        legacyMessageIds: legacyIds,
-      );
+    if (timeline != null) {
+      if (turnIds.isNotEmpty) {
+        timelineResult = await timeline.restoreByTurnIds(turnIds);
+      } else if (messageIds.isNotEmpty || legacyIds.isNotEmpty) {
+        timelineResult = await timeline.restoreMessagesChanges(
+          messageIds,
+          legacyMessageIds: legacyIds,
+        );
+      }
     }
 
     // Truncate the chat. The session-list ordering / persisted JSON
@@ -2977,6 +2987,7 @@ class ChatController extends ChangeNotifier {
     // partially finishes — even a cancelled turn produced timeline
     // entries we want to highlight).
     String? capturedTurnId;
+    String? capturedMessageId;
 
     // ── Per-turn timing instrumentation (hoisted) ─────────────
     // Same hoist rationale as `throttleTimer` / `capturedTurnId`
@@ -3109,12 +3120,12 @@ class ChatController extends ChangeNotifier {
       // (the "we don't pass reasoning options for Ollama" comment
       // above) doesn't apply to a model with a real per-request
       // knob.
-      final isDeepseekV4Turn =
-          DeepseekV4Handler.isDeepseekV4(selectedRawModel);
+      final isDeepseekV4Turn = DeepseekV4Handler.isDeepseekV4(selectedRawModel);
       ReasoningEffort? effort;
       if (isDeepseekV4Turn) {
-        final coerced =
-            DeepseekV4Handler.coercedEffort(session.reasoningEffort);
+        final coerced = DeepseekV4Handler.coercedEffort(
+          session.reasoningEffort,
+        );
         if (DeepseekV4Handler.floorCoerced(session.reasoningEffort)) {
           debugPrint(
             '[deepseek-v4] pill was Off; coercing to Standard '
@@ -3411,6 +3422,7 @@ class ChatController extends ChangeNotifier {
       // service docs that only agent-origin entries should carry
       // chat fields, and the recorder respects that).
       final liveMsgId = session.messages[liveIdx].id;
+      capturedMessageId = liveMsgId;
       timeline?.setChatContext(
         sessionId: session.id,
         turnId: turnId,
@@ -4499,6 +4511,20 @@ class ChatController extends ChangeNotifier {
         // Fire-and-forget: blob diffs are off the hot path, the editor
         // overlay listens to the tracker so it'll repaint when ready.
         unawaited(_recentEdits.noteTurnComplete(capturedTurnId, timeline!));
+      }
+      if (timeline != null &&
+          capturedTurnId != null &&
+          capturedMessageId != null) {
+        unawaited(
+          timeline!.recordTurnManifest(
+            turnId: capturedTurnId,
+            sessionId: session.id,
+            messageId: capturedMessageId,
+            startedAt: turnStartedAt,
+            endedAt: DateTime.now(),
+            userPromptPreview: trimmed,
+          ),
+        );
       }
       timeline?.clearChatContext();
       notifyListeners();

@@ -211,23 +211,6 @@ class CommandCatalog {
         category: 'Help',
         run: (ctx) => handleMenuAction(ctx, 'about'),
       ),
-      // Dev-only: replay the empty-editor duck mischief gag. Clears the
-      // per-workspace played flag and bumps a replay tick on AppState
-      // so the keyed `_DuckMischief` widget tears down and re-mounts.
-      // If files are open the gag plays the next time you land on the
-      // empty editor surface; if you're already on it, it plays now.
-      // Disabled when no workspace is open (gag is workspace-scoped).
-      IdeCommand(
-        id: 'dev.replayDuckMischief',
-        title: S.paletteDevReplayDuck,
-        icon: Icons.pets,
-        category: S.paletteCategoryDev,
-        enabled: (s) => s.currentDirectory != null,
-        run: (ctx) {
-          // ignore: discarded_futures
-          ctx.read<AppState>().replayDuckMischief();
-        },
-      ),
     ];
   }
 }

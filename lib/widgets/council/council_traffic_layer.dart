@@ -1,3 +1,60 @@
+/// Council Traffic Layer — Dispatch Beams + Sustained Channels
+/// =============================================================
+///
+/// This layer paints the orchestrator → agent dispatch traffic. It
+/// reads three signals to build the picture every frame:
+///
+///   1. Recent `dispatched` events → fire a bright BEAM from the
+///      orchestrator card edge toward the recipient. The beam is a
+///      thick gradient lance with a short contrail; it travels over
+///      ~400ms and dies. On arrival the recipient end of the beam
+///      flares briefly so the eye reads "the packet landed."
+///
+///   2. Agents currently in `working` (or replying / askingPool)
+///      state → draw a SUSTAINED CHANNEL between the orchestrator
+///      and that agent. Dim, bezier-arced, with a slow low-alpha
+///      energy pulse riding the curve from source to target. Reads
+///      as "this agent is actively under orders." Persists for the
+///      duration of the agent's work.
+///
+///   3. Recent `agentDone` events → fire a one-shot RETURN PACKET
+///      from the agent back to the orchestrator. Bright cyan,
+///      source/target swapped from the dispatch beam. Reads as
+///      "result coming back." After it lands the channel fades.
+///
+///   * Recent `agentError` events → the channel desaturates to grey
+///     and fades out (no return packet).
+///
+/// The three phases all use the same accent family (cyan / mint
+/// frost — `DuckColors.councilAccent` ramp) so the user reads them
+/// as distinct phases of ONE conversation, not three independent
+/// effects. Color discipline:
+///
+///   * Beam (outbound dispatch) — `councilAccentHi`, bright, sharp.
+///   * Channel (sustained work) — `councilAccentDim` → `councilAccent`,
+///     low alpha, slow pulse.
+///   * Return packet — `councilAccentHi`, one-shot, swapped endpoints.
+///   * Error fade — desaturates to `fgSubtle`, no replacement glow.
+///
+/// A faint ambient mesh continues to live in the background. Without
+/// it the chamber's "everyone could whisper" topology disappears and
+/// idle moments read as cold; with it the room stays networked at all
+/// times. The mesh is intentionally MUCH dimmer than the dispatch
+/// beams — it's wallpaper, not signal.
+///
+/// Z-order: rendered above the chamber backdrop + stage lighting,
+/// below the discourse layer and the agent cards.
+///
+/// Performance:
+///   * Single [CustomPaint] with one painter, owns one [RepaintBoundary].
+///   * Per-frame work is O(agents) for the channels + O(recent events)
+///     for the beams/return-packets. Path / Paint objects are reused
+///     between frames where possible.
+///   * `NetworkController` API surface is preserved. Its imperative
+///     `pulse(...)` API still works — it now feeds the same beam
+///     pipeline as event-driven dispatches.
+library;
+
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -5,45 +62,32 @@ import 'package:flutter/material.dart';
 
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
-
-// Pulse visual encoding (event kind -> color/speed/intensity)
-//
-//   dispatch        councilAccentHi  fast    bright   orchestrator -> agent kickoff
-//   reply / done    councilAccent    normal  warm     agent -> orchestrator return
-//   ask_pool        accentPurple     normal  medium   inter-agent question
-//   pool_reply      accentMint mix   normal  warm     pool answer
-//   ask_user        accentDuck       normal  medium   agent -> user
-//   user_reply      accentDuck       normal  medium   user -> agent
-//   review/followup accentDuck       normal  medium   evaluator turn
-//   agent_error     stateError       x1.55   strobe   triple-burst red
-//
-// Accent source: DuckColors.councilAccent / councilAccentHi / councilAccentDim
-// (agent_0's published dark-blue ramp). No literals.
 import 'council_speech_bubbles.dart';
 import 'network_controller.dart';
 
-/// Persistent inter-agent network mesh + traveling communication packets.
+/// Lifetime of an outbound dispatch beam. Tuned so the eye can
+/// register the source, the travel, and the arrival burst as one
+/// coherent gesture without it lingering on the stage. 400ms is the
+/// canonical Material "expressive" duration for a directional motion.
+const Duration kDispatchBeamLifetime = Duration(milliseconds: 420);
+
+/// Lifetime of a return-packet from agent → orchestrator on agentDone.
+/// Slightly longer than the outbound beam — the result coming back
+/// is the satisfying beat the user is waiting for, so we let it
+/// breathe.
 ///
-/// Z-order: rendered above the diagonal backdrop, below Drift's bubbles
-/// and below the agent cards (theater stacks bubbles + cards above us).
-///
-/// Topology: orchestrator-spokes are always brighter (the orchestrator
-/// is the real broker) plus a dimmer full-mesh between non-orchestrator
-/// agents so the eye reads "everyone could whisper to everyone". For
-/// 10 nodes this is 9 spokes + 36 chords = 45 edges, matching the
-/// perf-budget brief.
-///
-/// Volume mapping: each [CouncilEvent] within the last 4s adds heat
-/// to its (from,to) edge; heat decays exponentially and modulates
-/// stroke width (0.55 -> 1.8 logical px) and alpha (0.06 floor -> 0.55
-/// ceiling). Idle edges therefore never disappear — alpha floor is
-/// load-bearing for the brief's "lines never disappear entirely"
-/// constraint.
-///
-/// Packets: come from two sources — recent [CouncilEvent]s and the
-/// imperative [NetworkController.pulse] API (Signal uses the latter
-/// for `agent_error`). Each packet is drawn as an eased traveling
-/// head + 4-segment fading trail; error packets strobe + bigger halo.
+/// Named `kDispatchReturnPacketLifetime` rather than the shorter
+/// `kReturnPacketLifetime` because `council_discourse_layer.dart`
+/// already exports the latter (with a different meaning + value)
+/// and both files are imported into `council_theater.dart` — the
+/// rename avoids a top-level symbol collision.
+const Duration kDispatchReturnPacketLifetime = Duration(milliseconds: 520);
+
+/// How long after an agent enters `error` we keep painting the
+/// channel as a desaturated fade-out. Past this window the channel
+/// is gone.
+const Duration kErrorFadeOutLifetime = Duration(milliseconds: 900);
+
 class CouncilTrafficLayer extends StatelessWidget {
   final List<CouncilAgent> agents;
   final CouncilAgent orchestrator;
@@ -69,31 +113,52 @@ class CouncilTrafficLayer extends StatelessWidget {
     final repaint = network == null
         ? Listenable.merge(<Listenable>[pulse, anchors])
         : Listenable.merge(<Listenable>[pulse, anchors, network!]);
-    return IgnorePointer(
-      child: AnimatedBuilder(
-        animation: anchors,
-        builder: (context, _) {
-          return CustomPaint(
-            painter: _CouncilTrafficPainter(
-              agents: agents,
-              orchestrator: orchestrator,
-              events: events.length > 80
-                  ? events.sublist(events.length - 80)
-                  : events,
-              pulse: pulse.value,
-              anchors: anchors,
-              mutedAgentIds: mutedAgentIds,
-              network: network,
-              repaint: repaint,
-            ),
-          );
-        },
+    return RepaintBoundary(
+      child: IgnorePointer(
+        child: AnimatedBuilder(
+          animation: anchors,
+          builder: (context, _) {
+            return CustomPaint(
+              painter: _DispatchTrafficPainter(
+                agents: agents,
+                orchestrator: orchestrator,
+                events: _windowEvents(events),
+                pulse: pulse.value,
+                anchors: anchors,
+                mutedAgentIds: mutedAgentIds,
+                network: network,
+                repaint: repaint,
+              ),
+            );
+          },
+        ),
       ),
     );
   }
+
+  /// Trim the events list to the recent window the painter actually
+  /// reads. Anything older than the longest relevant lifetime can
+  /// safely be dropped — saves us a per-frame scan over the full
+  /// event history.
+  List<CouncilEvent> _windowEvents(List<CouncilEvent> all) {
+    if (all.isEmpty) return all;
+    final now = DateTime.now();
+    final maxAge = math.max(
+      math.max(
+        kDispatchBeamLifetime.inMilliseconds,
+        kDispatchReturnPacketLifetime.inMilliseconds,
+      ),
+      kErrorFadeOutLifetime.inMilliseconds,
+    );
+    final cutoff = now.subtract(Duration(milliseconds: maxAge + 200));
+    // Cap by count too — protects against pathological event spam.
+    final list = all.where((e) => e.createdAt.isAfter(cutoff)).toList();
+    if (list.length > 64) return list.sublist(list.length - 64);
+    return list;
+  }
 }
 
-class _CouncilTrafficPainter extends CustomPainter {
+class _DispatchTrafficPainter extends CustomPainter {
   final List<CouncilAgent> agents;
   final CouncilAgent orchestrator;
   final List<CouncilEvent> events;
@@ -102,7 +167,7 @@ class _CouncilTrafficPainter extends CustomPainter {
   final Set<String> mutedAgentIds;
   final NetworkController? network;
 
-  _CouncilTrafficPainter({
+  _DispatchTrafficPainter({
     required this.agents,
     required this.orchestrator,
     required this.events,
@@ -113,36 +178,29 @@ class _CouncilTrafficPainter extends CustomPainter {
     required Listenable repaint,
   }) : super(repaint: repaint);
 
+  // Reusable paint objects. The shaders MUST be rebuilt every paint
+  // (their gradients depend on per-frame endpoints) but the Paint
+  // struct itself can be reused.
+  final Paint _strokePaint = Paint()
+    ..style = PaintingStyle.stroke
+    ..isAntiAlias = true
+    ..strokeCap = StrokeCap.round;
+  final Paint _fillPaint = Paint()..isAntiAlias = true;
+  final Path _path = Path();
+
   Offset _resolve(String id, Offset fallback) {
     return anchors.centerOf(id) ?? fallback;
   }
 
-  String _pairKey(String a, String b) {
-    return a.compareTo(b) <= 0 ? '$a\u0001$b' : '$b\u0001$a';
-  }
-
-  // Quadratic bezier control point that bows the edge AWAY from the
-  // stage center. Two effects fall out of this:
-  //   • inter-agent chords no longer cut straight through the
-  //     orchestrator card — they arc around it, so the topology reads
-  //     as a *bundle* of fiber, not an X-shaped scribble.
-  //   • orchestrator spokes get a tiny perpendicular sag (sign derived
-  //     from a hash of the pair key) so no two spokes lie on top of
-  //     each other when the ring is symmetric.
-  Offset _curveControl(
-    Offset a,
-    Offset b,
-    Offset center, {
-    required double sagFactor,
-    double minSagPx = 6.0,
-  }) {
+  /// Quadratic bezier control point for the bezier that the channel
+  /// and return-packet ride on. Slight outward bow so concurrent
+  /// channels don't all overlap each other.
+  Offset _channelControl(Offset a, Offset b, Offset center) {
     final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
     final delta = b - a;
     final length = delta.distance;
     if (length < 1) return mid;
-    // Perpendicular unit vector (rotate 90°).
     final perp = Offset(-delta.dy / length, delta.dx / length);
-    // Direction from midpoint to center; we want to push AWAY from it.
     final outward = mid - center;
     final outLen = outward.distance;
     final sign = outLen < 0.5
@@ -150,7 +208,7 @@ class _CouncilTrafficPainter extends CustomPainter {
         : (perp.dx * outward.dx + perp.dy * outward.dy) >= 0
             ? 1.0
             : -1.0;
-    final sag = math.max(minSagPx, length * sagFactor);
+    final sag = math.max(8.0, length * 0.07);
     return mid + perp * (sag * sign);
   }
 
@@ -162,21 +220,33 @@ class _CouncilTrafficPainter extends CustomPainter {
     );
   }
 
+  /// Direction of the recent error events keyed by agent id, so the
+  /// channel painter can desaturate while the fade-out window runs.
+  /// Returns the age of the most recent error event or null if none
+  /// landed in the fade window.
+  int? _recentErrorAgeMs(String agentId, DateTime now) {
+    int? best;
+    for (var i = events.length - 1; i >= 0; i--) {
+      final e = events[i];
+      if (e.type != CouncilEventType.agentError) continue;
+      if (e.fromAgentId != agentId && e.toAgentId != agentId) continue;
+      final age = now.difference(e.createdAt).inMilliseconds;
+      if (age < 0) continue;
+      if (age > kErrorFadeOutLifetime.inMilliseconds) continue;
+      if (best == null || age < best) best = age;
+    }
+    return best;
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
     if (agents.isEmpty) return;
     final center = Offset(size.width / 2, size.height / 2);
     final orchPoint = _resolve(orchestrator.id, center);
-    // Monotonic flow clock — seconds since epoch as a double. The
-    // wire-flow blobs phase off this instead of `pulse.value`, which
-    // is an AnimationController in repeat() mode and snaps 1.0→0.0
-    // every cycle. That snap was making every edge's blob stream
-    // jump backwards in lockstep ("all lines jump at once"). Using
-    // a monotonic clock and wrapping with `t - t.floor()` keeps
-    // motion perfectly continuous across cycle boundaries.
-    final flowTime =
-        DateTime.now().millisecondsSinceEpoch / 1000.0;
 
+    // Resolve every agent's anchor. Fall back to a ring approximation
+    // so the layer still draws *something* before the post-frame
+    // anchor sync lands on the first paint of a new session.
     final points = <String, Offset>{orchestrator.id: orchPoint};
     for (var i = 0; i < agents.length; i++) {
       final fallbackAngle = -math.pi / 2 + (math.pi * 2 * i / agents.length);
@@ -187,43 +257,176 @@ class _CouncilTrafficPainter extends CustomPainter {
       points[agents[i].id] = _resolve(agents[i].id, fallback);
     }
 
-    // ── Volume / heat map ─────────────────────────────────────────
-    // Walk recent events and accumulate exponentially-decayed heat
-    // per canonical edge key. Heat drives both width and alpha.
     final now = DateTime.now();
-    final heat = <String, double>{};
-    for (final e in events) {
-      if (e.fromAgentId.isEmpty || e.toAgentId.isEmpty) continue;
-      if (e.fromAgentId == e.toAgentId) continue;
-      if (mutedAgentIds.contains(e.fromAgentId)) continue;
-      if (mutedAgentIds.contains(e.toAgentId)) continue;
-      final ageMs = now.difference(e.createdAt).inMilliseconds;
-      if (ageMs > 4000) continue;
-      final w = math.exp(-ageMs / 1400.0);
-      final k = _pairKey(e.fromAgentId, e.toAgentId);
-      heat[k] = (heat[k] ?? 0) + w;
+
+    // ── 1. Ambient mesh ─────────────────────────────────────────
+    // VERY dim baseline so the room stays networked when nothing
+    // active is happening. The mesh is wallpaper, not signal — beams
+    // and channels dominate visually.
+    _paintAmbientMesh(canvas, points, center);
+
+    // ── 2. Sustained channels ────────────────────────────────────
+    // One per agent currently working / replying / asking pool. The
+    // channel is a thin bezier with a slow low-alpha energy pulse
+    // riding source → target.
+    for (final agent in agents) {
+      if (mutedAgentIds.contains(agent.id)) continue;
+      final pt = points[agent.id];
+      if (pt == null || pt == orchPoint) continue;
+      final isWorking = agent.status == CouncilAgentStatus.working ||
+          agent.status == CouncilAgentStatus.replying ||
+          agent.status == CouncilAgentStatus.askingPool;
+      if (!isWorking) continue;
+      final errorAge = _recentErrorAgeMs(agent.id, now);
+      _paintChannel(
+        canvas,
+        from: orchPoint,
+        to: pt,
+        center: center,
+        agentId: agent.id,
+        // Channel is bright until the agent transitions away from
+        // working; once an error has landed within the fade window,
+        // we desaturate over the remaining time.
+        errorAgeMs: errorAge,
+      );
     }
 
-    // Per-edge deterministic phase offset so streams on different
-    // edges aren't all aligned (would read as a single global pulse
-    // instead of independent network links).
-    double edgePhase(String ka, String kb) {
-      final s = ka.compareTo(kb) <= 0 ? '$ka|$kb' : '$kb|$ka';
-      var hash = 0x811c9dc5;
-      for (var i = 0; i < s.length; i++) {
-        hash ^= s.codeUnitAt(i);
-        hash = (hash * 0x01000193) & 0xFFFFFFFF;
+    // Agents in `error` get an explicit fade-out channel even after
+    // their status moved off `working`. This is the "no replacement
+    // glow" the brief calls for — the channel still paints, just
+    // desaturated, then disappears.
+    for (final agent in agents) {
+      if (mutedAgentIds.contains(agent.id)) continue;
+      if (agent.status != CouncilAgentStatus.error) continue;
+      final pt = points[agent.id];
+      if (pt == null || pt == orchPoint) continue;
+      final errorAge = _recentErrorAgeMs(agent.id, now);
+      if (errorAge == null) continue;
+      _paintChannel(
+        canvas,
+        from: orchPoint,
+        to: pt,
+        center: center,
+        agentId: agent.id,
+        errorAgeMs: errorAge,
+        errorOnly: true,
+      );
+    }
+
+    // ── 3. Event-driven beams + return packets ─────────────────
+    for (final event in events) {
+      final ageMs = now.difference(event.createdAt).inMilliseconds;
+      if (ageMs < 0) continue;
+      switch (event.type) {
+        case CouncilEventType.dispatched:
+          if (ageMs > kDispatchBeamLifetime.inMilliseconds) continue;
+          _paintBeam(
+            canvas,
+            from: _resolveBeamEndpoint(event.fromAgentId, points, orchPoint),
+            to: _resolveBeamEndpoint(event.toAgentId, points, orchPoint),
+            center: center,
+            ageMs: ageMs,
+            lifetimeMs: kDispatchBeamLifetime.inMilliseconds,
+            color: DuckColors.councilAccentHi,
+            isReturn: false,
+          );
+        case CouncilEventType.agentDone:
+        case CouncilEventType.evaluatorDone:
+          if (ageMs > kDispatchReturnPacketLifetime.inMilliseconds) continue;
+          // `agentDone` carries fromAgentId = agent, toAgentId =
+          // orchestrator in the council event schema. The return
+          // packet visually moves from the agent back to the orch.
+          _paintBeam(
+            canvas,
+            from: _resolveBeamEndpoint(event.fromAgentId, points, orchPoint),
+            to: _resolveBeamEndpoint(event.toAgentId, points, orchPoint),
+            center: center,
+            ageMs: ageMs,
+            lifetimeMs: kDispatchReturnPacketLifetime.inMilliseconds,
+            color: DuckColors.councilAccentHi,
+            isReturn: true,
+          );
+        default:
+          break;
       }
-      return (hash & 0xFFFF) / 0xFFFF;
     }
 
-    // ── Baseline persistent edges ─────────────────────────────────
-    // 1) Inter-agent dim full-mesh (chords).
-    // 2) Orchestrator spokes (brighter — real broker topology).
-    // Both layers always paint and always *flow* — the wire itself is
-    // the ambient activity, not occasional blips on top of a static
-    // line. Alpha floor is load-bearing for the brief's "lines never
-    // disappear entirely" constraint.
+    // ── 4. Imperative NetworkController packets ────────────────
+    // External callers (Signal, debug tooling) can still fire a
+    // packet via `network.pulse(...)`. We route them through the
+    // same beam pipeline so they read identically to event-driven
+    // dispatches. Error packets get the desaturated-grey treatment
+    // because we don't want a red beam strobing across the chamber
+    // when an agent's already showing a red status pill.
+    final ctrl = network;
+    if (ctrl != null) {
+      ctrl.prune();
+      for (final p in ctrl.packets) {
+        if (mutedAgentIds.contains(p.fromId)) continue;
+        if (mutedAgentIds.contains(p.toId)) continue;
+        final ttl = p.kind == NetworkPacketKind.error
+            ? NetworkController.errorPacketTtl.inMilliseconds
+            : NetworkController.packetTtl.inMilliseconds;
+        final ageMs =
+            now.difference(p.spawnedAt).inMilliseconds * p.speedScale;
+        if (ageMs > ttl) continue;
+        final color = switch (p.kind) {
+          NetworkPacketKind.message => DuckColors.councilAccentHi,
+          NetworkPacketKind.reply => DuckColors.councilAccent,
+          NetworkPacketKind.error => DuckColors.fgSubtle,
+        };
+        _paintBeam(
+          canvas,
+          from: _resolveBeamEndpoint(p.fromId, points, orchPoint),
+          to: _resolveBeamEndpoint(p.toId, points, orchPoint),
+          center: center,
+          ageMs: ageMs.round(),
+          lifetimeMs: ttl,
+          color: color,
+          isReturn: p.kind == NetworkPacketKind.reply,
+        );
+      }
+    }
+  }
+
+  Offset _resolveBeamEndpoint(
+    String id,
+    Map<String, Offset> points,
+    Offset orchFallback,
+  ) {
+    if (id.isEmpty) return orchFallback;
+    return points[id] ?? orchFallback;
+  }
+
+  /// Ambient mesh — VERY dim baseline lines so the room stays
+  /// networked when nothing is in flight. Significantly quieter than
+  /// the previous fiber-flow blob spam so the eye doesn't read
+  /// "decorative noise" when looking at idle state.
+  void _paintAmbientMesh(
+    Canvas canvas,
+    Map<String, Offset> points,
+    Offset center,
+  ) {
+    final orchPoint = points[orchestrator.id] ?? center;
+    // Orchestrator spokes — bright enough to register as the backbone.
+    for (final agent in agents) {
+      if (mutedAgentIds.contains(agent.id)) continue;
+      final pt = points[agent.id];
+      if (pt == null || pt == orchPoint) continue;
+      final ctrl = _channelControl(orchPoint, pt, center);
+      _path
+        ..reset()
+        ..moveTo(orchPoint.dx, orchPoint.dy)
+        ..quadraticBezierTo(ctrl.dx, ctrl.dy, pt.dx, pt.dy);
+      _strokePaint
+        ..shader = null
+        ..color = DuckColors.councilAccentDim.withValues(alpha: 0.10)
+        ..strokeWidth = 0.6;
+      canvas.drawPath(_path, _strokePaint);
+    }
+    // Inter-agent chords — dimmer still. Cap to the first N pairs to
+    // bound per-frame cost on large councils.
+    var pairs = 0;
     for (var i = 0; i < agents.length; i++) {
       final a = agents[i];
       if (mutedAgentIds.contains(a.id)) continue;
@@ -234,531 +437,265 @@ class _CouncilTrafficPainter extends CustomPainter {
         if (mutedAgentIds.contains(b.id)) continue;
         final pb = points[b.id];
         if (pb == null) continue;
-        final h = heat[_pairKey(a.id, b.id)] ?? 0;
-        final ctrl = _curveControl(pa, pb, center, sagFactor: 0.11);
-        _drawEdge(
-          canvas,
-          pa,
-          pb,
-          control: ctrl,
-          baseAlpha: 0.07,
-          heat: h,
-          baseColor: DuckColors.councilAccentDim,
-          hotColor: DuckColors.councilAccentHi,
-          baseWidth: 0.55,
-          phaseOffset: edgePhase(a.id, b.id),
-          flowDensity: 0.6,
-          flowTime: flowTime,
-        );
-      }
-    }
-
-    for (final agent in agents) {
-      if (mutedAgentIds.contains(agent.id)) continue;
-      final p = points[agent.id];
-      if (p == null) continue;
-      final h = heat[_pairKey(orchestrator.id, agent.id)] ?? 0;
-      // Spokes get a smaller sag — they're the broker backbone, the
-      // eye expects them mostly straight. The hash-driven sign baked
-      // into _curveControl still keeps adjacent spokes from
-      // collapsing onto each other visually.
-      final ctrl = _curveControl(orchPoint, p, center, sagFactor: 0.05);
-      _drawEdge(
-        canvas,
-        orchPoint,
-        p,
-        control: ctrl,
-        // Spokes have a higher floor — the orchestrator backbone is
-        // always slightly more present than the inter-agent web.
-        baseAlpha: 0.16,
-        heat: h,
-        baseColor: DuckColors.councilAccent,
-        hotColor: DuckColors.councilAccentHi,
-        baseWidth: 0.85,
-        phaseOffset: edgePhase(orchestrator.id, agent.id),
-        flowDensity: 1.0,
-        flowTime: flowTime,
-      );
-    }
-
-    // ── Live packets from CouncilEvents ───────────────────────────
-    // Real events drive every packet — no fake timer. Each event
-    // resolves to a (color, speed, intensity, isError) spec via
-    // `_eventSpec`. message_sent events read their `data['kind']`
-    // so dispatch reads bright, reply reads warm, ask_pool reads
-    // purple, errors strobe red. See encoding table at top of file.
-    //
-    // Multiple concurrent packets on the same edge are staggered
-    // two ways: (a) ageMs naturally separates them along t, and
-    // (b) a per-event lane offset hashed from createdAt nudges the
-    // bezier control point so co-directional packets ride slightly
-    // different sub-curves instead of stacking into one smear.
-    for (final event in events.reversed.take(40)) {
-      final ageMs = now.difference(event.createdAt).inMilliseconds;
-      final spec = _eventSpec(event.type, event.data);
-      if (spec == null) continue;
-      if (ageMs > spec.ttlMs) continue;
-      if (mutedAgentIds.contains(event.fromAgentId)) continue;
-      if (mutedAgentIds.contains(event.toAgentId)) continue;
-      final fromPoint = points[event.fromAgentId];
-      final toPoint = points[event.toAgentId];
-      if (fromPoint == null && toPoint == null) continue;
-      final from = fromPoint ?? orchPoint;
-      final to = toPoint ?? orchPoint;
-      if (from == to) continue;
-      final t = ((ageMs / spec.ttlMs) * spec.speedScale).clamp(0.0, 1.0);
-      // Lane offset in [-1,1] from a stable hash of the event's
-      // timestamp + endpoints. Multiplies the perpendicular sag so
-      // concurrent packets fan out instead of overlapping.
-      final laneSeed = event.createdAt.microsecondsSinceEpoch ^
-          event.fromAgentId.hashCode ^
-          (event.toAgentId.hashCode << 1);
-      final laneOffset = (((laneSeed & 0xFFFF) / 0xFFFF) - 0.5) * 0.06;
-      final ctrl = _curveControl(
-        from,
-        to,
-        center,
-        sagFactor: 0.10 + laneOffset,
-      );
-      _drawPacket(
-        canvas,
-        from,
-        to,
-        control: ctrl,
-        t: t,
-        accent: spec.color,
-        isError: spec.isError,
-        intensity: spec.intensity,
-      );
-    }
-
-    // ── Imperative packets via NetworkController ──────────────────
-    final ctrl = network;
-    if (ctrl != null) {
-      ctrl.prune();
-      for (final p in ctrl.packets) {
-        if (mutedAgentIds.contains(p.fromId)) continue;
-        if (mutedAgentIds.contains(p.toId)) continue;
-        final from = points[p.fromId];
-        final to = points[p.toId];
-        if (from == null || to == null || from == to) continue;
-        final ttl = p.kind == NetworkPacketKind.error
-            ? NetworkController.errorPacketTtl.inMilliseconds
-            : NetworkController.packetTtl.inMilliseconds;
-        final ageMs =
-            now.difference(p.spawnedAt).inMilliseconds * p.speedScale;
-        final t = (ageMs / ttl).clamp(0.0, 1.0);
-        if (t >= 1.0) continue;
-        final accent = switch (p.kind) {
-          NetworkPacketKind.message => DuckColors.councilAccentHi,
-          NetworkPacketKind.reply => DuckColors.councilAccent,
-          NetworkPacketKind.error => DuckColors.stateError,
-        };
-        final intensity = switch (p.kind) {
-          NetworkPacketKind.message => 1.15,
-          NetworkPacketKind.reply => 0.9,
-          NetworkPacketKind.error => 1.4,
-        };
-        _drawPacket(
-          canvas,
-          from,
-          to,
-          control: _curveControl(from, to, center, sagFactor: 0.10),
-          t: t,
-          accent: accent,
-          isError: p.kind == NetworkPacketKind.error,
-          intensity: intensity,
-        );
+        if (pairs++ > 28) return; // cap
+        final ctrl = _channelControl(pa, pb, center);
+        _path
+          ..reset()
+          ..moveTo(pa.dx, pa.dy)
+          ..quadraticBezierTo(ctrl.dx, ctrl.dy, pb.dx, pb.dy);
+        _strokePaint
+          ..shader = null
+          ..color = DuckColors.councilAccentDim.withValues(alpha: 0.045)
+          ..strokeWidth = 0.45;
+        canvas.drawPath(_path, _strokePaint);
       }
     }
   }
 
-  // ──────────────────────────────────────────────────────────────
-  // Edge rendering: curved (quadratic-bezier) wire with three
-  // layered strokes for depth + a traveling Gaussian highlight that
-  // reads as fiber-optic light, not Morse-code dashes.
-  //
-  //   Layer 1 (only when hot): wide, blurred halo, additive — the
-  //           "the wire is glowing through fog" cue.
-  //   Layer 2 (always)       : the persistent colored core, drawn
-  //           as a path stroke so curvature is preserved end-to-end.
-  //   Layer 3 (when warm)    : a thin white-hot specular sitting on
-  //           top of the core for ~30% of width — gives the wire a
-  //           sense of being lit FROM ABOVE rather than emitting.
-  //   Highlight stream       : N traveling Gaussian "blobs" sampled
-  //           along the bezier with a bell envelope. Two streams
-  //           (forward + reverse) phase-locked to the global pulse.
-  //
-  // Heat saturates around 2.5 (~3 events within ~1.4s) and increases
-  // brightness, width, halo radius, and blob count.
-  // ──────────────────────────────────────────────────────────────
-  void _drawEdge(
-    Canvas canvas,
-    Offset a,
-    Offset b, {
-    required Offset control,
-    required double baseAlpha,
-    required double heat,
-    required Color baseColor,
-    required Color hotColor,
-    required double baseWidth,
-    double phaseOffset = 0.0,
-    double flowDensity = 1.0,
-    required double flowTime,
+  /// Sustained channel from [from] (orchestrator) to [to] (an agent
+  /// currently in `working`/`replying`/`askingPool` state).
+  ///
+  /// Visual:
+  ///   * A thin bezier core drawn in the cyan accent ramp.
+  ///   * A slow energy pulse (Gaussian highlight) riding the bezier
+  ///     source → target. Subtle — the pulse is the cue that the
+  ///     channel is "live", but not loud enough to compete with the
+  ///     dispatch beam that lit it up in the first place.
+  ///
+  /// If [errorAgeMs] is non-null we desaturate by interpolating to
+  /// muted grey over the fade-out window. If [errorOnly] is true the
+  /// channel is painted ONLY as the fade-out (used when the agent
+  /// itself transitioned to error and is no longer "working").
+  void _paintChannel(
+    Canvas canvas, {
+    required Offset from,
+    required Offset to,
+    required Offset center,
+    required String agentId,
+    int? errorAgeMs,
+    bool errorOnly = false,
   }) {
-    if (a == b) return;
-    final length = (b - a).distance;
-    if (length < 4) return;
+    if (from == to) return;
+    final ctrl = _channelControl(from, to, center);
 
-    final norm = (heat / 2.5).clamp(0.0, 1.0);
-    final width = baseWidth + (1.6 - baseWidth) * norm;
-    final wireAlpha = (baseAlpha + (0.18 * norm)).clamp(0.0, 0.42);
-    final hot = Color.lerp(baseColor, hotColor, 0.35 + 0.65 * norm)!;
-
-    final path = Path()
-      ..moveTo(a.dx, a.dy)
-      ..quadraticBezierTo(control.dx, control.dy, b.dx, b.dy);
-
-    // 1) Hot bloom underlay (only when there's recent traffic).
-    if (norm > 0.05) {
-      final glow = Paint()
-        ..style = PaintingStyle.stroke
-        ..color = hotColor.withValues(alpha: 0.20 * norm)
-        ..strokeCap = StrokeCap.round
-        ..strokeWidth = width + 5
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5)
-        ..blendMode = BlendMode.plus;
-      canvas.drawPath(path, glow);
+    // Fade math — 1.0 for healthy channel, 0.0 at the end of the
+    // error fade window.
+    var alphaScale = 1.0;
+    var desaturation = 0.0;
+    if (errorAgeMs != null) {
+      final norm = (errorAgeMs / kErrorFadeOutLifetime.inMilliseconds)
+          .clamp(0.0, 1.0);
+      alphaScale = 1.0 - norm;
+      desaturation = norm;
+      if (errorOnly) {
+        // For error-only channels we additionally taper the start
+        // alpha because the agent has already moved past `working`.
+        alphaScale *= 0.85;
+      }
     }
+    if (alphaScale <= 0.02) return;
 
-    // 2) Persistent colored core — draw with a longitudinal gradient
-    //    shader so the line itself has parallax-style brightness
-    //    variation along its length (brighter mid, dimmer at the
-    //    endpoints). This is the single biggest "not flat" cue.
+    final baseColor = Color.lerp(
+      DuckColors.councilAccent,
+      DuckColors.fgSubtle,
+      desaturation,
+    )!;
+    final hotColor = Color.lerp(
+      DuckColors.councilAccentHi,
+      DuckColors.fgSubtle,
+      desaturation,
+    )!;
+
+    _path
+      ..reset()
+      ..moveTo(from.dx, from.dy)
+      ..quadraticBezierTo(ctrl.dx, ctrl.dy, to.dx, to.dy);
+
+    // Core stroke — a thin bezier core with a longitudinal gradient
+    // so the channel feels "lit through" rather than uniformly dim.
     final coreShader = ui.Gradient.linear(
-      a,
-      b,
+      from,
+      to,
       [
-        baseColor.withValues(alpha: wireAlpha * 0.55),
-        hot.withValues(alpha: wireAlpha),
-        baseColor.withValues(alpha: wireAlpha * 0.55),
+        baseColor.withValues(alpha: 0.22 * alphaScale),
+        hotColor.withValues(alpha: 0.32 * alphaScale),
+        baseColor.withValues(alpha: 0.18 * alphaScale),
       ],
       const <double>[0.0, 0.5, 1.0],
     );
-    final wirePaint = Paint()
-      ..style = PaintingStyle.stroke
+    _strokePaint
       ..shader = coreShader
-      ..strokeCap = StrokeCap.round
-      ..strokeWidth = width * 0.75;
-    canvas.drawPath(path, wirePaint);
+      ..color = baseColor.withValues(alpha: 0.30 * alphaScale)
+      ..strokeWidth = 1.05;
+    canvas.drawPath(_path, _strokePaint);
 
-    // 3) Specular highlight (warm/hot only) — a thinner, brighter
-    //    inner stroke that lands inside the core and sells "lit from
-    //    above" geometry instead of "I am a flat line".
-    if (norm > 0.18) {
-      final spec = Paint()
-        ..style = PaintingStyle.stroke
-        ..color = Color.lerp(hot, Colors.white, 0.55)!
-            .withValues(alpha: (0.22 + 0.30 * norm).clamp(0.0, 0.55))
-        ..strokeCap = StrokeCap.round
-        ..strokeWidth = math.max(0.4, width * 0.32);
-      canvas.drawPath(path, spec);
+    // Soft halo (only on healthy channels) — sells the "lit" feel
+    // when the channel is active. Suppressed during error fade so
+    // the desaturation reads clearly.
+    if (desaturation < 0.45) {
+      final haloShader = ui.Gradient.linear(
+        from,
+        to,
+        [
+          hotColor.withValues(alpha: 0.08 * alphaScale),
+          hotColor.withValues(alpha: 0.16 * alphaScale),
+          hotColor.withValues(alpha: 0.08 * alphaScale),
+        ],
+        const <double>[0.0, 0.5, 1.0],
+      );
+      _strokePaint
+        ..shader = haloShader
+        ..color = hotColor.withValues(alpha: 0.16 * alphaScale)
+        ..strokeWidth = 4.0
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+      canvas.drawPath(_path, _strokePaint);
+      _strokePaint.maskFilter = null;
     }
 
-    // 4) Traveling Gaussian highlights — fiber-optic light packets
-    //    riding the wire. Each "blob" is a soft circle sampled at a
-    //    point on the bezier; multiple blobs per stream give a
-    //    smooth flowing quality without the staccato of dashes.
-    // Cut blob density hard: a single forward stream with 1..2 blobs
-    // reads as light traveling along a wire, not a beaded necklace.
-    // (Old: 2 streams × 1..2 blobs = 2..4 dots per edge.)
-    final blobCount = 1 + (1 * norm).round();
-    const streamCount = 1;
-    // Flow speed is now in CYCLES PER SECOND. Driven by the
-    // monotonic flowTime clock so cycle boundaries don't snap every
-    // edge backwards in lockstep (the old `pulse * flowSpeed` form
-    // did exactly that — pulse wraps 1.0→0.0 every 5.2s).
-    final flowSpeed = 0.085 + 0.125 * norm;
-    final blobAlpha = (0.34 + 0.42 * norm).clamp(0.30, 0.78);
-    final blobRadius = (width * 1.6 + 1.4).clamp(1.6, 4.4);
-
-    for (var stream = 0; stream < streamCount; stream++) {
-      final reverse = stream == 1;
-      final streamPhase = stream * 0.5;
-      for (var i = 0; i < blobCount; i++) {
-        final raw = flowTime * flowSpeed +
-            phaseOffset +
-            streamPhase +
-            i / blobCount;
-        var t = raw - raw.floorToDouble();
-        if (reverse) t = 1.0 - t;
-        // Bell envelope so blobs softly fade in/out at the ends.
-        final env = math.sin(t * math.pi);
-        if (env <= 0.06) continue;
-
-        final pos = _bezier(a, control, b, t);
-        // Soft outer glow for this blob.
-        canvas.drawCircle(
-          pos,
-          blobRadius + 2.2,
-          Paint()
-            ..color = hotColor.withValues(alpha: blobAlpha * env * 0.45)
-            ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3)
-            ..blendMode = BlendMode.plus,
-        );
-        // Crisp head.
-        canvas.drawCircle(
-          pos,
-          blobRadius,
-          Paint()..color = hot.withValues(alpha: blobAlpha * env),
-        );
-        // White-hot pinpoint specular at peak only — turns the blob
-        // into a glistening bead rather than a colored dot.
-        if (env > 0.7) {
-          canvas.drawCircle(
-            pos,
-            blobRadius * 0.45,
-            Paint()
-              ..color = Colors.white.withValues(alpha: 0.55 * (env - 0.7) / 0.3),
-          );
-        }
+    // Slow source → target energy pulse. The pulse phase is derived
+    // from a stable hash of `agentId` so different agents' channels
+    // don't pulse in lockstep.
+    if (desaturation < 0.85) {
+      final clockSec = DateTime.now().millisecondsSinceEpoch / 1000.0;
+      final phaseOffset = _phaseForId(agentId);
+      final raw = clockSec * 0.55 + phaseOffset;
+      final t = raw - raw.floorToDouble();
+      final env = math.sin(t * math.pi);
+      if (env > 0.05) {
+        final pos = _bezier(from, ctrl, to, t);
+        _fillPaint
+          ..color = hotColor.withValues(alpha: 0.45 * env * alphaScale)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3.0)
+          ..blendMode = BlendMode.plus;
+        canvas.drawCircle(pos, 3.2, _fillPaint);
+        _fillPaint
+          ..maskFilter = null
+          ..blendMode = BlendMode.srcOver
+          ..color = hotColor.withValues(alpha: 0.85 * env * alphaScale);
+        canvas.drawCircle(pos, 1.6, _fillPaint);
       }
     }
   }
 
-  // ──────────────────────────────────────────────────────────────
-  // Packet rendering: the packet now rides the SAME quadratic bezier
-  // the edge was drawn on, so live comms read as light traveling
-  // along the fiber rather than a separate straight overlay.
-  // ──────────────────────────────────────────────────────────────
-  void _drawPacket(
-    Canvas canvas,
-    Offset from,
-    Offset to, {
-    required Offset control,
-    required double t,
-    required Color accent,
-    required bool isError,
-    double intensity = 1.0,
+  /// One-shot beam (outbound dispatch OR return packet).
+  ///
+  /// Visuals:
+  ///   * The path "fires" from [from] toward [to] — at ageMs=0 nothing
+  ///     is visible, at ageMs ~ 0.18 * lifetime the whole bezier is
+  ///     lit, then the trailing edge collapses behind the leading
+  ///     edge to give a moving lance with a contrail.
+  ///   * On arrival (t > 0.75) a soft halo blooms at the recipient
+  ///     end so the eye sees "the packet landed".
+  ///
+  /// Return packets are visually identical to outbound beams except
+  /// the endpoints are swapped at the call site, so the reader sees
+  /// "result coming back" via direction alone.
+  void _paintBeam(
+    Canvas canvas, {
+    required Offset from,
+    required Offset to,
+    required Offset center,
+    required int ageMs,
+    required int lifetimeMs,
+    required Color color,
+    required bool isReturn,
   }) {
-    final eased = Curves.easeInOutCubic.transform(t);
-    final fade = (1 - t) * intensity;
-    final strobe = isError
-        ? (0.65 + 0.35 * math.sin(pulse * math.pi * 18))
-        : 1.0;
+    if (from == to) return;
+    final t = (ageMs / lifetimeMs).clamp(0.0, 1.0);
+    final eased = Curves.easeOutCubic.transform(t);
+    final ctrl = _channelControl(from, to, center);
 
-    // Energized edge under the packet — same bezier as the wire so
-    // the highlight kisses the curve, not a chord across it.
-    final path = Path()
-      ..moveTo(from.dx, from.dy)
-      ..quadraticBezierTo(control.dx, control.dy, to.dx, to.dy);
-    final edgePaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..color = accent.withValues(alpha: 0.55 * fade * strobe)
-      ..strokeWidth = isError ? 2.4 : 1.8
-      ..strokeCap = StrokeCap.round;
-    canvas.drawPath(path, edgePaint);
+    // Lance window: a moving span [tHead-len, tHead] along the
+    // bezier. The lance grows from a point to ~30% of the curve as
+    // it accelerates, then shrinks at arrival.
+    final tHead = eased;
+    final lanceLen = (0.28 * math.sin(t * math.pi)).clamp(0.04, 0.32);
+    final tTail = (tHead - lanceLen).clamp(0.0, 1.0);
 
-    // Trail: 5 fading dots behind the head along the eased curve.
-    const trailSteps = 5;
-    for (var i = trailSteps; i >= 1; i--) {
-      final lag = i * 0.040;
-      final tt = (eased - lag).clamp(0.0, 1.0);
-      final pos = _bezier(from, control, to, tt);
-      final alpha = (fade * (1.0 - i / (trailSteps + 1.0))) * 0.85 * strobe;
-      canvas.drawCircle(
-        pos,
-        (isError ? 4.5 : 3.8) * (1.0 - i / (trailSteps + 1.5)),
-        Paint()..color = accent.withValues(alpha: alpha),
-      );
+    // Sample the bezier in N segments between tTail and tHead and
+    // paint a tapered line. Easier + faster than Path.extractPath
+    // for a one-shot lance.
+    const segments = 14;
+    Offset? prev;
+    for (var i = 0; i <= segments; i++) {
+      final segT = tTail + (tHead - tTail) * (i / segments);
+      final pos = _bezier(from, ctrl, to, segT);
+      if (prev != null) {
+        // Brightness ramps from 0 at the tail to 1 at the head.
+        final localT = i / segments;
+        final brightness = math.pow(localT, 1.4).toDouble();
+        final segColor = color.withValues(
+          alpha: (0.85 * brightness * (1.0 - t * 0.45)).clamp(0.0, 0.95),
+        );
+        _strokePaint
+          ..shader = null
+          ..color = segColor
+          ..strokeWidth = isReturn
+              ? (1.6 + 1.6 * brightness)
+              : (2.0 + 2.0 * brightness)
+          ..strokeCap = StrokeCap.round;
+        canvas.drawLine(prev, pos, _strokePaint);
+      }
+      prev = pos;
     }
 
-    // Head + halo — sampled on the curve.
-    final head = _bezier(from, control, to, eased);
-    final headRadius = (isError ? 6.0 : 5.0) + fade * 2.0;
-    canvas.drawCircle(
-      head,
-      headRadius + (isError ? 8 : 5),
-      Paint()
-        ..color = accent.withValues(alpha: 0.30 * fade * strobe)
-        ..maskFilter = MaskFilter.blur(
-          BlurStyle.normal,
-          isError ? 9 : 6,
-        )
-        ..blendMode = BlendMode.plus,
-    );
-    canvas.drawCircle(
-      head,
-      headRadius,
-      Paint()..color = accent.withValues(alpha: fade * strobe),
-    );
-    // White-hot core: the packet has a tiny bright pinpoint that
-    // sells it as a coherent "thing" rather than a colored smudge.
-    canvas.drawCircle(
-      head,
-      headRadius * 0.42,
-      Paint()
-        ..color = Colors.white.withValues(alpha: 0.85 * fade * strobe),
-    );
+    // Head halo — wide soft glow around the leading point. Sells the
+    // "fired projectile" energy.
+    final head = _bezier(from, ctrl, to, tHead);
+    final headFade = 1.0 - t;
+    _fillPaint
+      ..color = color.withValues(alpha: 0.45 * headFade)
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, isReturn ? 7 : 9)
+      ..blendMode = BlendMode.plus;
+    canvas.drawCircle(head, isReturn ? 8 : 10, _fillPaint);
+    _fillPaint
+      ..maskFilter = null
+      ..blendMode = BlendMode.srcOver
+      ..color = color.withValues(alpha: 0.95 * headFade);
+    canvas.drawCircle(head, isReturn ? 3.0 : 3.6, _fillPaint);
+    // White-hot pinpoint so the head reads as a coherent object.
+    _fillPaint.color = Colors.white.withValues(alpha: 0.85 * headFade);
+    canvas.drawCircle(head, isReturn ? 1.0 : 1.4, _fillPaint);
 
-    // Arrival ring near landing.
-    if (t > 0.78) {
-      final arriveT = ((t - 0.78) / 0.22).clamp(0.0, 1.0);
-      canvas.drawCircle(
-        to,
-        14 + arriveT * (isError ? 26 : 18),
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = (isError ? 1.8 : 1.4) * (1 - arriveT)
-          ..color = accent.withValues(alpha: 0.55 * (1 - arriveT) * strobe),
-      );
+    // Arrival burst — once the lance is past ~75% of travel, paint
+    // an expanding ring at the destination. Reads as "packet landed".
+    if (t > 0.62) {
+      final arriveT = ((t - 0.62) / 0.38).clamp(0.0, 1.0);
+      final r = 6.0 + 22.0 * arriveT;
+      _strokePaint
+        ..shader = null
+        ..color = color.withValues(alpha: 0.55 * (1.0 - arriveT))
+        ..strokeWidth = (1.6 * (1.0 - arriveT)).clamp(0.4, 1.6);
+      canvas.drawCircle(to, r, _strokePaint);
+
+      // Soft inner bloom at the recipient — the card-edge flash the
+      // brief calls for. We paint it here so the traffic layer owns
+      // it; agent cards don't need to react.
+      _fillPaint
+        ..color = color.withValues(alpha: 0.35 * (1.0 - arriveT))
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, 8 + 12 * arriveT)
+        ..blendMode = BlendMode.plus;
+      canvas.drawCircle(to, 14 + 6 * arriveT, _fillPaint);
+      _fillPaint
+        ..maskFilter = null
+        ..blendMode = BlendMode.srcOver;
     }
   }
 
-  // (Ambient-packet stub removed — fiber-flow blobs in _drawEdge
-  // now own the ambient channel.)
-
-  // Resolve a CouncilEvent to its visual pulse spec. message_sent
-  // events delegate to the embedded `kind` (dispatch / reply /
-  // ask_pool / pool_reply / ask_user / user_reply / review /
-  // followup) — without this, the bulk of agent-to-agent traffic
-  // would emit zero pulses (only lifecycle events would fire).
-  _EventSpec? _eventSpec(String type, Map<String, dynamic> data) {
-    switch (type) {
-      case 'message_sent':
-        final kind = (data['kind'] as String?) ?? '';
-        return _messageKindSpec(kind);
-      case 'dispatched':
-        return const _EventSpec(
-          DuckColors.councilAccentHi,
-          false,
-          ttlMs: 2400,
-          speedScale: 1.25,
-          intensity: 1.2,
-        );
-      case 'asked_pool':
-        return const _EventSpec(
-          DuckColors.accentPurple,
-          false,
-          ttlMs: 2400,
-          intensity: 1.0,
-        );
-      case 'pool_reply':
-        return const _EventSpec(
-          DuckColors.councilAccent,
-          false,
-          ttlMs: 2400,
-          intensity: 0.95,
-        );
-      case 'asked_user':
-      case 'user_reply':
-        return const _EventSpec(
-          DuckColors.accentDuck,
-          false,
-          ttlMs: 2400,
-          intensity: 1.0,
-        );
-      case 'agent_done':
-      case 'evaluator_done':
-        return const _EventSpec(
-          DuckColors.councilAccent,
-          false,
-          ttlMs: 2400,
-          intensity: 0.9,
-        );
-      case 'reviewer_followup':
-        return const _EventSpec(
-          DuckColors.accentDuck,
-          false,
-          ttlMs: 2400,
-          intensity: 1.0,
-        );
-      case 'agent_error':
-        return const _EventSpec(
-          DuckColors.stateError,
-          true,
-          ttlMs: 1600,
-          speedScale: 1.55,
-          intensity: 1.4,
-        );
+  double _phaseForId(String id) {
+    var h = 2166136261;
+    for (var i = 0; i < id.length; i++) {
+      h = (h ^ id.codeUnitAt(i)) & 0xFFFFFFFF;
+      h = (h * 16777619) & 0xFFFFFFFF;
     }
-    return null;
-  }
-
-  _EventSpec? _messageKindSpec(String kind) {
-    switch (kind) {
-      case 'dispatch':
-        return const _EventSpec(
-          DuckColors.councilAccentHi,
-          false,
-          ttlMs: 2400,
-          speedScale: 1.25,
-          intensity: 1.2,
-        );
-      case 'reply':
-        return const _EventSpec(
-          DuckColors.councilAccent,
-          false,
-          ttlMs: 2400,
-          intensity: 0.95,
-        );
-      case 'ask_pool':
-        return const _EventSpec(
-          DuckColors.accentPurple,
-          false,
-          ttlMs: 2400,
-          intensity: 1.0,
-        );
-      case 'pool_reply':
-        return const _EventSpec(
-          DuckColors.councilAccent,
-          false,
-          ttlMs: 2400,
-          intensity: 0.9,
-        );
-      case 'ask_user':
-      case 'user_reply':
-        return const _EventSpec(
-          DuckColors.accentDuck,
-          false,
-          ttlMs: 2400,
-          intensity: 1.0,
-        );
-      case 'review':
-      case 'followup':
-        return const _EventSpec(
-          DuckColors.accentDuck,
-          false,
-          ttlMs: 2400,
-          intensity: 1.0,
-        );
-    }
-    return null;
+    return (h % 1000) / 1000.0;
   }
 
   @override
-  bool shouldRepaint(covariant _CouncilTrafficPainter oldDelegate) {
-    return oldDelegate.events.length != events.length ||
-        oldDelegate.agents.length != agents.length ||
-        oldDelegate.pulse != pulse ||
-        oldDelegate.network != network;
+  bool shouldRepaint(covariant _DispatchTrafficPainter old) {
+    return old.events.length != events.length ||
+        old.agents.length != agents.length ||
+        old.pulse != pulse ||
+        old.network != network;
   }
 }
-
-class _EventSpec {
-  final Color color;
-  final bool isError;
-  final int ttlMs;
-  final double speedScale;
-  final double intensity;
-  const _EventSpec(
-    this.color,
-    this.isError, {
-    this.ttlMs = 2400,
-    this.speedScale = 1.0,
-    this.intensity = 1.0,
-  });
-}
-
-// (`_AgentRhythm` removed — was dead code; per-edge phase is now
-// derived inline in _CouncilTrafficPainter via `edgePhase`.)

@@ -82,8 +82,7 @@ class AppState extends ChangeNotifier {
       path == processManagerSentinel;
 
   /// Returns `true` when the given path is the knowledge base sentinel.
-  static bool isKnowledgeBaseTab(String? path) =>
-      path == knowledgeBaseSentinel;
+  static bool isKnowledgeBaseTab(String? path) => path == knowledgeBaseSentinel;
 
   /// Returns `true` when the given path is the council theater sentinel.
   static bool isCouncilTheaterTab(String? path) =>
@@ -136,6 +135,7 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     return s;
   }
+
   final WorkspaceService _workspaceService = WorkspaceService();
   final PreferencesService prefs = PreferencesService();
   final ChatPersistenceService _persistence = ChatPersistenceService();
@@ -428,6 +428,7 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     return true;
   }
+
   bool isProviderEnabled(String p) => _enabledProviders.contains(p);
 
   String get editorTheme => _editorTheme;
@@ -447,23 +448,6 @@ class AppState extends ChangeNotifier {
   bool get chatHidden => _chatHidden;
   String get settingsInitialCategory => _settingsInitialCategory;
   int get settingsOpenRevision => _settingsOpenRevision;
-
-  // Per-workspace one-shotfor the empty-editor duck mischief gag.
-  // Pre-loaded by `setDirectory` so the `_DuckMischief` widget can
-  // read it synchronously on mount and decide whether to play the
-  // full animation or skip straight to the static "quip + button"
-  // layout. See `PreferencesService._kDuckMischiefPlayed` for the
-  // full rationale.
-  bool _duckMischiefPlayed = false;
-  bool get duckMischiefPlayedForCurrentProject => _duckMischiefPlayed;
-  // Dev affordance — bumped by `replayDuckMischief()` so the
-  // `_DuckMischief` widget keyed off this value tears down and
-  // re-mounts, which is the only way to get the gag to play
-  // again from the same empty-editor surface (otherwise the
-  // controller has already finished and `initState` is the only
-  // entry point that reads the played-flag).
-  int _duckMischiefReplayTick = 0;
-  int get duckMischiefReplayTick => _duckMischiefReplayTick;
 
   AppState() {
     chat = ChatController(
@@ -511,6 +495,7 @@ class AppState extends ChangeNotifier {
       },
     );
     council.addListener(notifyListeners);
+    timeline.addListener(notifyListeners);
     // Auto-open the council theater as an editor tab when the
     // controller flips `theaterVisible` (start, resurrect, manual
     // showTheater). Replaces the v1 layout-level overlay that swapped
@@ -583,6 +568,7 @@ class AppState extends ChangeNotifier {
     _fsWatcher?.cancel();
     _fsRefreshDebounce?.cancel();
     autoBackup.dispose();
+    timeline.removeListener(notifyListeners);
     timeline.dispose();
     council.removeListener(notifyListeners);
     unawaited(_copilotService.dispose());
@@ -606,8 +592,8 @@ class AppState extends ChangeNotifier {
     _historySummaryMaxChars = await prefs.getHistorySummaryMaxChars();
     _historySummaryRefreshDelta = await prefs.getHistorySummaryRefreshDelta();
     _knowledgebaseAutoSummarize = await prefs.getKnowledgebaseAutoSummarize();
-    _knowledgebaseAutoSummarizeThresholdChars =
-        await prefs.getKnowledgebaseAutoSummarizeThresholdChars();
+    _knowledgebaseAutoSummarizeThresholdChars = await prefs
+        .getKnowledgebaseAutoSummarizeThresholdChars();
     _ollamaService.baseUrl = _ollamaEndpoint;
     _ollamaService.apiKey = _ollamaApiKey;
     _geminiService.apiKey = _geminiApiKey;
@@ -768,9 +754,7 @@ class AppState extends ChangeNotifier {
       _fileContents[knowledgeBaseSentinel] = '';
       _savedFileContents[knowledgeBaseSentinel] = '';
     }
-    _activeFile = _openFiles.firstWhere(
-      (f) => f.path == knowledgeBaseSentinel,
-    );
+    _activeFile = _openFiles.firstWhere((f) => f.path == knowledgeBaseSentinel);
     notifyListeners();
   }
 
@@ -955,8 +939,9 @@ class AppState extends ChangeNotifier {
   void openSettingsTab({String category = 'general'}) {
     _settingsInitialCategory = category;
     _settingsOpenRevision++;
-    final existingIndex =
-        _openFiles.indexWhere((f) => f.path == settingsSentinel);
+    final existingIndex = _openFiles.indexWhere(
+      (f) => f.path == settingsSentinel,
+    );
     if (existingIndex < 0) {
       _openFiles.insert(0, File(settingsSentinel));
       _fileContents[settingsSentinel] = '';
@@ -1060,8 +1045,8 @@ class AppState extends ChangeNotifier {
     if (newIndex < 0 || newIndex >= _openFiles.length) return;
     // Settings tab is pinned: it can never move out of slot 0, and
     // nothing else can occupy slot 0 while it is present.
-    final hasSettings = _openFiles.isNotEmpty &&
-        _openFiles.first.path == settingsSentinel;
+    final hasSettings =
+        _openFiles.isNotEmpty && _openFiles.first.path == settingsSentinel;
     if (hasSettings) {
       if (oldIndex == 0) return; // can't drag the settings tab
       if (newIndex == 0) newIndex = 1; // bump anything else past it
@@ -1331,10 +1316,21 @@ class AppState extends ChangeNotifier {
     String messageId, {
     String? legacyMessageId,
   }) async {
-    final result = await timeline.restoreMessageChanges(
-      messageId,
-      legacyMessageId: legacyMessageId,
-    );
+    final turnIds = timeline
+        .turnIdsForMessage(messageId, legacyMessageId: legacyMessageId)
+        .toSet();
+    final result = turnIds.isNotEmpty
+        ? await timeline.restoreByTurnIds(turnIds)
+        : await timeline.restoreMessageChanges(
+            messageId,
+            legacyMessageId: legacyMessageId,
+          );
+    await _resyncTouchedPaths(result.touchedRelPaths);
+    return result.message;
+  }
+
+  Future<String> restoreTimelineChangesForTurns(Set<String> turnIds) async {
+    final result = await timeline.restoreByTurnIds(turnIds);
     await _resyncTouchedPaths(result.touchedRelPaths);
     return result.message;
   }
@@ -1495,17 +1491,21 @@ class AppState extends ChangeNotifier {
     String norm(String p) => p.toLowerCase().replaceAll('\\', '/');
     final isNewProject = !_recentProjects.map(norm).contains(norm(path));
 
+    // Kill any running PTY children from the OUTGOING workspace before
+    // we swap. Agent RUN_CMD invocations (hidden + promoted), interactive
+    // tabs, and any descendants tracked by `lumenProcesses` all get a
+    // brief Ctrl+C grace window followed by a hard kill. Without this,
+    // `npm run dev` started in workspace A keeps running while the user
+    // is now editing workspace B — exactly the "renegade terminals
+    // from llm tools" complaint.
+    await shutdownAllTerminals(killTrackedPids: false);
+
     _currentDirectory = path;
     _openFiles.clear();
     _fileContents.clear();
     _savedFileContents.clear();
     _fileLanguageOverrides.clear();
     _activeFile = null;
-    // Pre-load the per-workspace duck mischief flag so `_DuckMischief`
-    // (which mounts as soon as the editor area renders with no open
-    // files) can read it synchronously without flashing the static
-    // "quip + button" layout before the animation kicks in.
-    _duckMischiefPlayed = await prefs.getDuckMischiefPlayedForWorkspace(path);
     _restartFileWatcher(path);
     // Mount the per-workspace revision timeline. Bind is awaited so
     // any subsequent file open / save lands in the right journal,
@@ -1679,46 +1679,19 @@ class AppState extends ChangeNotifier {
     await _loadRecentProjects();
   }
 
-  /// Called once by `_DuckMischief` after the empty-editor mascot gag
-  /// finishes its in-flight performance for the current workspace. Flips
-  /// the in-memory cache AND persists the per-workspace pref so the
-  /// next time this project is opened (now or after an app restart) the
-  /// gag is skipped and the static "quip + button" layout is shown
-  /// directly. Intentionally does NOT `notifyListeners` — the widget
-  /// already knows the gag is finishing and a notify here would just
-  /// trigger an extra rebuild for no visible change.
-  Future<void> markDuckMischiefPlayedForCurrentProject() async {
-    if (_duckMischiefPlayed) return;
-    _duckMischiefPlayed = true;
-    await prefs.setDuckMischiefPlayedForWorkspace(_currentDirectory, true);
-  }
-
-  /// Dev / debugging affordance. Clears the per-workspace played flag
-  /// AND bumps `duckMischiefReplayTick` so the `_DuckMischief` widget
-  /// (keyed off that tick) tears down and re-mounts. If the empty
-  /// editor surface is currently visible, the gag plays immediately;
-  /// if files are open, it plays the next time the user lands on the
-  /// empty editor. Wired into the Command Palette as `dev.replayDuck`
-  /// — not exposed via the menu bar because it's an animation-replay,
-  /// not a user-facing feature.
-  Future<void> replayDuckMischief() async {
-    _duckMischiefPlayed = false;
-    _duckMischiefReplayTick++;
-    await prefs.setDuckMischiefPlayedForWorkspace(_currentDirectory, false);
-    notifyListeners();
-  }
-
   Future<void> closeWorkspace() async {
+    // Same reasoning as `setDirectory`: drain any in-flight terminal
+    // sessions before we detach the workspace. The welcome screen has
+    // no terminal pane, so without this the hidden agent bridge
+    // sessions for the just-closed project would silently keep
+    // running.
+    await shutdownAllTerminals(killTrackedPids: false);
     _currentDirectory = null;
     _openFiles.clear();
     _fileContents.clear();
     _savedFileContents.clear();
     _fileLanguageOverrides.clear();
     _activeFile = null;
-    // No workspace = no duck gag (the welcome screen takes over). Reset
-    // to the default so a stale `true` from the previous project doesn't
-    // bleed into the next setDirectory call before its preload runs.
-    _duckMischiefPlayed = false;
     _restartFileWatcher(null); // tear down the recursive watcher
     await timeline.bindToWorkspace(null);
     recentEdits.bindWorkspace(null);
@@ -1729,6 +1702,64 @@ class AppState extends ChangeNotifier {
     await chat.bindToWorkspace(null);
     unawaited(workspaceSkills.reload(null));
     notifyListeners();
+  }
+
+  /// Drain every running PTY child the IDE spawned: hidden RUN_CMD
+  /// agent invocations, promoted visible agent tabs, AND the user's
+  /// own interactive terminal tabs. Each session gets a short Ctrl+C
+  /// grace window so foreground process groups (`npm` → `node`,
+  /// `python` → `uvicorn`, etc.) can flush before the hard kill.
+  ///
+  /// Used by three call sites with different intent:
+  ///   1. [setDirectory] — workspace swap. Renegades from the outgoing
+  ///      project shouldn't survive the swap. [killTrackedPids] is
+  ///      `false` so we don't accidentally murder long-running daemons
+  ///      tracked elsewhere (e.g. adopted gitnexus serve).
+  ///   2. [closeWorkspace] — same reasoning as (1).
+  ///   3. [AppCloseGuard._closeForReal] — the IDE itself is exiting.
+  ///      [killTrackedPids] is `true` so the defence-in-depth sweep
+  ///      via [LumenProcessTracker.killAllTracked] also reaps any
+  ///      descendant that survived the graceful path (an interactive
+  ///      shell that swallowed Ctrl+C, a tool process detached with
+  ///      `start /B`, etc).
+  Future<void> shutdownAllTerminals({
+    Duration graceWindow = const Duration(milliseconds: 250),
+    bool killTrackedPids = false,
+  }) async {
+    // Run the bridge sweep and the pane sweep concurrently — they
+    // operate on disjoint session sets (bridge owns hidden + promoted
+    // agent sessions; pane owns interactive). Promoted agent sessions
+    // appear in both lists; double-terminate is harmless (Ctrl+C +
+    // dispose are idempotent).
+    final futures = <Future<void>>[
+      _safeShutdownBridge(graceWindow),
+      _safeShutdownPane(graceWindow),
+    ];
+    await Future.wait(futures);
+    if (killTrackedPids) {
+      try {
+        lumenProcesses.killAllTracked();
+      } catch (_) {
+        // Tracker sweep is defence-in-depth; never raise.
+      }
+    }
+  }
+
+  Future<void> _safeShutdownBridge(Duration grace) async {
+    try {
+      await agentTerminals.shutdownAll(graceWindow: grace);
+    } catch (_) {
+      // Best-effort; the pane sweep and tracker sweep still run.
+    }
+  }
+
+  Future<void> _safeShutdownPane(Duration grace) async {
+    try {
+      await ideActions.shutdownAllTerminals(graceWindow: grace);
+    } catch (_) {
+      // The pane may not be mounted (welcome screen) — that's fine,
+      // the callback is null and the IdeActions helper no-ops.
+    }
   }
 
   // --- Chat convenience pass-throughs (so legacy widgets keep working) ---
@@ -1745,5 +1776,4 @@ class AppState extends ChangeNotifier {
   void appendTerminalOutputToChat(String text) {
     chat.appendTerminalOutput(text, workspacePath: _currentDirectory);
   }
-
 }

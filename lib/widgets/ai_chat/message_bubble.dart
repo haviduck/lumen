@@ -24,7 +24,7 @@ import 'tool_segments.dart';
 ///   sent this" — restores file changes AND truncates the chat. Can
 ///   be shown with `count == 0` when there are no file changes but
 ///   subsequent messages still exist to truncate.
-enum BubbleRestoreScope { assistantTurn, chatRewind }
+enum BubbleRestoreScope { assistantTurn, chatRewind, workspaceMismatch }
 
 /// Single chat bubble in the AI chat panel.
 ///
@@ -241,6 +241,7 @@ class _MessageBubbleState extends State<MessageBubble> {
         seg.pendingBody = bodies[bodyIdx].body;
         bodyIdx++;
       }
+
       for (final seg in segs) {
         if (seg is ToolSegment) {
           attach(seg);
@@ -296,7 +297,9 @@ class _MessageBubbleState extends State<MessageBubble> {
                   children: [
                     if (widget.onRestore != null &&
                         (widget.restoreChangeCount > 0 ||
-                            widget.restoreFollowupMessages > 0)) ...[
+                            widget.restoreFollowupMessages > 0 ||
+                            widget.restoreScope ==
+                                BubbleRestoreScope.workspaceMismatch)) ...[
                       _RestoreChip(
                         count: widget.restoreChangeCount,
                         scope: widget.restoreScope,
@@ -458,10 +461,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     if (seg is ThinkingSegment) {
       return KeyedSubtree(
         key: ValueKey('think-$index'),
-        child: _ThinkingBlock(
-          content: seg.content,
-          isActive: seg.isActive,
-        ),
+        child: _ThinkingBlock(content: seg.content, isActive: seg.isActive),
       );
     }
     if (seg is ProseSegment) {
@@ -510,9 +510,7 @@ class _MessageBubbleState extends State<MessageBubble> {
     return MarkdownBody(
       data: text,
       selectable: false,
-      builders: <String, MarkdownElementBuilder>{
-        'pre': _CodeBlockBuilder(),
-      },
+      builders: <String, MarkdownElementBuilder>{'pre': _CodeBlockBuilder()},
       styleSheet: MarkdownStyleSheet(
         // Assistant reply prose intentionally renders dimmer than
         // user-typed text (which uses [fgPrimary] in
@@ -684,10 +682,7 @@ class _CodeBlockState extends State<_CodeBlock> {
             padding: const EdgeInsets.fromLTRB(12, 5, 5, 5),
             decoration: const BoxDecoration(
               border: Border(
-                bottom: BorderSide(
-                  color: DuckColors.glassSeam,
-                  width: 0.5,
-                ),
+                bottom: BorderSide(color: DuckColors.glassSeam, width: 0.5),
               ),
             ),
             child: Row(
@@ -859,17 +854,13 @@ class _TurnTimingFooter extends StatelessWidget {
         (lastIter != null && lastIter >= 175000 && lastIter <= 185000);
 
     return Tooltip(
-      message: hitTheWall
-          ? S.turnTimingWallTooltip
-          : S.turnTimingTooltip,
+      message: hitTheWall ? S.turnTimingWallTooltip : S.turnTimingTooltip,
       waitDuration: const Duration(milliseconds: 350),
       child: Text(
         text,
         style: TextStyle(
           fontSize: 11,
-          color: hitTheWall
-              ? DuckColors.stateWarn
-              : DuckColors.fgMuted,
+          color: hitTheWall ? DuckColors.stateWarn : DuckColors.fgMuted,
           fontFamily: DuckTheme.monoFont,
           height: 1.3,
         ),
@@ -1037,10 +1028,9 @@ class _RestoreChipState extends State<_RestoreChip> {
       case BubbleRestoreScope.assistantTurn:
         return S.chatRestoreFilesTooltip(widget.count);
       case BubbleRestoreScope.chatRewind:
-        return S.chatRewindTooltip(
-          widget.count,
-          widget.followupMessageCount,
-        );
+        return S.chatRewindTooltip(widget.count, widget.followupMessageCount);
+      case BubbleRestoreScope.workspaceMismatch:
+        return S.chatRestoreUnavailableWorkspace;
     }
   }
 
@@ -1233,11 +1223,7 @@ class _SlashCommandLabel extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(
-            Icons.terminal,
-            size: 12,
-            color: DuckColors.accentCyan,
-          ),
+          const Icon(Icons.terminal, size: 12, color: DuckColors.accentCyan),
           const SizedBox(width: 6),
           Flexible(
             child: Text(
@@ -1310,16 +1296,19 @@ class _ThinkingBlockState extends State<_ThinkingBlock>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           MouseRegion(
-            cursor: clickable ? SystemMouseCursors.click : SystemMouseCursors.basic,
+            cursor: clickable
+                ? SystemMouseCursors.click
+                : SystemMouseCursors.basic,
             onEnter: (_) => setState(() => _hover = true),
             onExit: (_) => setState(() => _hover = false),
             child: GestureDetector(
-              onTap: clickable ? () => setState(() => _expanded = !_expanded) : null,
+              onTap: clickable
+                  ? () => setState(() => _expanded = !_expanded)
+                  : null,
               behavior: HitTestBehavior.opaque,
               child: AnimatedContainer(
                 duration: DuckMotion.fast,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
                 decoration: BoxDecoration(
                   color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
                   borderRadius: BorderRadius.circular(DuckTheme.radiusS),
@@ -1348,9 +1337,7 @@ class _ThinkingBlockState extends State<_ThinkingBlock>
                       ),
                     const SizedBox(width: 5),
                     Text(
-                      widget.isActive
-                          ? S.thinkingActive
-                          : S.thinkingDone,
+                      widget.isActive ? S.thinkingActive : S.thinkingDone,
                       style: TextStyle(
                         fontSize: 11,
                         color: widget.isActive
@@ -1362,9 +1349,7 @@ class _ThinkingBlockState extends State<_ThinkingBlock>
                     if (hasContent && !widget.isActive) ...[
                       const SizedBox(width: 2),
                       Icon(
-                        _expanded
-                            ? Icons.expand_less
-                            : Icons.expand_more,
+                        _expanded ? Icons.expand_less : Icons.expand_more,
                         size: 12,
                         color: DuckColors.fgFaint,
                       ),

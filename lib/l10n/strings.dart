@@ -326,6 +326,16 @@ class S {
   static const String chatQueuedSendNowTooltip =
       'Stop the current turn and send this prompt right away';
   static const String chatRestoreConfirmTitle = 'Restore file changes?';
+  static const String chatRestoreUnavailableTitle =
+      'No file changes found for this message';
+  static const String chatRestoreUnavailableWorkspace =
+      'This chat was recorded in a different workspace. Open that workspace '
+      'and try restore again.';
+  static const String chatRestoreUnavailableNoRows =
+      'No timeline rows are tagged to this chat bubble. The turn may have '
+      'been rewound already, pruned, or recorded before durable turn '
+      'savepoints existed. Open the File Timeline and check Orphaned chat '
+      'turns or Time machine.';
   static String chatRestoreFilesTooltip(int count) =>
       count == 1 ? 'Restore 1 file change' : 'Restore $count file changes';
   static String chatRestoreConfirmBody(int count) =>
@@ -740,6 +750,31 @@ class S {
   static const String explorerRedoSourceMissing =
       'Cannot redo because the original item is missing.';
 
+  // Drag-OUT confirmation (file/folder row → Windows Explorer / other app).
+  // Fired from `_DragOutPromptDialog` the first time the user drags a row
+  // out of Lumen in a given session. Optional "don't ask again this
+  // session" checkbox suppresses the dialog for subsequent drags until
+  // the app is restarted. See `widgets/file_explorer/drag_out_prompt.dart`.
+  static const String dragOutPromptTitle = 'Drag out of Lumen?';
+  static String dragOutPromptBodyFileFmt(String name) =>
+      'Drop "$name" into Windows Explorer or another app. The original stays in your workspace.';
+  static String dragOutPromptBodyFolderFmt(String name) =>
+      'Drop the folder "$name" into Windows Explorer or another app. The original stays in your workspace.';
+  static const String dragOutPromptConfirm = 'Drag';
+  static const String dragOutPromptCancel = 'Cancel';
+  static const String dragOutPromptSkipSession =
+      "Don't ask again this session";
+
+  // Drop-IN of virtual files from archive viewers (WinRAR / 7-Zip /
+  // Bandizip / etc.). When the extracted name collides with an existing
+  // file in the destination directory we suffix " (n)" via the same
+  // `_uniquePastePath` helper used for regular paste, so the toast text
+  // here is informational only.
+  static String dropExtractedFmt(int n) => n == 1
+      ? 'Extracted 1 file into the workspace.'
+      : 'Extracted $n files into the workspace.';
+  static const String dropExtractFailed = 'Some files failed to extract.';
+
   // Slash commands
   static const String slashHandoffDescription =
       'Write a chat-to-chat handoff so a fresh chat can pick up where you left off.';
@@ -764,23 +799,12 @@ class S {
 
   // Editor
   static const String editorNoFileOpen = 'No file open';
-  // Empty-editor mascot gag (see _DuckMischief in widgets/editor/editor.dart).
-  // The stage starts empty (just the always-shown `editorEmptyAnatidaephobia`
-  // flavor line — the definition of the fear that, somewhere, a duck is
-  // watching you), then the duck waddles in, slaps the Create New File
-  // button into existence at center, pauses to declare
-  // `editorEmptyDuckRebellion` in a comic speech bubble, and exits left.
-  // The slapped button stays put after — the duck literally placed it.
-  static const String editorEmptyAnatidaephobia =
-      'Anatidaephobia — the irrational fear that somewhere, a duck is watching you.';
+  // Empty-editor surface (see `_EmptyEditorState` in
+  // widgets/editor/editor.dart). A single calm headline + a Create
+  // New File button — same on every visit, no animation, no mascot.
+  static const String editorEmptyHeadline =
+      'Nothing open. Pick a file from the explorer or start a new one.';
   static const String editorEmptyCreateNewFile = 'Create New File';
-  static const String editorEmptyDuckRebellion = 'I AM THE REBELLION';
-  // Dev-only Command Palette entry — bumps a replay tick on AppState
-  // so `_DuckMischief` (keyed off it) tears down and re-mounts. Lets
-  // us iterate on the gag without resetting prefs by hand. Category
-  // and title kept short because the palette truncates aggressively.
-  static const String paletteDevReplayDuck = 'Replay duck mischief';
-  static const String paletteCategoryDev = 'Dev';
   static const String editorSaved = 'Saved';
   static const String editorUnsaved = 'Unsaved changes';
   static const String editorLanguage = 'Language';
@@ -1401,6 +1425,10 @@ class S {
   static const String timelineDiffCurrent = 'CURRENT FILE';
   static const String timelineRestoreAction = 'Restore this version';
   static const String timelineRestoreConfirmTitle = 'Restore this revision?';
+  static const String timelineRestoreNoMessageChanges =
+      'No file changes were recorded for this revert.';
+  static const String timelineRestoreNoTurnChanges =
+      'No file changes were recorded for these turns.';
   static const String timelineSearchHint = 'Filter by path, tool, or note…';
   static const String timelineScopeOff = 'Active file only';
   static const String timelineFilterAll = 'All';
@@ -1408,6 +1436,23 @@ class S {
   static const String timelineFilterUser = 'You';
   static const String timelineFilterExternal = 'External';
   static const String timelineFilterBaseline = 'Baselines';
+  static const String timelineFilterOrphaned = 'Orphaned chat turns';
+  static const String timelineShowArchived = 'Show archived';
+  static const String timelineHideArchived = 'Hide archived';
+  static const String timelineOrphanedEmpty =
+      'No orphaned chat turns in this workspace.';
+  static const String timelineRestoreTurn = 'Restore this turn';
+  static const String timelineTimeMachineAction = 'Time machine';
+  static const String timelineTimeMachineTooltip =
+      'Revert the project to a point in the recorded timeline';
+  static const String timelineTimeMachineTitle = 'Project time machine';
+  static const String timelineTimeMachineNoEntries =
+      'No timeline entries are available yet.';
+  static const String timelineTimeMachinePick = 'Pick a restore point';
+  static const String timelineIntegrityLegacy =
+      'Timeline loaded legacy chat edits without durable turn savepoints.';
+  static String timelineIntegritySummary(int legacyRows, int orphanTurns) =>
+      'Timeline: $legacyRows legacy row(s), $orphanTurns orphaned turn(s) still restorable.';
   static const String timelineGroupToday = 'TODAY';
   static const String timelineGroupYesterday = 'YESTERDAY';
   static const String timelineGroupThisWeek = 'THIS WEEK';
@@ -1439,6 +1484,22 @@ class S {
   static const String timelineMenuTooltip = 'Browse file revision history';
   static String timelineScopeOn(String label) =>
       label.isEmpty ? 'Active file only' : 'Active file: $label';
+  static String timelineOrphanedSummary(int turns) => turns == 1
+      ? '1 orphaned turn is still restorable.'
+      : '$turns orphaned turns are still restorable.';
+  static String timelineTurnEntryCount(int count) =>
+      count == 1 ? '1 file change' : '$count file changes';
+  static String timelineArchivedCount(int count) =>
+      count == 1 ? '1 archived entry' : '$count archived entries';
+  static String timelineRestoreBreakdown({
+    required int restored,
+    required int failed,
+    required int skipped,
+    required int total,
+  }) =>
+      'Restored $restored, failed $failed, skipped $skipped of $total timeline change(s).';
+  static String timelineRestoreFailureDetails(String detail, int hidden) =>
+      hidden <= 0 ? 'Failed: $detail' : 'Failed: $detail and $hidden more.';
   static String timelineRestoreConfirmBody(String path, String when) =>
       'Replace the current contents of $path with the version from $when?\n\n'
       'A pre-restore snapshot is captured first, so you can undo this from '
@@ -2192,8 +2253,7 @@ class S {
   // Convene-the-Council modal: doc / image attachment surfaces.
   static const String councilWizardAttachDocsHint =
       'Drag files in, paste images, or attach docs.';
-  static const String councilWizardDropHint =
-      'Drop to attach to the brief.';
+  static const String councilWizardDropHint = 'Drop to attach to the brief.';
   static const String councilWizardPickDocs = 'Attach docs';
   static String councilWizardDocsAttached(int count) =>
       '$count document${count == 1 ? '' : 's'} attached.';
@@ -2302,6 +2362,53 @@ class S {
   static const String councilSecurityGoalExploit = 'Validate impact';
   static const String councilSecurityGoalEvidence = 'Gather evidence';
   static const String councilSecurityGoalRemediate = 'Report fixes';
+
+  // Excellence Doctrine — phase labels (rendered on the phase strip).
+  static const String councilPhaseDiscovery = 'Discovery';
+  static const String councilPhaseArchitecture = 'Architecture';
+  static const String councilPhaseBuild = 'Build';
+  static const String councilPhaseReview = 'Review';
+  static const String councilPhasePolish = 'Polish';
+  static const String councilPhaseShip = 'Ship';
+
+  // Excellence Doctrine — quality gate panel.
+  static const String councilGatePanelTitle = 'Quality gate';
+  static const String councilGateArtifacts = 'Artifacts shipped';
+  static const String councilGateReview = 'Adversarial review';
+  static const String councilGateClaims = 'Claims grounded';
+  static const String councilGateUserAsks = 'User asks resolved';
+  static const String councilGateRisks = 'Open risks named';
+  static const String councilGatePhases = 'Phases covered';
+  static const String councilGateLocked = 'Locked — keep working';
+  static const String councilGateUnlocked = 'Unlocked — ready to ship';
+  static String councilGateProgress(int passed, int total) =>
+      '$passed of $total gates';
+  static String councilGateAttempts(int attempts) =>
+      attempts == 1 ? '1 check' : '$attempts checks';
+
+  // Adversarial Critic — visual surface.
+  static const String councilCriticTitle = 'Adversarial Critic';
+  static const String councilCriticStarted =
+      'Critic summoned — attacking the council\'s work.';
+  static const String councilCriticIdle =
+      'The Critic arrives when the council attempts to ship.';
+  static const String councilCriticEmpty =
+      'Critic ran but produced no attacks.';
+  static String councilCriticAttackCount(int n) =>
+      n == 1 ? '1 attack' : '$n attacks';
+  static String councilCriticBlockerLabel(int n) =>
+      n == 1 ? '1 BLOCKER' : '$n BLOCKERS';
+  static String councilCriticMajorLabel(int n) =>
+      n == 1 ? '1 major' : '$n major';
+  static String councilCriticMinorLabel(int n) =>
+      n == 1 ? '1 minor' : '$n minor';
+  static const String councilCriticOpenSummary = 'View Critic findings';
+  static const String councilCriticCloseSummary = 'Hide Critic findings';
+  static const String councilCriticTargetLabel = 'TARGET';
+  static const String councilCriticAttackLabel = 'ATTACK';
+  static const String councilCriticAcceptanceLabel = 'ACCEPTANCE';
+  static const String councilCriticResolved = 'Resolved by orchestrator';
+  static const String councilCriticUnresolved = 'Unresolved';
   static const String councilStatusIdle = 'idle';
   static const String councilStatusDispatching = 'dispatching';
   static const String councilStatusWorking = 'working';
@@ -2327,8 +2434,7 @@ class S {
       'No transcript yet. Output appears here as the agent thinks and acts.';
   static const String councilInspectorCopyTranscriptTooltip =
       'Copy full transcript';
-  static const String councilInspectorTranscriptStreaming =
-      'streaming…';
+  static const String councilInspectorTranscriptStreaming = 'streaming…';
   static const String councilInspectorCopied = 'Copied to clipboard.';
   static String councilInspectorTasksLabel(int count) =>
       count == 1 ? 'TASKS · 1' : 'TASKS · $count';
@@ -2363,8 +2469,7 @@ class S {
   static const String councilFinishedTitle = 'Council Complete';
   static const String councilFinishedSubtitle =
       'All agents have finished. Review the report or start a follow-up round.';
-  static String councilFinishedElapsed(String duration) =>
-      'Elapsed: $duration';
+  static String councilFinishedElapsed(String duration) => 'Elapsed: $duration';
   static String councilFinishedAgentsDone(int done, int total) =>
       '$done / $total agents done';
   static const String councilFinishedViewReport = 'View Report';
@@ -2391,11 +2496,16 @@ class S {
   static const String councilActivityThinking = 'Thinking through it.';
   static const String councilActivityWorking = 'Working on it.';
   static const String councilActivityReplying = 'Drafting my reply.';
-  static const String councilActivitySynthesizing = 'Synthesizing the council\'s findings.';
-  static const String councilActivityAwaitingUser = 'I need your input to continue.';
-  static const String councilActivityAwaitingPool = 'Waiting on the pool to weigh in.';
-  static const String councilActivityAskingPool = 'Asking the pool for a sanity check.';
-  static const String councilActivityDispatching = 'Dispatching tasks to the team.';
+  static const String councilActivitySynthesizing =
+      'Synthesizing the council\'s findings.';
+  static const String councilActivityAwaitingUser =
+      'I need your input to continue.';
+  static const String councilActivityAwaitingPool =
+      'Waiting on the pool to weigh in.';
+  static const String councilActivityAskingPool =
+      'Asking the pool for a sanity check.';
+  static const String councilActivityDispatching =
+      'Dispatching tasks to the team.';
   static const String councilActivityCoordinating = 'Coordinating the team.';
   static const String councilActivityDone = 'Done — findings logged.';
   static const String councilActivityAborted = 'Aborted.';
@@ -2406,7 +2516,8 @@ class S {
   // the column at ~256px wide.
   static String councilActivityWorkingOn(String task) => 'Working on: $task';
   static String councilActivityNextUp(String action) => 'Next: $action';
-  static String councilActivityWaitingOn(String reason) => 'Waiting on $reason.';
+  static String councilActivityWaitingOn(String reason) =>
+      'Waiting on $reason.';
   static String councilActivityStuck(String error) => 'Stuck: $error';
   // Transient event flash labels — overlay the primary line for ~6s
   // when something newsworthy happens. Quoted text comes from the
@@ -2417,7 +2528,8 @@ class S {
   static String councilFlashUserReply(String r) => 'You replied: $r';
   static String councilFlashUserPing(String p) => 'You pinged me: $p';
   static const String councilFlashDispatchSelf = 'Got my orders. Going in.';
-  static String councilFlashDispatchOut(String agent) => 'Dispatching to $agent.';
+  static String councilFlashDispatchOut(String agent) =>
+      'Dispatching to $agent.';
   static const String councilFlashFinished = 'Finished. Tap to read.';
   static String councilFlashError(String e) => 'Error: $e';
   static const String councilFlashStalled = 'Stalled — re-nudging.';
@@ -2429,7 +2541,8 @@ class S {
   static String councilFlashEditing(String path) => 'Editing $path';
   static String councilFlashWriting(String path) => 'Writing $path';
   static String councilFlashExploring(String path) => 'Exploring $path';
-  static String councilFlashSearching(String pattern) => 'Searching for $pattern';
+  static String councilFlashSearching(String pattern) =>
+      'Searching for $pattern';
   static String councilFlashRunning(String cmd) => 'Running $cmd';
   static const String councilFlashWebSearch = 'Searching the web';
   static String councilFlashWebFetch(String url) => 'Fetching $url';
@@ -2442,19 +2555,40 @@ class S {
   // task. Drives the per-card step indicator and the bubble's
   // "Step K/N" primary line.
   static String councilFlashSubtasksPlanned(int total) =>
-      total == 1
-          ? 'Planned 1 step.'
-          : 'Planned $total steps.';
+      total == 1 ? 'Planned 1 step.' : 'Planned $total steps.';
   static String councilFlashSubtaskDone(int step, int total, String summary) =>
       summary.isEmpty
-          ? 'Step $step of $total done.'
-          : 'Step $step/$total: $summary';
+      ? 'Step $step of $total done.'
+      : 'Step $step/$total: $summary';
   static String councilActivityStepOf(int step, int total, String label) =>
       'Step $step/$total: $label';
   static String councilActivityJustDid(String summary) => 'Just did: $summary';
   static String councilStepIndicatorLabel(int step, int total) =>
       'Step $step / $total';
   static const String councilStepIndicatorPlanned = 'Plan pending';
+
+  // --- Council voice panel (integrated speech surface inside agent card) ---
+  // The voice panel replaced the floating speech bubble layer. It lives
+  // inside the agent card as a distinct region between the identity
+  // header and the activity well. These strings drive the eyebrow,
+  // mention chip, and pool-targeting chip.
+  /// Label of the recipient's mention chip — sits on the recipient's
+  /// eyebrow when speaker A name-drops them. `$speaker` is the speaker
+  /// display name. Kept compact (pill widget, ~10ch budget).
+  static String councilVoicePanelMentionedByFmt(String speaker) =>
+      '@$speaker';
+  /// Tooltip text on the mention chip — full sentence form for
+  /// accessibility / hover-to-confirm.
+  static String councilVoicePanelMentionedByTooltip(String speaker) =>
+      '$speaker mentioned me';
+  /// Label of the askPool targeting chip on the asker's voice panel.
+  /// Sits next to the status chip while the pool question is unresolved.
+  /// `$targets` is a comma-separated list of recipient display names.
+  static String councilVoicePanelTargetingFmt(String targets) =>
+      '\u2192 $targets';
+  /// Tooltip text on the targeting chip.
+  static String councilVoicePanelTargetingTooltip(String targets) =>
+      'Targeting pool: $targets';
 
   // --- Pentest / security-test mode ---
   static const String councilPentestGoalLabel = 'TARGET';
@@ -2470,4 +2604,26 @@ class S {
   static const String councilPentestAttackSurface = 'Attack Surface';
   static const String councilPentestExploitChains = 'Exploit Chains';
   static const String councilPentestRemediation = 'Remediation';
+
+  // --- Late-night well-being panel ---
+  // Surfaces from the top of the IDE when the user has put in 9+
+  // hours of active work in the current local day AND the clock has
+  // crossed into the late band (22:00..05:00). Tone is empathetic,
+  // first-person, written by a designer for a developer who might be
+  // stuck. Once dismissed, stays quiet until the next local day.
+  static const String wellbeingTitle = 'How are you holding up?';
+  // Body line 1 — hours-aware. `$hours` is today's active hour count
+  // (rounded down). Keep this human; the panel is not a status bar.
+  static String wellbeingBody1Fmt(int hours) =>
+      'You\'ve been at it for $hours+ hours today. That\'s a real shift, '
+      'and you\'ve done really good.';
+  static const String wellbeingBody2 =
+      'If you\'re stuck on something — speaking from someone who\'s '
+      'struggled with design too — stepping away to get some sleep often '
+      'helps more than another hour of pushing through.';
+  static const String wellbeingBody3 =
+      'Completely understand if you\'re deep in a programming challenge '
+      'though.';
+  static const String wellbeingGoodLuck = 'Good luck out there.';
+  static const String wellbeingClose = 'Dismiss';
 }

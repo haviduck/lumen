@@ -224,6 +224,79 @@ class TimelineEntry {
   }
 }
 
+/// Durable index for "one assistant turn touched these timeline entries".
+///
+/// The journal remains the source of truth for content and ordering. This
+/// manifest is a recovery index: even if the chat bubble that originally
+/// owned the edits is removed by chat rewind, the turn still appears in
+/// the timeline and can be restored by [entryIds].
+class TimelineTurnManifest {
+  static const int schemaVersion = 1;
+
+  final String turnId;
+  final String sessionId;
+  final String messageId;
+  final DateTime startedAt;
+  final DateTime endedAt;
+  final String userPromptPreview;
+  final List<String> entryIds;
+
+  const TimelineTurnManifest({
+    required this.turnId,
+    required this.sessionId,
+    required this.messageId,
+    required this.startedAt,
+    required this.endedAt,
+    required this.userPromptPreview,
+    required this.entryIds,
+  });
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'v': schemaVersion,
+    'turnId': turnId,
+    'sessionId': sessionId,
+    'messageId': messageId,
+    'startedAt': startedAt.toUtc().toIso8601String(),
+    'endedAt': endedAt.toUtc().toIso8601String(),
+    'userPromptPreview': userPromptPreview,
+    'entryIds': entryIds,
+  };
+
+  static TimelineTurnManifest? tryFromJson(Map<String, dynamic> json) {
+    try {
+      final v = json['v'];
+      if (v is! int || v != schemaVersion) return null;
+      final turnId = json['turnId'] as String?;
+      final sessionId = json['sessionId'] as String?;
+      final messageId = json['messageId'] as String?;
+      final startedAt = DateTime.tryParse(json['startedAt'] as String? ?? '');
+      final endedAt = DateTime.tryParse(json['endedAt'] as String? ?? '');
+      if (turnId == null ||
+          sessionId == null ||
+          messageId == null ||
+          startedAt == null ||
+          endedAt == null) {
+        return null;
+      }
+      final ids = ((json['entryIds'] as List?) ?? const <Object?>[])
+          .whereType<String>()
+          .where((id) => id.isNotEmpty)
+          .toList(growable: false);
+      return TimelineTurnManifest(
+        turnId: turnId,
+        sessionId: sessionId,
+        messageId: messageId,
+        startedAt: startedAt.toLocal(),
+        endedAt: endedAt.toLocal(),
+        userPromptPreview: (json['userPromptPreview'] as String?) ?? '',
+        entryIds: ids,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
 /// Tiny helper because `firstOrNull` on a filtered iterable isn't on
 /// `WhereIterable` directly. Avoids pulling `package:collection` for
 /// one call site.

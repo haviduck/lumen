@@ -152,16 +152,6 @@ class PreferencesService {
   // installed Node or never want the integration can turn it off and
   // forget about it.
   static const String _kGitNexusEnabled = 'gitnexus.enabled';
-  // Per-workspace one-shot flag: has the empty-editor duck mischief gag
-  // played for this project yet? On the first visit it plays in full
-  // (smaller duck waddles in along the bottom, jumps to "throw" the
-  // Create New File button into existence, exits left). On subsequent
-  // visits the empty-editor surface skips the animation and just shows
-  // the Create New File button under the quip — no waiting, no mascot
-  // doing his thing every time you close the last open tab. Stored
-  // per-workspace via the existing `_wsKey` hash so two unrelated
-  // projects don't share the flag.
-  static const String _kDuckMischiefPlayed = 'editor.duckMischief.played';
 
   Future<SharedPreferences> get _p => SharedPreferences.getInstance();
 
@@ -521,16 +511,6 @@ class PreferencesService {
     await (await _p).setString('$_kCurrentSessionId.${_wsKey(path)}', v);
   }
 
-  /// Per-workspace one-shot flag. `false` (or never set) means the duck
-  /// mischief gag has NOT yet played for this project — the empty-editor
-  /// surface should run the full animation. `true` means subsequent
-  /// visits should skip straight to the static "quip + button" layout.
-  /// See `_kDuckMischiefPlayed` for the full rationale.
-  Future<bool> getDuckMischiefPlayedForWorkspace(String? path) async =>
-      (await _p).getBool('$_kDuckMischiefPlayed.${_wsKey(path)}') ?? false;
-  Future<void> setDuckMischiefPlayedForWorkspace(String? path, bool v) async =>
-      (await _p).setBool('$_kDuckMischiefPlayed.${_wsKey(path)}', v);
-
   Future<String?> getTerminalShellId() async =>
       (await _p).getString(_kTerminalShell);
   Future<void> setTerminalShellId(String? id) async {
@@ -620,6 +600,54 @@ class PreferencesService {
       (await _p).getBool(_kGitNexusEnabled) ?? true;
   Future<void> setGitNexusEnabled(bool v) async =>
       (await _p).setBool(_kGitNexusEnabled, v);
+
+  // --- Work-session tracker (late-night well-being panel) ---
+  // Per-day "active work" seconds, keyed by local-date `YYYY-MM-DD`.
+  // The tracker counts time only when the window is focused AND the
+  // user has interacted in the last few minutes (see
+  // `WorkSessionTracker`) — wallclock IDE-open time would over-count
+  // dinner breaks, while a pure idle-debounce would under-count a
+  // designer staring at a Figma frame. The hybrid is good enough for
+  // a kind nudge at 9h+.
+  //
+  // We persist only today and yesterday to keep `SharedPreferences`
+  // small. The wellbeing-shown gate is a single date string ("last
+  // day we surfaced the panel"); once today matches, the panel
+  // stays put until tomorrow.
+  static const String _kWorkDailyActivePrefix = 'work.dailyActive';
+  static const String _kWellbeingLastShownDay = 'work.wellbeingLastShownDay';
+
+  String _workDailyKey(String day) => '$_kWorkDailyActivePrefix.$day';
+
+  Future<int> getDailyActiveSeconds(String day) async =>
+      (await _p).getInt(_workDailyKey(day)) ?? 0;
+
+  Future<void> setDailyActiveSeconds(String day, int seconds) async =>
+      (await _p).setInt(_workDailyKey(day), seconds < 0 ? 0 : seconds);
+
+  /// Drops every persisted `work.dailyActive.*` entry except for
+  /// [keepDays]. Caller passes today (and optionally yesterday) so
+  /// the cache stays tiny across long-lived installs.
+  Future<void> pruneDailyActiveDays(Set<String> keepDays) async {
+    final p = await _p;
+    final keepKeys = keepDays.map(_workDailyKey).toSet();
+    final stale = p
+        .getKeys()
+        .where(
+          (k) =>
+              k.startsWith('$_kWorkDailyActivePrefix.') &&
+              !keepKeys.contains(k),
+        )
+        .toList();
+    for (final k in stale) {
+      await p.remove(k);
+    }
+  }
+
+  Future<String> getWellbeingLastShownDay() async =>
+      (await _p).getString(_kWellbeingLastShownDay) ?? '';
+  Future<void> setWellbeingLastShownDay(String day) async =>
+      (await _p).setString(_kWellbeingLastShownDay, day);
 
   // --- Remote Access (Lumen mobile companion) ---
   /// Master switch for the embedded HTTP server. Off by default —

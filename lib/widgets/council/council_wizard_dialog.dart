@@ -2,12 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
@@ -209,13 +209,80 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
           padding: const EdgeInsets.all(24),
           child: Material(
             color: Colors.transparent,
-            child: DropTarget(
-              onDragEntered: (_) => setState(() => _dropHover = true),
-              onDragExited: (_) => setState(() => _dropHover = false),
-              onDragDone: (detail) async {
+            child: DropRegion(
+              formats: Formats.standardFormats,
+              hitTestBehavior: HitTestBehavior.opaque,
+              onDropOver: (event) {
+                for (final item in event.session.items) {
+                  if (item.canProvide(Formats.fileUri) ||
+                      item.platformFormats.isNotEmpty) {
+                    return DropOperation.copy;
+                  }
+                }
+                return DropOperation.none;
+              },
+              onDropEnter: (_) => setState(() => _dropHover = true),
+              onDropLeave: (_) => setState(() => _dropHover = false),
+              onPerformDrop: (event) async {
                 setState(() => _dropHover = false);
-                for (final f in detail.files) {
-                  await _ingestDroppedFile(f.path);
+                for (final item in event.session.items) {
+                  final reader = item.dataReader;
+                  if (reader == null) continue;
+                  if (reader.canProvide(Formats.fileUri)) {
+                    reader.getValue<Uri>(
+                      Formats.fileUri,
+                      (uri) async {
+                        if (uri == null) return;
+                        await _ingestDroppedFile(uri.toFilePath());
+                      },
+                      onError: (e) => debugPrint(
+                        '[Lumen council-drop] fileUri read failed: $e',
+                      ),
+                    );
+                    continue;
+                  }
+                  // Virtual file (WinRAR / archives) → extract to a
+                  // temp file then ingest. Matches the chat-composer
+                  // strategy; the temp file lingers but the council
+                  // wizard is modal and short-lived so the impact is
+                  // negligible.
+                  reader.getFile(
+                    null,
+                    (file) async {
+                      try {
+                        final name = file.fileName ??
+                            await reader.getSuggestedName() ??
+                            'lumen-council-drop';
+                        final flat =
+                            name.replaceAll('\\', '/').split('/').last;
+                        final safe = flat.replaceAll(
+                          RegExp(r'[<>:"|?*]'),
+                          '_',
+                        );
+                        final tmpDir = await Directory.systemTemp
+                            .createTemp('lumen_council_drop_');
+                        final destPath = p.join(tmpDir.path, safe);
+                        final sink = File(destPath).openWrite();
+                        try {
+                          await for (final chunk in file.getStream()) {
+                            sink.add(chunk);
+                          }
+                        } finally {
+                          await sink.flush();
+                          await sink.close();
+                        }
+                        if (!mounted) return;
+                        await _ingestDroppedFile(destPath);
+                      } catch (e) {
+                        debugPrint(
+                          '[Lumen council-drop] virtual extract failed: $e',
+                        );
+                      }
+                    },
+                    onError: (e) => debugPrint(
+                      '[Lumen council-drop] virtual read failed: $e',
+                    ),
+                  );
                 }
               },
               child: _Sheet(

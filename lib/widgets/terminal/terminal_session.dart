@@ -497,6 +497,44 @@ class TerminalSession {
     _hardKill();
   }
 
+  /// Generalised graceful shutdown that works for BOTH interactive and
+  /// agent sessions. Writes Ctrl+C into the PTY (broadcasts SIGINT to
+  /// the foreground process group, which is the only way to take down
+  /// long-running grandchildren spawned via the shell — `Process.killPid`
+  /// alone would orphan `node`/`python`/etc.), waits [graceWindow], and
+  /// then unconditionally hard-kills. Always followed by a [dispose] in
+  /// the caller; this method does NOT release the focus/scroll
+  /// controllers.
+  ///
+  /// The agent variant ([killAgent]) is preserved for callers that
+  /// specifically want to race the agent exit completer (RUN_CMD's
+  /// soft-timeout / cancel path). For "I just want this terminal dead
+  /// before I tear down the workspace", use this method.
+  Future<void> terminate({
+    Duration graceWindow = const Duration(milliseconds: 250),
+  }) async {
+    if (_disposed) return;
+    try {
+      _pty?.write(Uint8List.fromList([0x03]));
+    } catch (_) {}
+    // For agent sessions we have a real exit completer to race against,
+    // so we get an early return on clean exit. For interactive sessions
+    // there's nothing to await on — just sleep the grace window and
+    // hard-kill.
+    if (isAgent && !(_agentExitCompleter?.isCompleted ?? true)) {
+      try {
+        await _agentExitCompleter!.future.timeout(graceWindow);
+      } on TimeoutException {
+        // Fall through to hard-kill.
+      } catch (_) {
+        // Completer errored — hard kill anyway.
+      }
+    } else {
+      await Future<void>.delayed(graceWindow);
+    }
+    _hardKill();
+  }
+
   /// Final-resort kill. Called by [killAgent] after the grace window
   /// and unconditionally by [dispose]. Idempotent — safe to call when
   /// the process has already exited.

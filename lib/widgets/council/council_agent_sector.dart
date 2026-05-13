@@ -8,12 +8,13 @@ import 'package:provider/provider.dart';
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
 import '../../services/council/council_models.dart';
-import '../../services/council/council_protocol.dart';
 import '../../services/council/council_task_ledger.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import 'council_agent_idle_indicator.dart';
 import 'compact_model_label.dart';
+import 'role_signatures/role_signature.dart';
+import 'speech/agent_voice_panel.dart';
 
 class CouncilAgentSector extends StatefulWidget {
   final CouncilAgent agent;
@@ -113,6 +114,24 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
       // Filter for events that affect THIS agent's card. Cheaper than
       // routing through a global broker — Flutter's stream subscription
       // overhead is negligible compared to the per-card painters.
+      //
+      // ── BEGIN: dispatch-stage / orchestrator-presence subagent ──
+      // The orchestrator additionally listens for `agentDone` /
+      // `evaluatorDone` events arriving AT it (toAgentId == this.id).
+      // When an agent's return packet lands the conductor card
+      // fires an "acknowledged" tool-pulse so the user reads the
+      // orchestrator visibly receiving the result. Without this the
+      // conductor was silent during the most exciting part of the
+      // run — the moment work comes back.
+      if (widget.isOrchestrator) {
+        if ((event.type == CouncilEventType.agentDone ||
+                event.type == CouncilEventType.evaluatorDone) &&
+            event.toAgentId == widget.agent.id) {
+          _toolPulse.forward(from: 0);
+          return;
+        }
+      }
+      // ── END: dispatch-stage / orchestrator-presence subagent ──
       if (event.fromAgentId != widget.agent.id) return;
       switch (event.type) {
         case CouncilEventType.agentToolFire:
@@ -170,6 +189,14 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
         agent.status == CouncilAgentStatus.replying;
     final done = agent.status == CouncilAgentStatus.done;
     final errored = agent.status == CouncilAgentStatus.error;
+    // Orchestrator's role signature paints a phase-aware tick ring. We
+    // only watch the session's `currentPhase` for orchestrator cards
+    // to keep peer cards from rebuilding on every phase transition.
+    final currentPhase = isOrchestrator
+        ? context.select<AppState, CouncilPhase?>(
+            (s) => s.council.session?.currentPhase,
+          )
+        : null;
 
     return AnimatedBuilder(
       animation:
@@ -304,6 +331,7 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
                     idleT: _idle.value,
                     desat: desat,
                     pulseAccentBoost: pulseAccentBoost,
+                    currentPhase: currentPhase,
                   ),
                   // Tool-fire glow — a soft accent wash that pulses
                   // ON TOP of the card during the brief micro-pulse.
@@ -338,6 +366,7 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
     required double idleT,
     required double desat,
     double pulseAccentBoost = 0.0,
+    CouncilPhase? currentPhase,
   }) {
     final agent = widget.agent;
     // Stronger card presence (Stage Director spec):
@@ -423,23 +452,26 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
       ),
       child: Stack(
         children: [
-          // Digital-grid overlay — paints behind the card content
-          // (between the gradient background and the children). The
-          // grid + scanline + corner-ticks combine to read as an "AI
-          // visualization panel" rather than a flat material card.
+          // Role-signature texture — paints behind the card content
+          // (between the gradient background and the children). Each
+          // RolePreset gets a distinct CustomPainter built by
+          // `buildRoleSignaturePainter`; the orchestrator gets a
+          // dedicated command-surface signature regardless of role.
           // Animation is tied to the existing `_idle` ticker so we
-          // don't add another vsync; opacity scales with `idleT` so
-          // active cards "breathe" the digitized look.
+          // don't add another vsync; alpha scales with `idleT` so
+          // active cards breathe the signature subtly.
           Positioned.fill(
             child: IgnorePointer(
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(DuckTheme.radiusL),
                 child: CustomPaint(
-                  painter: _DigitalGridPainter(
-                    accent: accent,
+                  painter: buildRoleSignaturePainter(
+                    role: agent.role,
                     active: active,
                     idleT: idleT,
+                    accent: accent,
                     isOrchestrator: isOrchestrator,
+                    currentPhase: currentPhase,
                   ),
                 ),
               ),
@@ -515,19 +547,19 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
                 // on the same row as the model badge".
               ],
             ),
-            const SizedBox(height: 10),
-            Text(
-              isOrchestrator
-                  ? S.councilOrchestrator
-                  : CouncilProtocol.roleInstruction(agent),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: DuckColors.fgMuted,
-                fontSize: 11,
-                height: 1.32,
-                letterSpacing: 0.1,
-              ),
+            const SizedBox(height: 8),
+            // Voice section — the integrated speech surface that
+            // replaced the floating bubble layer in the 2026-05
+            // redesign. Reads as a distinct "this is what the agent
+            // is saying" region inside the card. Drives off the
+            // shared `_idle` controller via `breathT` so the voice
+            // hairline pulses without a new vsync (landmine: do NOT
+            // add a per-card ticker for this section).
+            AgentVoicePanel(
+              key: ValueKey('voice-${agent.id}'),
+              agent: agent,
+              isOrchestrator: isOrchestrator,
+              breathT: idleT,
             ),
             // Subtask step indicator — only renders when the agent has
             // declared a plan via `council_plan_subtasks`. Collapsed
@@ -538,7 +570,7 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
               accent: accent,
               idleT: idleT,
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
             _AgentStatusBlock(
               agent: agent,
               errored: errored,
@@ -707,6 +739,14 @@ class _DoneBurstPainter extends CustomPainter {
 ///   ~120° hot-arc that rotates around the card.
 /// * `intensity` — 0..1, dimmed when the council is idle so the
 ///   halo doesn't strobe over a quiet stage.
+///
+/// ── dispatch-stage / orchestrator-presence subagent (2026-05) ──
+/// The halo now paints TWO rings: an inner ring rotating with
+/// `angle` and an outer ring rotating in the opposite direction at
+/// a slightly larger radius, lower alpha. The counter-rotation cue
+/// reads as "control system in motion" rather than a single spinning
+/// loader. Each ring is its own sweep — drawn one after the other so
+/// the inner brighter sweep visibly overlaps the outer dim sweep.
 class _OrchestratorHaloPainter extends CustomPainter {
   final double angle;
   final Color accent;
@@ -721,6 +761,47 @@ class _OrchestratorHaloPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (intensity <= 0) return;
+
+    // ── Outer counter-rotating ring ───────────────────────────────
+    // Larger radius, lower alpha, opposite spin. Reads as a slow
+    // "control sphere" enclosing the conductor.
+    const outerOutset = 14.0;
+    final outerRect = Rect.fromLTWH(
+      -outerOutset,
+      -outerOutset,
+      size.width + outerOutset * 2,
+      size.height + outerOutset * 2,
+    );
+    final outerShader = SweepGradient(
+      center: Alignment.center,
+      startAngle: 0,
+      endAngle: math.pi * 2,
+      // Counter-rotation: negate the angle so the eye reads the two
+      // rings as moving against each other.
+      transform: GradientRotation(-angle * 0.65),
+      colors: [
+        accent.withValues(alpha: 0.0),
+        accent.withValues(alpha: 0.18 * intensity),
+        accent.withValues(alpha: 0.30 * intensity),
+        accent.withValues(alpha: 0.10 * intensity),
+        accent.withValues(alpha: 0.0),
+      ],
+      stops: const [0.0, 0.22, 0.36, 0.55, 1.0],
+    ).createShader(Rect.fromCircle(
+      center: outerRect.center,
+      radius: outerRect.longestSide,
+    ));
+    final outerPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.9 + 0.7 * intensity
+      ..shader = outerShader
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3.0);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(outerRect, const Radius.circular(28)),
+      outerPaint,
+    );
+
+    // ── Inner primary ring (original sweep) ───────────────────────
     const outset = 6.0;
     final rect = Rect.fromLTWH(
       -outset,
@@ -729,9 +810,6 @@ class _OrchestratorHaloPainter extends CustomPainter {
       size.height + outset * 2,
     );
     final center = rect.center;
-    // Conic sweep gradient — implemented via SweepGradient. The
-    // sweep is rotated by `angle` and the alpha falls off rapidly
-    // so we get a comet-tail arc instead of a flat ring.
     final shader = SweepGradient(
       center: Alignment.center,
       startAngle: 0,
@@ -1898,169 +1976,10 @@ class _CadenceSpectrumPainter extends CustomPainter {
   }
 }
 
-/// Painter that gives each agent card an "AI visualization" texture:
-///   • Faint pixel-grid (4×4 dot field at low alpha)
-///   • Slow vertical scan-line that sweeps top→bottom
-///   • Corner ticks (HUD-style brackets) at the four card corners
-///   • Faint horizontal data-stream shimmer near the bottom
-///
-/// All four layers are tuned to be subtle by default — the user
-/// asked for "more digitizing effects" but the cards still need to
-/// be readable, so the grid sits below 0.06 alpha and the scan
-/// line below 0.10. Active cards bump opacities slightly via
-/// `idleT`. Orchestrator gets a hue shift toward purple.
-///
-/// Driven off the agent's existing `_idle` ticker so we don't add
-/// another vsync per card. Repaints are gated on `shouldRepaint`
-/// so static frames (idleT pinned, status unchanged) don't burn
-/// CPU.
-class _DigitalGridPainter extends CustomPainter {
-  _DigitalGridPainter({
-    required this.accent,
-    required this.active,
-    required this.idleT,
-    required this.isOrchestrator,
-  });
-
-  final Color accent;
-  final bool active;
-  final double idleT;
-  final bool isOrchestrator;
-
-  // Grid spacing — 4px feels like "pixel art" without being too busy.
-  // Larger spacing reads as a checker; smaller starts looking like noise.
-  static const double _gridStride = 4.0;
-  // Corner-tick length in logical pixels.
-  static const double _tickLen = 6.0;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (size.isEmpty) return;
-    final r = Offset.zero & size;
-
-    // ── Layer 1: pixel-grid dot field ─────────────────────────────
-    // Tiny 1px dots on a 4px grid. Alpha is intentionally so low that
-    // it reads as texture, not pattern. Active cards bump it slightly.
-    final gridAlpha = (active ? 0.052 : 0.030) + 0.012 * idleT;
-    final dotPaint = Paint()
-      ..color = accent.withValues(alpha: gridAlpha)
-      ..style = PaintingStyle.fill;
-    for (var y = _gridStride; y < size.height - 1; y += _gridStride) {
-      for (var x = _gridStride; x < size.width - 1; x += _gridStride) {
-        canvas.drawRect(Rect.fromLTWH(x, y, 1, 1), dotPaint);
-      }
-    }
-
-    // ── Layer 2: vertical scan line ───────────────────────────────
-    // Sweeps top → bottom across the lifetime of the idle ticker.
-    // The line is a thin gradient stripe (8px tall) painted with a
-    // soft horizontal fade so its leading/trailing edges aren't sharp.
-    final scanY = size.height * (0.05 + 0.95 * idleT);
-    final scanRect = Rect.fromLTWH(0, scanY - 4, size.width, 8);
-    final scanPaint = Paint()
-      ..shader = LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [
-          accent.withValues(alpha: 0.0),
-          accent.withValues(alpha: active ? 0.10 : 0.05),
-          accent.withValues(alpha: 0.0),
-        ],
-        stops: const [0.0, 0.5, 1.0],
-      ).createShader(scanRect);
-    canvas.drawRect(scanRect, scanPaint);
-
-    // ── Layer 3: corner ticks (HUD brackets) ──────────────────────
-    // Four L-shaped strokes at the card corners. Standard sci-fi UI
-    // bracketing — frames the card as a "reading panel" without
-    // drawing a full inner border. Brighter on active cards.
-    final tickPaint = Paint()
-      ..color = accent.withValues(alpha: active ? 0.55 : 0.28)
-      ..strokeWidth = 0.9
-      ..isAntiAlias = true
-      ..style = PaintingStyle.stroke;
-
-    // Top-left
-    canvas.drawLine(const Offset(0, 0), const Offset(_tickLen, 0), tickPaint);
-    canvas.drawLine(const Offset(0, 0), const Offset(0, _tickLen), tickPaint);
-    // Top-right
-    canvas.drawLine(
-      Offset(size.width - _tickLen, 0),
-      Offset(size.width, 0),
-      tickPaint,
-    );
-    canvas.drawLine(
-      Offset(size.width, 0),
-      Offset(size.width, _tickLen),
-      tickPaint,
-    );
-    // Bottom-left
-    canvas.drawLine(
-      Offset(0, size.height),
-      Offset(_tickLen, size.height),
-      tickPaint,
-    );
-    canvas.drawLine(
-      Offset(0, size.height - _tickLen),
-      Offset(0, size.height),
-      tickPaint,
-    );
-    // Bottom-right
-    canvas.drawLine(
-      Offset(size.width - _tickLen, size.height),
-      Offset(size.width, size.height),
-      tickPaint,
-    );
-    canvas.drawLine(
-      Offset(size.width, size.height - _tickLen),
-      Offset(size.width, size.height),
-      tickPaint,
-    );
-
-    // ── Layer 4: horizontal data stripe (bottom) ──────────────────
-    // Thin moving stripe near the card footer that suggests "data
-    // flowing through". Reuses the idle ticker — a phase-shifted
-    // gradient that wraps. Subtler than the scan line so the two
-    // motions don't compete for attention.
-    final dataPhase = ((idleT * 1.7) % 1.0);
-    final dataRect = Rect.fromLTWH(
-      0,
-      size.height - 12,
-      size.width,
-      2,
-    );
-    final dataPaint = Paint()
-      ..shader = LinearGradient(
-        colors: [
-          accent.withValues(alpha: 0.0),
-          accent.withValues(alpha: active ? 0.22 : 0.10),
-          accent.withValues(alpha: 0.0),
-        ],
-        stops: [
-          (dataPhase - 0.18).clamp(0.0, 1.0),
-          dataPhase.clamp(0.0, 1.0),
-          (dataPhase + 0.18).clamp(0.0, 1.0),
-        ],
-      ).createShader(dataRect);
-    canvas.drawRect(dataRect, dataPaint);
-
-    // Faint hue shift for orchestrator: overlay a thin purple wash
-    // at very low alpha so the orchestrator card reads as the
-    // "command surface" without restyling the whole painter chain.
-    if (isOrchestrator) {
-      final purplePaint = Paint()
-        ..color = const Color(0xFFB48EAD).withValues(alpha: 0.025)
-        ..style = PaintingStyle.fill;
-      canvas.drawRect(r, purplePaint);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _DigitalGridPainter old) {
-    if (old.idleT != idleT) return true;
-    if (old.active != active) return true;
-    if (old.accent != accent) return true;
-    if (old.isOrchestrator != isOrchestrator) return true;
-    return false;
-  }
-}
+// _DigitalGridPainter was retired in the 2026-05 role-signatures pass.
+// The old single painter that backed every card regardless of role now
+// lives split across `role_signatures/role_signature_*.dart` — each
+// RolePreset gets a distinct background texture, orchestrator gets a
+// dedicated "command surface" painter, and the custom fallback
+// preserves the original digital-grid look. Dispatch happens via
+// `buildRoleSignaturePainter` (see import above).

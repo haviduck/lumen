@@ -13,9 +13,12 @@ import 'providers/media_controller.dart';
 import 'providers/ssh_controller.dart';
 import 'services/ide_actions.dart';
 import 'services/language_detector.dart';
+import 'services/preferences_service.dart';
 import 'services/recent_edits_tracker.dart';
 import 'services/ssh/ssh_remote_file_service.dart';
+import 'services/webview_environment.dart';
 import 'services/window_chrome.dart';
+import 'services/work_session_tracker.dart';
 import 'widgets/common/duck_toast.dart';
 import 'widgets/ssh/ssh_grab_conflict_dialog.dart';
 import 'widgets/ssh/ssh_remote_conflict_dialog.dart';
@@ -32,7 +35,9 @@ import 'widgets/lock_screen.dart';
 import 'widgets/menu_bar.dart';
 import 'widgets/overlays/overlay_host.dart';
 import 'widgets/terminal/terminal_pane.dart';
+import 'widgets/wellbeing_panel.dart';
 import 'widgets/welcome_screen.dart';
+import 'widgets/work_session_probe.dart';
 
 Future<void> main() async {
   // Native-window setup BEFORE the framework binds to a surface size.
@@ -42,6 +47,15 @@ Future<void> main() async {
   // Idempotent + graceful on unsupported hosts; never crashes boot.
   WidgetsFlutterBinding.ensureInitialized();
   await WindowChrome.bootstrap();
+  // Lock in a per-process WebView2 `userDataFolder` BEFORE the first
+  // `WebviewController.initialize()` lands anywhere downstream.
+  // Multi-window Lumen used to freeze because every process pointed
+  // WebView2 at the same default folder — Chromium's
+  // `EBWebView/Default/parent.lock` blocks the second environment
+  // creation indefinitely. `WebviewEnvironment.bootstrap` reserves
+  // a slot-locked unique folder per process; failures fall back to
+  // the (pre-fix) shared default so the IDE still boots.
+  await WebviewEnvironment.bootstrap();
 
   runApp(
     MultiProvider(
@@ -59,8 +73,21 @@ Future<void> main() async {
         // host list); we kick it off here and the `_SshAppStateBridge`
         // widget below waits for `ready` before binding to AppState.
         ChangeNotifierProvider(create: (_) => SshController()..init()),
+        // WorkSessionTracker is the kind-nudge backend: counts
+        // active-work seconds per local day, surfaces the late-night
+        // well-being panel once the user crosses ~9h after 22:00.
+        // Lives at root because it has to count across the welcome
+        // screen → workspace transition (a user who opens Lumen, idles
+        // for hours at the welcome screen, then dives in late, should
+        // not get a panel about a day that was mostly idle). The
+        // probe widget below feeds it pointer/keyboard/focus events.
+        ChangeNotifierProvider(
+          create: (_) => WorkSessionTracker(PreferencesService())..init(),
+        ),
       ],
-      child: const _SshAppStateBridge(child: LumenApp()),
+      child: const _SshAppStateBridge(
+        child: WorkSessionProbe(child: LumenApp()),
+      ),
     ),
   );
 }
@@ -294,6 +321,13 @@ class _IdeShell extends StatelessWidget {
                   const _StatusBar(),
                 ],
               ),
+              // Late-night well-being panel — slides down from above
+              // the menu bar. Stays mounted; the widget short-circuits
+              // to a zero-sized stub when the tracker says "not now".
+              // Sits above the IDE column on the Stack so the slide-in
+              // animation reads as "from outside the window" rather
+              // than "from behind the menu bar".
+              const WellbeingPanel(),
             ],
           ),
         ),

@@ -120,8 +120,15 @@ class AgentLiveState {
 /// How long a flash overlay stays on top of the primary line, by kind.
 const Map<FlashKind, Duration> kFlashDurations = <FlashKind, Duration>{
   FlashKind.dispatch: Duration(seconds: 4),
-  FlashKind.askPool: Duration(seconds: 7),
-  FlashKind.poolReply: Duration(seconds: 7),
+  // 2026-05 (voice-panel redesign): pool chatter calmed down. The voice
+  // section is now a permanent surface on every agent card, so the
+  // ask/reply flash competes with the structural narration. 3.5s reads
+  // as "register, then yield" rather than "dominate the panel". Update
+  // here is paired with the discourse-layer dial-down in
+  // council_discourse_layer.dart — together they're the "calmer pool"
+  // pass the user asked for.
+  FlashKind.askPool: Duration(milliseconds: 3500),
+  FlashKind.poolReply: Duration(milliseconds: 3500),
   FlashKind.askUser: Duration(seconds: 12),
   FlashKind.userReply: Duration(seconds: 6),
   FlashKind.userPing: Duration(seconds: 6),

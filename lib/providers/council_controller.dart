@@ -88,7 +88,10 @@ class CouncilController extends ChangeNotifier {
   final Map<String, String> _taskIdByDispatchKey = <String, String>{};
   Completer<bool>? _roundTwoDecision;
   CouncilAgentRunner? _orchestratorRunner;
-  static const int _maxPoolExchangesPerSession = 2;
+  // Pool budget raised from 2 → 6 under the Excellence Doctrine. The
+  // review phase wants agents to actually challenge each other; the old
+  // ceiling of 2 produced a token-effort review and then a ship.
+  static const int _maxPoolExchangesPerSession = 6;
   static const int _maxPoolTargetsPerQuestion = 3;
   final List<String> _queuedSynthesisPings = <String>[];
   int _orchestratorFailureStreak = 0;
@@ -97,6 +100,28 @@ class CouncilController extends ChangeNotifier {
   // The orchestrator often self-recovers silently — early escalation
   // just creates noise. 20 retries is the "genuinely broken" signal.
   static const int _orchestratorFailureEscalationThreshold = 20;
+
+  // ===== Excellence Doctrine — budgets =====
+  // The council exists to outperform a solo run. Budgets are sized for
+  // multi-phase work, not single-wave shipping. Numbers tuned for top-
+  // tier models on ambitious briefs; weaker models naturally exit earlier
+  // through their own iteration caps.
+  static const int _orchestratorMaxIterations = 60;
+  static const int _agentMaxIterations = 30;
+  static const int _evaluatorMaxIterations = 6;
+  // Tool-fire surfaces tracked by the structural quality-gate auto-check.
+  // Any agent firing one of these tools (with a write-side effect) counts
+  // as "artifacts produced" without the orchestrator having to assert it.
+  static const Set<String> _artifactProducingTools = {
+    'create_file',
+    'edit_file',
+    'multi_edit',
+    'edit_range',
+    'append_file',
+    'move_file',
+    'copy_file',
+    'delete_file',
+  };
 
   /// True when the user is allowed to ping the orchestrator with a
   /// mid-session note. We allow this whenever the council is in a state
@@ -439,7 +464,7 @@ $brief
       _emitThinkingEnded(session.config.orchestrator);
     }
     try {
-      final result = await runner.run(maxIterations: 24);
+      final result = await runner.run(maxIterations: _orchestratorMaxIterations);
       endThinking();
       if (result.cancelled) return;
       if (session.status == CouncilStatus.done ||
@@ -1239,6 +1264,10 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         return _waitForAgents();
       case CouncilProtocol.askUserToolId:
         return _askUser(_session!.config.orchestrator.id, call);
+      case CouncilProtocol.phaseToolId:
+        return _declarePhase(call);
+      case CouncilProtocol.qualityCheckToolId:
+        return _runQualityCheck(call);
       case CouncilProtocol.reportToolId:
         final ledgerRefusal = ledger.refusalReasonForReport();
         if (ledgerRefusal != null) {
@@ -1258,13 +1287,17 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
                 'or abort.',
           );
         }
-        // The "must have one pool exchange before report" gate that
-        // used to live here was removed — it forced the orchestrator
-        // to dispatch fake collaboration tasks just to satisfy the
-        // gate, even when the work was mechanical and shippable.
-        // Pool is now genuinely opt-in: agents call it when they
-        // actually have a load-bearing question for a peer; otherwise
-        // they ship and the orchestrator reports.
+        // Excellence Doctrine: the quality gate must have passed before
+        // council_report becomes legal. If the orchestrator hasn't run
+        // the gate yet, refuse and push it to run the gate first; if it
+        // ran the gate but some checks failed, refuse and name the
+        // failing gates so the orchestrator dispatches the missing
+        // work instead of papering over the gap.
+        final gateRefusal = _qualityGateRefusal();
+        if (gateRefusal != null) {
+          _emitDispatchGuardTripped(gateRefusal);
+          return CouncilToolResult(feedback: gateRefusal);
+        }
         final markdown = call.arguments['markdown'] as String? ?? '';
         await _finishWithReport(markdown);
         return const CouncilToolResult(
@@ -1277,6 +1310,557 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
           feedback: 'Unknown Council tool: ${call.name}',
         );
     }
+  }
+
+  /// Handles a `council_phase` declaration from the orchestrator. Updates
+  /// the session phase, appends to phase history, emits a `phaseDeclared`
+  /// event for the UI, and returns a feedback string nudging the next
+  /// natural move within that phase.
+  Future<CouncilToolResult> _declarePhase(CouncilToolCall call) async {
+    final session = _session;
+    if (session == null) {
+      return const CouncilToolResult(feedback: 'No active session.');
+    }
+    final raw = (call.arguments['phase'] as String? ?? '').trim().toLowerCase();
+    final rationale = (call.arguments['rationale'] as String? ?? '').trim();
+    final phase = _parsePhase(raw);
+    if (phase == null) {
+      return CouncilToolResult(
+        feedback: 'Unknown phase: "$raw". Legal phases: ${CouncilPhase.values.map((p) => p.name).join(', ')}.',
+      );
+    }
+    final previous = session.currentPhase;
+    session.currentPhase = phase;
+    session.phaseHistory.add(CouncilPhaseEntry(
+      phase: phase,
+      rationale: rationale,
+    ));
+    // Structural quality-gate check: phases covered.
+    final phaseSet = session.phaseHistory.map((p) => p.phase).toSet();
+    session.qualityGate.enoughPhasesCovered = phaseSet.length >= 3;
+    _event(
+      CouncilEventType.phaseDeclared,
+      fromAgentId: session.config.orchestrator.id,
+      message: rationale,
+      data: {
+        'phase': phase.name,
+        'rationale': rationale,
+        'previousPhase': previous.name,
+        'phasesCovered': phaseSet.length,
+      },
+    );
+    notifyListeners();
+    await _persist();
+    return CouncilToolResult(
+      feedback: _phaseGuidance(phase, session),
+    );
+  }
+
+  /// Handles a `council_quality_check` invocation.
+  ///
+  /// Flow (Excellence Doctrine Phase B):
+  /// 1. On the FIRST call only, synchronously run the Adversarial Critic
+  ///    over the session digest. The Critic's findings populate
+  ///    `session.critique` and feed into the gate feedback so the
+  ///    orchestrator must address (or accept) each blocker / major.
+  /// 2. Assert each gate from the orchestrator's call. Two gates are
+  ///    structurally overridden: `artifacts_produced` (any artifact-
+  ///    producing tool fire counts) and `user_asks_resolved` (no pending
+  ///    pool / user question). The orchestrator cannot lie on those.
+  /// 3. `adversarial_review_done` is structurally true once the Critic
+  ///    has produced at least one attack.
+  /// 4. Emit `qualityCheckRan` always; `qualityGatePassed` once on first
+  ///    transition to `allPassed`.
+  Future<CouncilToolResult> _runQualityCheck(CouncilToolCall call) async {
+    final session = _session;
+    if (session == null) {
+      return const CouncilToolResult(feedback: 'No active session.');
+    }
+    final gate = session.qualityGate;
+    final wasPassing = gate.allPassed;
+
+    // The Critic is one-shot per session. If it hasn't run yet, run it
+    // now BEFORE evaluating gates so its findings can populate the
+    // adversarial-review gate structurally and feed into the orchestrator
+    // feedback. Failures degrade gracefully (logged + skipped) — we
+    // never block the gate on Critic infrastructure issues.
+    if (session.critique == null) {
+      await _runCritic(session);
+    }
+
+    // Apply any resolutions the orchestrator declared in this call.
+    // Resolutions are sticky — once resolved, an attack stays resolved
+    // until a new critique replaces it (which we don't do today).
+    final resolvedIds = ((call.arguments['resolved_critic_ids'] as List?) ??
+            const [])
+        .whereType<String>()
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toSet();
+    final currentCritique = session.critique;
+    if (resolvedIds.isNotEmpty && currentCritique != null) {
+      for (final atk in currentCritique.attacks) {
+        if (resolvedIds.contains(atk.id)) atk.resolved = true;
+      }
+      currentCritique.acknowledged = currentCritique.allBlockingResolved;
+    }
+
+    // Orchestrator-asserted values. We trust them as INPUTS but override
+    // the gates we can verify structurally.
+    final critique = session.critique;
+    gate
+      ..artifactsProduced =
+          (call.arguments['artifacts_produced'] == true) || _hasArtifactsProduced(session)
+      // Adversarial review is structurally true once the Critic has run
+      // and produced at least one attack. The orchestrator's own claim is
+      // ignored — the controller owns this gate.
+      ..adversarialReviewDone =
+          critique != null && critique.attacks.isNotEmpty
+      ..claimsGrounded = call.arguments['claims_grounded'] == true
+      ..userAsksResolved =
+          (call.arguments['user_asks_resolved'] == true) && _allUserAsksResolved(session)
+      // `risksNamed` requires that the orchestrator has acknowledged every
+      // blocker/major Critic attack (resolved or accepted). The orchestrator
+      // can still self-assert it, but if the critique has open blockers,
+      // we override to false — the user must see those addressed.
+      ..risksNamed = (call.arguments['risks_named'] == true) &&
+          (critique == null || critique.allBlockingResolved)
+      // Phase coverage is structural — recompute from history.
+      ..enoughPhasesCovered =
+          session.phaseHistory.map((p) => p.phase).toSet().length >= 3
+      ..summary = (call.arguments['summary'] as String? ?? '').trim()
+      ..checkedAt = DateTime.now()
+      ..attempts = gate.attempts + 1;
+
+    _event(
+      CouncilEventType.qualityCheckRan,
+      fromAgentId: session.config.orchestrator.id,
+      message: gate.summary,
+      data: gate.toJson(),
+    );
+    notifyListeners();
+    await _persist();
+
+    if (gate.allPassed && !wasPassing) {
+      _event(
+        CouncilEventType.qualityGatePassed,
+        fromAgentId: session.config.orchestrator.id,
+        message: gate.summary,
+        data: gate.toJson(),
+      );
+    }
+
+    final criticBlock = _formatCritiqueForOrchestrator(critique);
+
+    if (gate.allPassed) {
+      return CouncilToolResult(
+        feedback:
+            'Quality gate PASSED on attempt ${gate.attempts}. '
+            'council_report is now legal. Synthesize the markdown report '
+            'from the agents\' deliverables and ship.\n\n$criticBlock',
+      );
+    }
+    final failing = gate.failingGates.join(', ');
+    return CouncilToolResult(
+      feedback:
+          'Quality gate FAILED. Failing gates: $failing.\n\n$criticBlock\n\n'
+          'Address each failing gate before retrying. Concrete moves per gate:\n'
+          '• artifacts_produced — dispatch a doer agent on a specific file/edit.\n'
+          '• adversarial_review_done — wait for the Adversarial Critic (just '
+          'ran above). Already handled structurally.\n'
+          '• claims_grounded — re-dispatch agents with "first read X, Y, Z" '
+          'in the brief; cite file paths in their replies.\n'
+          '• user_asks_resolved — resolve the pending user question.\n'
+          '• risks_named — the Critic\'s blocker/major attacks above MUST be '
+          'addressed (dispatch a fix) or accepted (named honestly under "Open '
+          'Risks"). The orchestrator declaring `risks_named: true` while '
+          'unresolved Critic blockers exist is overridden to false.\n'
+          '• enough_phases_covered — call council_phase to declare the next '
+          'phase, then dispatch into it.\n\n'
+          'When you\'ve addressed the gaps, call council_quality_check again. '
+          'The Critic does NOT re-run — its findings persist on the session.',
+    );
+  }
+
+  /// Format the Critic's critique for inclusion in the orchestrator's tool
+  /// feedback. Returns a section that the orchestrator can read as a
+  /// concrete list of attacks to address or accept.
+  String _formatCritiqueForOrchestrator(CouncilCritique? critique) {
+    if (critique == null) {
+      return '(Critic did not produce findings — running in degraded mode. '
+          'Take extra care to surface risks honestly in the report.)';
+    }
+    if (critique.attacks.isEmpty) {
+      return 'Adversarial Critic ran but produced no attacks: '
+          '"${critique.summary}". Unusual — proceed with normal rigor.';
+    }
+    final buf = StringBuffer()
+      ..writeln('=== Adversarial Critic findings ===')
+      ..writeln(critique.summary);
+    for (final a in critique.attacks) {
+      final marker = a.isBlocker
+          ? '[BLOCKER]'
+          : (a.isMajor ? '[MAJOR]' : '[minor]');
+      final status = a.resolved ? '(resolved)' : '';
+      buf
+        ..writeln()
+        ..writeln('${a.id} $marker $status')
+        ..writeln('  Target: ${a.target}')
+        ..writeln('  Attack: ${a.attack}')
+        ..writeln('  Acceptance: ${a.acceptance}');
+    }
+    final blockers = critique.blockerCount;
+    final majors = critique.majorCount;
+    if (blockers > 0 || majors > 0) {
+      buf
+        ..writeln()
+        ..writeln(
+          'Must address or accept (Open Risks): $blockers blocker(s), '
+          '$majors major(s). Minor attacks may pass through.',
+        );
+    }
+    return buf.toString();
+  }
+
+  /// Run the Adversarial Critic once per session, synchronously, inside
+  /// the first quality-check call. Builds a digest of session state,
+  /// hits the configured Critic model (final-evaluator model by default),
+  /// parses the JSON output, and persists the critique on the session.
+  ///
+  /// Failure modes (model error, timeout, malformed JSON) are logged via
+  /// `criticCompleted` with an empty critique. We never block the gate
+  /// on infrastructure issues — degraded mode emits a single attack
+  /// flagging the missing critique so the user sees the gap.
+  Future<void> _runCritic(CouncilSession session) async {
+    final criticModel = session.config.finalEvaluator.model.trim().isEmpty
+        ? session.config.orchestrator.model
+        : session.config.finalEvaluator.model;
+
+    _event(
+      CouncilEventType.criticStarted,
+      fromAgentId: session.config.finalEvaluator.id,
+      message: S.councilCriticStarted,
+      data: {'criticModel': criticModel},
+    );
+    notifyListeners();
+
+    final digest = _buildCriticDigest(session);
+    final prompt = CouncilProtocol.criticSystemPrompt(
+      config: session.config,
+      sessionDigest: digest,
+    );
+
+    String raw;
+    try {
+      raw = await _generateOneShot(
+        model: criticModel,
+        messages: [
+          {'role': 'system', 'content': prompt},
+          {'role': 'user', 'content': 'Attack now. Output JSON only.'},
+        ],
+      );
+    } catch (e) {
+      // Degraded mode — record a synthetic critique that flags the failure
+      // so the gate sees adversarial_review_done as true but the user knows
+      // the Critic didn't really run.
+      final critique = CouncilCritique(
+        summary: 'Critic failed to run: $e',
+        attacks: [
+          CouncilCriticAttack(
+            id: 'C-degraded',
+            target: 'Critic infrastructure',
+            attack: 'The Adversarial Critic could not complete its pass '
+                '($e). The council shipped without external adversarial '
+                'review. Re-run with a working Critic model before trusting '
+                'the result.',
+            severity: 'major',
+            acceptance: 'Re-run the council with a Critic model that '
+                'responds. Until then, this is an open risk.',
+          ),
+        ],
+      );
+      session.critique = critique;
+      _event(
+        CouncilEventType.criticCompleted,
+        fromAgentId: session.config.finalEvaluator.id,
+        message: critique.summary,
+        data: {
+          ...critique.toJson(),
+          'degraded': true,
+        },
+      );
+      notifyListeners();
+      await _persist();
+      return;
+    }
+
+    final critique = _parseCritique(raw);
+    session.critique = critique;
+    _event(
+      CouncilEventType.criticCompleted,
+      fromAgentId: session.config.finalEvaluator.id,
+      message: critique.summary,
+      data: critique.toJson(),
+    );
+    notifyListeners();
+    await _persist();
+  }
+
+  /// One-shot non-streaming call to whichever provider the Critic model
+  /// belongs to. Mirrors the shape of `proposeAgentsForBrief` so we don't
+  /// reinvent provider switching.
+  Future<String> _generateOneShot({
+    required String model,
+    required List<Map<String, dynamic>> messages,
+  }) async {
+    final split = _splitModel(model);
+    switch (split.provider) {
+      case 'claude':
+        return anthropic.generateChat(messages, model: split.rawModel);
+      case 'copilot':
+        return copilot.generateChat(messages, model: split.rawModel);
+      case 'gemini':
+        return gemini.generateChat(messages, model: split.rawModel);
+      case 'ollama-cloud':
+        return ollama.generateChat(
+          messages,
+          model: split.rawModel,
+          forceCloud: true,
+        );
+      case 'ollama':
+        return ollama.generateChat(messages, model: split.rawModel);
+      case 'github':
+        throw StateError(
+          'GitHub Models was removed; pick another Critic model.',
+        );
+      default:
+        throw StateError(
+          'Critic does not support provider "${split.provider}".',
+        );
+    }
+  }
+
+  /// Build the session digest the Critic attacks. Lean and structured —
+  /// no streaming junk, no duplication. Phases, gate state, every agent's
+  /// last 800 chars of transcript, every pool exchange, and the ledger.
+  String _buildCriticDigest(CouncilSession session) {
+    final buf = StringBuffer()
+      ..writeln('## Brief')
+      ..writeln(session.config.brief)
+      ..writeln()
+      ..writeln('## Phases declared')
+      ..writeln(session.phaseHistory.isEmpty
+          ? '(none — orchestrator never called council_phase)'
+          : session.phaseHistory
+              .map((p) => '- ${p.phase.name}: ${p.rationale}')
+              .join('\n'))
+      ..writeln()
+      ..writeln('## Current phase: ${session.currentPhase.name}')
+      ..writeln()
+      ..writeln('## Quality gate self-assertion (orchestrator-asserted)')
+      ..writeln('- artifactsProduced: ${session.qualityGate.artifactsProduced}')
+      ..writeln('- adversarialReviewDone: ${session.qualityGate.adversarialReviewDone}')
+      ..writeln('- claimsGrounded: ${session.qualityGate.claimsGrounded}')
+      ..writeln('- userAsksResolved: ${session.qualityGate.userAsksResolved}')
+      ..writeln('- risksNamed: ${session.qualityGate.risksNamed}')
+      ..writeln('- enoughPhasesCovered: ${session.qualityGate.enoughPhasesCovered}')
+      ..writeln('- orchestrator summary: ${session.qualityGate.summary}')
+      ..writeln()
+      ..writeln('## Ledger')
+      ..writeln('- successCount: ${ledger.successCount}')
+      ..writeln('- failureCount: ${ledger.failureCount}')
+      ..writeln('- pendingCount: ${ledger.pendingCount}');
+    for (final t in ledger.tasks) {
+      buf.writeln(
+        '  - ${t.agentName} (${t.state.name}): "${t.task}" '
+        '${t.lastError == null ? '' : '[error: ${t.lastError}]'}',
+      );
+    }
+    buf
+      ..writeln()
+      ..writeln('## Agent transcripts (tail)');
+    for (final agent in session.config.agents) {
+      final transcript = agent.transcript.trim();
+      if (transcript.isEmpty) {
+        buf.writeln('### ${agent.name}: (empty transcript)');
+        continue;
+      }
+      final tail = transcript.length > 1200
+          ? transcript.substring(transcript.length - 1200)
+          : transcript;
+      buf
+        ..writeln('### ${agent.name} (${CouncilProtocol.roleInstruction(agent).split('.').first})')
+        ..writeln(tail)
+        ..writeln();
+    }
+    if (session.poolQuestions.isNotEmpty) {
+      buf
+        ..writeln('## Pool exchanges')
+        ..writeln(_orchestratorPoolDigest(session));
+    }
+    return buf.toString();
+  }
+
+  /// Parse the Critic's JSON output. Tolerant of leading/trailing prose
+  /// (some models can't help adding "Here is the JSON:") — grabs the
+  /// substring from the first `{` to the matching last `}`. Returns a
+  /// best-effort critique even on partial parse; a totally malformed
+  /// output yields a single synthetic attack noting the failure so the
+  /// user sees the gap.
+  CouncilCritique _parseCritique(String raw) {
+    final start = raw.indexOf('{');
+    final end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) {
+      return CouncilCritique(
+        summary: 'Critic returned malformed output (no JSON object).',
+        attacks: [
+          CouncilCriticAttack(
+            id: 'C-parse',
+            target: 'Critic output',
+            attack: 'The Critic did not return parseable JSON. Raw output '
+                'prefix: "${raw.substring(0, raw.length > 200 ? 200 : raw.length)}".',
+            severity: 'major',
+            acceptance: 'Re-run with a more JSON-disciplined Critic model.',
+          ),
+        ],
+      );
+    }
+    try {
+      final parsed = jsonDecode(raw.substring(start, end + 1))
+          as Map<String, dynamic>;
+      final attacks = ((parsed['attacks'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((m) {
+        final d = m.cast<String, dynamic>();
+        return CouncilCriticAttack(
+          id: (d['id'] as String?)?.trim().isNotEmpty == true
+              ? d['id'] as String
+              : 'C-${DateTime.now().microsecondsSinceEpoch}',
+          target: (d['target'] as String? ?? '').trim(),
+          attack: (d['attack'] as String? ?? '').trim(),
+          severity: (d['severity'] as String? ?? 'minor').trim().toLowerCase(),
+          acceptance: (d['acceptance'] as String? ?? '').trim(),
+        );
+      }).where((a) => a.target.isNotEmpty && a.attack.isNotEmpty).toList();
+      final summary = (parsed['summary'] as String? ?? '').trim();
+      return CouncilCritique(
+        summary: summary.isEmpty ? 'Critic produced ${attacks.length} attacks.' : summary,
+        attacks: attacks,
+      );
+    } catch (e) {
+      return CouncilCritique(
+        summary: 'Critic JSON parse failed: $e',
+        attacks: [
+          CouncilCriticAttack(
+            id: 'C-parse',
+            target: 'Critic output',
+            attack: 'The Critic returned JSON that failed to parse: $e',
+            severity: 'major',
+            acceptance: 'Re-run the council with a Critic model that '
+                'produces clean JSON.',
+          ),
+        ],
+      );
+    }
+  }
+
+  /// Quality-gate-aware refusal for `council_report`. Returns null when
+  /// the gate has passed; otherwise returns a description the orchestrator
+  /// gets as tool feedback.
+  String? _qualityGateRefusal() {
+    final session = _session;
+    if (session == null) return null;
+    final gate = session.qualityGate;
+    if (gate.allPassed) return null;
+    if (gate.attempts == 0) {
+      return 'BLOCKED — quality gate not yet run.\n\n'
+          'Before council_report becomes legal, you must call '
+          'council_quality_check and pass all six gates: '
+          'artifacts_produced, adversarial_review_done, claims_grounded, '
+          'user_asks_resolved, risks_named, enough_phases_covered.\n\n'
+          'Run the gate now. Be honest — failing a gate just means more '
+          'work, not failure.';
+    }
+    final failing = gate.failingGates.join(', ');
+    return 'BLOCKED — quality gate has not yet passed.\n\n'
+        'Failing gates: $failing.\n\n'
+        'Dispatch the missing work to address each failing gate, then call '
+        'council_quality_check again. council_report will unlock once every '
+        'gate is PASS.';
+  }
+
+  /// Structural check: any artifact-producing tool fire from any agent
+  /// this session counts. Walks the session events because the runner's
+  /// onToolFire callback already emits `agentToolFire` for every write.
+  bool _hasArtifactsProduced(CouncilSession session) {
+    for (final ev in session.events) {
+      if (ev.type != CouncilEventType.agentToolFire) continue;
+      final toolId = ev.data['toolId'] as String? ?? '';
+      if (_artifactProducingTools.contains(toolId)) return true;
+    }
+    return false;
+  }
+
+  /// Structural check: every pool / user question has been resolved (or
+  /// none was raised). Pending [_session!.pendingUserQuestion] blocks.
+  bool _allUserAsksResolved(CouncilSession session) {
+    if (session.pendingUserQuestion != null) return false;
+    return session.poolQuestions.every((q) => q.resolved);
+  }
+
+  /// Map the raw phase string from the tool call to the enum, tolerant
+  /// of common alternates ("design" -> architecture, "implement" -> build).
+  CouncilPhase? _parsePhase(String raw) {
+    final lower = raw.toLowerCase().trim();
+    for (final p in CouncilPhase.values) {
+      if (p.name == lower) return p;
+    }
+    return switch (lower) {
+      'design' || 'plan' || 'planning' => CouncilPhase.architecture,
+      'implement' || 'implementation' || 'code' || 'coding' => CouncilPhase.build,
+      'audit' || 'critique' || 'attack' => CouncilPhase.review,
+      'harden' || 'fix' || 'fixing' => CouncilPhase.polish,
+      'final' || 'finalize' || 'wrap' => CouncilPhase.ship,
+      _ => null,
+    };
+  }
+
+  /// What the orchestrator should naturally do next given a phase.
+  String _phaseGuidance(CouncilPhase phase, CouncilSession session) {
+    final phasesSeen = session.phaseHistory.map((p) => p.phase).toSet();
+    final reviewedYet = phasesSeen.contains(CouncilPhase.review);
+    final builtYet = phasesSeen.contains(CouncilPhase.build);
+    return switch (phase) {
+      CouncilPhase.discovery =>
+        'Phase: DISCOVERY. Dispatch agents to read the project tree and the '
+        'specific files / surfaces the brief touches. No edits yet — output '
+        'is grounding notes. After agents return, transition to architecture.',
+      CouncilPhase.architecture =>
+        'Phase: ARCHITECTURE. Dispatch decision work. Each agent owns one '
+        'decision artifact (design doc, decision matrix, trade-off table). '
+        'Surface DISAGREEMENT — do not paper over conflicting agent opinions. '
+        'After agents return, transition to build.',
+      CouncilPhase.build =>
+        'Phase: BUILD. Dispatch implementation. Each agent OWNS specific files. '
+        'Briefs name the file path + the change ("edit `lib/foo.dart` to add the '
+        'new route"). No more "design" tasks — only execution. After build '
+        'completes, transition to review (do NOT skip).',
+      CouncilPhase.review =>
+        'Phase: REVIEW. Adversarial. Dispatch reviewers to ATTACK the build '
+        'artifacts — find weak claims, missing tests, unproven assumptions, '
+        'untested paths. Use pool challenges between agents for falsifiable '
+        'cross-checks. After review, transition to polish if findings exist '
+        'or directly to ship if review found nothing concrete (rare).',
+      CouncilPhase.polish =>
+        '${reviewedYet ? '' : 'WARNING: you entered polish without a review phase. Findings will be theoretical. Consider going back to review.\n\n'}'
+        'Phase: POLISH. Address every blocker/major review finding. Each '
+        'finding gets an owner who produces the concrete fix artifact. After '
+        'fixes land, transition to ship and run the quality gate.',
+      CouncilPhase.ship =>
+        '${builtYet && reviewedYet ? '' : 'WARNING: you entered ship without build+review. This is malpractice on a non-trivial brief.\n\n'}'
+        'Phase: SHIP. Run council_quality_check to assert all six gates. '
+        'Once every gate is PASS, call council_report with the final markdown.',
+    };
   }
 
   Future<CouncilToolResult> _handleAgentTool(
@@ -1464,22 +2048,40 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       }
       buf.writeln();
     }
+    // Excellence-Doctrine wait digest. The old digest said "DEFAULT NEXT
+    // ACTION: call council_report" — biased the orchestrator toward
+    // shipping after one wave. The council is gathered for DEPTH; the
+    // default is "move to the next phase," not "ship the first draft."
+    final currentPhase = session.currentPhase.name;
+    final phasesCovered = session.phaseHistory
+        .map((p) => p.phase.name)
+        .toSet()
+        .length;
+    final gate = session.qualityGate;
+    final gatesPassed = 6 - gate.failingGates.length;
     buf.writeln(
       'The results above are the agents\' DELIVERABLES — not progress reports, '
       'not "still working" updates. This is what they produced for the brief.\n\n'
-      'DEFAULT NEXT ACTION: call council_report with a markdown synthesis of '
-      'these results. The brief is satisfied unless a specific phase is '
-      'demonstrably still missing.\n\n'
-      'Only dispatch another wave if the brief explicitly requires a phase '
-      'you have NOT yet executed (e.g. design wave done → now an implementation '
-      'wave that depends on the design output). Do NOT re-dispatch agents on '
-      'work that already returned — the dispatch guard will reject re-runs of '
-      'essentially identical tasks.\n\n'
-      'If work came back incomplete (errored / blocked / refused), call '
+      'Current phase: $currentPhase. Phases covered so far: $phasesCovered. '
+      'Quality gate: $gatesPassed/6 passing.\n\n'
+      'NEXT ACTION DECISION TREE:\n'
+      '1. If the current phase is INCOMPLETE (e.g. half the architecture is '
+      'sketched, or build is missing review), dispatch the missing work.\n'
+      '2. If the current phase is COMPLETE, call council_phase to move to the '
+      'next phase, then dispatch into it. Typical order: discovery -> '
+      'architecture -> build -> review -> polish -> ship.\n'
+      '3. council_report is ONLY legal AFTER council_quality_check returns '
+      'all gates PASS. If $gatesPassed/6 are passing right now, the gate is '
+      'NOT YET PASSED — keep working.\n'
+      '4. If work came back incomplete (errored / blocked / refused), call '
       'council_ask_user with a concrete ship-partial / retry-narrower / abort '
-      'choice. Don\'t ask process questions like "should I wait" or "ship as '
-      'they come" — make that call yourself.\n\n'
-      'You MUST call a tool. Do not exit without council_report or council_dispatch.',
+      'choice. Don\'t ask process questions like "should I wait" — own the call.\n'
+      '5. Do NOT re-dispatch agents on work that already returned (the dedup '
+      'guard rejects identical re-runs). Rephrase the task to name the SPECIFIC '
+      'new surface / decision / phase you want addressed.\n\n'
+      'The council is gathered for DEPTH. Do not ship after one wave on a '
+      'non-trivial brief. You MUST call a tool — typically council_phase or '
+      'council_dispatch — to advance the work.',
     );
 
     return CouncilToolResult(feedback: buf.toString());
@@ -1664,7 +2266,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       );
       _runners.add(runner);
       try {
-        result = await runner.run();
+        result = await runner.run(maxIterations: _agentMaxIterations);
         break; // Success — exit retry loop.
       } catch (e) {
         if (attempt < maxRetries && _isTransientError('$e')) {
@@ -2780,7 +3382,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       _runners.add(runner);
       CouncilRunResult result;
       try {
-        result = await runner.run(maxIterations: 4);
+        result = await runner.run(maxIterations: _evaluatorMaxIterations);
       } catch (e) {
         if (_isTransientError('$e') && attempt < maxAttempts) {
           final delaySecs = attempt * 5;
@@ -3077,8 +3679,20 @@ The draft report and agent transcripts are in your system prompt. You have every
         bestMatch = prior;
       }
     }
-    const threshold = 0.78;
+    // Excellence Doctrine softening: raised 0.78 -> 0.88. The lower
+    // threshold was too aggressive, refusing legitimate phase-follow-up
+    // work ("design the auth UI" then "build the auth UI" share 70%+
+    // vocabulary and got blocked). 0.88 still catches true paraphrases.
+    const threshold = 0.88;
     if (bestScore < threshold || bestMatch == null) return null;
+
+    // Phase-aware bypass: if the prior task and the new one are in
+    // different phases (e.g. discovery -> build, architecture -> build,
+    // review -> polish), the work is NOT a re-fire. Phases shift the
+    // verb prefix even when the noun stays the same.
+    if (_isCrossPhaseFollowup(prior: bestMatch.task, fresh: task)) {
+      return null;
+    }
 
     final agent = _session?.agentById(agentId);
     final priorTranscript = (agent?.transcript ?? '').trim();
@@ -3092,12 +3706,47 @@ The draft report and agent transcripts are in your system prompt. You have every
         'PRIOR TASK BRIEF:\n${bestMatch.task}\n\n'
         'PRIOR RESULT (summary):\n$priorSummary\n\n'
         'Do NOT re-run this. Pick one:\n'
-        '• Call council_report and synthesize the existing results above.\n'
+        '• Move to the next phase via council_phase, then dispatch genuinely '
+        'new work for that phase (a different verb on the same surface IS '
+        'legitimate — "design X" -> "build X" -> "review X" -> "polish X").\n'
         '• Dispatch GENUINELY NEW work — a different surface, a follow-up '
         'phase, an explicit refinement. Rephrase the task so the novelty is '
         'unambiguous (don\'t just paraphrase the original brief).\n'
         '• If you think the prior result is wrong, route a council_ask_pool '
         'question to a peer to challenge it — don\'t silently redo the work.';
+  }
+
+  /// Returns true when [prior] and [fresh] differ by a phase-shift verb
+  /// (e.g. "design"/"plan" -> "implement"/"build" -> "review"/"audit" ->
+  /// "polish"/"harden"). The simple heuristic: tokenize both, check if a
+  /// phase-verb from each set differs. False positives are fine — they
+  /// just mean an edge case slips through dedup, which is recoverable.
+  /// False negatives (blocking legitimate phase work) are NOT fine.
+  static bool _isCrossPhaseFollowup({
+    required String prior,
+    required String fresh,
+  }) {
+    const phaseVerbs = <Set<String>>[
+      {'discover', 'discovery', 'map', 'read', 'understand', 'explore', 'survey'},
+      {'design', 'plan', 'architect', 'sketch', 'decide', 'propose'},
+      {'build', 'implement', 'create', 'write', 'add', 'wire', 'ship'},
+      {'review', 'audit', 'attack', 'critique', 'challenge', 'verify', 'test'},
+      {'polish', 'harden', 'fix', 'refine', 'address', 'resolve', 'patch'},
+    ];
+    Set<int> phasesPresent(String text) {
+      final tokens = text.toLowerCase().split(RegExp(r'\W+'));
+      final result = <int>{};
+      for (var i = 0; i < phaseVerbs.length; i++) {
+        if (tokens.any(phaseVerbs[i].contains)) result.add(i);
+      }
+      return result;
+    }
+    final priorPhases = phasesPresent(prior);
+    final freshPhases = phasesPresent(fresh);
+    if (priorPhases.isEmpty || freshPhases.isEmpty) return false;
+    // Cross-phase if the dominant phase verb shifts.
+    return !priorPhases.containsAll(freshPhases) ||
+        !freshPhases.containsAll(priorPhases);
   }
 
   /// Jaccard similarity over normalized word sets. Symmetric, in [0..1].
@@ -3150,7 +3799,9 @@ The draft report and agent transcripts are in your system prompt. You have every
     final hasQuestionMark = q.contains('?');
     if (!hasQuestionMark) return null;
 
-    // Ship-as-they-come vs wait-for-all.
+    // Ship-as-they-come vs wait-for-all. Same canonical answer (wait, then
+    // synthesize once everyone returns) — that part of the doctrine
+    // didn't change.
     final shipsAsCome = q.contains('ship') &&
         (q.contains('as they') ||
             q.contains('as it') ||
@@ -3179,7 +3830,9 @@ The draft report and agent transcripts are in your system prompt. You have every
           'dispatch decisions — do not ask permission.';
     }
 
-    // "Should I write/ship/finalize the report".
+    // EXCELLENCE DOCTRINE — flipped from prior version:
+    // "Should I write/ship/finalize the report" is no longer auto-answered
+    // toward ship. Push the orchestrator back to the gate + phase flow.
     if (q.contains('report') &&
         (q.contains('should i') ||
             q.contains('shall i') ||
@@ -3189,13 +3842,18 @@ The draft report and agent transcripts are in your system prompt. You have every
             q.contains('ship')) &&
         !q.contains('round two') &&
         !q.contains('round 2')) {
-      return 'Yes. Call council_report with the markdown synthesis of the '
-          'work that has returned. The user does not need to confirm — '
-          'when all dispatched work has come back, reporting is the '
-          'default next action.';
+      return 'Not yet — by default. council_report is gated on '
+          'council_quality_check passing all six gates. Steps before report:\n'
+          '1. Run council_quality_check honestly. If gates fail, address them.\n'
+          '2. If you have not progressed through review + polish phases, do so '
+          'before considering ship. The council exists for DEPTH; one-wave '
+          'shipping is not the default on non-trivial briefs.\n'
+          '3. Only after a passing gate (and a real review + polish pass) is '
+          'council_report the right move. The user expects rigor here.';
     }
 
-    // "How should I organize / approach / structure the work".
+    // "How should I organize / approach / structure the work" — flipped
+    // toward phase-driven depth.
     if ((q.contains('how should i') ||
             q.contains('what approach') ||
             q.contains('which approach') ||
@@ -3204,10 +3862,29 @@ The draft report and agent transcripts are in your system prompt. You have every
         !q.contains('credential') &&
         !q.contains('risk') &&
         !q.contains('access')) {
-      return 'Pick the most natural shape for the brief. Independent threads '
-          'run parallel (council_dispatch with parallel=true, then '
-          'council_wait); dependent threads run sequential. The orchestrator '
-          'owns this call — that is the job.';
+      return 'Use the phase spine: discovery -> architecture -> build -> '
+          'review -> polish -> ship. Declare each phase via council_phase '
+          'before dispatching into it. Independent threads within a phase '
+          'run parallel; phases run sequentially. You own this call — that is '
+          'the job.';
+    }
+
+    // "Should I keep going" / "is there more work" / "am I done" — flipped
+    // hard. The whole POINT of the council is depth; the auto-answer here
+    // is "yes, keep going."
+    if (q.contains('should i keep') ||
+        q.contains('is there more') ||
+        q.contains('any more work') ||
+        q.contains('am i done') ||
+        q.contains('done yet') ||
+        q.contains('enough work') ||
+        q.contains('is this enough') ||
+        q.contains('shall i stop')) {
+      return 'Almost certainly yes — keep going. The council was gathered for '
+          'DEPTH. Default move: advance to the next phase (council_phase), '
+          'dispatch work into it, and run council_quality_check before '
+          'considering ship. If every gate is genuinely PASS and you are in '
+          'the ship phase, then ship — otherwise, more work.';
     }
 
     // "Is this ok" / "look ok" / "proceed" style permission asks.

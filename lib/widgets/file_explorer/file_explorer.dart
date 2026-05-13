@@ -1,13 +1,13 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:pasteboard/pasteboard.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
 
 import '../../l10n/strings.dart';
 import '../../providers/app_state.dart';
@@ -26,6 +26,7 @@ import '../menu_bar.dart';
 import '../ssh/ssh_session_picker.dart';
 import '../timeline/timeline_dialog.dart';
 import '../timeline/timeline_rail.dart';
+import 'drag_out_prompt.dart';
 import 'file_icon_colors.dart';
 
 class FileExplorer extends StatefulWidget {
@@ -186,9 +187,10 @@ class _FileExplorerState extends State<FileExplorer> {
   // isn't a registered folder row → drop falls through to the
   // workspace root, matching the prior behaviour.
   //
-  // The cursor-tracking approach is deliberate: `desktop_drop` only
-  // raises events on the outer `DropTarget` (per-row DropTargets
-  // don't reliably bubble on Windows OLE drag), so we hit-test the
+  // The cursor-tracking approach is deliberate: super_drag_and_drop
+  // raises drop events on the outer `DropRegion` only — nested per-row
+  // DropRegions don't reliably hit-test through the Win32 OLE drag
+  // (same constraint that `desktop_drop` had). So we hit-test the
   // global cursor position against folder GlobalKeys we collect
   // from each `_FileTree` mount. The deepest matching folder wins
   // so dropping inside `src/components/` lands there, not in `src/`.
@@ -1140,7 +1142,7 @@ class _FileExplorerState extends State<FileExplorer> {
   }
 
   /// Copy a single dropped file/folder into [destDir]. Lifted out of
-  /// the inline `onDragDone` callback so it can be reused for the
+  /// the inline `onPerformDrop` callback so it can be reused for the
   /// per-folder drop path. Errors are caught and logged — one bad
   /// entry shouldn't abort the rest of the batch.
   ///
@@ -1172,6 +1174,126 @@ class _FileExplorerState extends State<FileExplorer> {
     } catch (e) {
       debugPrint('[Lumen drop] FAILED $sourcePath -> $dest: $e');
     }
+  }
+
+  /// Ingest one [DropItem] coming in via super_drag_and_drop into
+  /// [destDir]. Handles two distinct shapes:
+  ///
+  /// 1. **Real on-disk file/folder** — the item exposes
+  ///    `Formats.fileUri` (Win32 CF_HDROP, X11 text/uri-list, etc.).
+  ///    We read the Uri, convert to a local path, and route through
+  ///    [_copyDroppedEntry] which already handles file-vs-dir
+  ///    branching, conflict-safe naming and timeline recording.
+  /// 2. **Virtual file** — comes from archive viewers like WinRAR,
+  ///    7-Zip, Bandizip, Outlook attachments, GMail web, etc. The
+  ///    file has NO on-disk path; the source app streams the bytes
+  ///    on demand via `CFSTR_FILECONTENTS`. super_drag_and_drop
+  ///    exposes this through `reader.getFile()`. We pipe the
+  ///    `DataReaderFile.getStream()` straight to a fresh file under
+  ///    [destDir] using [_uniquePastePath] for collision safety.
+  ///
+  /// Fire-and-forget on purpose — `onPerformDrop` blocks the
+  /// platform thread, so per super_drag_and_drop's contract we
+  /// must NOT `await` the underlying read here. Each completion
+  /// triggers a directory refresh so new items pop into the tree
+  /// without a manual reload. Errors are logged, not re-thrown.
+  void _ingestDropItem(
+    DropItem item,
+    String destDir,
+    AppState appState,
+  ) {
+    final reader = item.dataReader;
+    if (reader == null) return;
+
+    if (reader.canProvide(Formats.fileUri)) {
+      reader.getValue<Uri>(
+        Formats.fileUri,
+        (uri) {
+          if (uri == null) return;
+          try {
+            _copyDroppedEntry(uri.toFilePath(), destDir);
+          } catch (e) {
+            debugPrint('[Lumen drop] copy failed: $e');
+          }
+          if (mounted) appState.refreshDirectory();
+        },
+        onError: (e) => debugPrint('[Lumen drop] fileUri read failed: $e'),
+      );
+      return;
+    }
+
+    // Virtual file fallback. Try a generic getFile() so super_clipboard
+    // picks the best available file format for us — WinRAR typically
+    // advertises a single virtual rendition per dragged entry.
+    reader.getFile(
+      null,
+      (file) async {
+        try {
+          final raw = file.fileName ??
+              await reader.getSuggestedName() ??
+              'lumen-drop';
+          // WinRAR/7-Zip sometimes include path components ("docs/file.txt")
+          // when the user drags from a nested archive folder. Strip those
+          // to a flat name so we always land in destDir, never in a
+          // (potentially non-existent) subdirectory.
+          final flat = raw.replaceAll('\\', '/').split('/').last;
+          // Win32-illegal characters → underscore. Defensive only; legit
+          // archive entries shouldn't contain these, but corrupt archives
+          // do exist and we don't want to throw on `openWrite`.
+          final safe = flat.replaceAll(RegExp(r'[<>:"|?*]'), '_');
+          if (safe.isEmpty) {
+            debugPrint('[Lumen drop] virtual file had empty name, skipping');
+            return;
+          }
+          // _uniquePastePath needs a "source" path to derive the basename
+          // from — we pass `${destDir}/${safe}` so the function treats
+          // `safe` as the candidate filename.
+          final candidateSrc = p.join(destDir, safe);
+          final destPath = _uniquePastePath(Directory(destDir), candidateSrc);
+          final sink = File(destPath).openWrite();
+          try {
+            await for (final Uint8List chunk in file.getStream()) {
+              sink.add(chunk);
+            }
+          } finally {
+            await sink.flush();
+            await sink.close();
+          }
+          _recordExplorerOperation(
+            _ExplorerOperation.copy(
+              destPath,
+              destPath,
+              isDirectory: false,
+            ),
+          );
+          debugPrint('[Lumen drop] virtual -> $destPath');
+        } catch (e) {
+          debugPrint('[Lumen drop] virtual write failed: $e');
+        } finally {
+          if (mounted) appState.refreshDirectory();
+        }
+      },
+      onError: (e) => debugPrint('[Lumen drop] virtual read failed: $e'),
+    );
+  }
+
+  /// `DropRegion.onDropOver` predicate. We accept a copy operation if
+  /// the session contains at least one item that looks like a file —
+  /// either a real on-disk URI or anything we could conceivably stream
+  /// into a file (canProvide with any standard format). Returning
+  /// `DropOperation.none` makes the cursor show the "not allowed"
+  /// glyph and ensures `onPerformDrop` won't fire.
+  DropOperation _onSidebarDropOver(DropOverEvent event) {
+    for (final item in event.session.items) {
+      if (item.canProvide(Formats.fileUri)) return DropOperation.copy;
+      // Heuristic: any item that's NOT pure plainText is almost
+      // certainly a file rendition (image, doc, virtual stream, etc.).
+      // We'd rather over-accept and no-op in `_ingestDropItem` than
+      // refuse a valid virtual file because we didn't enumerate every
+      // possible mime/CF format.
+      if (item.platformFormats.isNotEmpty) return DropOperation.copy;
+    }
+    return DropOperation.none;
   }
 
   GitIgnoreMatcher _matcherFor(AppState appState) {
@@ -1287,33 +1409,62 @@ class _FileExplorerState extends State<FileExplorer> {
           child: Consumer<AppState>(
             builder: (context, appState, child) {
               if (appState.currentDirectory == null) {
-                // Empty-workspace state: still render a `DropTarget`
+                // Empty-workspace state: still render a drop region
                 // so dragging a folder from Windows Explorer onto
                 // the (otherwise blank) sidebar opens it as the
                 // active workspace. Without this the panel was a
                 // dead `Container` and the user's "drop folder to
-                // open" muscle memory failed silently.
-                return DropTarget(
-                  onDragEntered: (_) =>
-                      setState(() => _isDragging = true),
-                  onDragExited: (_) =>
-                      setState(() => _isDragging = false),
-                  onDragDone: (detail) async {
-                    setState(() => _isDragging = false);
-                    if (detail.files.isEmpty) return;
-                    // Pick the first dropped folder; if the user
-                    // dropped only files, fall back to their parent
-                    // directory so the workspace opens at a useful
-                    // root rather than an individual file.
-                    String? target;
-                    for (final f in detail.files) {
-                      if (FileSystemEntity.isDirectorySync(f.path)) {
-                        target = f.path;
-                        break;
+                // open" muscle memory failed silently. Only accepts
+                // `Formats.fileUri` items — virtual streams from
+                // WinRAR can't open as a workspace (they have no
+                // on-disk root).
+                return DropRegion(
+                  formats: const [Formats.fileUri],
+                  hitTestBehavior: HitTestBehavior.opaque,
+                  onDropOver: (event) {
+                    for (final item in event.session.items) {
+                      if (item.canProvide(Formats.fileUri)) {
+                        return DropOperation.copy;
                       }
                     }
-                    target ??= File(detail.files.first.path).parent.path;
-                    await appState.setDirectory(target);
+                    return DropOperation.none;
+                  },
+                  onDropEnter: (_) => setState(() => _isDragging = true),
+                  onDropLeave: (_) => setState(() => _isDragging = false),
+                  onPerformDrop: (event) async {
+                    setState(() => _isDragging = false);
+                    // Read the first fileUri synchronously inside the
+                    // perform-drop callback (per super_drag_and_drop
+                    // contract). The actual workspace open fires
+                    // inside the value callback once the platform
+                    // returns the resolved path.
+                    for (final item in event.session.items) {
+                      if (!item.canProvide(Formats.fileUri)) continue;
+                      final reader = item.dataReader;
+                      if (reader == null) continue;
+                      reader.getValue<Uri>(
+                        Formats.fileUri,
+                        (uri) async {
+                          if (uri == null) return;
+                          final path = uri.toFilePath();
+                          // Prefer a directory; fall back to the
+                          // file's parent. Mirrors the pre-migration
+                          // behaviour of opening the dropped folder
+                          // as workspace, or the containing folder
+                          // if the user dropped a file.
+                          final target =
+                              FileSystemEntity.isDirectorySync(path)
+                                  ? path
+                                  : File(path).parent.path;
+                          await appState.setDirectory(target);
+                        },
+                        onError: (e) => debugPrint(
+                            '[Lumen drop:empty-ws] read failed: $e'),
+                      );
+                      // Only the first valid item matters here —
+                      // setDirectory replaces the workspace.
+                      break;
+                    }
                   },
                   child: Container(
                     color: DuckColors.bgRaised,
@@ -1322,13 +1473,9 @@ class _FileExplorerState extends State<FileExplorer> {
                       duration: DuckMotion.fast,
                       decoration: BoxDecoration(
                         border: _isDragging
-                            ? Border.all(
-                                color: DuckColors.accentMint,
-                                width: 1,
-                              )
+                            ? Border.all(color: DuckColors.accentMint, width: 1)
                             : null,
-                        borderRadius:
-                            BorderRadius.circular(DuckTheme.radiusM),
+                        borderRadius: BorderRadius.circular(DuckTheme.radiusM),
                       ),
                       padding: const EdgeInsets.all(16),
                       child: const Text(
@@ -1352,8 +1499,18 @@ class _FileExplorerState extends State<FileExplorer> {
                   .last
                   .toUpperCase();
 
-              return DropTarget(
-                onDragEntered: (_) => setState(() {
+              return DropRegion(
+                // Accept real file URIs AND every standard format —
+                // the latter is what WinRAR/7-Zip use to advertise
+                // virtual file content (CFSTR_FILEDESCRIPTOR + the
+                // matching MIME for the inner file). Listing
+                // `standardFormats` keeps the door open for any
+                // archive viewer that picks a different rendition
+                // per archive entry without us having to enumerate
+                // them all.
+                formats: Formats.standardFormats,
+                hitTestBehavior: HitTestBehavior.opaque,
+                onDropEnter: (_) => setState(() {
                   _isDragging = true;
                   // Reset stale value at the START of a fresh drag
                   // (in case the previous drag ended without a drop
@@ -1361,54 +1518,52 @@ class _FileExplorerState extends State<FileExplorer> {
                   _externalDropFolder = null;
                 }),
                 // **Don't clear `_externalDropFolder` here.** On
-                // Windows, `desktop_drop` fires `onDragExited`
-                // BEFORE `onDragDone` when the user releases the
-                // mouse — Win32's `IDropTarget::Drop` routes
-                // through DragLeave → Drop semantics. Clearing the
-                // hovered folder on exit makes onDragDone read
-                // null and fall back to the workspace root —
-                // which was the "drops always land in root" bug.
-                // Only the panel-border highlight (`_isDragging`)
-                // is cleared on exit; folder-row highlight is
-                // gated below on both `_isDragging == true` AND a
-                // matching path so a stale `_externalDropFolder`
-                // can't paint a ghost highlight after the drag is
-                // gone.
-                onDragExited: (_) => setState(() => _isDragging = false),
+                // Windows, both `desktop_drop` AND `super_drag_and_drop`
+                // fire the leave-equivalent BEFORE `onPerformDrop`
+                // when the user releases the mouse — Win32's
+                // `IDropTarget::Drop` routes through DragLeave →
+                // Drop semantics. Clearing the hovered folder on
+                // exit makes the perform-drop callback read null
+                // and fall back to the workspace root — which was
+                // the "drops always land in root" bug. Only the
+                // panel-border highlight (`_isDragging`) is cleared
+                // on exit; folder-row highlight is gated below on
+                // both `_isDragging == true` AND a matching path so
+                // a stale `_externalDropFolder` can't paint a ghost
+                // highlight after the drag is gone.
+                onDropLeave: (_) => setState(() => _isDragging = false),
                 // Hit-test the folder under the cursor on every
                 // movement so the highlight tracks live with the
                 // drag. setState is cheap because we only repaint
                 // when the resolved folder actually changes.
-                onDragUpdated: (details) {
-                  final next = _hitTestFolder(details.globalPosition);
+                onDropOver: (event) {
+                  final next = _hitTestFolder(event.position.global);
                   if (next != _externalDropFolder) {
                     setState(() => _externalDropFolder = next);
                   }
+                  return _onSidebarDropOver(event);
                 },
-                onDragDone: (detail) {
+                onPerformDrop: (event) async {
                   // Pin the destination BEFORE clearing UI state
                   // (otherwise the setState below races the read).
                   final destDir =
                       _externalDropFolder ?? appState.currentDirectory!;
-                  // Diagnostic: tells us at a glance whether
-                  // `desktop_drop` is delivering a fresh file list
-                  // per drop or stuck on a cached one. If a second
-                  // drop logs the SAME source as the first, that's
-                  // a package-level bug and we'd need to vendor the
-                  // plugin or upgrade. So far we've only seen
-                  // silent-overwrite-mistaken-for-cache, hence the
-                  // unique-name fix in `_copyDroppedEntry`.
                   debugPrint(
-                    '[Lumen drop] dest=$destDir files=${detail.files.map((f) => f.path).toList()}',
+                    '[Lumen drop] dest=$destDir items=${event.session.items.length}',
                   );
                   setState(() {
                     _isDragging = false;
                     _externalDropFolder = null;
                   });
-                  for (final file in detail.files) {
-                    _copyDroppedEntry(file.path, destDir);
+                  // Fire-and-forget per item; each ingestion handles
+                  // both real-file and virtual-file shapes, and
+                  // triggers its own refresh on completion. We
+                  // intentionally don't `await` here — per
+                  // super_drag_and_drop's contract `onPerformDrop`
+                  // blocks the platform thread until it returns.
+                  for (final item in event.session.items) {
+                    _ingestDropItem(item, destDir, appState);
                   }
-                  appState.refreshDirectory();
                 },
                 child: DuckGlass(
                   border: _isDragging
@@ -1434,6 +1589,7 @@ class _FileExplorerState extends State<FileExplorer> {
                       _ExplorerActivityBar(
                         onSettings: () => handleMenuAction(context, 'settings'),
                         onSearch: () => appState.ideActions.openQuickOpen(),
+                        onTimeline: () => showTimelineDialog(context),
                         onMediaHub: () => showMediaUrlPrompt(context),
                         onCouncil: () {
                           if (appState.currentDirectory == null ||
@@ -1990,12 +2146,14 @@ class _FileExplorerState extends State<FileExplorer> {
 class _ExplorerActivityBar extends StatelessWidget {
   final VoidCallback onSettings;
   final VoidCallback onSearch;
+  final VoidCallback onTimeline;
   final VoidCallback onMediaHub;
   final VoidCallback onCouncil;
 
   const _ExplorerActivityBar({
     required this.onSettings,
     required this.onSearch,
+    required this.onTimeline,
     required this.onMediaHub,
     required this.onCouncil,
   });
@@ -2017,6 +2175,11 @@ class _ExplorerActivityBar extends StatelessWidget {
         icon: Icons.search,
         tooltip: S.menuBarSearchTooltip,
         onTap: onSearch,
+      ),
+      BrightIconButton(
+        icon: Icons.manage_history,
+        tooltip: S.timelineTimeMachineTooltip,
+        onTap: onTimeline,
       ),
       BrightIconButton(
         icon: Icons.video_settings_outlined,
@@ -2567,55 +2730,63 @@ class _FileTreeState extends State<_FileTree> {
       isDirectory: true,
     );
 
-    // Wrap the folder row in both Draggable (so it can be moved) and
-    // DragTarget (so items can be dropped into it). Uses the tolerant
-    // draggable with an 8px movement threshold so a click-and-twitch
-    // doesn't fire an accidental folder move — see the
-    // `_TolerantDraggable` doc at the bottom of this file.
+    // Wrap the folder row in three layers:
+    //   1. `_DragOutWrapper`  — Ctrl+drag OS drag-out (sup_drag_and_drop)
+    //   2. `_TolerantDraggable` — Plain drag for in-app folder moves
+    //                              (Flutter `Draggable`, 8px slop)
+    //   3. `DragTarget`       — Drop target for in-app moves landing
+    //                              ON this folder.
+    // See `_DragOutWrapper` and `_TolerantDraggable` docs at the
+    // bottom of this file for gesture-arena reasoning.
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _TolerantDraggable<String>(
-          data: widget.directory.path,
-          allowedButtonsFilter: (buttons) => buttons == kPrimaryButton,
-          feedback: Material(
-            color: Colors.transparent,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: DuckColors.bgRaisedHi,
-                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-                border: Border.all(color: DuckColors.accentCyan, width: 0.5),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.keyboard_arrow_right,
-                    size: 13,
-                    color: DuckColors.fgSubtle,
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    dirName,
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: DuckColors.fgPrimary,
+        _DragOutWrapper(
+          path: widget.directory.path,
+          isDirectory: true,
+          child: _TolerantDraggable<String>(
+            data: widget.directory.path,
+            allowedButtonsFilter: (buttons) => buttons == kPrimaryButton,
+            feedback: Material(
+              color: Colors.transparent,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: DuckColors.bgRaisedHi,
+                  borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                  border:
+                      Border.all(color: DuckColors.accentCyan, width: 0.5),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.keyboard_arrow_right,
+                      size: 13,
+                      color: DuckColors.fgSubtle,
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 6),
+                    Text(
+                      dirName,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: DuckColors.fgPrimary,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-          childWhenDragging: Opacity(
-            opacity: 0.3,
-            child: _buildFolderRow(
-              dirName,
-              selected: selected,
-              ignored: ignored,
+            childWhenDragging: Opacity(
+              opacity: 0.3,
+              child: _buildFolderRow(
+                dirName,
+                selected: selected,
+                ignored: ignored,
+              ),
             ),
-          ),
-          child: DragTarget<String>(
+            child: DragTarget<String>(
             onWillAcceptWithDetails: (details) {
               final src = details.data;
               if (!_canAcceptDrop(src)) return false;
@@ -2654,6 +2825,7 @@ class _FileTreeState extends State<_FileTree> {
                 ),
               );
             },
+            ),
           ),
         ),
         if (_expanded)
@@ -2877,46 +3049,62 @@ class _FileItemRowState extends State<_FileItemRow> {
 
     return MouseRegion(
       cursor: SystemMouseCursors.click,
-      // Tolerant draggable — 8px movement threshold so quick clicks
-      // (especially click-and-release with hand twitch) don't kick
-      // off an accidental file move. See `_TolerantDraggable` doc.
-      child: _TolerantDraggable<String>(
-        data: widget.file.path,
-        allowedButtonsFilter: (buttons) => buttons == kPrimaryButton,
-        feedback: Material(
-          color: Colors.transparent,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: DuckColors.bgRaisedHi,
-              borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-              border: Border.all(color: DuckColors.accentCyan, width: 0.5),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  FileIconColors.iconForFileName(fileName),
-                  size: 13,
-                  color: FileIconColors.forFileName(fileName),
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  fileName,
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: DuckColors.fgPrimary,
+      // The row gets BOTH drag systems wired in:
+      //   • `_DragOutWrapper`   — outer; super_drag_and_drop OS drag,
+      //                           gated on Ctrl-held-at-pointer-down so
+      //                           it stays out of the way for plain
+      //                           drags. Used to drop the file into
+      //                           Windows Explorer / external apps.
+      //   • `_TolerantDraggable` — inner; Flutter in-app drag with an
+      //                           8px movement threshold so a click +
+      //                           hand-twitch doesn't kick off an
+      //                           accidental file move. Drops into
+      //                           sibling `DragTarget<String>` folder
+      //                           rows for in-app moves.
+      // See the `_DragOutWrapper` and `_TolerantDraggable` docs for the
+      // gesture-arena reasoning.
+      child: _DragOutWrapper(
+        path: widget.file.path,
+        isDirectory: false,
+        child: _TolerantDraggable<String>(
+          data: widget.file.path,
+          allowedButtonsFilter: (buttons) => buttons == kPrimaryButton,
+          feedback: Material(
+            color: Colors.transparent,
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: DuckColors.bgRaisedHi,
+                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+                border: Border.all(color: DuckColors.accentCyan, width: 0.5),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    FileIconColors.iconForFileName(fileName),
+                    size: 13,
+                    color: FileIconColors.forFileName(fileName),
                   ),
-                ),
-              ],
+                  const SizedBox(width: 6),
+                  Text(
+                    fileName,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: DuckColors.fgPrimary,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
-        childWhenDragging: Opacity(
-          opacity: 0.3,
+          childWhenDragging: Opacity(
+            opacity: 0.3,
+            child: _buildRow(fileName, isActive, appState),
+          ),
           child: _buildRow(fileName, isActive, appState),
         ),
-        child: _buildRow(fileName, isActive, appState),
       ),
     );
   }
@@ -3400,6 +3588,158 @@ class _DeleteConfirmDialog extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+// ── Drag-OUT wrapper (Ctrl+drag → Windows Explorer / other apps) ───
+//
+// `_DragOutWrapper` wraps a file or folder row in super_drag_and_drop's
+// `DragItemWidget` + `DraggableWidget` so the OS can pick up the drag
+// and hand it off to another application (Windows Explorer, Outlook,
+// browsers' upload-by-drag, etc.).
+//
+// Why Ctrl is the gate:
+//
+// The wrapper sits OUTSIDE the row's existing `_TolerantDraggable`,
+// which means two competing `ImmediateMultiDragGestureRecognizer`s
+// are in the gesture arena whenever the user clicks the row. The
+// super_drag_and_drop variant has effectively 0px slop; the tolerant
+// Flutter `Draggable` waits for 8px. Whichever claims first wins —
+// and without a tie-breaker that's always super_drag_and_drop, which
+// would silently break in-app drag-to-folder moves users rely on.
+//
+// `isLocationDraggable: ctrlHeld` is the tie-breaker. super_drag_and_drop's
+// `_ImmediateMultiDragGestureRecognizer.isPointerAllowed` consults
+// the predicate at pointer-down; if it returns false the recognizer
+// rejects the gesture entirely and leaves the arena. So:
+//
+// - Plain click+drag         → predicate is false → only the tolerant
+//                              recognizer claims → in-app move (existing).
+// - Ctrl+click+drag          → predicate is true  → super_drag_and_drop's
+//                              0-slop recognizer wins → OS drag-out.
+//
+// This is sticky: if the user releases Ctrl mid-drag, the gesture has
+// already been claimed by super_drag_and_drop and the drag completes
+// as an OS drag-out.
+//
+// Why the prompt:
+//
+// On confirmed Ctrl+drag, `dragItemProvider` awaits a
+// `_DragOutPromptDialog` (drag_out_prompt.dart). Returning `null`
+// aborts the drag — super_drag_and_drop never calls the platform's
+// drag-source API for that session. The "Don't ask again this session"
+// checkbox flips a top-level flag in `drag_out_prompt.dart` so power
+// users with many drags don't get prompted every time.
+class _DragOutWrapper extends StatelessWidget {
+  const _DragOutWrapper({
+    required this.path,
+    required this.isDirectory,
+    required this.child,
+  });
+
+  final String path;
+  final bool isDirectory;
+  final Widget child;
+
+  static bool _isCtrlHeld(Offset _) {
+    final keys = HardwareKeyboard.instance.logicalKeysPressed;
+    return keys.contains(LogicalKeyboardKey.controlLeft) ||
+        keys.contains(LogicalKeyboardKey.controlRight) ||
+        keys.contains(LogicalKeyboardKey.control);
+  }
+
+  Future<DragItem?> _provider(DragItemRequest request) async {
+    final ctx = _DragOutContext._current;
+    if (ctx == null) {
+      debugPrint(
+        '[Lumen drag-out] no context registered; aborting drag start',
+      );
+      return null;
+    }
+    // Last-second existence check — a row could have been deleted /
+    // moved by another agent edit between mousedown and drag start,
+    // and dragging a stale path into Explorer would create an empty
+    // shortcut. Cheap and silent fail.
+    final entityType = FileSystemEntity.typeSync(path);
+    if (entityType == FileSystemEntityType.notFound) return null;
+
+    final confirmed = await maybeAskBeforeDragOut(
+      ctx,
+      name: path.split(Platform.pathSeparator).last,
+      isDirectory: isDirectory,
+    );
+    if (!confirmed) return null;
+
+    final item = DragItem(
+      // Local data lets in-app DropRegions detect "this came from
+      // Lumen itself" so we could short-circuit to an in-app move
+      // path. Not used yet — the in-app folder DragTargets still
+      // route through Flutter's `Draggable`/`DragTarget` for plain
+      // drags — but it's cheap to set and will save a refactor when
+      // we eventually consolidate.
+      localData: <String, dynamic>{
+        'lumen.source': 'file_explorer',
+        'lumen.path': path,
+        'lumen.isDirectory': isDirectory,
+      },
+      suggestedName: path.split(Platform.pathSeparator).last,
+    );
+    item.add(Formats.fileUri(Uri.file(path)));
+    return item;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _DragOutContext(
+      child: DragItemWidget(
+        dragItemProvider: _provider,
+        allowedOperations: () => const [
+          DropOperation.copy,
+          DropOperation.move,
+        ],
+        // Dim the drag preview slightly to telegraph "this is going
+        // out of Lumen" — matches the existing in-app drag feedback's
+        // bgRaisedHi chip but with a tighter border-radius.
+        dragBuilder: (ctx, c) => Opacity(opacity: 0.85, child: c),
+        child: DraggableWidget(
+          isLocationDraggable: _isCtrlHeld,
+          hitTestBehavior: HitTestBehavior.deferToChild,
+          child: child,
+        ),
+      ),
+    );
+  }
+}
+
+/// `BuildContext` shuttle for `_DragOutWrapper._provider`.
+///
+/// `dragItemProvider` is a top-level callback that runs OUTSIDE the
+/// widget tree (the future resolves while the platform is preparing
+/// the drag image). It has no `BuildContext` of its own and can't use
+/// `Navigator.of(context)` directly, which is exactly what
+/// `showDialog` needs.
+///
+/// Workaround: each `_DragOutWrapper` registers its build context
+/// while it's mounted (push on `initState`-equivalent, pop on
+/// `dispose`-equivalent). The provider grabs the topmost registered
+/// context to show the prompt against the right `Overlay`. Cheap
+/// because the file explorer tree mounts a handful of these at most
+/// (only visible rows).
+class _DragOutContext extends StatefulWidget {
+  const _DragOutContext({required this.child});
+  final Widget child;
+
+  static BuildContext? _current;
+
+  @override
+  State<_DragOutContext> createState() => _DragOutContextState();
+}
+
+class _DragOutContextState extends State<_DragOutContext> {
+  @override
+  Widget build(BuildContext context) {
+    _DragOutContext._current = context;
+    return widget.child;
   }
 }
 

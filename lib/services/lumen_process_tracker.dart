@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 
 import 'process_manager_service.dart';
@@ -39,6 +41,30 @@ class LumenProcessTracker extends ChangeNotifier {
   void unregister(int? pid) {
     if (pid == null) return;
     if (_direct.remove(pid)) notifyListeners();
+  }
+
+  /// Defence-in-depth sweep: hard-kill every PID we currently track.
+  /// Called from `AppState.shutdownAllTerminals` on the app-close path
+  /// after the bridge + pane have already had their graceful Ctrl+C
+  /// pass — anything still tracked at this point is either a session
+  /// that escaped both the agent bridge and the visible pane, or a
+  /// grandchild whose parent shell didn't propagate SIGINT down. We
+  /// favour an aggressive cleanup over leaving renegade `node`/`python`
+  /// processes squatting on ports / file handles after Lumen closes.
+  ///
+  /// Best-effort: `Process.killPid` returning `false` (already dead
+  /// PID, permission denied, etc.) is silent. Always clears the
+  /// tracker set so a subsequent boot doesn't carry stale PIDs.
+  void killAllTracked() {
+    if (_direct.isEmpty) return;
+    final snapshot = _direct.toList(growable: false);
+    for (final pid in snapshot) {
+      try {
+        Process.killPid(pid, ProcessSignal.sigterm);
+      } catch (_) {}
+    }
+    _direct.clear();
+    notifyListeners();
   }
 
   /// Expand the direct set into the *transitive* set of "everything

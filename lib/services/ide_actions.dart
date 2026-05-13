@@ -83,25 +83,43 @@ class IdeActions extends ChangeNotifier {
   // ---- terminal ----
   VoidCallback? _newTerminal;
   VoidCallback? _killActiveTerminal;
+  Future<void> Function(Duration graceWindow)? _shutdownAllTerminals;
   bool get hasTerminal => _newTerminal != null;
 
   void registerTerminalActions({
     required VoidCallback onNewTerminal,
     required VoidCallback onKillActive,
+    Future<void> Function(Duration graceWindow)? onShutdownAll,
   }) {
     _newTerminal = onNewTerminal;
     _killActiveTerminal = onKillActive;
+    _shutdownAllTerminals = onShutdownAll;
     notifyListeners();
   }
 
   void unregisterTerminalActions() {
     _newTerminal = null;
     _killActiveTerminal = null;
+    _shutdownAllTerminals = null;
     notifyListeners();
   }
 
   void newTerminal() => _newTerminal?.call();
   void killActiveTerminal() => _killActiveTerminal?.call();
+
+  /// Drains every interactive terminal session the pane owns. The
+  /// agent-spawned (`RUN_CMD`-backed) sessions live in
+  /// [AgentTerminalBridge] and are NOT touched by this callback —
+  /// `AppState.shutdownAllTerminals` orchestrates both halves.
+  /// Returns a future that completes once every session has had its
+  /// Ctrl+C grace window and been hard-killed + disposed.
+  Future<void> shutdownAllTerminals({
+    Duration graceWindow = const Duration(milliseconds: 250),
+  }) async {
+    final cb = _shutdownAllTerminals;
+    if (cb == null) return;
+    await cb(graceWindow);
+  }
 
   // ---- overlay panels (command palette / quick open / global search) ----
   // Registered by the overlay host widget that lives once at the IDE shell

@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../l10n/strings.dart';
 import 'timeline_models.dart';
 
 /// Per-workspace foolproof file revision history.
@@ -130,7 +131,7 @@ class TimelineService extends ChangeNotifier {
   /// active mid-size project (Lumen itself, ~500 source files,
   /// dozens of saves/day) comfortably under a couple hundred MB
   /// over a month.
-  static const Duration _maxAge = Duration(days: 30);
+  static const Duration _maxAge = Duration(days: 90);
   static const int _maxWorkspaceBytes = 200 * 1024 * 1024;
   static const Duration _pruneInterval = Duration(hours: 1);
 
@@ -141,12 +142,18 @@ class TimelineService extends ChangeNotifier {
   String? _workspacePath;
   Directory? _root;
   File? _journalFile;
+  File? _tombJournalFile;
   Directory? _objectsDir;
+  Directory? _tombObjectsDir;
+  Directory? _turnsDir;
 
   /// In-memory cache of the journal — newest first. Kept in step
   /// with `journal.ndjson` writes. Bounded only by the prune
   /// schedule.
   final List<TimelineEntry> _entries = <TimelineEntry>[];
+  final List<TimelineEntry> _archivedEntries = <TimelineEntry>[];
+  final Map<String, TimelineTurnManifest> _turnsById =
+      <String, TimelineTurnManifest>{};
 
   /// Quick lookup of the most recent entry per file (newest first).
   /// `_headByPath[rel]` returns the entry that established the
@@ -191,6 +198,22 @@ class TimelineService extends ChangeNotifier {
   /// Read-only newest-first snapshot of every entry currently held
   /// in memory. Returned as an unmodifiable view.
   List<TimelineEntry> get entries => List.unmodifiable(_entries);
+  List<TimelineEntry> get archivedEntries =>
+      List.unmodifiable(_archivedEntries);
+  List<TimelineTurnManifest> get turnManifests {
+    final manifests = _turnsById.values.toList(growable: false)
+      ..sort((a, b) => b.endedAt.compareTo(a.endedAt));
+    return List.unmodifiable(manifests);
+  }
+
+  int get legacyAgentEntryCount => _entries
+      .where(
+        (e) =>
+            e.origin == TimelineOrigin.agentTool &&
+            e.turnId != null &&
+            !_turnsById.containsKey(e.turnId),
+      )
+      .length;
 
   String? get workspacePath => _workspacePath;
 
@@ -206,6 +229,8 @@ class TimelineService extends ChangeNotifier {
     _initInFlight = true;
     try {
       _entries.clear();
+      _archivedEntries.clear();
+      _turnsById.clear();
       _headByPath.clear();
       _inFlight.clear();
       _pruneTimer?.cancel();
@@ -214,7 +239,10 @@ class TimelineService extends ChangeNotifier {
       _workspacePath = workspacePath;
       _root = null;
       _journalFile = null;
+      _tombJournalFile = null;
       _objectsDir = null;
+      _tombObjectsDir = null;
+      _turnsDir = null;
 
       if (workspacePath == null || workspacePath.isEmpty) {
         notifyListeners();
@@ -229,13 +257,24 @@ class TimelineService extends ChangeNotifier {
       }
       _root = root;
       _journalFile = File(p.join(root.path, 'journal.ndjson'));
+      _tombJournalFile = File(p.join(root.path, 'journal.tomb.ndjson'));
       _objectsDir = Directory(p.join(root.path, 'objects'));
+      _tombObjectsDir = Directory(p.join(root.path, 'objects.tomb'));
+      _turnsDir = Directory(p.join(root.path, 'turns'));
       if (!await _objectsDir!.exists()) {
         await _objectsDir!.create(recursive: true);
+      }
+      if (!await _tombObjectsDir!.exists()) {
+        await _tombObjectsDir!.create(recursive: true);
+      }
+      if (!await _turnsDir!.exists()) {
+        await _turnsDir!.create(recursive: true);
       }
 
       await _writeMetaIfMissing(root, workspacePath);
       await _loadJournal();
+      await _loadArchivedJournal();
+      await _loadTurnManifests();
       _pruneTimer = Timer.periodic(_pruneInterval, (_) => _runPruneSafe());
       // Run an initial prune asynchronously — don't block bind, the
       // sweep can take a second on a large journal.
@@ -581,7 +620,44 @@ class TimelineService extends ChangeNotifier {
     for (final e in _entries) {
       if (e.id == id) return e;
     }
+    for (final e in _archivedEntries) {
+      if (e.id == id) return e;
+    }
     return null;
+  }
+
+  TimelineTurnManifest? turnById(String turnId) => _turnsById[turnId];
+
+  List<String> turnIdsForMessage(String messageId, {String? legacyMessageId}) {
+    return _turnsById.values
+        .where(
+          (t) =>
+              t.messageId == messageId ||
+              (legacyMessageId != null && t.messageId == legacyMessageId),
+        )
+        .map((t) => t.turnId)
+        .toList(growable: false);
+  }
+
+  List<TimelineEntry> entriesForTurnId(String turnId) {
+    final manifest = _turnsById[turnId];
+    if (manifest == null) {
+      return _entries
+          .where(
+            (e) => e.turnId == turnId && e.origin == TimelineOrigin.agentTool,
+          )
+          .toList(growable: false);
+    }
+    final byId = <String, TimelineEntry>{
+      for (final e in [..._entries, ..._archivedEntries]) e.id: e,
+    };
+    final out = <TimelineEntry>[];
+    for (final id in manifest.entryIds) {
+      final entry = byId[id];
+      if (entry != null) out.add(entry);
+    }
+    out.sort((a, b) => b.when.compareTo(a.when));
+    return out;
   }
 
   /// Agent-origin entries tied to a chat assistant message. New builds tag
@@ -591,14 +667,26 @@ class TimelineService extends ChangeNotifier {
     String messageId, {
     String? legacyMessageId,
   }) {
-    return _entries
-        .where(
-          (e) =>
-              e.origin == TimelineOrigin.agentTool &&
-              (e.messageId == messageId ||
-                  (legacyMessageId != null && e.messageId == legacyMessageId)),
-        )
-        .toList(growable: false);
+    final byId = <String, TimelineEntry>{};
+    for (final turnId in turnIdsForMessage(
+      messageId,
+      legacyMessageId: legacyMessageId,
+    )) {
+      for (final entry in entriesForTurnId(turnId)) {
+        byId[entry.id] = entry;
+      }
+    }
+    for (final entry in _entries) {
+      if (entry.origin == TimelineOrigin.agentTool &&
+          (entry.messageId == messageId ||
+              (legacyMessageId != null &&
+                  entry.messageId == legacyMessageId))) {
+        byId[entry.id] = entry;
+      }
+    }
+    final out = byId.values.toList(growable: false)
+      ..sort((a, b) => b.when.compareTo(a.when));
+    return out;
   }
 
   /// Read a blob from disk. Returns null when the blob is missing
@@ -607,14 +695,71 @@ class TimelineService extends ChangeNotifier {
   Future<Uint8List?> readBlob(String hash) async {
     if (hash.isEmpty || _objectsDir == null) return null;
     final file = _blobFileFor(hash);
-    if (!await file.exists()) return null;
+    if (await file.exists()) {
+      try {
+        final compressed = await file.readAsBytes();
+        final out = const GZipDecoder().decodeBytes(compressed);
+        return Uint8List.fromList(out);
+      } catch (e) {
+        debugPrint('TimelineService.readBlob failed for $hash: $e');
+      }
+    }
+    final tombDir = _tombObjectsDir;
+    if (tombDir == null) return null;
+    final tomb = _tombBlobFileFor(hash);
+    if (!await tomb.exists()) return null;
     try {
-      final compressed = await file.readAsBytes();
+      final compressed = await tomb.readAsBytes();
       final out = const GZipDecoder().decodeBytes(compressed);
       return Uint8List.fromList(out);
     } catch (e) {
-      debugPrint('TimelineService.readBlob failed for $hash: $e');
+      debugPrint('TimelineService.readBlob archived failed for $hash: $e');
       return null;
+    }
+  }
+
+  Future<void> recordTurnManifest({
+    required String turnId,
+    required String sessionId,
+    required String messageId,
+    required DateTime startedAt,
+    required DateTime endedAt,
+    required String userPromptPreview,
+  }) async {
+    if (!isReady || _turnsDir == null || turnId.isEmpty) return;
+    final ids = _entries
+        .where(
+          (e) =>
+              e.origin == TimelineOrigin.agentTool &&
+              e.turnId == turnId &&
+              e.sessionId == sessionId,
+        )
+        .map((e) => e.id)
+        .toSet()
+        .toList(growable: false);
+    if (ids.isEmpty) return;
+    ids.sort((a, b) {
+      final ea = entryById(a);
+      final eb = entryById(b);
+      if (ea == null || eb == null) return 0;
+      return eb.when.compareTo(ea.when);
+    });
+    final manifest = TimelineTurnManifest(
+      turnId: turnId,
+      sessionId: sessionId,
+      messageId: messageId,
+      startedAt: startedAt,
+      endedAt: endedAt,
+      userPromptPreview: _clipPrompt(userPromptPreview),
+      entryIds: ids,
+    );
+    final file = File(p.join(_turnsDir!.path, '$turnId.json'));
+    try {
+      await file.writeAsString(jsonEncode(manifest.toJson()), flush: true);
+      _turnsById[turnId] = manifest;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('TimelineService.recordTurnManifest failed: $e');
     }
   }
 
@@ -784,28 +929,72 @@ class TimelineService extends ChangeNotifier {
         message: 'No file changes were recorded for this revert.',
       );
     }
-    final entries = _entries
-        .where(
-          (e) =>
-              e.origin == TimelineOrigin.agentTool &&
-              e.messageId != null &&
-              (messageIds.contains(e.messageId) ||
-                  (legacyMessageIds != null &&
-                      legacyMessageIds.contains(e.messageId))),
-        )
-        .toList(growable: false);
-    if (entries.isEmpty) {
+    final turnIds = <String>{};
+    for (final id in messageIds) {
+      turnIds.addAll(turnIdsForMessage(id));
+    }
+    if (legacyMessageIds != null) {
+      for (final id in legacyMessageIds) {
+        turnIds.addAll(turnIdsForMessage(id));
+      }
+    }
+    final byId = <String, TimelineEntry>{};
+    for (final turnId in turnIds) {
+      for (final entry in entriesForTurnId(turnId)) {
+        byId[entry.id] = entry;
+      }
+    }
+    for (final entry in _entries) {
+      if (entry.origin == TimelineOrigin.agentTool &&
+          entry.messageId != null &&
+          (messageIds.contains(entry.messageId) ||
+              (legacyMessageIds != null &&
+                  legacyMessageIds.contains(entry.messageId)))) {
+        byId[entry.id] = entry;
+      }
+    }
+    return _restoreEntries(
+      byId.values.toList(growable: false),
+      emptyMessage: S.timelineRestoreNoMessageChanges,
+    );
+  }
+
+  Future<TimelineBulkRestoreResult> restoreByTurnIds(
+    Set<String> turnIds,
+  ) async {
+    if (!isReady) {
       return const TimelineBulkRestoreResult(
         ok: false,
-        message: 'No file changes were recorded for this revert.',
+        message: 'Timeline not bound to a workspace.',
       );
     }
+    final byId = <String, TimelineEntry>{};
+    for (final turnId in turnIds) {
+      for (final entry in entriesForTurnId(turnId)) {
+        byId[entry.id] = entry;
+      }
+    }
+    return _restoreEntries(
+      byId.values.toList(growable: false),
+      emptyMessage: S.timelineRestoreNoTurnChanges,
+    );
+  }
 
+  Future<TimelineBulkRestoreResult> _restoreEntries(
+    List<TimelineEntry> entries, {
+    required String emptyMessage,
+  }) async {
+    entries.sort((a, b) => b.when.compareTo(a.when));
+    if (entries.isEmpty) {
+      return TimelineBulkRestoreResult(ok: false, message: emptyMessage);
+    }
     final touched = <String>{};
     final failures = <String>[];
+    var restored = 0;
     for (final entry in entries) {
       try {
         await _revertEntry(entry);
+        restored++;
         touched.add(entry.relPath);
         if (entry.renamedFrom != null) touched.add(entry.renamedFrom!);
       } catch (e) {
@@ -813,17 +1002,25 @@ class TimelineService extends ChangeNotifier {
       }
     }
     notifyListeners();
+    final skipped = entries.length - restored - failures.length;
+    final summary = S.timelineRestoreBreakdown(
+      restored: restored,
+      failed: failures.length,
+      skipped: skipped,
+      total: entries.length,
+    );
     if (failures.isNotEmpty) {
+      final detail = failures.take(3).join('; ');
+      final hidden = failures.length - 3;
       return TimelineBulkRestoreResult(
         ok: false,
-        message:
-            'Restored ${entries.length - failures.length}/${entries.length} timeline change(s). Failed: ${failures.join('; ')}',
+        message: '$summary ${S.timelineRestoreFailureDetails(detail, hidden)}',
         touchedRelPaths: touched.toList(growable: false),
       );
     }
     return TimelineBulkRestoreResult(
       ok: true,
-      message: 'Restored ${entries.length} timeline change(s).',
+      message: summary,
       touchedRelPaths: touched.toList(growable: false),
     );
   }
@@ -1087,8 +1284,7 @@ class TimelineService extends ChangeNotifier {
     }
     return TimelineBulkRestoreResult(
       ok: true,
-      message:
-          'Reverted $changedCount file(s) to ${_humanWhen(when)}.',
+      message: 'Reverted $changedCount file(s) to ${_humanWhen(when)}.',
       touchedRelPaths: touched.toList(growable: false),
     );
   }
@@ -1307,6 +1503,56 @@ class TimelineService extends ChangeNotifier {
     }
   }
 
+  Future<void> _loadArchivedJournal() async {
+    final f = _tombJournalFile;
+    if (f == null) return;
+    _archivedEntries.clear();
+    if (!await f.exists()) return;
+    try {
+      final raw = await f.readAsString();
+      if (raw.isEmpty) return;
+      final loaded = <TimelineEntry>[];
+      for (final line in raw.split('\n')) {
+        if (line.trim().isEmpty) continue;
+        try {
+          final obj = jsonDecode(line) as Map<String, dynamic>;
+          final entry = TimelineEntry.tryFromJson(obj);
+          if (entry != null) loaded.add(entry);
+        } catch (_) {
+          continue;
+        }
+      }
+      loaded.sort((a, b) => b.when.compareTo(a.when));
+      _archivedEntries.addAll(loaded);
+    } catch (e) {
+      debugPrint('TimelineService archived journal load failed: $e');
+    }
+  }
+
+  Future<void> _loadTurnManifests() async {
+    final dir = _turnsDir;
+    if (dir == null) return;
+    _turnsById.clear();
+    if (!await dir.exists()) return;
+    try {
+      await for (final entity in dir.list()) {
+        if (entity is! File || !entity.path.endsWith('.json')) continue;
+        try {
+          final obj = jsonDecode(await entity.readAsString());
+          if (obj is! Map<String, dynamic>) continue;
+          final manifest = TimelineTurnManifest.tryFromJson(obj);
+          if (manifest != null) {
+            _turnsById[manifest.turnId] = manifest;
+          }
+        } catch (_) {
+          continue;
+        }
+      }
+    } catch (e) {
+      debugPrint('TimelineService turn manifest load failed: $e');
+    }
+  }
+
   Future<void> _writeMetaIfMissing(Directory root, String workspace) async {
     final meta = File(p.join(root.path, 'meta.json'));
     if (await meta.exists()) return;
@@ -1324,8 +1570,22 @@ class TimelineService extends ChangeNotifier {
     return File(p.join(dir.path, shard, '$hash.gz'));
   }
 
+  File _tombBlobFileFor(String hash) {
+    final dir = _tombObjectsDir!;
+    final shard = hash.substring(0, 2);
+    return File(p.join(dir.path, shard, '$hash.gz'));
+  }
+
   Future<void> _persistBlob(String hash, Uint8List bytes) async {
     final file = _blobFileFor(hash);
+    if (await file.exists()) return;
+    await file.parent.create(recursive: true);
+    final compressed = const GZipEncoder().encode(bytes);
+    await file.writeAsBytes(compressed, flush: true);
+  }
+
+  Future<void> _persistTombBlob(String hash, Uint8List bytes) async {
+    final file = _tombBlobFileFor(hash);
     if (await file.exists()) return;
     await file.parent.create(recursive: true);
     final compressed = const GZipEncoder().encode(bytes);
@@ -1388,6 +1648,12 @@ class TimelineService extends ChangeNotifier {
     return rel.replaceAll(r'\', '/');
   }
 
+  String _clipPrompt(String prompt) {
+    final compact = prompt.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (compact.length <= 160) return compact;
+    return '${compact.substring(0, 157)}...';
+  }
+
   bool _isIgnored(String rel) {
     final segs = rel.split('/');
     for (final s in segs) {
@@ -1443,11 +1709,13 @@ class TimelineService extends ChangeNotifier {
       }
     }
 
+    final archive = _entries.where((e) => !keep.contains(e.id)).toList();
     if (keep.length == _entries.length) {
       // No journal change needed; still GC orphan blobs.
       await _gcOrphanBlobs();
       return;
     }
+    await _archiveEntries(archive);
 
     // Rewrite the journal atomically. NDJSON makes this trivial.
     final f = _journalFile;
@@ -1477,6 +1745,42 @@ class TimelineService extends ChangeNotifier {
     notifyListeners();
     await _gcOrphanBlobs();
     await _enforceWorkspaceSize();
+  }
+
+  Future<void> _archiveEntries(List<TimelineEntry> entries) async {
+    final f = _tombJournalFile;
+    if (f == null || entries.isEmpty) return;
+    final knownIds = <String>{for (final e in _archivedEntries) e.id};
+    final fresh = entries.where((e) => !knownIds.contains(e.id)).toList();
+    if (fresh.isEmpty) return;
+    try {
+      final sink = f.openWrite(mode: FileMode.append);
+      try {
+        for (final entry in fresh) {
+          await _copyEntryBlobsToTomb(entry);
+          sink.write(jsonEncode(entry.toJson()));
+          sink.write('\n');
+          _archivedEntries.add(entry);
+        }
+        await sink.flush();
+      } finally {
+        await sink.close();
+      }
+      _archivedEntries.sort((a, b) => b.when.compareTo(a.when));
+    } catch (e) {
+      debugPrint('TimelineService archive failed: $e');
+    }
+  }
+
+  Future<void> _copyEntryBlobsToTomb(TimelineEntry entry) async {
+    for (final hash in <String>{entry.newHash, entry.prevHash}) {
+      if (hash.isEmpty) continue;
+      if (await _tombBlobFileFor(hash).exists()) continue;
+      final bytes = await readBlob(hash);
+      if (bytes != null) {
+        await _persistTombBlob(hash, bytes);
+      }
+    }
   }
 
   Future<void> _gcOrphanBlobs() async {

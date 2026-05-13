@@ -36,13 +36,14 @@ class TimelineDialog extends StatefulWidget {
   State<TimelineDialog> createState() => _TimelineDialogState();
 }
 
-enum _OriginFilter { all, agent, user, external, baseline }
+enum _OriginFilter { all, agent, user, external, baseline, orphaned }
 
 class _TimelineDialogState extends State<TimelineDialog> {
   String? _selectedEntryId;
   _OriginFilter _filter = _OriginFilter.all;
   String _query = '';
   bool _scopeToPath;
+  bool _showArchived = false;
 
   TimelineSnapshotPair? _pair;
   bool _loadingPair = false;
@@ -71,7 +72,9 @@ class _TimelineDialogState extends State<TimelineDialog> {
   }
 
   List<TimelineEntry> _filterEntries(TimelineService timeline) {
-    final all = timeline.entries;
+    final all = _showArchived
+        ? [...timeline.entries, ...timeline.archivedEntries]
+        : timeline.entries;
     final relScope = widget.initialRelPath;
     final q = _query.trim().toLowerCase();
     return all
@@ -94,6 +97,8 @@ class _TimelineDialogState extends State<TimelineDialog> {
             case _OriginFilter.baseline:
               if (e.origin != TimelineOrigin.baseline) return false;
               break;
+            case _OriginFilter.orphaned:
+              return false;
           }
           if (q.isNotEmpty) {
             if (!e.relPath.toLowerCase().contains(q) &&
@@ -105,6 +110,28 @@ class _TimelineDialogState extends State<TimelineDialog> {
           return true;
         })
         .toList(growable: false);
+  }
+
+  List<TimelineTurnManifest> _orphanedTurns(AppState state) {
+    final liveMessageIds = <String>{};
+    for (final session in state.chat.sessions) {
+      for (final message in session.messages) {
+        liveMessageIds.add(message.id);
+        liveMessageIds.add(
+          '${session.id}@${message.timestamp.microsecondsSinceEpoch}',
+        );
+      }
+    }
+    return state.timeline.turnManifests
+        .where((turn) => !liveMessageIds.contains(turn.messageId))
+        .toList(growable: false);
+  }
+
+  Future<void> _restoreTurn(TimelineTurnManifest turn) async {
+    final state = context.read<AppState>();
+    final message = await state.restoreTimelineChangesForTurns({turn.turnId});
+    if (!mounted) return;
+    showDuckToast(context, message);
   }
 
   Future<void> _selectEntry(TimelineEntry entry, TimelineService svc) async {
@@ -169,10 +196,7 @@ class _TimelineDialogState extends State<TimelineDialog> {
   /// Project-wide revert path. Treats the entry's timestamp as the
   /// chosen point in time and rolls the whole workspace back to that
   /// moment, regardless of which file the entry refers to.
-  Future<void> _revertProject(
-    TimelineEntry entry,
-    TimelineService svc,
-  ) async {
+  Future<void> _revertProject(TimelineEntry entry, TimelineService svc) async {
     final preview = svc.previewProjectRevertTo(entry.when);
     if (preview.isNoOp) {
       showDuckToast(context, S.timelineProjectRevertNoChanges);
@@ -196,6 +220,26 @@ class _TimelineDialogState extends State<TimelineDialog> {
       // re-fetch so the user sees the synchronised state.
       await _selectEntry(entry, svc);
     }
+  }
+
+  Future<void> _openTimeMachine(TimelineService svc) async {
+    final entries = svc.entries;
+    if (entries.isEmpty) {
+      showDuckToast(context, S.timelineTimeMachineNoEntries);
+      return;
+    }
+    final state = context.read<AppState>();
+    final choice = await showDialog<_TimeMachineChoice>(
+      context: context,
+      builder: (ctx) => _TimeMachineDialog(entries: entries, timeline: svc),
+    );
+    if (choice == null) return;
+    final result = await state.revertProjectToPointInTime(
+      choice.when,
+      deleteFilesCreatedAfter: choice.deleteCreatedAfter,
+    );
+    if (!mounted) return;
+    showDuckToast(context, result.message);
   }
 
   Future<bool> _confirmRestore(TimelineEntry entry) async {
@@ -232,10 +276,8 @@ class _TimelineDialogState extends State<TimelineDialog> {
   ) async {
     return showDialog<_ProjectRevertChoice>(
       context: context,
-      builder: (ctx) => _ProjectRevertConfirmDialog(
-        entry: entry,
-        preview: preview,
-      ),
+      builder: (ctx) =>
+          _ProjectRevertConfirmDialog(entry: entry, preview: preview),
     );
   }
 
@@ -244,6 +286,15 @@ class _TimelineDialogState extends State<TimelineDialog> {
     final state = context.watch<AppState>();
     final svc = state.timeline;
     final entries = _filterEntries(svc);
+    final orphanedTurns = _orphanedTurns(state);
+    final showingOrphaned = _filter == _OriginFilter.orphaned;
+    final integrity =
+        (svc.legacyAgentEntryCount > 0 || orphanedTurns.isNotEmpty)
+        ? S.timelineIntegritySummary(
+            svc.legacyAgentEntryCount,
+            orphanedTurns.length,
+          )
+        : null;
 
     final selected = _selectedEntryId != null
         ? svc.entryById(_selectedEntryId!)
@@ -283,13 +334,18 @@ class _TimelineDialogState extends State<TimelineDialog> {
             children: [
               _Header(
                 onClose: () => Navigator.of(context).pop(),
+                onTimeMachine: () => _openTimeMachine(svc),
                 workspace: state.currentDirectory,
+                integrity: integrity,
               ),
               _Filters(
                 filter: _filter,
                 onFilter: (f) => setState(() => _filter = f),
                 query: _query,
                 onQuery: (q) => setState(() => _query = q),
+                showArchived: _showArchived,
+                archivedCount: svc.archivedEntries.length,
+                onShowArchived: (v) => setState(() => _showArchived = v),
                 scopeToPath: _scopeToPath,
                 pathLabel: widget.initialRelPath,
                 onScopeToggle: widget.initialRelPath == null
@@ -302,16 +358,22 @@ class _TimelineDialogState extends State<TimelineDialog> {
                   children: [
                     SizedBox(
                       width: 340,
-                      child: _EntryList(
-                        entries: entries,
-                        selectedId: _selectedEntryId,
-                        onSelect: (e) => _selectEntry(e, svc),
-                      ),
+                      child: showingOrphaned
+                          ? _TurnList(
+                              turns: orphanedTurns,
+                              timeline: svc,
+                              onRestore: _restoreTurn,
+                            )
+                          : _EntryList(
+                              entries: entries,
+                              selectedId: _selectedEntryId,
+                              onSelect: (e) => _selectEntry(e, svc),
+                            ),
                     ),
                     Container(width: 0.5, color: DuckColors.glassSeam),
                     Expanded(
                       child: _DiffPane(
-                        entry: selected,
+                        entry: showingOrphaned ? null : selected,
                         pair: _pair,
                         loading: _loadingPair,
                         error: _pairError,
@@ -338,8 +400,15 @@ class _TimelineDialogState extends State<TimelineDialog> {
 
 class _Header extends StatelessWidget {
   final VoidCallback onClose;
+  final VoidCallback onTimeMachine;
   final String? workspace;
-  const _Header({required this.onClose, required this.workspace});
+  final String? integrity;
+  const _Header({
+    required this.onClose,
+    required this.onTimeMachine,
+    required this.workspace,
+    required this.integrity,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -366,18 +435,47 @@ class _Header extends StatelessWidget {
           const SizedBox(width: 14),
           if (workspace != null && workspace!.isNotEmpty)
             Expanded(
-              child: Text(
-                workspace!,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: DuckColors.fgSubtle,
-                  fontSize: 11,
-                  letterSpacing: 0.2,
-                ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    workspace!,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: DuckColors.fgSubtle,
+                      fontSize: 11,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                  if (integrity != null)
+                    Text(
+                      integrity!,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: DuckColors.accentDuck,
+                        fontSize: 10,
+                        letterSpacing: 0.1,
+                      ),
+                    ),
+                ],
               ),
             )
           else
             const Spacer(),
+          TextButton.icon(
+            onPressed: onTimeMachine,
+            icon: const Icon(Icons.manage_history, size: 16),
+            label: const Text(S.timelineTimeMachineAction),
+            style: TextButton.styleFrom(
+              foregroundColor: DuckColors.accentDuck,
+              textStyle: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
           IconButton(
             tooltip: S.close,
             onPressed: onClose,
@@ -398,6 +496,9 @@ class _Filters extends StatelessWidget {
   final ValueChanged<_OriginFilter> onFilter;
   final String query;
   final ValueChanged<String> onQuery;
+  final bool showArchived;
+  final int archivedCount;
+  final ValueChanged<bool> onShowArchived;
   final bool scopeToPath;
   final String? pathLabel;
   final ValueChanged<bool>? onScopeToggle;
@@ -407,6 +508,9 @@ class _Filters extends StatelessWidget {
     required this.onFilter,
     required this.query,
     required this.onQuery,
+    required this.showArchived,
+    required this.archivedCount,
+    required this.onShowArchived,
     required this.scopeToPath,
     required this.pathLabel,
     required this.onScopeToggle,
@@ -452,6 +556,21 @@ class _Filters extends StatelessWidget {
             tint: DuckColors.fgSubtle,
             onTap: () => onFilter(_OriginFilter.baseline),
           ),
+          _Chip(
+            label: S.timelineFilterOrphaned,
+            selected: filter == _OriginFilter.orphaned,
+            tint: DuckColors.accentDuck,
+            onTap: () => onFilter(_OriginFilter.orphaned),
+          ),
+          if (archivedCount > 0)
+            _Chip(
+              label: showArchived
+                  ? S.timelineHideArchived
+                  : S.timelineArchivedCount(archivedCount),
+              selected: showArchived,
+              tint: DuckColors.accentPurple,
+              onTap: () => onShowArchived(!showArchived),
+            ),
           const SizedBox(width: 12),
           if (onScopeToggle != null)
             _Chip(
@@ -639,6 +758,97 @@ class _EntryList extends StatelessWidget {
   }
 
   static String _two(int n) => n.toString().padLeft(2, '0');
+}
+
+class _TurnList extends StatelessWidget {
+  final List<TimelineTurnManifest> turns;
+  final TimelineService timeline;
+  final ValueChanged<TimelineTurnManifest> onRestore;
+
+  const _TurnList({
+    required this.turns,
+    required this.timeline,
+    required this.onRestore,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (turns.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            S.timelineOrphanedEmpty,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: DuckColors.fgSubtle, fontSize: 12),
+          ),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: turns.length,
+      itemBuilder: (context, index) {
+        final turn = turns[index];
+        final count = timeline.entriesForTurnId(turn.turnId).length;
+        return Container(
+          margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: DuckColors.bgChip,
+            borderRadius: BorderRadius.circular(DuckTheme.radiusM),
+            border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                turn.userPromptPreview.isEmpty
+                    ? turn.turnId
+                    : turn.userPromptPreview,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: DuckColors.fgPrimary,
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '${_humanWhen(turn.endedAt)} · ${S.timelineTurnEntryCount(count)}',
+                style: const TextStyle(
+                  color: DuckColors.fgSubtle,
+                  fontSize: 10.5,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.centerRight,
+                child: OutlinedButton.icon(
+                  onPressed: count == 0 ? null : () => onRestore(turn),
+                  icon: const Icon(Icons.restore, size: 14),
+                  label: const Text(S.timelineRestoreTurn),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: DuckColors.accentDuck,
+                    side: const BorderSide(color: DuckColors.glassSeam),
+                    textStyle: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 }
 
 class _EntryGroup {
@@ -1054,6 +1264,127 @@ class _ProjectRevertChoice {
   const _ProjectRevertChoice({required this.deleteCreatedAfter});
 }
 
+class _TimeMachineChoice {
+  final DateTime when;
+  final bool deleteCreatedAfter;
+  const _TimeMachineChoice({
+    required this.when,
+    required this.deleteCreatedAfter,
+  });
+}
+
+class _TimeMachineDialog extends StatefulWidget {
+  final List<TimelineEntry> entries;
+  final TimelineService timeline;
+  const _TimeMachineDialog({required this.entries, required this.timeline});
+
+  @override
+  State<_TimeMachineDialog> createState() => _TimeMachineDialogState();
+}
+
+class _TimeMachineDialogState extends State<_TimeMachineDialog> {
+  late TimelineEntry _selected = widget.entries.first;
+  bool _deleteCreatedAfter = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = widget.timeline.previewProjectRevertTo(_selected.when);
+    return AlertDialog(
+      backgroundColor: DuckColors.bgRaised,
+      title: const Text(S.timelineTimeMachineTitle),
+      content: SizedBox(
+        width: 460,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              S.timelineTimeMachinePick,
+              style: TextStyle(color: DuckColors.fgMuted, fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            DropdownButton<TimelineEntry>(
+              value: _selected,
+              isExpanded: true,
+              dropdownColor: DuckColors.bgRaised,
+              items: widget.entries
+                  .take(100)
+                  .map((entry) {
+                    return DropdownMenuItem<TimelineEntry>(
+                      value: entry,
+                      child: Text(
+                        '${_humanWhen(entry.when)} · ${entry.relPath}',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    );
+                  })
+                  .toList(growable: false),
+              onChanged: (entry) {
+                if (entry != null) setState(() => _selected = entry);
+              },
+            ),
+            const SizedBox(height: 12),
+            Text(
+              S.timelineProjectRevertSummary(
+                changed: preview.filesToRewrite.length,
+                recreated: preview.filesToRecreate.length,
+                createdAfter: preview.filesCreatedAfter.length,
+                unrestorable: preview.filesUnrestorable.length,
+              ),
+              style: const TextStyle(color: DuckColors.fgMuted, fontSize: 12),
+            ),
+            if (preview.filesCreatedAfter.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: _deleteCreatedAfter,
+                onChanged: (v) =>
+                    setState(() => _deleteCreatedAfter = v ?? false),
+                title: const Text(
+                  S.timelineProjectRevertDeleteNewFiles,
+                  style: TextStyle(color: DuckColors.fgPrimary, fontSize: 12),
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            const Text(
+              S.timelineProjectRevertSafetyNote,
+              style: TextStyle(
+                color: DuckColors.fgSubtle,
+                fontSize: 11,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text(S.cancel),
+        ),
+        ElevatedButton(
+          onPressed: preview.isNoOp
+              ? null
+              : () => Navigator.pop(
+                  context,
+                  _TimeMachineChoice(
+                    when: _selected.when,
+                    deleteCreatedAfter: _deleteCreatedAfter,
+                  ),
+                ),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: DuckColors.accentCyan,
+            foregroundColor: DuckColors.bgDeepest,
+          ),
+          child: const Text(S.timelineProjectRevertAction),
+        ),
+      ],
+    );
+  }
+}
+
 /// Confirm dialog that explains the blast radius of a project-wide
 /// revert. Shows counts grouped by category (rewrite / recreate /
 /// created-after / unrestorable) and exposes the keep-or-delete
@@ -1107,10 +1438,7 @@ class _ProjectRevertConfirmDialogState
                 createdAfter: preview.filesCreatedAfter.length,
                 unrestorable: preview.filesUnrestorable.length,
               ),
-              style: const TextStyle(
-                color: DuckColors.fgMuted,
-                fontSize: 12,
-              ),
+              style: const TextStyle(color: DuckColors.fgMuted, fontSize: 12),
             ),
             if (preview.filesToRewrite.isNotEmpty) ...[
               const SizedBox(height: 14),
@@ -1162,16 +1490,14 @@ class _ProjectRevertConfirmDialogState
                     label: S.timelineProjectRevertKeepNewFiles,
                     selected: !_deleteCreatedAfter,
                     tint: DuckColors.stateOk,
-                    onTap: () =>
-                        setState(() => _deleteCreatedAfter = false),
+                    onTap: () => setState(() => _deleteCreatedAfter = false),
                   ),
                   const SizedBox(width: 6),
                   _RadioPill(
                     label: S.timelineProjectRevertDeleteNewFiles,
                     selected: _deleteCreatedAfter,
                     tint: DuckColors.stateError,
-                    onTap: () =>
-                        setState(() => _deleteCreatedAfter = true),
+                    onTap: () => setState(() => _deleteCreatedAfter = true),
                   ),
                 ],
               ),

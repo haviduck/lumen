@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.10+10
+version: 1.0.11+11
 
 environment:
   sdk: ^3.11.0
@@ -43,7 +43,25 @@ dependencies:
   shared_preferences: ^2.5.5
   re_editor: ^0.8.0
   re_highlight: ^0.0.3
-  desktop_drop: ^0.7.1
+  # super_drag_and_drop is the project's single OLE drag-and-drop
+  # plugin. It replaced `desktop_drop` (which only handled real
+  # on-disk file drops via Win32 CF_HDROP). super_drag_and_drop
+  # gives us two things `desktop_drop` couldn't:
+  #   1. Drag OUT of Lumen into Windows Explorer / other apps (file
+  #      rows in the explorer become draggable sources via
+  #      DragItemWidget — see `widgets/file_explorer/file_explorer.dart`
+  #      `_DragOutWrapper`).
+  #   2. Drop IN from archive viewers (WinRAR, 7-Zip, Bandizip) that
+  #      present files as IDataObject virtual streams
+  #      (CFSTR_FILEDESCRIPTOR + CFSTR_FILECONTENTS), NOT CF_HDROP.
+  #      super_drag_and_drop synthesizes a unified stream API for
+  #      virtual + real files — see `_ingestDropItem`.
+  # Do NOT add `desktop_drop` back alongside this. Both plugins call
+  # Win32 `RegisterDragDrop()` on the Flutter HWND, and Win32 only
+  # allows a single IDropTarget per HWND. The second registration
+  # silently fails with `DRAGDROP_E_ALREADYREGISTERED` and that
+  # plugin's drop targets just stop firing. See `.agents/landmines.md`.
+  super_drag_and_drop: ^0.9.1
   xterm: ^4.0.0
   flutter_pty: ^0.4.2
   flutter_markdown_plus: ^1.0.3
@@ -113,11 +131,6 @@ flutter:
   # To add assets to your application, add an assets section, like this:
   assets:
     - assets/images/lumen_logo.png
-    # Empty-editor mascot — used by the "duck steals the Open File button"
-    # gag in lib/widgets/editor/editor.dart::_DuckMischief. Right-facing
-    # walk cycle gif; we flip horizontally when the duck waddles back
-    # out of frame.
-    - assets/Haviduck.gif
     # uBlock Origin Lite (MV3) — bundled as a zip and unpacked at first
     # launch into %LOCALAPPDATA%/Lumen/extensions/ublock-lite/. Loaded
     # into the shared media WebView2 via `WebviewController.addBrowserExtension`.

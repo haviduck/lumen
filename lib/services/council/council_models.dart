@@ -15,6 +15,163 @@ enum CouncilStatus {
   error,
 }
 
+/// Semantic phase of the council's work — orthogonal to [CouncilStatus]
+/// (which tracks where the runner is in its state machine). Phases drive
+/// the Excellence Doctrine: an ambitious brief progresses through several
+/// of these before [CouncilPhase.ship] becomes legal. The orchestrator
+/// declares phase transitions via the `council_phase` tool.
+///
+/// `discovery` → map the surface, read the project, understand the brief.
+/// `architecture` → design decisions, structure, named trade-offs.
+/// `build` → produce concrete artifacts (files, diffs, tests).
+/// `review` → adversarial cross-check; agents attack each other's work.
+/// `polish` → address review findings, add docs/tests, harden.
+/// `ship` → final synthesis; report is now legal.
+enum CouncilPhase {
+  discovery,
+  architecture,
+  build,
+  review,
+  polish,
+  ship,
+}
+
+/// One declared phase transition in a session. The orchestrator emits one
+/// of these every time it calls `council_phase`. Persisted on the session
+/// so the visual layer can render the journey and the quality gate can
+/// audit that enough phases happened before ship.
+class CouncilPhaseEntry {
+  final CouncilPhase phase;
+  final String rationale;
+  final DateTime declaredAt;
+
+  CouncilPhaseEntry({
+    required this.phase,
+    this.rationale = '',
+    DateTime? declaredAt,
+  }) : declaredAt = declaredAt ?? DateTime.now();
+
+  Map<String, dynamic> toJson() => {
+        'phase': phase.name,
+        'rationale': rationale,
+        'declaredAt': declaredAt.toIso8601String(),
+      };
+
+  static CouncilPhaseEntry fromJson(Map<String, dynamic> json) {
+    return CouncilPhaseEntry(
+      phase: _enumByName(CouncilPhase.values, json['phase'] as String?) ??
+          CouncilPhase.discovery,
+      rationale: json['rationale'] as String? ?? '',
+      declaredAt: DateTime.tryParse(json['declaredAt'] as String? ?? '') ??
+          DateTime.now(),
+    );
+  }
+}
+
+/// Pre-ship quality gate. Six checks; the orchestrator runs them by calling
+/// `council_quality_check`, and the controller refuses `council_report` if
+/// the gate has never passed. Persisted so a reload can resume mid-gate.
+class CouncilQualityGate {
+  /// Concrete artifacts (files created/edited, diffs, tests) produced by
+  /// at least one doer agent. Computed from the ledger + tool-fire events.
+  bool artifactsProduced;
+
+  /// An adversarial review phase happened — either via the `review` phase
+  /// being declared, a pool exchange with falsifiable challenges, or the
+  /// auto-spawned Critic (Phase B). At least one critique resulted in a
+  /// concrete change.
+  bool adversarialReviewDone;
+
+  /// Load-bearing claims are grounded in files actually read in-session
+  /// (i.e. agents called `read_file` / `tree` / `list_dir` and cited
+  /// what they found, not just trained-knowledge guesses).
+  bool claimsGrounded;
+
+  /// All user-asked questions resolved (no pending [CouncilQuestion] with
+  /// `resolved: false`) — or zero asks raised, which also passes.
+  bool userAsksResolved;
+
+  /// Open risks have been named and the orchestrator has decided whether
+  /// they block ship or are accepted with a recommended next action.
+  bool risksNamed;
+
+  /// At least N phases declared (default 3; configurable on the session
+  /// for trivial briefs).
+  bool enoughPhasesCovered;
+
+  /// Most recent self-assessment text from the orchestrator (one-liner per
+  /// gate). The orchestrator passes this in via `council_quality_check`.
+  String summary;
+
+  /// Timestamp of last `council_quality_check` invocation; null until first.
+  DateTime? checkedAt;
+
+  /// Number of attempts the orchestrator has made at the gate. Each call
+  /// to `council_quality_check` increments. UI shows this as "Quality
+  /// pass N/M" to surface how hard the council had to work.
+  int attempts;
+
+  CouncilQualityGate({
+    this.artifactsProduced = false,
+    this.adversarialReviewDone = false,
+    this.claimsGrounded = false,
+    this.userAsksResolved = false,
+    this.risksNamed = false,
+    this.enoughPhasesCovered = false,
+    this.summary = '',
+    this.checkedAt,
+    this.attempts = 0,
+  });
+
+  /// True when every gate has passed at least once.
+  bool get allPassed =>
+      artifactsProduced &&
+      adversarialReviewDone &&
+      claimsGrounded &&
+      userAsksResolved &&
+      risksNamed &&
+      enoughPhasesCovered;
+
+  /// Human-readable list of gates that have not yet passed. Used by the
+  /// report-tool refusal and the visual layer.
+  List<String> get failingGates {
+    final out = <String>[];
+    if (!artifactsProduced) out.add('artifacts_produced');
+    if (!adversarialReviewDone) out.add('adversarial_review_done');
+    if (!claimsGrounded) out.add('claims_grounded');
+    if (!userAsksResolved) out.add('user_asks_resolved');
+    if (!risksNamed) out.add('risks_named');
+    if (!enoughPhasesCovered) out.add('enough_phases_covered');
+    return out;
+  }
+
+  Map<String, dynamic> toJson() => {
+        'artifactsProduced': artifactsProduced,
+        'adversarialReviewDone': adversarialReviewDone,
+        'claimsGrounded': claimsGrounded,
+        'userAsksResolved': userAsksResolved,
+        'risksNamed': risksNamed,
+        'enoughPhasesCovered': enoughPhasesCovered,
+        'summary': summary,
+        if (checkedAt != null) 'checkedAt': checkedAt!.toIso8601String(),
+        'attempts': attempts,
+      };
+
+  static CouncilQualityGate fromJson(Map<String, dynamic> json) {
+    return CouncilQualityGate(
+      artifactsProduced: json['artifactsProduced'] == true,
+      adversarialReviewDone: json['adversarialReviewDone'] == true,
+      claimsGrounded: json['claimsGrounded'] == true,
+      userAsksResolved: json['userAsksResolved'] == true,
+      risksNamed: json['risksNamed'] == true,
+      enoughPhasesCovered: json['enoughPhasesCovered'] == true,
+      summary: json['summary'] as String? ?? '',
+      checkedAt: DateTime.tryParse(json['checkedAt'] as String? ?? ''),
+      attempts: (json['attempts'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
 /// Canonical names for every event the Council emits on its lifecycle bus.
 /// Stagecraft (visual layer) and persistence subscribe to these. Adding new
 /// event types here is the only sanctioned way to introduce new visual
@@ -95,6 +252,34 @@ class CouncilEventType {
   static const evaluatorStarted = 'evaluator_started';
   static const evaluatorDone = 'evaluator_done';
   static const agentChunk = 'agent_chunk';
+
+  // Excellence Doctrine — phase + quality gate events.
+  /// Emitted when the orchestrator declares a new semantic phase via the
+  /// `council_phase` tool. Data carries the phase name, rationale string,
+  /// and the previous phase name (null on first declaration). Drives the
+  /// phase progress strip on the theater.
+  static const phaseDeclared = 'phase_declared';
+
+  /// Emitted every time the orchestrator runs the pre-ship quality gate
+  /// via `council_quality_check`. Data carries the full gate state. The
+  /// UI uses this to animate the gate-fill indicator.
+  static const qualityCheckRan = 'quality_check_ran';
+
+  /// Emitted once when the gate first reaches `allPassed`. After this
+  /// fires, `council_report` is unblocked. Distinct from `qualityCheckRan`
+  /// so the UI can show a one-shot celebration / unlock animation.
+  static const qualityGatePassed = 'quality_gate_passed';
+
+  /// Emitted when the Adversarial Critic begins its one-shot attack pass.
+  /// The Critic runs synchronously inside the first quality-check call.
+  /// Data: { 'criticModel': '<provider:model>' }.
+  static const criticStarted = 'critic_started';
+
+  /// Emitted when the Critic completes. Data carries the full critique
+  /// (summary, attacks list, counts). Drives the findings strip on the
+  /// theater and feeds the orchestrator's next turn as concrete attacks
+  /// it must address or accept.
+  static const criticCompleted = 'critic_completed';
 
   // Pentest / security-theater visual events
   /// Emitted once when pentest mode detects the goal target from the brief
@@ -503,6 +688,110 @@ class CouncilPoolReply {
   }
 }
 
+/// One attack landed by the Adversarial Critic during the pre-ship gate.
+/// The Critic produces 3–10 of these on a single one-shot pass; the
+/// orchestrator either addresses each (by dispatching follow-up work) or
+/// accepts each (by surfacing it under "Open Risks" in the final report).
+class CouncilCriticAttack {
+  final String id;
+  /// The specific claim, file, decision, or absence under attack. Quoted
+  /// verbatim from the council transcript wherever possible.
+  final String target;
+  /// The challenge itself — what is wrong, missing, or unproven.
+  final String attack;
+  /// Severity drives visual urgency and gate behavior. Blocker findings
+  /// block the gate even when every other check passes.
+  final String severity;
+  /// What artifact / evidence / answer would resolve this attack. The
+  /// orchestrator uses this as the acceptance criterion for follow-up.
+  final String acceptance;
+  /// Set true once the orchestrator declares this attack addressed or
+  /// accepted-as-risk in a subsequent quality check call.
+  bool resolved;
+
+  CouncilCriticAttack({
+    required this.id,
+    required this.target,
+    required this.attack,
+    this.severity = 'minor',
+    this.acceptance = '',
+    this.resolved = false,
+  });
+
+  bool get isBlocker => severity.toLowerCase() == 'blocker';
+  bool get isMajor => severity.toLowerCase() == 'major';
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'target': target,
+        'attack': attack,
+        'severity': severity,
+        'acceptance': acceptance,
+        'resolved': resolved,
+      };
+
+  static CouncilCriticAttack fromJson(Map<String, dynamic> json) {
+    return CouncilCriticAttack(
+      id: json['id'] as String? ?? '',
+      target: json['target'] as String? ?? '',
+      attack: json['attack'] as String? ?? '',
+      severity: json['severity'] as String? ?? 'minor',
+      acceptance: json['acceptance'] as String? ?? '',
+      resolved: json['resolved'] == true,
+    );
+  }
+}
+
+/// Single one-shot critique produced by the Adversarial Critic. The Critic
+/// runs once per session, inside the first `council_quality_check` call.
+/// Its findings are persisted on the session so the UI can render them
+/// and the orchestrator's subsequent quality checks can verify resolution.
+class CouncilCritique {
+  final DateTime runAt;
+  final String summary;
+  final List<CouncilCriticAttack> attacks;
+  /// True once the orchestrator has declared every blocker + major attack
+  /// resolved (or explicitly accepted them via "Open Risks"). The gate's
+  /// `adversarialReviewDone` flag stays true once the Critic has run, but
+  /// `risksNamed` cannot pass while a blocker is still unresolved.
+  bool acknowledged;
+
+  CouncilCritique({
+    DateTime? runAt,
+    this.summary = '',
+    List<CouncilCriticAttack>? attacks,
+    this.acknowledged = false,
+  })  : runAt = runAt ?? DateTime.now(),
+        attacks = List<CouncilCriticAttack>.from(attacks ?? const []);
+
+  int get blockerCount => attacks.where((a) => a.isBlocker).length;
+  int get majorCount => attacks.where((a) => a.isMajor).length;
+
+  /// True when every blocker and major attack has been resolved. Minor
+  /// attacks are allowed through with "open risks" status.
+  bool get allBlockingResolved =>
+      attacks.where((a) => a.isBlocker || a.isMajor).every((a) => a.resolved);
+
+  Map<String, dynamic> toJson() => {
+        'runAt': runAt.toIso8601String(),
+        'summary': summary,
+        'attacks': attacks.map((a) => a.toJson()).toList(),
+        'acknowledged': acknowledged,
+      };
+
+  static CouncilCritique fromJson(Map<String, dynamic> json) {
+    return CouncilCritique(
+      runAt: DateTime.tryParse(json['runAt'] as String? ?? '') ?? DateTime.now(),
+      summary: json['summary'] as String? ?? '',
+      attacks: ((json['attacks'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((m) => CouncilCriticAttack.fromJson(m.cast<String, dynamic>()))
+          .toList(),
+      acknowledged: json['acknowledged'] == true,
+    );
+  }
+}
+
 /// Severity levels for pentest findings — drive visual urgency.
 enum PentestSeverity { critical, major, minor, info }
 
@@ -571,6 +860,31 @@ class CouncilSession {
   /// used by the visual layer to animate attack-line strikes.
   final List<PentestFinding> pentestFindings = <PentestFinding>[];
 
+  /// Current semantic phase of the council's work. Updated by the
+  /// orchestrator via the `council_phase` tool. Drives the phase progress
+  /// strip and the quality-gate "enoughPhasesCovered" check.
+  CouncilPhase currentPhase = CouncilPhase.discovery;
+
+  /// Ordered history of declared phases. The first entry is always the
+  /// initial declaration (defaulted to `discovery` if the orchestrator
+  /// hasn't called `council_phase` yet). New entries append on every
+  /// orchestrator `council_phase` call, even when re-declaring the same
+  /// phase (re-affirms intent).
+  final List<CouncilPhaseEntry> phaseHistory = <CouncilPhaseEntry>[];
+
+  /// Pre-ship quality gate state. Mutated by `council_quality_check`
+  /// calls and by the controller's structural checks (e.g. when the
+  /// ledger sees its first concrete-artifact tool fire).
+  final CouncilQualityGate qualityGate = CouncilQualityGate();
+
+  /// Adversarial Critic critique. Null until the first
+  /// `council_quality_check` triggers the one-shot critic pass; populated
+  /// thereafter and persisted. The orchestrator addresses each attack
+  /// (resolved) or accepts it under Open Risks; the gate's
+  /// `adversarialReviewDone` is structurally true once the critique
+  /// exists with at least one attack.
+  CouncilCritique? critique;
+
   CouncilSession({
     required this.config,
     String? runId,
@@ -586,12 +900,33 @@ class CouncilSession {
     this.pendingUserQuestion,
     List<CouncilTask>? tasks,
     this.pentestGoal = '',
+    CouncilPhase? currentPhase,
+    List<CouncilPhaseEntry>? phaseHistory,
+    CouncilQualityGate? qualityGate,
+    this.critique,
   }) : runId = runId ??
             '${config.id}_${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}',
        startedAt = startedAt ?? DateTime.now(),
        events = List<CouncilEvent>.from(events ?? const []),
        poolQuestions = List<CouncilQuestion>.from(poolQuestions ?? const []),
-       tasks = List<CouncilTask>.from(tasks ?? const []);
+       tasks = List<CouncilTask>.from(tasks ?? const []) {
+    this.currentPhase = currentPhase ?? CouncilPhase.discovery;
+    if (phaseHistory != null) {
+      this.phaseHistory.addAll(phaseHistory);
+    }
+    if (qualityGate != null) {
+      this.qualityGate
+        ..artifactsProduced = qualityGate.artifactsProduced
+        ..adversarialReviewDone = qualityGate.adversarialReviewDone
+        ..claimsGrounded = qualityGate.claimsGrounded
+        ..userAsksResolved = qualityGate.userAsksResolved
+        ..risksNamed = qualityGate.risksNamed
+        ..enoughPhasesCovered = qualityGate.enoughPhasesCovered
+        ..summary = qualityGate.summary
+        ..checkedAt = qualityGate.checkedAt
+        ..attempts = qualityGate.attempts;
+    }
+  }
 
   CouncilAgent? agentById(String id) {
     if (config.orchestrator.id == id) return config.orchestrator;
@@ -616,6 +951,11 @@ class CouncilSession {
     'poolQuestions': poolQuestions.map((q) => q.toJson()).toList(),
     'pendingUserQuestion': pendingUserQuestion?.toJson(),
     'tasks': tasks.map((t) => t.toJson()).toList(),
+    'currentPhase': currentPhase.name,
+    if (phaseHistory.isNotEmpty)
+      'phaseHistory': phaseHistory.map((p) => p.toJson()).toList(),
+    'qualityGate': qualityGate.toJson(),
+    if (critique != null) 'critique': critique!.toJson(),
     if (pentestGoal.isNotEmpty) 'pentestGoal': pentestGoal,
     if (pentestFindings.isNotEmpty)
       'pentestFindings': pentestFindings.map((f) => f.toJson()).toList(),
@@ -661,6 +1001,23 @@ class CouncilSession {
           .map((t) => CouncilTask.fromJson(t.cast<String, dynamic>()))
           .toList(),
       pentestGoal: json['pentestGoal'] as String? ?? '',
+      currentPhase:
+          _enumByName(CouncilPhase.values, json['currentPhase'] as String?) ??
+              CouncilPhase.discovery,
+      phaseHistory: ((json['phaseHistory'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((p) => CouncilPhaseEntry.fromJson(p.cast<String, dynamic>()))
+          .toList(),
+      qualityGate: json['qualityGate'] is Map
+          ? CouncilQualityGate.fromJson(
+              (json['qualityGate'] as Map).cast<String, dynamic>(),
+            )
+          : null,
+      critique: json['critique'] is Map
+          ? CouncilCritique.fromJson(
+              (json['critique'] as Map).cast<String, dynamic>(),
+            )
+          : null,
     );
     final findings = ((json['pentestFindings'] as List?) ?? const [])
         .whereType<Map>()

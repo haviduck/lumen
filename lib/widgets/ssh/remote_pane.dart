@@ -1,9 +1,9 @@
 import 'dart:async';
 
-import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../l10n/strings.dart';
@@ -38,8 +38,8 @@ class RemotePane extends StatefulWidget {
 
 class _RemotePaneState extends State<RemotePane> {
   /// True while the user is mid-drag with files from the OS desktop /
-  /// Explorer. Drives the cyan drop overlay. Updated by `desktop_drop`'s
-  /// `onDragEntered` / `onDragExited`.
+  /// Explorer. Drives the cyan drop overlay. Updated by
+  /// super_drag_and_drop's `onDropEnter` / `onDropLeave`.
   bool _osDragging = false;
 
   /// True while the user is mid-drag from Lumen's own file explorer
@@ -84,10 +84,11 @@ class _RemotePaneState extends State<RemotePane> {
 
     // Two independent drop systems, layered:
     //
-    //   OUTER  — `desktop_drop` `DropTarget` for OS-level drops
-    //            (Explorer / Finder / GNOME Files / external apps).
-    //            Pure native drag protocol, separate from Flutter's
-    //            in-app pointer system.
+    //   OUTER  — `super_drag_and_drop` `DropRegion` for OS-level
+    //            drops (Explorer / Finder / GNOME Files / archive
+    //            viewers like WinRAR). Native drag protocol via the
+    //            Win32 / Cocoa / GTK IDropTarget shim; separate from
+    //            Flutter's in-app pointer system.
     //   INNER  — Flutter `DragTarget<String>` for in-app drags from
     //            Lumen's file explorer (`_TolerantDraggable<String>`
     //            carries `widget.file.path`). This is plain-ass
@@ -96,13 +97,53 @@ class _RemotePaneState extends State<RemotePane> {
     // They CAN'T conflict because the underlying systems are
     // disjoint, but rendering-wise we share one cyan drop overlay
     // gated on `_showDropOverlay = _osDragging || _internalDragging`.
-    return DropTarget(
-      onDragEntered: (_) => setState(() => _osDragging = true),
-      onDragExited: (_) => setState(() => _osDragging = false),
-      onDragDone: (detail) async {
+    return DropRegion(
+      // Only accept items that resolve to a real on-disk path.
+      // The SSH upload path needs a local file to scp/sftp — we
+      // explicitly do NOT extract virtual files here because the
+      // user's intent ("upload this archive entry to the host")
+      // would silently lose the archive context (the dropped entry
+      // is just one file, not the whole archive). If that's wanted
+      // later, fall back to a temp-file extract like the chat
+      // composer does and route through `_handleDroppedFiles`.
+      formats: const [Formats.fileUri],
+      hitTestBehavior: HitTestBehavior.opaque,
+      onDropOver: (event) {
+        for (final item in event.session.items) {
+          if (item.canProvide(Formats.fileUri)) return DropOperation.copy;
+        }
+        return DropOperation.none;
+      },
+      onDropEnter: (_) => setState(() => _osDragging = true),
+      onDropLeave: (_) => setState(() => _osDragging = false),
+      onPerformDrop: (event) async {
         setState(() => _osDragging = false);
-        if (detail.files.isEmpty) return;
-        final paths = detail.files.map((f) => f.path).toList();
+        final paths = <String>[];
+        final pendingReads = <Completer<void>>[];
+        for (final item in event.session.items) {
+          if (!item.canProvide(Formats.fileUri)) continue;
+          final reader = item.dataReader;
+          if (reader == null) continue;
+          final completer = Completer<void>();
+          pendingReads.add(completer);
+          reader.getValue<Uri>(
+            Formats.fileUri,
+            (uri) {
+              if (uri != null) paths.add(uri.toFilePath());
+              if (!completer.isCompleted) completer.complete();
+            },
+            onError: (e) {
+              debugPrint('[Lumen ssh-drop] read failed: $e');
+              if (!completer.isCompleted) completer.complete();
+            },
+          );
+        }
+        // Wait for every fileUri to resolve before kicking off the
+        // upload. Unlike the file-explorer drop, here we DO need the
+        // full path list up front — the upload dialog is one modal
+        // covering ALL dropped files, not a per-file ingestion.
+        await Future.wait(pendingReads.map((c) => c.future));
+        if (paths.isEmpty) return;
         await _handleDroppedFiles(ssh, active, paths);
       },
       child: DragTarget<String>(

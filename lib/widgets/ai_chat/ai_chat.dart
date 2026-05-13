@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:desktop_drop/desktop_drop.dart' as desktop_drop;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollDirection;
@@ -11,6 +10,7 @@ import 'package:image/image.dart' as img;
 import 'package:pasteboard/pasteboard.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
+import 'package:super_drag_and_drop/super_drag_and_drop.dart';
 import 'package:webview_windows/webview_windows.dart';
 
 import '../../l10n/strings.dart';
@@ -408,14 +408,8 @@ class _AiChatState extends State<AiChat> {
       if (rel == '.') rel = p.basename(normalizedWorkspace);
     }
     final chip = type == FileSystemEntityType.directory
-        ? ChatChip.folder(
-            path: normalizedPath,
-            workspaceRelativePath: rel,
-          )
-        : ChatChip.file(
-            path: normalizedPath,
-            workspaceRelativePath: rel,
-          );
+        ? ChatChip.folder(path: normalizedPath, workspaceRelativePath: rel)
+        : ChatChip.file(path: normalizedPath, workspaceRelativePath: rel);
     chat.addPendingChip(chip);
     showDuckToast(context, S.chatReferenceAdded);
     _focus.requestFocus();
@@ -709,15 +703,28 @@ class _AiChatState extends State<AiChat> {
                 ? () => _confirmAndRewindChat(appState, index, gathered)
                 : null;
           } else {
-            scope = BubbleRestoreScope.assistantTurn;
-            final entries = appState.timeline.entriesForMessage(
+            final turns = appState.timeline.turnIdsForMessage(
               m.id,
               legacyMessageId: legacyMessageId,
             );
+            final entries = turns.isNotEmpty
+                ? turns
+                      .expand(appState.timeline.entriesForTurnId)
+                      .toList(growable: false)
+                : appState.timeline.entriesForMessage(
+                    m.id,
+                    legacyMessageId: legacyMessageId,
+                  );
             restoreCount = entries.length;
             followupCount = 0;
-            onRestore = entries.isNotEmpty && !isStreaming
-                ? () => _restoreMessageChanges(appState, m, legacyMessageId)
+            final workspaceMismatch = !_chatMatchesWorkspace(appState, chat);
+            scope = workspaceMismatch
+                ? BubbleRestoreScope.workspaceMismatch
+                : BubbleRestoreScope.assistantTurn;
+            onRestore =
+                !isStreaming && (entries.isNotEmpty || workspaceMismatch)
+                ? () =>
+                      _restoreMessageChanges(appState, chat, m, legacyMessageId)
                 : null;
           }
 
@@ -765,6 +772,14 @@ class _AiChatState extends State<AiChat> {
         },
       ),
     );
+  }
+
+  bool _chatMatchesWorkspace(AppState appState, ChatController chat) {
+    final sessionPath = chat.currentSession?.workspacePath;
+    final current = appState.currentDirectory;
+    if (sessionPath == null || current == null) return true;
+    return p.normalize(sessionPath).toLowerCase() ==
+        p.normalize(current).toLowerCase();
   }
 
   /// Compute the data the user-bubble revert chip needs: how many
@@ -849,13 +864,27 @@ class _AiChatState extends State<AiChat> {
 
   Future<void> _restoreMessageChanges(
     AppState appState,
+    ChatController chat,
     PersistedMessage message,
     String legacyMessageId,
   ) async {
-    final count = appState.timeline
-        .entriesForMessage(message.id, legacyMessageId: legacyMessageId)
-        .length;
-    if (count == 0) return;
+    if (!_chatMatchesWorkspace(appState, chat)) {
+      await _showRestoreUnavailable(S.chatRestoreUnavailableWorkspace);
+      return;
+    }
+    final turns = appState.timeline.turnIdsForMessage(
+      message.id,
+      legacyMessageId: legacyMessageId,
+    );
+    final count = turns.isNotEmpty
+        ? turns.expand(appState.timeline.entriesForTurnId).length
+        : appState.timeline
+              .entriesForMessage(message.id, legacyMessageId: legacyMessageId)
+              .length;
+    if (count == 0) {
+      await _showRestoreUnavailable(S.chatRestoreUnavailableNoRows);
+      return;
+    }
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -885,6 +914,24 @@ class _AiChatState extends State<AiChat> {
     );
     if (!mounted) return;
     showDuckToast(context, msg);
+  }
+
+  Future<void> _showRestoreUnavailable(String reason) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DuckColors.bgRaised,
+        title: const Text(S.chatRestoreUnavailableTitle),
+        content: Text(reason),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text(S.ok),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Tiny "just auto-approved" banner above the input strip.
@@ -1114,8 +1161,7 @@ class _AiChatState extends State<AiChat> {
                 // prompt semantics as before; see the pill class for
                 // the underlying API-param mapping. Hidden on Ollama
                 // for the same reason as before.
-                if (chat
-                    .reasoningEffortPillApplicableForCurrentModel) ...[
+                if (chat.reasoningEffortPillApplicableForCurrentModel) ...[
                   const SizedBox(width: 6),
                   _ReasoningEffortPill(
                     effort: chat.reasoningEffort,
@@ -1149,16 +1195,104 @@ class _AiChatState extends State<AiChat> {
               );
             },
             builder: (context, candidateData, rejectedData) {
-              return desktop_drop.DropTarget(
-                onDragEntered: (_) => setState(() => _referenceDragOver = true),
-                onDragExited: (_) => setState(() => _referenceDragOver = false),
-                onDragDone: (details) {
+              // Outer drop region for OS-level drops (Windows Explorer,
+              // WinRAR virtual files, browsers, email attachments).
+              // Sibling `DragTarget<String>` above this builder handles
+              // in-app drags from the file explorer — the two systems
+              // are disjoint at the platform layer.
+              return DropRegion(
+                formats: Formats.standardFormats,
+                hitTestBehavior: HitTestBehavior.opaque,
+                onDropOver: (event) {
+                  // Accept anything that smells like a file — the
+                  // composer's `_addReferenceToChat` does its own
+                  // filtering and produces sensible toasts for the
+                  // odd-format cases.
+                  for (final item in event.session.items) {
+                    if (item.canProvide(Formats.fileUri) ||
+                        item.platformFormats.isNotEmpty) {
+                      return DropOperation.copy;
+                    }
+                  }
+                  return DropOperation.none;
+                },
+                onDropEnter: (_) =>
+                    setState(() => _referenceDragOver = true),
+                onDropLeave: (_) =>
+                    setState(() => _referenceDragOver = false),
+                onPerformDrop: (event) async {
                   setState(() => _referenceDragOver = false);
-                  for (final file in details.files) {
-                    _addReferenceToChat(
-                      chat,
-                      file.path,
-                      workspacePath: appState.currentDirectory,
+                  for (final item in event.session.items) {
+                    final reader = item.dataReader;
+                    if (reader == null) continue;
+                    if (reader.canProvide(Formats.fileUri)) {
+                      // Real on-disk file → use its path directly so
+                      // `_addReferenceToChat` can read it via the
+                      // existing path-based code path.
+                      reader.getValue<Uri>(
+                        Formats.fileUri,
+                        (uri) {
+                          if (uri == null) return;
+                          _addReferenceToChat(
+                            chat,
+                            uri.toFilePath(),
+                            workspacePath: appState.currentDirectory,
+                          );
+                        },
+                        onError: (e) => debugPrint(
+                          '[Lumen chat-drop] fileUri read failed: $e',
+                        ),
+                      );
+                      continue;
+                    }
+                    // Virtual file (WinRAR / 7-Zip / email) — extract
+                    // to a temp file under the system temp dir then
+                    // attach. Keeps `_addReferenceToChat` ignorant of
+                    // virtual streams; downside is the temp file is
+                    // never cleaned (matches how Windows Explorer
+                    // itself handles WinRAR drops).
+                    reader.getFile(
+                      null,
+                      (file) async {
+                        try {
+                          final name = file.fileName ??
+                              await reader.getSuggestedName() ??
+                              'lumen-drop';
+                          final flat = name
+                              .replaceAll('\\', '/')
+                              .split('/')
+                              .last;
+                          final safe = flat.replaceAll(
+                            RegExp(r'[<>:"|?*]'),
+                            '_',
+                          );
+                          final tmpDir = await Directory.systemTemp
+                              .createTemp('lumen_chat_drop_');
+                          final destPath = p.join(tmpDir.path, safe);
+                          final sink = File(destPath).openWrite();
+                          try {
+                            await for (final chunk in file.getStream()) {
+                              sink.add(chunk);
+                            }
+                          } finally {
+                            await sink.flush();
+                            await sink.close();
+                          }
+                          if (!mounted) return;
+                          _addReferenceToChat(
+                            chat,
+                            destPath,
+                            workspacePath: appState.currentDirectory,
+                          );
+                        } catch (e) {
+                          debugPrint(
+                            '[Lumen chat-drop] virtual extract failed: $e',
+                          );
+                        }
+                      },
+                      onError: (e) => debugPrint(
+                        '[Lumen chat-drop] virtual read failed: $e',
+                      ),
                     );
                   }
                 },

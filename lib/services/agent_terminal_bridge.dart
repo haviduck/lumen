@@ -108,6 +108,70 @@ class AgentTerminalBridge extends ChangeNotifier {
     return handle;
   }
 
+  /// Tear down EVERY agent session this bridge knows about — both the
+  /// hidden in-flight RUN_CMD invocations (`_live`) and the promoted
+  /// visible tabs (`_visible`). Used by [AppState.shutdownAllTerminals]
+  /// to make sure renegade `node`/`python`/etc. processes don't outlive
+  /// a workspace switch or window close.
+  ///
+  /// Each session goes through [TerminalSession.terminate] (Ctrl+C
+  /// then hard-kill after [graceWindow]) so foreground process groups
+  /// get a chance to clean up. Disposal is unconditional regardless of
+  /// promotion status.
+  Future<void> shutdownAll({
+    Duration graceWindow = const Duration(milliseconds: 250),
+  }) async {
+    // Snapshot first — `handle._session.dispose()` calls back into
+    // `_disposeHandle` which mutates `_live`, so iterating directly
+    // would invalidate the iterator.
+    final liveHandles = _live.toList(growable: false);
+    final visibleSnapshot = _visible.toList(growable: false);
+    // Terminate everything in parallel — the grace window per session
+    // is short, and we'd rather block the workspace switch by ~250ms
+    // total than serialize through every hidden RUN_CMD that's
+    // currently mid-`npm install`.
+    final terminations = <Future<void>>[];
+    for (final h in liveHandles) {
+      terminations.add(_safeTerminate(h._session, graceWindow));
+    }
+    for (final s in visibleSnapshot) {
+      // A promoted session is in BOTH `_visible` and `_live` (its
+      // handle never left). The bridge's `_disposeHandle` is
+      // idempotent and the terminate call is a Ctrl+C + delay; double
+      // dispatch is harmless and removes the "is it in both lists?"
+      // bookkeeping from this method.
+      terminations.add(_safeTerminate(s, graceWindow));
+    }
+    if (terminations.isNotEmpty) {
+      await Future.wait(terminations);
+    }
+    for (final h in liveHandles) {
+      try {
+        h.dispose();
+      } catch (_) {}
+    }
+    for (final s in visibleSnapshot) {
+      try {
+        s.dispose();
+      } catch (_) {}
+    }
+    final hadVisible = _visible.isNotEmpty;
+    _visible.clear();
+    _live.clear();
+    if (hadVisible) notifyListeners();
+  }
+
+  static Future<void> _safeTerminate(
+    TerminalSession session,
+    Duration grace,
+  ) async {
+    try {
+      await session.terminate(graceWindow: grace);
+    } catch (_) {
+      // Termination is best-effort; subsequent dispose will hard-kill.
+    }
+  }
+
   /// Called by the terminal pane after a user-initiated tab close
   /// for an agent session. The bridge drops its reference and
   /// notifies (so any other listeners can re-sync). The pane is

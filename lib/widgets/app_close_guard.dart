@@ -128,6 +128,31 @@ class _AppCloseGuardState extends State<AppCloseGuard> with WindowListener {
   }
 
   Future<void> _closeForReal() async {
+    // Tear down every running PTY child the IDE spawned BEFORE we ask
+    // window_manager to destroy. `destroy()` skips Flutter's framework
+    // dispose chain, so anything left running at this point would
+    // outlive the parent process (Windows reparents the orphans to
+    // PID 0 and they keep squatting on ports / file handles). The
+    // shutdown method runs:
+    //   1. `AgentTerminalBridge.shutdownAll` — kills hidden RUN_CMD
+    //      sessions + promoted visible agent tabs.
+    //   2. `IdeActions.shutdownAllTerminals` — interactive sessions
+    //      registered by the terminal pane.
+    //   3. `LumenProcessTracker.killAllTracked` — defence-in-depth
+    //      hard-kill for any descendant that survived the graceful
+    //      Ctrl+C path (only on the close-for-real path; workspace
+    //      swaps pass `killTrackedPids: false`).
+    // Failures are swallowed inside the helper — we never want a
+    // straggling terminal to prevent the window from actually closing.
+    if (mounted) {
+      try {
+        await context.read<AppState>().shutdownAllTerminals(
+          killTrackedPids: true,
+        );
+      } catch (_) {
+        // proceed to destroy regardless
+      }
+    }
     if (!_isWindowManagerSupported) return;
     await windowManager.setPreventClose(false);
     await windowManager.destroy();

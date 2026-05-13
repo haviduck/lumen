@@ -47,6 +47,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   // hand-pointer (`SystemMouseCursors.click`) — same affordance VS Code
   // and Cursor use to signal "this is followable".
   bool _terminalCtrlHoverOverUrl = false;
+  Rect? _terminalCtrlHoverUrlRect;
   TerminalSession? _termHoveredSession;
   Offset? _termHoverPos;
 
@@ -104,6 +105,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         onKillActive: () {
           if (_sessions.isNotEmpty) _killSession(_focusedSessionIndex);
         },
+        onShutdownAll: _shutdownAllSessions,
       );
       // Subscribe to the agent terminal bridge — when a `RUN_CMD`
       // promotes its hidden session (e.g. dev server soft-timeouts,
@@ -200,14 +202,20 @@ class _TerminalPaneState extends State<TerminalPane> {
     final s = _termHoveredSession;
     final pos = _termHoverPos;
     bool next = false;
+    Rect? nextRect;
     if (s != null && pos != null) {
       final ctrl = HardwareKeyboard.instance.isControlPressed;
       if (ctrl) {
-        next = _hasUrlAtLocalPos(s, pos);
+        nextRect = _urlRectAtLocalPos(s, pos);
+        next = nextRect != null;
       }
     }
-    if (next != _terminalCtrlHoverOverUrl) {
-      setState(() => _terminalCtrlHoverOverUrl = next);
+    if (next != _terminalCtrlHoverOverUrl ||
+        nextRect != _terminalCtrlHoverUrlRect) {
+      setState(() {
+        _terminalCtrlHoverOverUrl = next;
+        _terminalCtrlHoverUrlRect = nextRect;
+      });
     }
   }
 
@@ -215,22 +223,34 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// but only return whether the cell falls inside a URL match — no
   /// trim, no launch. Kept lightweight because it runs on every hover
   /// pixel.
-  bool _hasUrlAtLocalPos(TerminalSession s, Offset localPos) {
+  Rect? _urlRectAtLocalPos(TerminalSession s, Offset localPos) {
     final state = s.viewKey.currentState;
-    if (state == null) return false;
+    if (state == null) return null;
     try {
       final dynamic render = (state as dynamic).renderTerminal;
-      if (render == null) return false;
+      if (render == null) return null;
       final CellOffset cell = render.getCellOffset(localPos);
       final lines = s.terminal.buffer.lines;
-      if (cell.y < 0 || cell.y >= lines.length) return false;
+      if (cell.y < 0 || cell.y >= lines.length) return null;
       final lineText = lines[cell.y].getText();
       for (final match in _urlPattern.allMatches(lineText)) {
-        if (cell.x >= match.start && cell.x < match.end) return true;
+        if (cell.x >= match.start && cell.x < match.end) {
+          final Offset start = render.getOffset(
+            CellOffset(match.start, cell.y),
+          );
+          final Offset end = render.getOffset(CellOffset(match.end, cell.y));
+          final double lineHeight = render.lineHeight as double;
+          return Rect.fromLTWH(
+            start.dx,
+            start.dy + lineHeight - 3,
+            end.dx - start.dx,
+            1.5,
+          );
+        }
       }
-      return false;
+      return null;
     } catch (_) {
-      return false;
+      return null;
     }
   }
 
@@ -332,6 +352,74 @@ class _TerminalPaneState extends State<TerminalPane> {
         if (!_splitView || _secondaryIndex == null) _focusedPane = 0;
       }
     });
+  }
+
+  /// Tear down every interactive terminal session the pane owns. Used
+  /// by `AppState.shutdownAllTerminals` (workspace switch / app close)
+  /// so PTY children don't outlive the surface that spawned them. Each
+  /// session goes through `terminate(graceWindow)` (Ctrl+C then hard
+  /// kill) and then `dispose()`. Agent-spawned sessions are flushed
+  /// from `agentTerminals` bookkeeping too — the bridge's own
+  /// `shutdownAll` already terminated them; this just keeps the
+  /// `visibleSessions` list consistent so a subsequent
+  /// `_onAgentTerminalsChanged` doesn't try to re-mount ghosts.
+  Future<void> _shutdownAllSessions(Duration graceWindow) async {
+    if (_sessions.isEmpty) return;
+    final snapshot = List<TerminalSession>.from(_sessions);
+    AppState? state;
+    try {
+      state = context.read<AppState>();
+    } catch (_) {
+      state = null;
+    }
+    final terminations = <Future<void>>[];
+    for (final s in snapshot) {
+      terminations.add(_safeTerminateSession(s, graceWindow));
+    }
+    if (terminations.isNotEmpty) {
+      await Future.wait(terminations);
+    }
+    for (final s in snapshot) {
+      if (s.isAgent && state != null) {
+        try {
+          state.agentTerminals.handleSessionRemoved(s);
+        } catch (_) {}
+      }
+      try {
+        s.dispose();
+      } catch (_) {}
+    }
+    if (!mounted) {
+      _sessions.clear();
+      _activeIndex = 0;
+      _secondaryIndex = null;
+      _splitView = false;
+      _focusedPane = 0;
+      _initializedFor = null;
+      return;
+    }
+    setState(() {
+      _sessions.clear();
+      _activeIndex = 0;
+      _secondaryIndex = null;
+      _splitView = false;
+      _focusedPane = 0;
+      // Reset the initialization sentinel so the next build for the
+      // (now-current) workspace path will lazily spin up a fresh
+      // session — same behavior as a workspace switch.
+      _initializedFor = null;
+    });
+  }
+
+  static Future<void> _safeTerminateSession(
+    TerminalSession s,
+    Duration grace,
+  ) async {
+    try {
+      await s.terminate(graceWindow: grace);
+    } catch (_) {
+      // dispose() below hard-kills anyway.
+    }
   }
 
   /// Drag-to-reorder. Mirrors `ReorderableListView`'s
@@ -573,6 +661,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       },
     );
 
+    final hoverRect = identical(_termHoveredSession, s)
+        ? _terminalCtrlHoverUrlRect
+        : null;
     return MouseRegion(
       cursor: _terminalCtrlHoverOverUrl
           ? SystemMouseCursors.click
@@ -600,7 +691,18 @@ class _TerminalPaneState extends State<TerminalPane> {
         onPointerSignal: (e) => _onTerminalPointerSignal(s, e),
         onPointerUp: (e) => _onTerminalPointerUp(s, e),
         onPointerCancel: (_) => _resetTermPointerState(),
-        child: terminalView,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            terminalView,
+            if (_terminalCtrlHoverOverUrl && hoverRect != null)
+              IgnorePointer(
+                child: CustomPaint(
+                  painter: _TerminalUrlHoverPainter(hoverRect),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -884,7 +986,12 @@ class _TerminalPaneState extends State<TerminalPane> {
             child: Stack(
               children: [
                 Positioned.fill(
-                  child: _buildTerminalView(context, appState, session, focused),
+                  child: _buildTerminalView(
+                    context,
+                    appState,
+                    session,
+                    focused,
+                  ),
                 ),
                 Positioned(
                   top: 4,
@@ -1511,8 +1618,8 @@ class _TerminalTabState extends State<_TerminalTab> {
       iconColor = widget.isFocused
           ? DuckColors.accentCyan
           : widget.isMounted
-              ? DuckColors.accentMint
-              : DuckColors.fgSubtle;
+          ? DuckColors.accentMint
+          : DuckColors.fgSubtle;
     }
     final Widget tab = MouseRegion(
       cursor: SystemMouseCursors.click,
@@ -1564,5 +1671,28 @@ class _TerminalTabState extends State<_TerminalTab> {
       return Tooltip(message: widget.tooltip!, child: tab);
     }
     return tab;
+  }
+}
+
+class _TerminalUrlHoverPainter extends CustomPainter {
+  final Rect rect;
+
+  _TerminalUrlHoverPainter(this.rect);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final clamped = rect.intersect(Offset.zero & size);
+    if (clamped.isEmpty) return;
+    final paint = Paint()
+      ..color = DuckColors.accentCyan.withValues(alpha: 0.95)
+      ..strokeWidth = 1.5
+      ..strokeCap = StrokeCap.round;
+    final y = clamped.center.dy;
+    canvas.drawLine(Offset(clamped.left, y), Offset(clamped.right, y), paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TerminalUrlHoverPainter oldDelegate) {
+    return oldDelegate.rect != rect;
   }
 }

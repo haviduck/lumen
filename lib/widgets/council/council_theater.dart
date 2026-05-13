@@ -19,8 +19,16 @@ import 'council_header_bar.dart';
 import 'council_orchestrator_ping_panel.dart';
 import 'council_pentest_attack_lines.dart';
 import 'council_pentest_goal_panel.dart';
+import 'council_phase_strip.dart';
+import 'council_phase_transition_overlay.dart';
+import 'council_quality_gate_panel.dart';
 import 'council_report_viewer.dart';
 import 'council_speech_bubbles.dart';
+// ── BEGIN: dispatch-stage / chamber subagent ──
+// `council_stage_lighting.dart` is a soft mood overlay mounted
+// between the chamber backdrop and the traffic mesh.
+import 'council_stage_lighting.dart';
+// ── END: dispatch-stage / chamber subagent ──
 import 'council_traffic_layer.dart';
 import 'council_user_prompt_panel.dart';
 import 'network_controller.dart';
@@ -177,6 +185,13 @@ class _CouncilTheaterState extends State<CouncilTheater>
                     });
                   },
           ),
+          // Excellence Doctrine — phase strip. Hidden in pentest mode
+          // where the goal/attack panel occupies the same top band.
+          if (!session.isPentestMode)
+            CouncilPhaseStrip(
+              currentPhase: session.currentPhase,
+              phaseHistory: session.phaseHistory,
+            ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
@@ -349,13 +364,29 @@ class _CouncilTheaterState extends State<CouncilTheater>
                     ),
                   ),
                 ),
+            // The previous `CouncilSpeechBubblesLayer` mount lived
+            // here — 2026-05 redesign integrated the voice section
+            // into each agent card (see `agent_voice_panel.dart`),
+            // so the floating overlay is gone. `CouncilStageAnchors`
+            // (this widget owns `_anchors`) still feeds the traffic +
+            // discourse layers as before.
+
+            // Excellence Doctrine — quality gate + Critic findings.
+            // Floats in the upper right of the stage (just left of the
+            // blackboard) so the user can watch the gate fill as the
+            // orchestrator's work progresses. Hidden in pentest mode to
+            // avoid stacking with the finding target panels along the
+            // top band.
             if (!isPentest)
-              Positioned.fill(
-                left: 0,
-                right: panelW,
-                child: CouncilSpeechBubblesLayer(
-                  session: session,
-                  anchors: _anchors,
+              Positioned(
+                right: panelW + 12,
+                top: 12,
+                child: IgnorePointer(
+                  ignoring: false,
+                  child: CouncilQualityGatePanel(
+                    gate: session.qualityGate,
+                    critique: session.critique,
+                  ),
                 ),
               ),
             if (blackboardMounted)
@@ -376,6 +407,18 @@ class _CouncilTheaterState extends State<CouncilTheater>
                         },
                 ),
               ),
+            // Phase transition cinema — fires whenever the orchestrator
+            // declares a new phase via `council_phase`. Sits ABOVE the
+            // agent ring + traffic + discourse + side panels, but
+            // BELOW the modal overlays so a user prompt / inspector
+            // can land on top of an in-flight transition without the
+            // sweep obscuring them. Click-through guaranteed via the
+            // overlay's own `IgnorePointer`.
+            Positioned.fill(
+              left: 0,
+              right: panelW,
+              child: CouncilPhaseTransitionOverlay(session: session),
+            ),
             if (session.pendingUserQuestion != null)
               Positioned.fill(
                 child: DecoratedBox(
@@ -493,8 +536,14 @@ class _CouncilStage extends StatelessWidget {
         // Cards: shrunk to fit the ring without overlap.  Width scales
         // with viewport so wide screens get bigger, presentable cards;
         // height stays modest because vertical room is the scarce axis.
+        // 2026-05: bumped the height range (196→260) to give the
+        // integrated voice section room to breathe. The voice panel
+        // is a structural region inside the card now, not a floating
+        // overlay, so the card has to host it without ellipsising the
+        // primary narration line. Ring spacing is still respected by
+        // the safe-zone clamp below.
         final cardW = math.min(236.0, math.max(196.0, size.width * 0.18));
-        final cardH = math.min(196.0, math.max(168.0, size.height * 0.24));
+        final cardH = math.min(260.0, math.max(220.0, size.height * 0.30));
 
         // Ring radii.  rx is intentionally ~1.55× ry so cards splay
         // sideways instead of stacking above / below the orchestrator.
@@ -605,6 +654,16 @@ class _CouncilStage extends StatelessWidget {
             Positioned.fill(
               child: CouncilDiagonalBackdrop(agentCount: agents.length),
             ),
+            // ── BEGIN: dispatch-stage / chamber subagent ──
+            // Mood overlay. Sits ABOVE the chamber backdrop, BELOW
+            // the traffic mesh + discourse + agent cards. Restricted
+            // to the stage rect (this Stack lives inside the
+            // `_CouncilStage` whose parent positions it with
+            // `right: panelW`, so the blackboard column is already
+            // excluded). Owns its own controllers + RepaintBoundary
+            // — does not piggy-back on `pulse`.
+            const Positioned.fill(child: CouncilStageLighting()),
+            // ── END: dispatch-stage / chamber subagent ──
             Positioned.fill(
               child: AnimatedBuilder(
                 animation: pulse,
@@ -644,13 +703,10 @@ class _CouncilStage extends StatelessWidget {
                               ? null
                               : () =>
                                     onTapAgent!(session.config.orchestrator.id),
-                          child: _maybeWithTicker(
-                            session.config.orchestrator,
-                            CouncilAgentSector(
-                              agent: session.config.orchestrator,
-                              isOrchestrator: true,
-                              spawnDelayMs: 0,
-                            ),
+                          child: CouncilAgentSector(
+                            agent: session.config.orchestrator,
+                            isOrchestrator: true,
+                            spawnDelayMs: 0,
                           ),
                         ),
                       ),
@@ -661,13 +717,10 @@ class _CouncilStage extends StatelessWidget {
                             onTap: onTapAgent == null
                                 ? null
                                 : () => onTapAgent!(agents[i].id),
-                            child: _maybeWithTicker(
-                              agents[i],
-                              CouncilAgentSector(
-                                key: ValueKey('agent-${agents[i].id}'),
-                                agent: agents[i],
-                                spawnDelayMs: 120 + i * 80,
-                              ),
+                            child: CouncilAgentSector(
+                              key: ValueKey('agent-${agents[i].id}'),
+                              agent: agents[i],
+                              spawnDelayMs: 120 + i * 80,
                             ),
                           ),
                         ),
@@ -682,73 +735,13 @@ class _CouncilStage extends StatelessWidget {
     );
   }
 
-  Widget _maybeWithTicker(CouncilAgent agent, Widget card) {
-    if (!session.isPentestMode) return card;
-    final transcript = agent.transcript.trim();
-    if (transcript.isEmpty) return card;
-    // Strip tool-call noise, grab the last few meaningful lines
-    var cleaned = transcript
-        .replaceAll(RegExp(r'<<<[A-Z_]+(?::\s*[^>]*)?\s*>>>'), '')
-        .replaceAll(
-          RegExp(r'<<<END_(?:FILE|EDIT|APPEND)>>>'),
-          '',
-        )
-        .replaceAll(RegExp(r'<!-- LUMEN_[^>]*-->'), '')
-        .replaceAll(RegExp(r'<tool_result>[\s\S]*?</tool_result>'), '')
-        .replaceAll(RegExp(r'^\[FAILED\]\s*', multiLine: true), '');
-    final lines = cleaned
-        .split('\n')
-        .map((l) => l.trim())
-        .where((l) => l.isNotEmpty && !l.startsWith('|') && l.length > 3)
-        .toList();
-    if (lines.isEmpty) return card;
-    final tail = lines.length <= 3 ? lines : lines.sublist(lines.length - 3);
-    final display = tail.join('\n');
-
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        card,
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 0,
-          child: IgnorePointer(
-            child: Container(
-              padding: const EdgeInsets.fromLTRB(10, 14, 10, 8),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  stops: const [0.0, 0.25, 1.0],
-                  colors: [
-                    Colors.black.withValues(alpha: 0.0),
-                    Colors.black.withValues(alpha: 0.7),
-                    Colors.black.withValues(alpha: 0.92),
-                  ],
-                ),
-                borderRadius: const BorderRadius.only(
-                  bottomLeft: Radius.circular(12),
-                  bottomRight: Radius.circular(12),
-                ),
-              ),
-              child: Text(
-                display,
-                maxLines: 3,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.75),
-                  fontSize: 10,
-                  height: 1.35,
-                  letterSpacing: 0.1,
-                ),
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
+  // The previous `_maybeWithTicker` overlay painted the last few
+  // transcript lines at the bottom of an agent card in pentest mode.
+  // It was an alternative speech surface for pentest runs back when
+  // the floating bubble layer didn't fire there. The 2026-05 voice
+  // panel redesign mounts the same narration directly inside every
+  // card in both modes, so the pentest ticker is redundant — kept
+  // here as a comment to record the rationale for the removal.
 
   Widget _positioned(Rect rect, Widget child) {
     return AnimatedPositioned(

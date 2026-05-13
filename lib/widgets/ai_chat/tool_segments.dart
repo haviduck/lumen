@@ -926,103 +926,102 @@ class _ToolGroupViewState extends State<ToolGroupView> {
 
   @override
   Widget build(BuildContext context) {
+    // 2026-05 visual de-clutter pass, phase 2: matches the slim row
+    // language used by `_FileToolCard` / `_InspectionBadge`. The
+    // collapsed header was previously a bordered card with a
+    // `_ToolStatusBadge` pill at the end, which read as heavy chrome
+    // next to its (now borderless) row siblings. Now: transparent
+    // chevron + small icon + slim title row with the count inline.
+    // Accent colour on the chevron/icon carries pending/failed
+    // status, so no separate badge is needed.
     final tools = widget.group.tools;
     final first = tools.first;
     final kind = _kindFor(first.toolId);
     final accent = first.failed
         ? DuckColors.stateError
-        : (first.pending ? DuckColors.accentCyan : DuckColors.accentMint);
+        : (first.pending ? DuckColors.accentCyan : DuckColors.fgSubtle);
     final headerIcon = kind == _ToolKind.fileOp
         ? _iconForFileGroup(tools)
         : _iconForInspection(first.toolId);
     final action = _actionLabel(first);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          MouseRegion(
-            cursor: SystemMouseCursors.click,
-            onEnter: (_) => setState(() => _hover = true),
-            onExit: (_) => setState(() => _hover = false),
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _expanded = !_expanded),
-              child: AnimatedContainer(
-                duration: DuckMotion.fast,
-                padding: const EdgeInsets.fromLTRB(10, 7, 10, 7),
-                decoration: BoxDecoration(
-                  color: _hover ? DuckColors.bgRaised : DuckColors.bgDeeper,
-                  borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-                  border: Border.all(
-                    color: _hover
-                        ? DuckColors.accentCyan.withValues(alpha: 0.4)
-                        : DuckColors.glassSeam,
-                    width: 0.5,
+    final isError = !first.pending && !first.ok;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        MouseRegion(
+          cursor: SystemMouseCursors.click,
+          onEnter: (_) => setState(() => _hover = true),
+          onExit: (_) => setState(() => _hover = false),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: AnimatedContainer(
+              duration: DuckMotion.fast,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+              decoration: BoxDecoration(
+                color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
+                borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+              ),
+              child: Row(
+                children: [
+                  AnimatedRotation(
+                    duration: DuckMotion.fast,
+                    turns: _expanded ? 0.25 : 0.0,
+                    child: const Icon(
+                      Icons.chevron_right,
+                      size: 11,
+                      color: DuckColors.fgMuted,
+                    ),
                   ),
-                ),
-                child: Row(
-                  children: [
-                    AnimatedRotation(
-                      duration: DuckMotion.fast,
-                      turns: _expanded ? 0.25 : 0.0,
-                      child: const Icon(
-                        Icons.chevron_right,
-                        size: 14,
-                        color: DuckColors.fgMuted,
+                  const SizedBox(width: 4),
+                  if (first.pending)
+                    const _PendingDot()
+                  else
+                    Icon(headerIcon, size: 11, color: accent),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      S.toolGroupTitle(action, tools.length),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight:
+                            isError ? FontWeight.w600 : FontWeight.w500,
+                        color: accent,
+                        fontStyle: FontStyle.italic,
                       ),
                     ),
-                    const SizedBox(width: 4),
-                    Icon(headerIcon, size: 14, color: DuckColors.fgMuted),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        S.toolGroupTitle(action, tools.length),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w600,
-                          color: DuckColors.fgPrimary,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    _ToolStatusBadge(
-                      label: '${tools.length}',
-                      accent: accent,
-                      pending: first.pending,
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
           ),
-          AnimatedSize(
-            duration: DuckMotion.fast,
-            curve: Curves.easeOutCubic,
-            alignment: Alignment.topCenter,
-            child: _expanded
-                ? Padding(
-                    padding: const EdgeInsets.only(left: 12, top: 2),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        for (var i = 0; i < tools.length; i++)
-                          KeyedSubtree(
-                            key: ValueKey(
-                              'group-member-${tools[i].toolId}-${tools[i].firstArg}-$i',
-                            ),
-                            child: ToolSegmentView(segment: tools[i]),
+        ),
+        AnimatedSize(
+          duration: DuckMotion.fast,
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.topCenter,
+          child: _expanded
+              ? Padding(
+                  padding: const EdgeInsets.only(left: 14, top: 1),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (var i = 0; i < tools.length; i++)
+                        KeyedSubtree(
+                          key: ValueKey(
+                            'group-member-${tools[i].toolId}-${tools[i].firstArg}-$i',
                           ),
-                      ],
-                    ),
-                  )
-                : const SizedBox.shrink(),
-          ),
-        ],
-      ),
+                          child: ToolSegmentView(segment: tools[i]),
+                        ),
+                    ],
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
+      ],
     );
   }
 
@@ -1806,152 +1805,88 @@ class _LiveBodyPanel extends StatelessWidget {
   }
 }
 
-/// Terminal-style card for shell commands. Slightly taller than the
-/// file card because the command itself is the payload — needs more
-/// horizontal room for typical command lines.
-class _CommandToolCard extends StatelessWidget {
+/// Slim row for shell commands. Matches the visual language of
+/// `_FileToolCard` / `_InspectionBadge` — transparent borderless
+/// row with hover lift, accent-tinted action label, mono command
+/// payload — so a turn that runs a few commands amongst reads /
+/// edits reads as one stream instead of mixed-weight chrome.
+///
+/// 2026-05 visual de-clutter pass, phase 2. The earlier solid
+/// `bgDeepest` card + status badge stood out next to its now-borderless
+/// siblings and made multi-tool turns look uneven. Stateful only so
+/// hover lift works; no other per-instance state.
+class _CommandToolCard extends StatefulWidget {
   final ToolSegment segment;
   const _CommandToolCard({required this.segment});
 
   @override
+  State<_CommandToolCard> createState() => _CommandToolCardState();
+}
+
+class _CommandToolCardState extends State<_CommandToolCard> {
+  bool _hover = false;
+
+  @override
   Widget build(BuildContext context) {
+    final segment = widget.segment;
     final accent = segment.pending
         ? DuckColors.accentCyan
         : segment.ok
         ? DuckColors.accentMint
         : DuckColors.stateError;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(10, 8, 12, 8),
+    final isError = !segment.pending && !segment.ok;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: AnimatedContainer(
+        duration: DuckMotion.fast,
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
         decoration: BoxDecoration(
-          color: DuckColors.bgDeepest,
-          borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-          border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+          color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
+          borderRadius: BorderRadius.circular(DuckTheme.radiusS),
         ),
         child: Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.terminal, size: 14, color: DuckColors.fgMuted),
-            const SizedBox(width: 8),
-            Expanded(
+            Padding(
+              padding: const EdgeInsets.only(top: 1),
+              child: segment.pending
+                  ? const _PendingDot()
+                  : Icon(Icons.terminal, size: 11, color: accent),
+            ),
+            const SizedBox(width: 6),
+            Padding(
+              padding: const EdgeInsets.only(top: 0.5),
+              child: Text(
+                _actionLabel(segment),
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: isError ? FontWeight.w600 : FontWeight.w500,
+                  color: accent,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Flexible(
               child: Text(
                 segment.firstArg,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
+                style: TextStyle(
                   fontFamily: DuckTheme.monoFont,
-                  fontSize: 12,
-                  color: DuckColors.fgPrimary,
-                  height: 1.4,
+                  fontSize: 11,
+                  color: isError
+                      ? DuckColors.stateError
+                      : DuckColors.fgMuted,
+                  height: 1.35,
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
-            _ToolStatusBadge(
-              label: _actionLabel(segment),
-              accent: accent,
-              pending: segment.pending,
             ),
           ],
         ),
       ),
-    );
-  }
-}
-
-/// Tiny accent-tinted pill that doubles as the status indicator
-/// inside file/command cards. Adds a subtle 1Hz breath to the
-/// background opacity when [pending] is true so the user can see
-/// at a glance which tools are still in flight, without the
-/// visual cost of a full spinner / shimmer overlay.
-///
-/// Cost: one [AnimationController] only when pending. In the
-/// finished-message case the badge is a plain [StatelessWidget]
-/// equivalent (no ticker), so persisted history doesn't allocate
-/// hundreds of controllers for old turns.
-class _ToolStatusBadge extends StatefulWidget {
-  final String label;
-  final Color accent;
-  final bool pending;
-
-  const _ToolStatusBadge({
-    required this.label,
-    required this.accent,
-    this.pending = false,
-  });
-
-  @override
-  State<_ToolStatusBadge> createState() => _ToolStatusBadgeState();
-}
-
-class _ToolStatusBadgeState extends State<_ToolStatusBadge>
-    with SingleTickerProviderStateMixin {
-  AnimationController? _ctrl;
-
-  @override
-  void initState() {
-    super.initState();
-    if (widget.pending) _ensureController();
-  }
-
-  @override
-  void didUpdateWidget(covariant _ToolStatusBadge oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.pending && _ctrl == null) {
-      _ensureController();
-    } else if (!widget.pending && _ctrl != null) {
-      _ctrl?.dispose();
-      _ctrl = null;
-    }
-  }
-
-  void _ensureController() {
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1100),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _ctrl?.dispose();
-    super.dispose();
-  }
-
-  Widget _pill(double alpha) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-      decoration: BoxDecoration(
-        color: widget.accent.withValues(alpha: alpha),
-        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
-      ),
-      child: Text(
-        widget.label,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(
-          fontSize: 10,
-          fontWeight: FontWeight.w600,
-          color: widget.accent,
-          letterSpacing: 0.3,
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final ctrl = _ctrl;
-    if (ctrl == null) return _pill(0.15);
-    return AnimatedBuilder(
-      animation: ctrl,
-      builder: (_, _) {
-        final t = Curves.easeInOut.transform(ctrl.value);
-        // Breathe between 0.10 and 0.28 — wide enough to read as
-        // "alive", not so wide it strobes.
-        final alpha = 0.10 + (0.18 * t);
-        return _pill(alpha);
-      },
     );
   }
 }
@@ -2114,97 +2049,82 @@ class _PendingDotPainter extends CustomPainter {
   bool shouldRepaint(covariant _PendingDotPainter old) => old.t != t;
 }
 
-/// Yellow warning card surfaced when the parser detected a
-/// tool-shaped block in the model's output but the inner structure
-/// rejected the strict per-tool regex. The block will NOT execute
-/// — neither here in the UI nor in `ToolExecutor.run` — so we
-/// surface a "model tried to do this, but the call is malformed"
-/// chip instead of letting the raw body leak into the chat as
-/// hundreds of lines of code.
+/// Slim warning row surfaced when the parser detected a tool-shaped
+/// block in the model's output but the inner structure rejected the
+/// strict per-tool regex. The block will NOT execute — neither here
+/// in the UI nor in `ToolExecutor.run` — so we surface a one-line
+/// "Malformed" indicator instead of letting the raw body leak into
+/// the chat as hundreds of lines of code.
 ///
-/// Displayed inline in the conversation flow alongside other tool
-/// segments. Tapping the help glyph opens a tooltip explaining
-/// what went wrong; tapping anywhere else is a no-op (there's
-/// nothing to navigate to — the call never ran).
-class _MalformedToolCard extends StatelessWidget {
+/// 2026-05 visual de-clutter pass, phase 2. The earlier card form
+/// (bordered, two-line block with a help glyph) read as alarming
+/// chrome amongst the now-borderless `_FileToolCard` siblings. The
+/// slim row keeps the warn accent so it remains scannable but lines
+/// up with the rest of the tool stream. The tooltip still explains
+/// what went wrong — hover anywhere on the row.
+class _MalformedToolCard extends StatefulWidget {
   final ToolSegment segment;
   const _MalformedToolCard({required this.segment});
 
   @override
+  State<_MalformedToolCard> createState() => _MalformedToolCardState();
+}
+
+class _MalformedToolCardState extends State<_MalformedToolCard> {
+  bool _hover = false;
+
+  @override
   Widget build(BuildContext context) {
+    final segment = widget.segment;
     final tool = ToolRegistry.byId(segment.toolId);
     final toolLabel = tool?.name ?? segment.toolId.toUpperCase();
     final summary = segment.firstArg.trim().isEmpty
         ? toolLabel
         : '$toolLabel: ${segment.firstArg.trim()}';
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Tooltip(
-        message: S.toolMalformedTooltip(toolLabel),
-        waitDuration: const Duration(milliseconds: 350),
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+    return Tooltip(
+      message: S.toolMalformedTooltip(toolLabel),
+      waitDuration: const Duration(milliseconds: 350),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hover = true),
+        onExit: (_) => setState(() => _hover = false),
+        child: AnimatedContainer(
+          duration: DuckMotion.fast,
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
           decoration: BoxDecoration(
-            color: DuckColors.bgDeeper,
-            borderRadius: BorderRadius.circular(DuckTheme.radiusM),
-            border: Border(
-              left: const BorderSide(color: DuckColors.stateWarn, width: 2),
-              top: BorderSide(
-                color: DuckColors.stateWarn.withValues(alpha: 0.25),
-                width: 0.5,
-              ),
-              right: BorderSide(
-                color: DuckColors.stateWarn.withValues(alpha: 0.25),
-                width: 0.5,
-              ),
-              bottom: BorderSide(
-                color: DuckColors.stateWarn.withValues(alpha: 0.25),
-                width: 0.5,
-              ),
-            ),
+            color: _hover ? DuckColors.bgRaisedHi : Colors.transparent,
+            borderRadius: BorderRadius.circular(DuckTheme.radiusS),
           ),
           child: Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
               const Icon(
                 Icons.warning_amber_rounded,
-                size: 14,
+                size: 11,
                 color: DuckColors.stateWarn,
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      S.toolMalformedTitle,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                        color: DuckColors.stateWarn,
-                        letterSpacing: 0.2,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      summary,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontFamily: DuckTheme.monoFont,
-                        fontSize: 11,
-                        color: DuckColors.fgMuted,
-                        height: 1.3,
-                      ),
-                    ),
-                  ],
+              const SizedBox(width: 6),
+              const Text(
+                S.toolMalformedLabel,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: DuckColors.stateWarn,
+                  fontStyle: FontStyle.italic,
                 ),
               ),
-              const SizedBox(width: 8),
-              const Icon(
-                Icons.help_outline,
-                size: 13,
-                color: DuckColors.fgSubtle,
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  summary,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  softWrap: false,
+                  style: const TextStyle(
+                    fontFamily: DuckTheme.monoFont,
+                    fontSize: 11,
+                    color: DuckColors.fgMuted,
+                  ),
+                ),
               ),
             ],
           ),
