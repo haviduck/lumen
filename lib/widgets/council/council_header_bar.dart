@@ -5,6 +5,7 @@ import '../../providers/council_controller.dart';
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
+import '../common/beta_badge.dart';
 
 class CouncilHeaderBar extends StatelessWidget {
   final CouncilController controller;
@@ -44,16 +45,31 @@ class CouncilHeaderBar extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  session?.config.title.isNotEmpty == true
-                      ? session!.config.title
-                      : S.councilTitle,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: DuckColors.fgPrimary,
-                    fontWeight: FontWeight.w800,
-                    fontSize: 15,
-                  ),
+                // Title row hosts the session title + a persistent
+                // BETA badge. The badge is a permanent reminder that
+                // the council is still in development — it does NOT
+                // get hidden when there's a custom session title.
+                // Drop the badge when the feature graduates.
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        session?.config.title.isNotEmpty == true
+                            ? session!.config.title
+                            : S.councilTitle,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: DuckColors.fgPrimary,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    const BetaBadge(),
+                  ],
                 ),
                 Text(
                   _statusLabel(session?.status ?? CouncilStatus.idle),

@@ -2193,6 +2193,21 @@ class S {
   // Council
   static const String councilTitle = 'The Council';
   static const String councilConvene = 'Convene Council';
+  // Council is still an in-development feature — surfaced visually
+  // via `BetaBadge` on the theater header + wizard, and via the
+  // construction strip inside the wizard. Drop the badge + strip
+  // (and these strings) when the feature graduates.
+  static const String councilBetaBadgeLabel = 'BETA';
+  static const String councilBetaBadgeTooltip =
+      'The Council is an in-development feature. Behaviour, models, '
+      'and persisted session shape may change between Lumen releases.';
+  static const String councilUnderConstructionTitle =
+      'Under construction';
+  static const String councilUnderConstructionBody =
+      'The Council is still being shaped. Expect rough edges: visual '
+      'glitches, retries on transient model failures, and occasional '
+      'shape changes to saved sessions and reports across Lumen '
+      'updates. Reports persist on disk; live sessions might not.';
   static const String councilSlashDescription =
       'Open the Council multi-agent wizard.';
   static const String councilNoWorkspace =

@@ -14,6 +14,7 @@ import '../../providers/app_state.dart';
 import '../../providers/council_controller.dart';
 import '../../services/council/council_models.dart';
 import '../../theme/app_colors.dart';
+import '../common/beta_badge.dart';
 import '../common/duck_toast.dart';
 import 'council_paste_field.dart';
 import 'wizard/wizard_agent_card.dart';
@@ -295,6 +296,15 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
                       selectedModel: _orchestrator.model,
                       onModelChanged: (m) => _applyModelToAll(m),
                     ),
+                    // Under-construction advisory — sits between the
+                    // header (with its BETA badge) and the step
+                    // indicator so it's the first thing the user
+                    // reads after the title. Always visible; do not
+                    // wire a per-session dismiss here without first
+                    // asking the user — the council is genuinely in
+                    // active development and the warning is the
+                    // contract.
+                    const UnderConstructionStrip(),
                     _StepIndicator(step: _step),
                     if (models.isEmpty) const _GateBanner(),
                     Expanded(
@@ -642,6 +652,12 @@ class _Header extends StatelessWidget {
               letterSpacing: -0.1,
             ),
           ),
+          // BETA badge sits inside the wizard's own header row so the
+          // user is warned BEFORE they invest time configuring the
+          // council. Pair with `UnderConstructionStrip` below the
+          // header for the explanation.
+          const SizedBox(width: 8),
+          const BetaBadge(),
           const Spacer(),
           if (models.isNotEmpty)
             Flexible(

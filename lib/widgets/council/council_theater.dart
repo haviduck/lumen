@@ -542,8 +542,17 @@ class _CouncilStage extends StatelessWidget {
         // overlay, so the card has to host it without ellipsising the
         // primary narration line. Ring spacing is still respected by
         // the safe-zone clamp below.
+        //
+        // 2026-05 follow-up: max bumped 260 → 290. With the voice
+        // panel maxLines (3 → 2) and padding (9 → 7) tightening, the
+        // worst-case Column total in `_buildCard` lands at ~250 px;
+        // 290 absorbs that plus a comfortable cadence-spectrum strip.
+        // See `.agents/knowledgebase.md::"Council Agent Card Vertical
+        // Budget"` for the line-by-line accounting — if any of the
+        // card's sub-blocks gets taller, recompute it before raising
+        // the lower bound (220).
         final cardW = math.min(236.0, math.max(196.0, size.width * 0.18));
-        final cardH = math.min(260.0, math.max(220.0, size.height * 0.30));
+        final cardH = math.min(290.0, math.max(220.0, size.height * 0.30));
 
         // Ring radii.  rx is intentionally ~1.55× ry so cards splay
         // sideways instead of stacking above / below the orchestrator.

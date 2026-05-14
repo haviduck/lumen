@@ -326,7 +326,13 @@ class _AgentVoicePanelState extends State<AgentVoicePanel>
             ),
           ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(10, 9, 10, 9),
+            // Vertical padding kept tight (7 not 9) — the voice panel
+            // sits inside an already-bordered card whose max height
+            // is ~290 px. Every extra px of breathing room here
+            // multiplies into a real overflow risk at the bottom of
+            // the agent card column (see the cardH math in
+            // `council_theater.dart::_layoutAgents`).
+            padding: const EdgeInsets.fromLTRB(10, 7, 10, 7),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -336,14 +342,14 @@ class _AgentVoicePanelState extends State<AgentVoicePanel>
                   narration: narration,
                   targetNames: targetNames,
                 ),
-                const SizedBox(height: 5),
+                const SizedBox(height: 4),
                 _buildPrimaryLine(narration),
                 if (narration.secondary.isNotEmpty) ...[
                   const SizedBox(height: 3),
                   _buildSecondaryLine(narration),
                 ],
                 if (narration.streaming) ...[
-                  const SizedBox(height: 5),
+                  const SizedBox(height: 4),
                   _VoiceTypingPulse(accent: accent, t: widget.breathT),
                 ],
               ],
@@ -383,11 +389,17 @@ class _AgentVoicePanelState extends State<AgentVoicePanel>
           child: child,
         ),
       ),
+      // Primary narration line caps at 2 visible lines. The earlier
+      // 3-line cap was the dominant contributor to the agent-card
+      // bottom-edge RenderFlex overflow (see knowledgebase entry
+      // "Council Agent Card Vertical Budget"). One ellipsised line
+      // is already plenty to read the narrative beat — the full text
+      // is available via the inspector + transcript well.
       child: Text(
         narration.primary,
         key: ValueKey(narration.primary),
         softWrap: true,
-        maxLines: 3,
+        maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: kActivityPrimaryText,
       ),
@@ -397,11 +409,14 @@ class _AgentVoicePanelState extends State<AgentVoicePanel>
   Widget _buildSecondaryLine(AgentNarration narration) {
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 260),
+      // Secondary line capped at 1 visible line for the same overflow
+      // budget reason above. Secondary line is almost always
+      // "Just did: …" / "Next: …" — short by construction.
       child: Text(
         narration.secondary,
         key: ValueKey(narration.secondary),
         softWrap: true,
-        maxLines: 2,
+        maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: kActivitySecondaryText,
       ),

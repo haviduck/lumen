@@ -1348,9 +1348,10 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final rationale = (call.arguments['rationale'] as String? ?? '').trim();
     final phase = _parsePhase(raw);
     if (phase == null) {
+      final hint = _closestPhaseHint(raw);
       return CouncilToolResult(
         feedback:
-            'Unknown phase: "$raw". Legal phases: ${CouncilPhase.values.map((p) => p.name).join(', ')}.',
+            'Unknown phase: "$raw". Legal phases: ${CouncilPhase.values.map((p) => p.name).join(', ')}.$hint',
       );
     }
     final previous = session.currentPhase;
@@ -1856,6 +1857,26 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     return false;
   }
 
+  /// Count artifact-producing tool fires by [agentId] across events at
+  /// or after [fromEventIdx]. Used by the artifact-or-die guard in
+  /// `_runAgent` to scope counting to a single dispatch lifetime.
+  int _countArtifactFiresForAgent({
+    required CouncilSession session,
+    required String agentId,
+    required int fromEventIdx,
+  }) {
+    if (fromEventIdx < 0 || fromEventIdx > session.events.length) return 0;
+    var count = 0;
+    for (var i = fromEventIdx; i < session.events.length; i++) {
+      final ev = session.events[i];
+      if (ev.type != CouncilEventType.agentToolFire) continue;
+      if (ev.fromAgentId != agentId) continue;
+      final toolId = ev.data['toolId'] as String? ?? '';
+      if (_artifactProducingTools.contains(toolId)) count++;
+    }
+    return count;
+  }
+
   /// Structural check: every pool / user question has been resolved (or
   /// none was raised). Pending [_session!.pendingUserQuestion] blocks.
   bool _allUserAsksResolved(CouncilSession session) {
@@ -1865,22 +1886,178 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
 
   /// Map the raw phase string from the tool call to the enum, tolerant
   /// of common alternates ("design" -> architecture, "implement" -> build).
+  /// Aliases are intentionally generous — weak models pick names from
+  /// their own vocabulary and a strict parser turns into a slow-motion
+  /// "Unknown phase" loop that leaves the strip stuck on discovery.
   CouncilPhase? _parsePhase(String raw) {
     final lower = raw.toLowerCase().trim();
     for (final p in CouncilPhase.values) {
       if (p.name == lower) return p;
     }
     return switch (lower) {
-      'design' || 'plan' || 'planning' => CouncilPhase.architecture,
+      'discover' ||
+      'scoping' ||
+      'scope' ||
+      'kickoff' ||
+      'kick-off' ||
+      'research' ||
+      'researching' ||
+      'grounding' ||
+      'recon' ||
+      'reconnaissance' => CouncilPhase.discovery,
+      'design' ||
+      'designing' ||
+      'plan' ||
+      'planning' ||
+      'architect' ||
+      'architecting' ||
+      'spec' ||
+      'specification' ||
+      'blueprint' => CouncilPhase.architecture,
       'implement' ||
       'implementation' ||
+      'implementing' ||
       'code' ||
-      'coding' => CouncilPhase.build,
-      'audit' || 'critique' || 'attack' => CouncilPhase.review,
-      'harden' || 'fix' || 'fixing' => CouncilPhase.polish,
-      'final' || 'finalize' || 'wrap' => CouncilPhase.ship,
+      'coding' ||
+      'develop' ||
+      'development' ||
+      'execute' ||
+      'execution' ||
+      'building' => CouncilPhase.build,
+      'audit' ||
+      'auditing' ||
+      'critique' ||
+      'critiquing' ||
+      'attack' ||
+      'attacking' ||
+      'test' ||
+      'testing' ||
+      'qa' ||
+      'verify' ||
+      'verification' ||
+      'validation' ||
+      'reviewing' => CouncilPhase.review,
+      'harden' ||
+      'hardening' ||
+      'fix' ||
+      'fixes' ||
+      'fixing' ||
+      'remediate' ||
+      'remediation' ||
+      'cleanup' ||
+      'polishing' ||
+      'finalize-fixes' => CouncilPhase.polish,
+      'final' ||
+      'finalize' ||
+      'finalise' ||
+      'wrap' ||
+      'wrap-up' ||
+      'wrapup' ||
+      'release' ||
+      'deploy' ||
+      'shipping' ||
+      'deliver' ||
+      'delivery' => CouncilPhase.ship,
       _ => null,
     };
+  }
+
+  /// Best-effort "did you mean…" hint when [_parsePhase] returns null.
+  /// Cheap Levenshtein-ish prefix/contains match against the legal phase
+  /// names — turns a wasted refusal into a self-correcting nudge for
+  /// weak models that miss the alias table.
+  String _closestPhaseHint(String raw) {
+    final lower = raw.toLowerCase().trim();
+    if (lower.isEmpty) return '';
+    for (final p in CouncilPhase.values) {
+      if (p.name.startsWith(lower) || lower.startsWith(p.name)) {
+        return ' Did you mean "${p.name}"?';
+      }
+    }
+    for (final p in CouncilPhase.values) {
+      if (p.name.contains(lower) || lower.contains(p.name)) {
+        return ' Did you mean "${p.name}"?';
+      }
+    }
+    return '';
+  }
+
+  /// Structurally bump the session phase when observable agent activity
+  /// has clearly passed the orchestrator-declared phase. Used as a
+  /// safety net for orchestrators (typically weaker models) that forget
+  /// to call `council_phase` between waves and leave the strip stuck
+  /// on `discovery` while doers are mid-build.
+  ///
+  /// Idempotent: a no-op if the session is already at or past [target].
+  /// Mirrors the side-effects of [_declarePhase] (history append,
+  /// discovery digest capture, structural quality-gate update, event
+  /// emit + persist) so anything downstream that reads phase state
+  /// reads consistent values regardless of who advanced.
+  ///
+  /// Rationale is always prefixed with `[auto] ` so the journey
+  /// renders honestly: "we got here from observed work, not a
+  /// declaration."
+  void _autoAdvancePhase(CouncilPhase target, String rationale) {
+    final session = _session;
+    if (session == null) return;
+    final currentIdx = CouncilPhase.values.indexOf(session.currentPhase);
+    final targetIdx = CouncilPhase.values.indexOf(target);
+    if (targetIdx <= currentIdx) return;
+    final previous = session.currentPhase;
+    if (previous == CouncilPhase.discovery &&
+        target != CouncilPhase.discovery &&
+        session.discoveryContext.trim().isEmpty) {
+      session.discoveryContext = discoveryContextFromTranscriptForTest(
+        session.config.orchestrator.transcript,
+      );
+    }
+    session.currentPhase = target;
+    final autoRationale = '[auto] $rationale';
+    session.phaseHistory.add(
+      CouncilPhaseEntry(phase: target, rationale: autoRationale),
+    );
+    final phaseSet = session.phaseHistory.map((p) => p.phase).toSet();
+    session.qualityGate.enoughPhasesCovered = phaseSet.length >= 3;
+    _event(
+      CouncilEventType.phaseDeclared,
+      fromAgentId: session.config.orchestrator.id,
+      message: autoRationale,
+      data: {
+        'phase': target.name,
+        'rationale': autoRationale,
+        'previousPhase': previous.name,
+        'phasesCovered': phaseSet.length,
+        'auto': true,
+      },
+    );
+    notifyListeners();
+    unawaited(_persist());
+  }
+
+  /// File extensions that signal "design / decision artifact" — used by
+  /// the auto-advance heuristic to distinguish architecture-phase work
+  /// (design docs, decision matrices) from build-phase work (code,
+  /// tests, configs).
+  static const Set<String> _designArtifactExtensions = {
+    '.md',
+    '.markdown',
+    '.txt',
+    '.adoc',
+    '.asciidoc',
+    '.rst',
+    '.org',
+  };
+
+  /// Returns true when the artifact path looks like a design/decision
+  /// document. The path may be relative (`docs/auth-decision.md`) or
+  /// absolute; we just look at the trailing extension.
+  static bool _looksLikeDesignArtifact(String? path) {
+    if (path == null) return false;
+    final lower = path.toLowerCase().trim();
+    if (lower.isEmpty) return false;
+    final dot = lower.lastIndexOf('.');
+    if (dot < 0 || dot >= lower.length - 1) return false;
+    return _designArtifactExtensions.contains(lower.substring(dot));
   }
 
   /// What the orchestrator should naturally do next given a phase.
@@ -2202,6 +2379,22 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
       return CouncilToolResult(feedback: dedupRefusal);
     }
 
+    // Vague-dispatch refusal. "Design the auth module" → sprawl.
+    // "Edit `lib/auth/session.dart` to add JWT refresh and write
+    // `test/auth/session_test.dart` covering the race" → real work.
+    // The guard refuses dispatches that have NO concrete anchor (no
+    // path, no backtick-quoted identifier, no deliverable noun) AND
+    // are short enough to be obviously underspecified. Generous on
+    // purpose — we want to catch the worst, not nag every dispatch.
+    final vagueRefusal = vagueDispatchRefusalForTest(
+      task: task,
+      agentName: agent.name,
+    );
+    if (vagueRefusal != null) {
+      _emitDispatchGuardTripped(vagueRefusal);
+      return CouncilToolResult(feedback: vagueRefusal);
+    }
+
     _event(
       CouncilEventType.dispatched,
       fromAgentId: session.config.orchestrator.id,
@@ -2303,6 +2496,176 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     return null;
   }
 
+  // ===== Dispatch quality guards =====
+  // Verb sets used by `_vagueDispatchRefusal` and `_taskRequiresArtifact`
+  // to classify a dispatch task's intent without an LLM call. Lowercased
+  // word-boundary matched. Keep these LARGE — under-classification
+  // (missing a verb) just lets a vague task through, which is recoverable;
+  // over-classification (false positive) refuses a legit dispatch, which
+  // breaks the run.
+  static const Set<String> _buildVerbs = {
+    'edit',
+    'write',
+    'implement',
+    'build',
+    'create',
+    'add',
+    'fix',
+    'refactor',
+    'rewrite',
+    'update',
+    'patch',
+    'extend',
+    'modify',
+    'rename',
+    'delete',
+    'remove',
+    'extract',
+    'merge',
+    'integrate',
+    'wire',
+    'hook',
+    'inject',
+    'replace',
+    'migrate',
+    'port',
+    'rebuild',
+    'reimplement',
+    'restructure',
+    'remediate',
+    'harden',
+    'optimize',
+    'enable',
+  };
+
+  // Tasks led by these verbs legitimately produce prose + reads — no
+  // artifact tool fire is required for them to count as "real work".
+  // Used by `_taskRequiresArtifact` to exempt review / research / pentest
+  // dispatches from the artifact-or-die refusal in `_runAgent`.
+  static const Set<String> _reviewVerbs = {
+    'review',
+    'audit',
+    'analyze',
+    'analyse',
+    'investigate',
+    'research',
+    'find',
+    'check',
+    'inspect',
+    'examine',
+    'attack',
+    'exploit',
+    'pentest',
+    'scan',
+    'enumerate',
+    'map',
+    'survey',
+    'study',
+    'evaluate',
+    'assess',
+    'critique',
+    'compare',
+    'verify',
+    'validate',
+    'document',
+    'describe',
+    'summarize',
+    'summarise',
+    'explain',
+    'trace',
+    'profile',
+    'measure',
+    'benchmark',
+    'reproduce',
+    'replicate',
+    'reconnaissance',
+    'recon',
+  };
+
+  // Tokens that count as a "concrete anchor" in a dispatch task. Any
+  // ONE of these present in the task text saves it from a vagueness
+  // refusal: a path-like extension, an explicit directory path, or a
+  // backtick-quoted identifier (the doctrine recommends `path` quoting).
+  static final RegExp _anchorPathExt = RegExp(
+    r'\b[\w\-./]+\.(?:dart|ts|tsx|js|jsx|py|md|markdown|txt|json|yaml|yml|go|rs|java|kt|swift|cpp|cc|c|h|hpp|cs|rb|php|html|css|scss|sass|sql|sh|ps1|toml|ini|env|gradle|lock|xml|proto)\b',
+    caseSensitive: false,
+  );
+  static final RegExp _anchorPath = RegExp(
+    r'\b(?:lib|src|test|tests|docs?|spec|specs|scripts?|tools?|server|client|frontend|backend|api|app|packages?|modules?)/[\w\-./]+',
+    caseSensitive: false,
+  );
+  static final RegExp _anchorBacktick = RegExp(r'`[^`\n]{2,}`');
+  static final RegExp _wordSplitter = RegExp(r'[^a-z]+');
+
+  /// True when the task text contains at least one concrete anchor
+  /// (path extension, directory path, or backtick-quoted symbol).
+  static bool _taskHasAnchor(String task) {
+    if (_anchorPathExt.hasMatch(task)) return true;
+    if (_anchorPath.hasMatch(task)) return true;
+    if (_anchorBacktick.hasMatch(task)) return true;
+    return false;
+  }
+
+  /// Returns true if the task text is clearly aimed at producing an
+  /// artifact (build verbs, no review verbs dominating). Used by the
+  /// artifact-or-die guard in `_runAgent` to decide whether a zero-edit
+  /// completion should be refused.
+  ///
+  /// Errs on the side of NOT requiring an artifact when intent is
+  /// ambiguous — a false refusal of a legit review dispatch is more
+  /// disruptive than letting one prose-only build slip through.
+  @visibleForTesting
+  static bool taskRequiresArtifactForTest(String task) {
+    final lower = task.toLowerCase();
+    final words = lower
+        .split(_wordSplitter)
+        .where((w) => w.isNotEmpty)
+        .toSet();
+    final hasBuild = words.any(_buildVerbs.contains);
+    if (!hasBuild) return false;
+    // If the first verb-shaped word is a review verb, treat the task
+    // as review-led (e.g. "review the auth module and propose fixes" —
+    // the agent is doing analysis, not implementation).
+    for (final w in lower.split(_wordSplitter)) {
+      if (w.isEmpty) continue;
+      if (_reviewVerbs.contains(w)) return false;
+      if (_buildVerbs.contains(w)) return true;
+    }
+    return true;
+  }
+
+  /// Returns a refusal string when the dispatch task is too vague to
+  /// produce useful work, or null when the task passes. A task is vague
+  /// when it is BOTH:
+  ///   - short (< 80 chars after trim), and
+  ///   - has zero concrete anchors per [_taskHasAnchor].
+  ///
+  /// Both conditions are required — a long task probably specified
+  /// something useful even without a path; a short task with a path is
+  /// the orchestrator being terse about a real surface.
+  @visibleForTesting
+  static String? vagueDispatchRefusalForTest({
+    required String task,
+    required String agentName,
+  }) {
+    final trimmed = task.trim();
+    if (trimmed.length >= 80) return null;
+    if (_taskHasAnchor(trimmed)) return null;
+    return 'Dispatch to $agentName was too vague. The task is '
+        '${trimmed.length} chars and names no concrete anchor (no file path, '
+        'no extension, no backtick-quoted symbol). Sub-Pro doers will produce '
+        'sprawl. Re-issue '
+        'the dispatch with at least ONE of:\n'
+        '  - the file path the agent should touch (e.g. `lib/auth/session.dart`)\n'
+        '  - the output artifact path (e.g. `docs/auth-decision.md` with named sections)\n'
+        '  - a backtick-quoted symbol or function name to anchor the work\n\n'
+        'Good: "Edit `lib/auth/session.dart` to add JWT refresh and write '
+        '`test/auth/session_test.dart` covering the race". Bad: "$trimmed". '
+        'If this dispatch is genuinely review/research/pentest work, name '
+        'the surface being reviewed (path or symbol) so the agent has a '
+        'concrete target.';
+  }
+
   static bool _hasDispatchSinceLastPhaseDeclaration(CouncilSession session) {
     for (final event in session.events.reversed) {
       if (event.type == CouncilEventType.dispatched) return true;
@@ -2327,6 +2690,12 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     final session = _session;
     final workspace = _workspacePath;
     if (session == null || workspace == null) return;
+    // Snapshot the event log size here so the artifact-or-die guard at
+    // the end of this dispatch knows where to start counting tool fires
+    // from. Counting only events newer than this captures fires from
+    // THIS dispatch even when the agent has run prior tasks in the
+    // session.
+    final artifactSnapshotIdx = session.events.length;
     agent.status = CouncilAgentStatus.working;
     _safeLedgerTransition(
       taskId,
@@ -2406,6 +2775,78 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     }
     _emitThinkingEnded(agent);
     final summary = _summariseTranscript(agent.transcript);
+
+    // Artifact-or-die. Build-shaped tasks ("edit X", "write Y",
+    // "implement Z") that finish with zero artifact-producing tool
+    // fires are prose theater — the agent talked instead of working.
+    // The doctrine ("past tense plus a file ref" / "describing edits
+    // in prose does not change files") is loud in the prompt but
+    // unenforced. Sub-Pro doers comply with the easier "ship a useful
+    // summary" pattern and slip through.
+    //
+    // We refuse those completions structurally: ledger transitions to
+    // `failed` with a clear reason, an `agentError` event surfaces the
+    // failure to the wait digest, the orchestrator sees a real failure
+    // it can re-dispatch with sharper scope (or escalate via
+    // council_ask_user). agentDone is still emitted so the UI closes
+    // cleanly and the inspector keeps the transcript.
+    //
+    // Exempt: pentest sessions (agents find exploits, not write code),
+    // review/research/audit tasks (the verb classifier resolves these),
+    // tasks where the agent fired *any* artifact tool.
+    final artifactCount = _countArtifactFiresForAgent(
+      session: session,
+      agentId: agent.id,
+      fromEventIdx: artifactSnapshotIdx,
+    );
+    final requiresArtifact =
+        !session.isPentestMode && taskRequiresArtifactForTest(task);
+    if (requiresArtifact && artifactCount == 0) {
+      final reason =
+          '${agent.name} returned without firing any artifact-producing '
+          'tool (create_file / edit_file / multi_edit / append_file / etc). '
+          'The task reads as build-shaped ("$task") but no file was written. '
+          'This is prose-theater completion — re-dispatch with sharper scope '
+          '(name the file path AND the change) or call council_ask_user if '
+          'the agent is blocked.';
+      agent.lastError = reason;
+      _safeLedgerTransition(
+        taskId,
+        CouncilTaskState.failed,
+        lastError: reason,
+        incrementErrorCount: true,
+      );
+      _event(
+        CouncilEventType.agentError,
+        fromAgentId: agent.id,
+        message: reason,
+        data: {
+          'reason': 'no_artifact',
+          'task': task,
+          'transcriptChars': agent.transcript.length,
+        },
+      );
+      _event(
+        CouncilEventType.agentDone,
+        fromAgentId: agent.id,
+        message: agent.transcript,
+        data: {'summary': summary, 'failedNoArtifact': true},
+      );
+      _emitMessage(
+        kind: CouncilMessageKind.reply,
+        from: agent.id,
+        to: session.config.orchestrator.id,
+        text: '[NO ARTIFACT PRODUCED] $summary',
+        data: {'final': true, 'failedNoArtifact': true},
+      );
+      agent
+        ..status = CouncilAgentStatus.error
+        ..currentTask = '';
+      notifyListeners();
+      await _persist();
+      return;
+    }
+
     _safeLedgerTransition(taskId, CouncilTaskState.done);
     _event(
       CouncilEventType.agentDone,
@@ -2837,6 +3278,20 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         'budget': '${_poolExchangeCount()}/$_maxPoolExchangesPerSession',
       },
     );
+    // Peer challenges = adversarial review starting. If the orchestrator
+    // never declared review, advance the strip so the user can see that
+    // attack-on-claims is underway. No-op once review (or later) is
+    // already current. _askPool is only reachable from a doer agent
+    // (orchestrator's tool surface doesn't include ask_pool), so the
+    // signal is structurally a peer-attack, not a planning question.
+    if (CouncilPhase.values.indexOf(session.currentPhase) <
+        CouncilPhase.values.indexOf(CouncilPhase.review)) {
+      _autoAdvancePhase(
+        CouncilPhase.review,
+        '${asker.name} fired council_ask_pool — peer adversarial '
+        'review has started.',
+      );
+    }
     final askLinkId = _emitLinkStarted(
       from: asker.id,
       to: 'pool',
@@ -4150,6 +4605,58 @@ The draft report and agent transcripts are in your system prompt. You have every
       message: primary == null ? toolId : '$toolId: $primary',
       data: data,
     );
+    _maybeAutoAdvanceFromToolFire(agentId, toolId, primary);
+  }
+
+  /// Bridge between observed agent tool fires and the phase strip.
+  /// Two structural advances:
+  ///
+  /// 1. **discovery → architecture**: any artifact-producing tool fire
+  ///    proves the council has left the "scout the codebase" phase. We
+  ///    bump the strip so the user sees the move; doesn't matter
+  ///    whether the artifact is a doc or code — discovery is "no edits
+  ///    yet" per the doctrine, so the first edit means we're past it.
+  ///
+  /// 2. **(discovery|architecture) → build**: artifact-producing fire
+  ///    on a non-design path (anything that isn't `.md`/`.txt`/etc.)
+  ///    is code-shaped work, which lives in build. This catches the
+  ///    common case where the orchestrator skips architecture entirely
+  ///    and the first thing an agent does is edit `lib/foo.dart`.
+  ///
+  /// Both advances are no-ops once the session is already at or past
+  /// the target — see [_autoAdvancePhase]. Fires for orchestrator tool
+  /// usage too (orchestrator runs `read_file`/`list_dir` during its
+  /// owned discovery digest, but those aren't in
+  /// [_artifactProducingTools], so this is safe).
+  void _maybeAutoAdvanceFromToolFire(
+    String agentId,
+    String toolId,
+    String? primaryArg,
+  ) {
+    if (!_artifactProducingTools.contains(toolId)) return;
+    final session = _session;
+    if (session == null) return;
+    final agentName = session.agentById(agentId)?.name ?? agentId;
+    final isDesignArtifact = _looksLikeDesignArtifact(primaryArg);
+
+    if (session.currentPhase == CouncilPhase.discovery) {
+      _autoAdvancePhase(
+        CouncilPhase.architecture,
+        '$agentName fired $toolId'
+        '${primaryArg != null ? ' on `$primaryArg`' : ''} — '
+        'discovery is no-edits, advancing strip.',
+      );
+    }
+    if (!isDesignArtifact &&
+        CouncilPhase.values.indexOf(session.currentPhase) <
+            CouncilPhase.values.indexOf(CouncilPhase.build)) {
+      _autoAdvancePhase(
+        CouncilPhase.build,
+        '$agentName fired $toolId'
+        '${primaryArg != null ? ' on `$primaryArg`' : ''} — '
+        'non-design artifact, this is build-phase work.',
+      );
+    }
   }
 
   /// Extract the user-facing "primary" argument for a tool — the bit that

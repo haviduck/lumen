@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:re_editor/re_editor.dart';
 import 'package:multi_split_view/multi_split_view.dart';
 import 'package:provider/provider.dart';
@@ -883,6 +884,23 @@ class _EditorPaneState extends State<_EditorPane> {
   /// `ScrollbarTheme` override so the change is scoped to this
   /// editor instance — no global ScrollbarThemeData changes (other
   /// scrollables in the app keep Flutter defaults).
+  ///
+  /// Ctrl+wheel claim: Material `RawScrollbar` wraps its child in a
+  /// `Listener(onPointerSignal: _receivedPointerSignal)` that calls
+  /// `pointerSignalResolver.register(event, _handlePointerScroll)`
+  /// for every wheel event that would scroll the underlying
+  /// position (Flutter SDK `widgets/scrollbar.dart` ~L2191/L2230).
+  /// `pointerSignalResolver` is first-registered-wins, and the
+  /// scrollbar's listener sits deeper in the editor subtree than
+  /// the outer `CtrlWheelZoom` Stack overlay, so without
+  /// intervention it grabs the event first and the editor scrolls
+  /// instead of zooming. Counter: wrap `child` in a `Listener` of
+  /// our own that registers a Ctrl+wheel zoom callback — being
+  /// even deeper, it lands at a smaller index in the hit-test
+  /// path than the scrollbar's listener and wins the resolver
+  /// race. We only consume the event when Ctrl is actually held,
+  /// so plain wheel scrolling still falls through to the scrollbar
+  /// / scrollable as normal.
   Widget _buildLumenScrollbar(
     BuildContext context,
     Widget child,
@@ -925,7 +943,22 @@ class _EditorPaneState extends State<_EditorPane> {
         controller: details.controller,
         scrollbarOrientation: orientation,
         thumbVisibility: isVertical,
-        child: child,
+        child: Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerSignal: (event) {
+            if (event is! PointerScrollEvent) return;
+            if (!HardwareKeyboard.instance.isControlPressed) return;
+            GestureBinding.instance.pointerSignalResolver.register(event, (
+              resolved,
+            ) {
+              if (resolved is! PointerScrollEvent) return;
+              final dy = resolved.scrollDelta.dy;
+              if (dy == 0) return;
+              widget.appState.bumpEditorFontSize(dy < 0 ? 1 : -1);
+            });
+          },
+          child: child,
+        ),
       ),
     );
   }
