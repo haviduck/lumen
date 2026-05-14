@@ -1,0 +1,19 @@
+# .mailmap — name/email canonicalization for git log, shortlog, blame,
+# and GitHub's contributors graph.
+#
+# GitHub respects .mailmap when building the contributors panel, so any
+# Co-authored-by trailer pointing at cursoragent gets folded back into
+# the real human author. Non-destructive — no history rewrite required.
+#
+# Format reference:
+#   <canonical-name> <canonical-email> <commit-name> <commit-email>
+#
+# If you want a full history rewrite that strips the Co-authored-by
+# trailers entirely, see the "release flow" section in
+# .agents/knowledgebase.md.
+
+# Fold AI-agent co-authorship into the project owner. Both Cursor and
+# GitHub Copilot CLI add a Co-authored-by trailer on commits authored
+# through them; this remaps those identities to the human committer.
+Haviduck <calleduck@gmail.com> Cursor <cursoragent@cursor.com>
+Haviduck <calleduck@gmail.com> Copilot <223556219+Copilot@users.noreply.github.com>

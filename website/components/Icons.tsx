@@ -123,6 +123,19 @@ export function IconTimeline(p: IconProps) {
   );
 }
 
+// Backup: archive box with a circular clock arrow over the lid
+export function IconBackup(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="3" y="6" width="18" height="4" rx="1" />
+      <path d="M5 10v9h14v-9" />
+      <path d="M10 13h4" />
+      <path d="M16 4.5a4 4 0 1 1-3.8 2.7" />
+      <path d="M16 2.5V5l-2.2 1" />
+    </Base>
+  );
+}
+
 // Process manager: stacked rows (table) with a crosshair (kill) on the active row
 export function IconProcess(p: IconProps) {
   return (

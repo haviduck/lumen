@@ -208,7 +208,7 @@ function RemotePaneVisual() {
         </span>
         <span className="ml-auto flex items-center gap-1.5 font-mono text-[11px] text-accent-cyan">
           <span className="pulse-dot inline-block size-1.5 rounded-full bg-accent-cyan text-accent-cyan" />
-          ssh · fishwall@reports-api
+          ssh · dev@reports-api
         </span>
       </div>
 
@@ -229,7 +229,7 @@ function RemotePaneVisual() {
         <span className="font-mono text-[11px] text-fg-subtle">/</span>
         <BreadcrumbChip>home</BreadcrumbChip>
         <span className="text-fg-subtle">/</span>
-        <BreadcrumbChip>fishwall</BreadcrumbChip>
+        <BreadcrumbChip>dev</BreadcrumbChip>
         <span className="text-fg-subtle">/</span>
         <BreadcrumbChip active>reports-api</BreadcrumbChip>
         <span className="ml-auto inline-flex items-center gap-1.5 text-[10.5px] font-mono text-fg-subtle">

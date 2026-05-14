@@ -8,6 +8,7 @@ import { SshShowcase } from "@/components/SshShowcase";
 import { MemoryShowcase } from "@/components/MemoryShowcase";
 import { CouncilPhases } from "@/components/CouncilPhases";
 import { ProcessShowcase } from "@/components/ProcessShowcase";
+import { BackupShowcase } from "@/components/BackupShowcase";
 import { Screenshots } from "@/components/Screenshots";
 import { Download } from "@/components/Download";
 import { FAQ } from "@/components/FAQ";
@@ -28,6 +29,7 @@ export default function HomePage() {
         <MemoryShowcase />
         <CouncilPhases />
         <ProcessShowcase />
+        <BackupShowcase />
         <Screenshots />
         <Download />
         <FAQ />

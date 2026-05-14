@@ -8,6 +8,7 @@ import {
   IconMemory,
   IconTimeline,
   IconProcess,
+  IconBackup,
   IconUpdate,
 } from "./Icons";
 
@@ -85,6 +86,14 @@ const FEATURES: Feature[] = [
       "PowerShell Win32_Process on Windows, BSD-style ps on Unix. Preset filters for Node / Python / Java runtimes, a workspace filter that scopes to your folder, and an accurate \"Lumen-spawned\" view backed by tracked PIDs — not name guessing. Kill with OS reasons surfaced inline.",
     accent: "mint",
     Icon: IconProcess,
+  },
+  {
+    tag: "Backup",
+    title: "Scheduled workspace snapshots with optional git push",
+    description:
+      "Every 5min to 24h (your call), Lumen zips the workspace to <app-support>/lumen/backups/. Respects .gitignore + a hardcoded skip list (node_modules, build, .venv, target, etc). Opt-in to git auto-commit and auto-push so a 3am scare isn't a story you tell later.",
+    accent: "duck",
+    Icon: IconBackup,
   },
   {
     tag: "Auto-update",
