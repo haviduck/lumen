@@ -123,6 +123,20 @@ export function IconTimeline(p: IconProps) {
   );
 }
 
+// Process manager: stacked rows (table) with a crosshair (kill) on the active row
+export function IconProcess(p: IconProps) {
+  return (
+    <Base {...p}>
+      <rect x="3" y="4" width="18" height="16" rx="1" />
+      <path d="M3 9h18" />
+      <path d="M3 14h11" />
+      <path d="M16.5 16.5h4" />
+      <path d="M18.5 14.5v4" />
+      <circle cx="18.5" cy="16.5" r="2.5" />
+    </Base>
+  );
+}
+
 // Auto-update: download cloud with a refresh arc
 export function IconUpdate(p: IconProps) {
   return (

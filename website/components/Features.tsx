@@ -7,6 +7,7 @@ import {
   IconPanes,
   IconMemory,
   IconTimeline,
+  IconProcess,
   IconUpdate,
 } from "./Icons";
 
@@ -76,6 +77,14 @@ const FEATURES: Feature[] = [
       "Content-addressed blob store plus an append-only journal under <app-support>/lumen/timeline/. Captures agent edits, manual saves, external tool writes, explorer renames. Diff against any past version, restore in one click. \"Go back to before the agent broke this\" works.",
     accent: "purple",
     Icon: IconTimeline,
+  },
+  {
+    tag: "Process manager",
+    title: "Built-in, cross-platform, workspace-aware",
+    description:
+      "PowerShell Win32_Process on Windows, BSD-style ps on Unix. Preset filters for Node / Python / Java runtimes, a workspace filter that scopes to your folder, and an accurate \"Lumen-spawned\" view backed by tracked PIDs — not name guessing. Kill with OS reasons surfaced inline.",
+    accent: "mint",
+    Icon: IconProcess,
   },
   {
     tag: "Auto-update",

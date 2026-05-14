@@ -7,9 +7,11 @@ import { ArchitectureDiagram } from "@/components/ArchitectureDiagram";
 import { SshShowcase } from "@/components/SshShowcase";
 import { MemoryShowcase } from "@/components/MemoryShowcase";
 import { CouncilPhases } from "@/components/CouncilPhases";
+import { ProcessShowcase } from "@/components/ProcessShowcase";
 import { Screenshots } from "@/components/Screenshots";
 import { Download } from "@/components/Download";
 import { FAQ } from "@/components/FAQ";
+import { Community } from "@/components/Community";
 import { Footer } from "@/components/Footer";
 
 export default function HomePage() {
@@ -25,9 +27,11 @@ export default function HomePage() {
         <SshShowcase />
         <MemoryShowcase />
         <CouncilPhases />
+        <ProcessShowcase />
         <Screenshots />
         <Download />
         <FAQ />
+        <Community />
       </main>
       <Footer />
     </>
