@@ -21,7 +21,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # UpdateService compares the `version` string against the GitHub tag
 # (e.g. `v1.0.12` vs. `1.0.12`); the build number is what Windows
 # resource compilation pins into `lumen.exe`'s version info.
-version: 1.0.14+14
+version: 1.0.15+15
 
 environment:
   sdk: ^3.11.0

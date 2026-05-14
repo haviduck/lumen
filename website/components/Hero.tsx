@@ -27,13 +27,15 @@ export function Hero() {
           </span>
 
           <h1 className="text-hero font-semibold text-fg max-w-4xl">
-            An IDE that doesn{"\u2019"}t pretend the rest of your{" "}
-            <span className="text-accent-cyan">desktop</span> doesn{"\u2019"}t exist.<span className="caret" aria-hidden />
+            Editor, terminal, SSH, agent.{" "}
+            <span className="text-accent-cyan">One window.</span>
+            <span className="caret" aria-hidden />
           </h1>
 
           <p className="text-lg sm:text-xl text-fg-muted max-w-2xl leading-relaxed">
-            Editor, terminal, file explorer, agent chat, SSH, Teams, and
-            YouTube/Twitch &mdash; one window, everything where you left it.
+            Plus a file explorer, Teams, YouTube, and Twitch &mdash; all
+            docked alongside. Open it tomorrow and you{"\u2019"}re back where
+            you stopped.
           </p>
 
           <div className="mt-2 flex flex-wrap items-center gap-3">
@@ -72,8 +74,10 @@ export function Hero() {
   );
 }
 
-// Hero preview — uses the council-running screenshot as the inline showpiece,
-// framed as a fake IDE window so the screenshot doesn't float in white space.
+// Hero preview — full multi-pane screenshot proving the tagline. Editor +
+// terminal (with SSH plugin activation visible) + Teams + YouTube, all
+// docked in one window. Framed as a fake IDE chrome so the screenshot
+// doesn't float without context.
 function HeroPreview() {
   return (
     <div className="mt-14 sm:mt-20 relative">
@@ -86,16 +90,21 @@ function HeroPreview() {
             <span className="size-2.5 rounded-full bg-fg-subtle/40" />
           </span>
           <span className="ml-3 font-mono text-xs text-fg-subtle">
-            lumen — council mode
+            lumen — synthetic_data
           </span>
-          <span className="ml-auto pill !text-fg-subtle">running</span>
+          <span className="ml-auto flex items-center gap-2">
+            <span className="pill !text-accent-mint !border-accent-mint/40">
+              ssh connected
+            </span>
+            <span className="pill !text-fg-subtle">4 panels</span>
+          </span>
         </div>
         <div className="relative">
           <Image
-            src="/screenshots/council-running.png"
-            alt="Lumen running a Council session — multiple agents working in parallel with a phase strip across the top and a shared blackboard."
+            src="/screenshots/terminal-teams-youtube.png"
+            alt="Lumen in real use — editor on the left with docker-compose.yml open, SSH terminal showing lumen-edit / lumen-grab / OSC-7 helpers active, Teams chat docked below, YouTube on the right. Single window."
             width={2400}
-            height={1500}
+            height={1340}
             sizes="(min-width: 1180px) 1180px, 100vw"
             priority
             className="w-full h-auto"
@@ -106,9 +115,14 @@ function HeroPreview() {
 
       {/* Sub-caption */}
       <p className="mt-4 text-sm text-fg-muted max-w-2xl">
-        Council mode &mdash; multi-agent orchestrated deep work. Phase strip on
-        top, blackboard on the right, each agent has its own card with a step
-        counter and live transcript.
+        A real session &mdash; <span className="text-fg">editor</span> on the
+        left with <code className="icode">docker-compose.yml</code> open, the{" "}
+        <span className="text-accent-mint">SSH terminal</span> showing the
+        on-connect helpers (
+        <code className="icode">lumen-edit · lumen-grab · OSC-7</code>),{" "}
+        <span className="text-accent-purple">Teams</span> docked below, and{" "}
+        <span className="text-accent-duck">YouTube</span> on the right.
+        Nothing alt-tabbed.
       </p>
     </div>
   );

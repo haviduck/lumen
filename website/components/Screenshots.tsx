@@ -11,6 +11,16 @@ type Shot = {
 
 const SHOTS: Shot[] = [
   {
+    src: "/screenshots/terminal-teams-youtube.png",
+    title: "Editor + SSH + Teams + YouTube",
+    alt:
+      "Real Lumen session — code editor on the left with docker-compose.yml open, SSH terminal in the middle with lumen-edit / lumen-grab / OSC-7 helpers active, Teams docked below, YouTube on the right.",
+    caption:
+      "Editor open on a docker-compose file, SSH terminal showing the on-connect helpers (lumen-edit, lumen-grab, OSC-7 cwd), Teams chat docked below, YouTube on the right. One window.",
+    width: 2400,
+    height: 1340,
+  },
+  {
     src: "/screenshots/council-idle.png",
     title: "Council, idle",
     alt:

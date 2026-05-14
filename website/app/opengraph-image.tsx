@@ -4,7 +4,7 @@ import { ImageResponse } from "next/og";
 // at build time. Next.js wires it into the page's metadata automatically
 // for OG + Twitter cards.
 
-export const alt = "Lumen — an IDE that doesn't pretend the rest of your desktop doesn't exist.";
+export const alt = "Lumen — editor, terminal, SSH, agent. One window.";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
@@ -78,35 +78,31 @@ export default async function OG() {
           </div>
         </div>
 
-        {/* Title */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 24, maxWidth: 980 }}>
+        {/* Title — two lines, second is the punch. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 1000 }}>
           <div
             style={{
               display: "flex",
-              fontSize: 72,
+              fontSize: 84,
               fontWeight: 600,
               letterSpacing: "-0.025em",
               lineHeight: 1.05,
               color: "#D8DEE9",
             }}
           >
-            An IDE that doesn{"\u2019"}t pretend
+            Editor, terminal, SSH, agent.
           </div>
           <div
             style={{
               display: "flex",
-              fontSize: 72,
+              fontSize: 84,
               fontWeight: 600,
               letterSpacing: "-0.025em",
               lineHeight: 1.05,
-              color: "#D8DEE9",
-              gap: 18,
-              flexWrap: "wrap",
+              color: "#88C0D0",
             }}
           >
-            <span style={{ display: "flex" }}>the rest of your</span>
-            <span style={{ display: "flex", color: "#88C0D0" }}>desktop</span>
-            <span style={{ display: "flex" }}>doesn{"\u2019"}t exist.</span>
+            One window.
           </div>
           <div
             style={{
@@ -114,11 +110,12 @@ export default async function OG() {
               fontSize: 28,
               color: "#7B88A1",
               lineHeight: 1.4,
-              maxWidth: 900,
+              maxWidth: 940,
+              marginTop: 16,
             }}
           >
-            Editor, terminal, agent chat, SSH, Teams, and YouTube/Twitch — one
-            window, everything where you left it.
+            Plus a file explorer, Teams, YouTube, and Twitch — all docked
+            alongside. Open it tomorrow, you{"\u2019"}re back where you stopped.
           </div>
         </div>
 

@@ -4,6 +4,7 @@ import { Pillars } from "@/components/Pillars";
 import { ProviderStrip } from "@/components/ProviderStrip";
 import { Features } from "@/components/Features";
 import { ArchitectureDiagram } from "@/components/ArchitectureDiagram";
+import { SshShowcase } from "@/components/SshShowcase";
 import { MemoryShowcase } from "@/components/MemoryShowcase";
 import { CouncilPhases } from "@/components/CouncilPhases";
 import { Screenshots } from "@/components/Screenshots";
@@ -21,6 +22,7 @@ export default function HomePage() {
         <ProviderStrip />
         <Features />
         <ArchitectureDiagram />
+        <SshShowcase />
         <MemoryShowcase />
         <CouncilPhases />
         <Screenshots />

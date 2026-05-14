@@ -4,6 +4,7 @@ import { PRODUCT } from "@/lib/product";
 
 const NAV = [
   { href: "/#features", label: "Features" },
+  { href: "/#ssh", label: "SSH" },
   { href: "/#screenshots", label: "Screenshots" },
   { href: "/docs", label: "Docs" },
   { href: "/#download", label: "Download" },

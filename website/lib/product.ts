@@ -4,10 +4,9 @@
 
 export const PRODUCT = {
   name: "Lumen",
-  tagline:
-    "An IDE that doesn't pretend the rest of your desktop doesn't exist.",
+  tagline: "Editor, terminal, SSH, agent. One window.",
   shortDescription:
-    "Editor, terminal, file explorer, agent chat, SSH, Teams, and YouTube/Twitch — one window, everything where you left it.",
+    "Lumen docks editor, terminal, SSH, agent chat, file explorer, Teams, YouTube and Twitch in one window — and remembers where you were when you reopen it.",
   // Public production URL. Update here when you move to a custom domain.
   // Used by metadataBase + OG card absolute URLs.
   siteUrl: "https://lumen-mu-seven.vercel.app",
@@ -16,7 +15,7 @@ export const PRODUCT = {
   issues: "https://github.com/haviduck/lumen/issues",
   latest: "https://github.com/haviduck/lumen/releases/latest",
   // Latest shipped version. Bump when you tag.
-  LATEST_VERSION: "1.0.14",
+  LATEST_VERSION: "1.0.15",
   // Asset names follow the installer-build script — auto-updater regex
   // matches these so don't rename without updating tools/installer/build.ps1.
   installerAssetName: (v: string) => `Lumen-Setup-v${v}.exe`,

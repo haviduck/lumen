@@ -745,6 +745,19 @@ class _EditorPaneState extends State<_EditorPane> {
   static const double _codeFieldPadding = 5;
   static const double _findBarHeight = 70;
   static const double _replaceBarHeight = 104;
+  // Scrollbar geometry — see the comment block on the CodeEditor
+  // constructor for the why. `_kEditorScrollbarThickness` is the
+  // total reservation (matches `verticalScrollbarWidth` /
+  // `horizontalScrollbarHeight` so re_editor's text-selection
+  // hit-test exclusion lines up with the painted thumb's gutter).
+  // `_kEditorScrollbarThumb` is the resting thumb width;
+  // `_kEditorScrollbarThumbHover` is the hover/drag width.
+  // Hover thumb + margin equals the reservation so the thickened
+  // thumb fills the gutter cleanly without spilling onto code.
+  static const double _kEditorScrollbarThickness = 14.0;
+  static const double _kEditorScrollbarThumb = 11.0;
+  static const double _kEditorScrollbarThumbHover = 13.0;
+  static const double _kEditorScrollbarMargin = 1.0;
 
   double get _effectiveCodeFieldTopPadding {
     final find = _findController?.value;
@@ -857,6 +870,66 @@ class _EditorPaneState extends State<_EditorPane> {
     );
   }
 
+  /// Custom scrollbar passed to `CodeEditor.scrollbarBuilder`.
+  ///
+  /// re_editor calls this once per axis (vertical → AxisDirection.down,
+  /// horizontal → AxisDirection.right). The vertical thumb is always
+  /// visible so the user has a permanent grab affordance; the
+  /// horizontal one auto-hides when not scrolling, matching the
+  /// upstream behaviour and avoiding visual noise on files that
+  /// fit horizontally.
+  ///
+  /// Hover/drag thicken + colour shift come from a local
+  /// `ScrollbarTheme` override so the change is scoped to this
+  /// editor instance — no global ScrollbarThemeData changes (other
+  /// scrollables in the app keep Flutter defaults).
+  Widget _buildLumenScrollbar(
+    BuildContext context,
+    Widget child,
+    ScrollableDetails details,
+  ) {
+    final ScrollbarOrientation? orientation;
+    if (details.direction == AxisDirection.down) {
+      orientation = ScrollbarOrientation.right;
+    } else if (details.direction == AxisDirection.right) {
+      orientation = ScrollbarOrientation.bottom;
+    } else {
+      orientation = null;
+    }
+    final isVertical = details.direction == AxisDirection.down;
+    return ScrollbarTheme(
+      data: ScrollbarThemeData(
+        thickness: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.dragged) ||
+              states.contains(WidgetState.hovered)) {
+            return _kEditorScrollbarThumbHover;
+          }
+          return _kEditorScrollbarThumb;
+        }),
+        thumbColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.dragged)) {
+            return DuckColors.accentCyan.withValues(alpha: 0.75);
+          }
+          if (states.contains(WidgetState.hovered)) {
+            return DuckColors.fgMuted.withValues(alpha: 0.85);
+          }
+          return DuckColors.fgFaint.withValues(alpha: 0.65);
+        }),
+        radius: const Radius.circular(7),
+        crossAxisMargin: _kEditorScrollbarMargin,
+        mainAxisMargin: 4,
+        minThumbLength: 40,
+        interactive: true,
+      ),
+      child: Scrollbar(
+        controller: details.controller,
+        scrollbarOrientation: orientation,
+        thumbVisibility: isVertical,
+        child: child,
+      ),
+    );
+  }
+
   CodeHighlightTheme? _buildHighlightTheme() {
     final override = widget.appState.languageOverrideFor(widget.path);
     final detected = LanguageDetector.detect(
@@ -916,6 +989,27 @@ class _EditorPaneState extends State<_EditorPane> {
                       controller: _controller!,
                       scrollController: _scrollController,
                       findController: _findController,
+                      // Bigger, themed scrollbars. re_editor's default
+                      // is 8 px which collides 1:1 with the
+                      // MultiSplitView `dividerHandleBuffer` (also 8)
+                      // on the right edge of any split / side-pane
+                      // adjacency — net result is the user can't
+                      // grab the thumb because the divider's
+                      // horizontal-drag recognizer competes for
+                      // every pixel. Reserving 14 px and painting a
+                      // 12 px-thick thumb gives ~6 px of exclusive
+                      // scrollbar zone past the divider buffer; the
+                      // gesture arena resolves cleanly because
+                      // scrolling is a vertical drag and resizing is
+                      // a horizontal one. The widths passed here
+                      // also tell the inner code field's hit-test to
+                      // exclude that strip from text-selection
+                      // drags (see `_code_field.dart` re:
+                      // `_verticalScrollbarWidth`), preserving the
+                      // editor's own drag-to-select rules.
+                      verticalScrollbarWidth: _kEditorScrollbarThickness,
+                      horizontalScrollbarHeight: _kEditorScrollbarThickness,
+                      scrollbarBuilder: _buildLumenScrollbar,
                       // `re_editor` registers Ctrl+S internally as
                       // `CodeShortcutSaveIntent`, but the package's
                       // built-in action table has no handler for that

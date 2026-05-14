@@ -1,11 +1,11 @@
 <h1 align="center">Lumen</h1>
 
 <p align="center">
-  <strong>An IDE that doesn't pretend the rest of your desktop doesn't exist.</strong>
+  <strong>Editor, terminal, SSH, agent. One window.</strong>
 </p>
 
 <p align="center">
-  Editor, terminal, file explorer, agent chat, SSH, Teams, and YouTube/Twitch &mdash; one window, everything where you left it.
+  Plus a file explorer, Teams, YouTube, and Twitch &mdash; all docked alongside. Open it tomorrow and you&rsquo;re back where you stopped.
 </p>
 
 <p align="center">
