@@ -91,9 +91,34 @@ Write-Host "  version : $version"
 Write-Host "  repo    : $repoRoot"
 Write-Host ""
 
+# Resolve Flutter SDK. The project pins Flutter via FVM (.fvmrc at the
+# repo root) because `re_editor 0.8.0` does NOT compile on Flutter
+# 3.44+ / Dart 3.12+ -- see `.agents/landmines.md::Toolchain` for the
+# full story. Prefer the FVM-managed symlink at
+# `.fvm\flutter_sdk\bin\flutter.bat`; only fall back to bare `flutter`
+# on PATH if there's no FVM bootstrap at all (and even then, hard-fail
+# if a pin is declared but the SDK isn't materialised, rather than
+# silently building against the wrong SDK).
+$flutterBin = Join-Path $repoRoot ".fvm\flutter_sdk\bin\flutter.bat"
+if (-not (Test-Path $flutterBin)) {
+    if (Test-Path (Join-Path $repoRoot ".fvmrc")) {
+        Write-Error @"
+FVM pin found in .fvmrc but no SDK symlink at .fvm\flutter_sdk.
+Run from the repo root:
+    dart pub global activate fvm
+    fvm install
+    fvm use
+"@
+        exit 1
+    }
+    Write-Warning "No FVM pin found; falling back to bare 'flutter' on PATH. This project requires Flutter 3.41.x (Dart 3.11.x)."
+    $flutterBin = "flutter"
+}
+
 # 1. flutter build windows --release
 if (-not $SkipBuild) {
     Write-Host "[1/3] flutter build windows --release ..." -ForegroundColor Cyan
+    Write-Host "       flutter : $flutterBin" -ForegroundColor DarkGray
     # Some Flutter plugin build scripts (notably super_native_extensions'
     # cargokit/resolve_symlinks.ps1) write benign warnings to stderr when
     # a Rust target symlink is stale. With $ErrorActionPreference=Stop
@@ -103,7 +128,7 @@ if (-not $SkipBuild) {
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & flutter build windows --release 2>&1 | ForEach-Object { Write-Host $_ }
+        & $flutterBin build windows --release 2>&1 | ForEach-Object { Write-Host $_ }
         $flutterExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevPref

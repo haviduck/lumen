@@ -30,7 +30,7 @@ import 'autocomplete_overlay.dart';
 import 'binary_preview.dart';
 import 'editor_themes.dart';
 import 'indent_guides.dart';
-import 'knowledge_base_view.dart';
+import 'wiki_view.dart';
 import 'markdown_preview.dart';
 import 'recent_edits_overlay.dart';
 import 'unsaved_changes_dialog.dart';
@@ -272,8 +272,8 @@ class _EditorState extends State<Editor> {
         child: const ProcessManagerView(),
       );
     }
-    // Knowledge Base sentinel — markdown editor + preview + summarize
-    // header for the workspace `.agents/knowledgebase.md`. Same
+    // Wiki sentinel — multi-page wiki library view (listing + per-page
+    // editor). Replaces the old single-file KnowledgeBaseView. Same
     // virtual-tab pattern as settings/process-manager: routed BEFORE
     // any real-file branch so the literal `__knowledge_base__` path
     // can never hit a code-editor mount.
@@ -285,7 +285,7 @@ class _EditorState extends State<Editor> {
           final file = appState.openFiles.firstWhere((f) => f.path == path);
           appState.setActiveFile(file);
         },
-        child: const KnowledgeBaseView(),
+        child: const WikiView(),
       );
     }
     // Council theater sentinel — full live council UI (orbital ring,
@@ -1698,6 +1698,8 @@ class _EditorTabBar extends StatelessWidget {
                       ? S.settingsTitle
                       : isProcessMgr
                       ? S.processManagerTitle
+                      : isKb
+                      ? S.wikiTabTitle
                       : isCouncil
                       ? S.councilTitle
                       : isUntitled

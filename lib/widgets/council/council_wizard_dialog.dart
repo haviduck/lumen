@@ -308,6 +308,7 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
                     _StepIndicator(step: _step),
                     if (models.isEmpty) const _GateBanner(),
                     Expanded(
+                      child: ClipRect(
                       child: AnimatedSwitcher(
                         duration: const Duration(milliseconds: 200),
                         switchInCurve: Curves.easeOutCubic,
@@ -359,6 +360,7 @@ class _CouncilWizardDialogState extends State<CouncilWizardDialog> {
                             ),
                           ),
                         ),
+                      ),
                       ),
                     ),
                     _Footer(

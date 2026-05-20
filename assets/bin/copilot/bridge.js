@@ -1,11 +1,38 @@
 #!/usr/bin/env node
 'use strict';
 
+// Lumen ↔ GitHub Copilot bridge.
+//
+// Architecture: long-lived Node process spawned by `CopilotService`
+// (Dart) over stdio JSON-RPC. ONE `CopilotClient` instance is cached
+// per auth-signature and reused across every `chat_start` request —
+// `client.start()` spawns the Copilot CLI as a child node process,
+// so creating a fresh client per prompt would leak one CLI child
+// per prompt (especially nasty during council runs with N parallel
+// agents × M turns). Cached client + per-request `Session` keeps the
+// child-process count at 1 per Lumen session.
+//
+// Lifecycle:
+// - `chat_start` / `list_models` → `ensureClient(auth)` (cache hit or
+//   new). The cached client lives until either (a) auth changes
+//   (signature mismatch → evict + recreate) or (b) bridge shuts down.
+// - Shutdown is triggered by stdin EOF (parent Lumen.exe died /
+//   closed the pipe), `SIGTERM`, `SIGINT`, or `SIGBREAK` (Windows).
+//   We then `forceStop()` the cached client so its CLI child is
+//   reaped synchronously rather than orphaning.
+//
+// Do NOT add per-request `client.stop()` calls anywhere — the only
+// stop sites are in `shutdownBridge()` and `ensureClient()`'s
+// eviction branch.
+
 const readline = require('readline');
 const { CopilotClient, approveAll, defineTool } = require('@github/copilot-sdk');
 
-const clients = new Map();
 const sessions = new Map();
+
+let cachedClient = null;
+let cachedAuthSignature = null;
+let shuttingDown = false;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -27,21 +54,67 @@ function clientConfig(auth = {}) {
   return { useLoggedInUser: auth.useLoggedInUser !== false };
 }
 
-async function createClient(auth) {
+function authSignature(auth = {}) {
+  const token = typeof auth.gitHubToken === 'string'
+    ? auth.gitHubToken.trim()
+    : (typeof auth.githubToken === 'string' ? auth.githubToken.trim() : '');
+  const useLoggedIn = token ? false : (auth.useLoggedInUser !== false);
+  return JSON.stringify({ token, useLoggedIn });
+}
+
+async function ensureClient(auth) {
+  const sig = authSignature(auth);
+  if (cachedClient && cachedAuthSignature === sig) {
+    return cachedClient;
+  }
+  if (cachedClient) {
+    const previous = cachedClient;
+    cachedClient = null;
+    cachedAuthSignature = null;
+    try {
+      await previous.stop();
+    } catch {
+      // Best-effort eviction; we already disowned the reference.
+    }
+  }
   const client = new CopilotClient(clientConfig(auth));
   await client.start();
+  cachedClient = client;
+  cachedAuthSignature = sig;
   return client;
 }
 
-async function stopClient(key) {
-  const client = clients.get(key);
-  if (!client) return;
-  clients.delete(key);
-  try {
-    await client.stop();
-  } catch {
-    // Best effort shutdown.
+async function shutdownBridge(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  for (const [requestId, session] of sessions) {
+    try { await session.abort(); } catch {}
+    try { await session.disconnect(); } catch {}
+    // Best-effort notice so any pending Dart stream gets a final
+    // sentinel rather than waiting forever for the next event.
+    try { send({ type: 'cancelled', requestId, reason }); } catch {}
   }
+  sessions.clear();
+
+  if (cachedClient) {
+    const client = cachedClient;
+    cachedClient = null;
+    cachedAuthSignature = null;
+    try {
+      // `forceStop` skips graceful CLI cleanup — appropriate when the
+      // parent has already died (stdin EOF) and we just need the
+      // child reaped. Falls back to `stop` on older SDK versions.
+      if (typeof client.forceStop === 'function') {
+        await client.forceStop();
+      } else {
+        await client.stop();
+      }
+    } catch {
+      // Already stopped or already dead; nothing more we can do.
+    }
+  }
+  process.exit(0);
 }
 
 function formatMessages(messages) {
@@ -104,30 +177,25 @@ function effortFor(value) {
 }
 
 async function handleListModels(message) {
-  const client = await createClient(message.auth || {});
-  try {
-    if (typeof client.listModels !== 'function') {
-      throw new Error('Installed @github/copilot-sdk does not expose client.listModels().');
-    }
-    const models = await client.listModels();
-    if (!Array.isArray(models) || models.length === 0) {
-      throw new Error('Copilot SDK returned no models for this account.');
-    }
-    const normalized = models.map((m) => ({
-      id: m.id || m.name || String(m),
-      name: m.name || m.id || String(m),
-      capabilities: m.capabilities || m.supports || null
-    }));
-    send({ type: 'models', requestId: message.requestId, models: normalized });
-  } finally {
-    await client.stop();
+  const client = await ensureClient(message.auth || {});
+  if (typeof client.listModels !== 'function') {
+    throw new Error('Installed @github/copilot-sdk does not expose client.listModels().');
   }
+  const models = await client.listModels();
+  if (!Array.isArray(models) || models.length === 0) {
+    throw new Error('Copilot SDK returned no models for this account.');
+  }
+  const normalized = models.map((m) => ({
+    id: m.id || m.name || String(m),
+    name: m.name || m.id || String(m),
+    capabilities: m.capabilities || m.supports || null
+  }));
+  send({ type: 'models', requestId: message.requestId, models: normalized });
 }
 
 async function handleChatStart(message) {
   const requestId = message.requestId;
-  const client = await createClient(message.auth || {});
-  clients.set(requestId, client);
+  const client = await ensureClient(message.auth || {});
 
   const session = await client.createSession({
     model: message.model || 'gpt-5',
@@ -174,7 +242,9 @@ async function handleChatStart(message) {
     } catch {
       // Best effort.
     }
-    await stopClient(requestId);
+    // Intentionally NO `client.stop()` here. The client is shared
+    // across every request for this auth-signature and only dies in
+    // `shutdownBridge()` or on auth eviction inside `ensureClient`.
   }
 }
 
@@ -194,7 +264,7 @@ async function handleCancel(message) {
     }
     sessions.delete(requestId);
   }
-  await stopClient(requestId);
+  // No `client.stop()` — see lifecycle note at top of file.
   send({ type: 'cancelled', requestId });
 }
 
@@ -215,7 +285,6 @@ async function handleMessage(message) {
       requestId: message.requestId,
       error: error && error.message ? error.message : String(error)
     });
-    if (message.requestId) await stopClient(message.requestId);
   }
 }
 
@@ -232,9 +301,15 @@ rl.on('line', (line) => {
   handleMessage(message);
 });
 
-process.on('SIGTERM', async () => {
-  for (const key of Array.from(sessions.keys())) {
-    await handleCancel({ requestId: key });
-  }
-  process.exit(0);
-});
+// Shutdown triggers. The critical one is `stdin end`: when the Dart
+// side closes its end of the pipe (during `CopilotService.dispose`)
+// we get an EOF here and can reap the cached CopilotClient + its
+// CLI child before Lumen.exe exits. Without this, the child node
+// orphans (Windows TerminateProcess on the bridge skips the SIGTERM
+// handler and any cleanup wiring tied to it).
+rl.on('close', () => shutdownBridge('stdin-close'));
+process.stdin.on('end', () => shutdownBridge('stdin-end'));
+process.on('SIGTERM', () => shutdownBridge('SIGTERM'));
+process.on('SIGINT', () => shutdownBridge('SIGINT'));
+process.on('SIGBREAK', () => shutdownBridge('SIGBREAK'));
+process.on('SIGHUP', () => shutdownBridge('SIGHUP'));

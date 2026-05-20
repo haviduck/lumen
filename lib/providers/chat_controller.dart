@@ -402,6 +402,11 @@ class ChatController extends ChangeNotifier {
   ///     (recon → reads → edits → build → ps → curl → logs → trace
   ///     config → re-edit → rebuild → retest), and the old hard 25
   ///     was clipping productive runs mid-fix.
+  ///   - raised to 250 — 100 was still clipping productive runs on
+  ///     ambitious multi-component tasks (full-stack scaffolding,
+  ///     large refactors with import fixups, multi-file test suites).
+  ///     The stall-detector is the real gate; this is purely the
+  ///     "heat death of the universe" backstop.
   ///
   /// Safety net is layered: cancel button, per-tool approval,
   /// in-iteration runaway guard (>80 markers / >12 RUN_CMDs aborts the
@@ -409,7 +414,7 @@ class ChatController extends ChangeNotifier {
   /// [maxUnproductiveStreak] stall-detector below. This constant is
   /// the last-resort backstop — if it ever fires the model is doing
   /// something genuinely pathological even by stall-detector standards.
-  static const int maxIters = 100;
+  static const int maxIters = 250;
 
   /// Soft cap on the agent loop: when this many *consecutive*
   /// iterations produce no genuinely new tool signature (id + first

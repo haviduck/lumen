@@ -699,6 +699,42 @@ class S {
   static const String menuOpenMediaFromChat =
       'Open media controls from the chat header.';
 
+  // Wiki (project wiki — `.agents/wiki/` directory of markdown pages).
+  static const String wikiTitle = 'Wiki';
+  static const String wikiTabTitle = 'Wiki';
+  static const String wikiTooltip = 'Wiki';
+  static const String wikiNewPage = 'New Page';
+  static const String wikiGenerateWiki = 'Generate Wiki';
+  static const String wikiGenerating = 'Generating…';
+  static const String wikiDeletePageTitle = 'Delete wiki page?';
+  static String wikiDeletePageBody(String title) =>
+      'This will permanently delete "$title". This cannot be undone.';
+  static const String wikiEmptyTitle = 'No wiki pages yet';
+  static const String wikiEmptySubtitle =
+      'Generate a wiki from your codebase, or create a page manually.';
+  static const String wikiSaved = 'Wiki page saved';
+  static const String wikiSaveFailed = 'Save failed — check log';
+  static const String wikiDeleted = 'Wiki page deleted';
+  static const String wikiDeleteFailed = 'Delete failed — check log';
+  static const String wikiCreated = 'Wiki page created';
+  static const String wikiNewPageSlug = 'new-page';
+  static const String wikiNewPageDefaultTitle = '# New Page\n\n';
+  static const String wikiNoWorkspace =
+      'Open a workspace to use the wiki.';
+  static const String wikiSearch = 'Search pages…';
+  static const String wikiEdit = 'Edit';
+  static const String wikiPreview = 'Preview';
+  static const String wikiBackToList = 'Back to wiki';
+  static const String wikiSummarize = 'Summarize';
+  static const String wikiMigrated = 'Knowledgebase migrated to wiki';
+  static const String wikiGenerateSuccess = 'Wiki generated';
+  static const String wikiGenerateFailed = 'Wiki generation failed';
+  static const String wikiGenerateNoModel =
+      'No reachable model — check Settings → AI/Chat';
+  static String wikiPageCount(int count) =>
+      '$count ${count == 1 ? 'page' : 'pages'}';
+  static String wikiLastModified(String when) => 'Modified $when';
+
   // Command palette / quick open / global search
   static const String paletteHint = 'Type a command or > for help…';
   static const String paletteNoResults = 'No matching commands';

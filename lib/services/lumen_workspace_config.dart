@@ -28,6 +28,7 @@ class LumenWorkspaceConfig {
   static const String toolsDirName = 'tools';
   static const String skillsDirName = 'skills';
   static const String knowledgebaseFileName = 'knowledgebase.md';
+  static const String wikiDirName = 'wiki';
 
   static Directory dir(String basePath) => Directory(p.join(basePath, dirName));
 
@@ -73,6 +74,21 @@ class LumenWorkspaceConfig {
   /// [knowledgebaseFile] on first open by `KbService.ensure`.
   static File legacyKnowledgebaseFile(String workspacePath) =>
       File(p.join(workspacePath, dirName, knowledgebaseFileName));
+
+  /// Project wiki directory. Lives under `.agents/wiki/` — each
+  /// `.md` file is a standalone wiki page the LLM and user can
+  /// create/read/update via normal file tools.
+  static Directory wikiDir(String workspacePath) =>
+      Directory(p.join(workspacePath, agentsDirName, wikiDirName));
+
+  /// Materialise `.agents/wiki/` (creating parents lazily). Idempotent.
+  static Future<Directory> ensureWikiDir(String workspacePath) async {
+    final d = wikiDir(workspacePath);
+    if (!await d.exists()) {
+      await d.create(recursive: true);
+    }
+    return d;
+  }
 
   /// Materialise `.agents/` (creating it lazily). Idempotent.
   static Future<Directory> ensureAgentsDir(String basePath) async {

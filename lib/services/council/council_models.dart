@@ -415,9 +415,46 @@ class CouncilAgent {
   final String model;
   final Set<String> enabledTools;
   CouncilAgentStatus status;
-  String transcript;
   String currentTask;
   String lastError;
+
+  /// Backing buffer for transcript accumulation. Using StringBuffer
+  /// avoids O(n) string copies on every streamed token — the old
+  /// `transcript += chunk` was O(n²) overall and the primary cause
+  /// of the mid-session freeze the user reported.
+  ///
+  /// Nullable backing field so hot-reload doesn't crash on pre-existing
+  /// instances that lack this field at the VM level.
+  StringBuffer? _transcriptBuf;
+
+  /// Lazy accessor — allocates the buffer on first touch so old
+  /// instances survive hot reload.
+  StringBuffer get _buf => _transcriptBuf ??= StringBuffer();
+
+  /// Cached materialisation of the buffer. Invalidated by
+  /// [appendTranscript]; lazily rebuilt on the next [transcript] read.
+  String? _transcriptCache;
+
+  /// Number of characters in the transcript. Cheaper than reading
+  /// [transcript] when only length is needed (avoids materialising
+  /// the StringBuffer).
+  int get transcriptLength => _buf.length;
+
+  String get transcript {
+    return _transcriptCache ??= _buf.toString();
+  }
+
+  set transcript(String value) {
+    _buf.clear();
+    if (value.isNotEmpty) _buf.write(value);
+    _transcriptCache = value;
+  }
+
+  /// O(1) amortised append — the hot path during streaming.
+  void appendTranscript(String chunk) {
+    _buf.write(chunk);
+    _transcriptCache = null;
+  }
 
   CouncilAgent({
     required this.id,
@@ -427,10 +464,12 @@ class CouncilAgent {
     this.customRole = '',
     Set<String>? enabledTools,
     this.status = CouncilAgentStatus.idle,
-    this.transcript = '',
+    String transcript = '',
     this.currentTask = '',
     this.lastError = '',
-  }) : enabledTools = Set.unmodifiable(enabledTools ?? const <String>{});
+  }) : enabledTools = Set.unmodifiable(enabledTools ?? const <String>{}),
+       _transcriptBuf = StringBuffer(transcript),
+       _transcriptCache = transcript.isEmpty ? '' : transcript;
 
   CouncilAgent copyWith({
     String? id,

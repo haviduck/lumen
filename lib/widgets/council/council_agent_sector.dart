@@ -42,10 +42,9 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
   CouncilAgentStatus? _lastStatus;
   late final AnimationController _doneFlash;
 
-  /// Continuous-forward ticker (no reverse) used to drive the per-card
-  /// bobbing and the orchestrator halo rotation. Distinct from `_idle`,
-  /// which bounces 0→1→0 for the breathing border alpha — bobbing
-  /// needs monotonic phase so the sine doesn't snap at the bounce.
+  /// Continuous-forward ticker — was used for per-card bobbing (now
+  /// disabled). Kept alive for the orchestrator halo rotation and any
+  /// other monotonic-phase consumers.
   late final AnimationController _bob;
 
   /// One-shot micro-pulse fired when the agent's tool-fire event lands.
@@ -55,10 +54,6 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
   /// final "I'm done" burst.
   late final AnimationController _toolPulse;
 
-  /// Per-agent phase offset for the bob — deterministic from agent.id
-  /// hash so two cards never bob in lockstep, but the same card has a
-  /// stable rhythm across rebuilds.
-  late final double _bobPhase;
 
   StreamSubscription<CouncilEvent>? _eventSub;
 
@@ -98,7 +93,6 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
       vsync: this,
       duration: const Duration(milliseconds: 480),
     );
-    _bobPhase = _phaseForId(widget.agent.id);
     _lastStatus = widget.agent.status;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -141,18 +135,6 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
           break;
       }
     });
-  }
-
-  /// Stable 0..1 phase from agent id. Same algorithm as the rest of
-  /// the codebase uses for hash-derived rhythm signatures — FNV-1a
-  /// over UTF-16 then divide.
-  double _phaseForId(String id) {
-    var h = 2166136261;
-    for (var i = 0; i < id.length; i++) {
-      h = (h ^ id.codeUnitAt(i)) & 0xFFFFFFFF;
-      h = (h * 16777619) & 0xFFFFFFFF;
-    }
-    return (h % 1000) / 1000.0;
   }
 
   @override
@@ -212,26 +194,15 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
         final arriveScale = 1.32 - 0.32 * eased;
         final fadeIn = Curves.easeOutCubic.transform(raw);
 
-        // ── Bobbing ───────────────────────────────────────────────
-        // Continuous sine over `_bob.value` (0..1, no reverse) with a
-        // per-agent phase offset so the ring breathes asynchronously.
-        // Amplitude scales with the agent's status — active cards
-        // bob harder so the eye reads them as alive; idle cards stay
-        // nearly still so the ring doesn't feel jittery.
+        // ── Bobbing (disabled) ────────────────────────────────────
+        // Cards stay stationary per user request. `isActive` is
+        // still needed by the orchestrator halo intensity.
         final isActive =
             agent.status == CouncilAgentStatus.working ||
             agent.status == CouncilAgentStatus.askingPool ||
             agent.status == CouncilAgentStatus.replying ||
             agent.status == CouncilAgentStatus.awaitingUser;
-        // Orchestrator bobs less — it's the conductor, the steady
-        // center the user's eye returns to. Peers do the dancing.
-        final bobAmpBase = isOrchestrator
-            ? 1.2
-            : (isActive ? 3.4 : 1.4);
-        final bobOffsetY = math.sin(
-              (_bob.value + _bobPhase) * math.pi * 2,
-            ) *
-            bobAmpBase;
+        const bobOffsetY = 0.0;
 
         // ── Tool-fire micro-pulse ────────────────────────────────
         // 480ms easeOut. Card gives a quick 1.0 → 1.03 → 1.0 scale
@@ -404,6 +375,7 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
         : 0.7;
     return AnimatedContainer(
       duration: DuckMotion.medium,
+      clipBehavior: Clip.hardEdge,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: active ? DuckColors.councilSurfaceHi : DuckColors.councilSurface,
@@ -479,114 +451,126 @@ class _CouncilAgentSectorState extends State<CouncilAgentSector>
           ),
           Opacity(
         opacity: desat,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            const titleH = 38.0;
+            const statusH = 48.0;
+            const transcriptMin = 36.0;
+            const gaps = 18.0;
+            final middleMax =
+                constraints.maxHeight - titleH - statusH - transcriptMin - gaps;
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Accent rail along the leading edge of the title row.
-                // Stands in for the dropped monogram tile so the role
-                // color still has a presence on the card without the
-                // 36px chip the user called clutter.
-                Container(
-                  width: 2,
-                  height: 30,
-                  decoration: BoxDecoration(
-                    color: accent.withValues(alpha: 0.85),
-                    borderRadius: BorderRadius.circular(1),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        agent.name,
-                        maxLines: 1,
-                        softWrap: false,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: DuckColors.fgPrimary,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.1,
-                        ),
+                Row(
+                  children: [
+                    Container(
+                      width: 2,
+                      height: 30,
+                      decoration: BoxDecoration(
+                        color: accent.withValues(alpha: 0.85),
+                        borderRadius: BorderRadius.circular(1),
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        isOrchestrator
-                            ? S.councilOrchestrator
-                            : _roleLabel(agent.role),
-                        maxLines: 1,
-                        softWrap: false,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            agent.name,
+                            maxLines: 1,
+                            softWrap: false,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: DuckColors.fgPrimary,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 0.1,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            isOrchestrator
+                                ? S.councilOrchestrator
+                                : _roleLabel(agent.role),
+                            maxLines: 1,
+                            softWrap: false,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: DuckColors.fgMuted,
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w500,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (done)
+                      const Padding(
+                        padding: EdgeInsets.only(left: 6),
+                        child: Icon(
+                          Icons.check_rounded,
+                          size: 16,
                           color: DuckColors.fgMuted,
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w500,
-                          letterSpacing: 0.3,
                         ),
                       ),
-                    ],
-                  ),
+                  ],
                 ),
-                if (done)
-                  const Padding(
-                    padding: EdgeInsets.only(left: 6),
-                    child: Icon(
-                      Icons.check_rounded,
-                      size: 16,
-                      color: DuckColors.fgMuted,
+                const SizedBox(height: 6),
+                // Voice + step indicator constrained to the space
+                // between the title and status block. Uses a non-
+                // scrollable SingleChildScrollView so overflow is
+                // absorbed silently (no yellow RenderFlex bars).
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: middleMax.clamp(40.0, 200.0),
+                  ),
+                  child: ClipRect(
+                    child: SingleChildScrollView(
+                      physics: const NeverScrollableScrollPhysics(),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          AgentVoicePanel(
+                            key: ValueKey('voice-${agent.id}'),
+                            agent: agent,
+                            isOrchestrator: isOrchestrator,
+                            breathT: idleT,
+                          ),
+                          _SubtaskStepIndicator(
+                            agentId: agent.id,
+                            accent: accent,
+                            idleT: idleT,
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                // Status pill intentionally NOT shown here — moved to
-                // the row alongside the model chip below, per Stage
-                // Director directive: "working/idle/etc. badge belongs
-                // on the same row as the model badge".
+                ),
+                const SizedBox(height: 6),
+                _AgentStatusBlock(
+                  agent: agent,
+                  errored: errored,
+                  accent: accent,
+                ),
+                const SizedBox(height: 6),
+                Expanded(
+                  child: _TranscriptWell(
+                    agentId: agent.id,
+                    transcript: agent.transcript,
+                    active: active,
+                    done: done,
+                    accent: accent,
+                  ),
+                ),
               ],
-            ),
-            const SizedBox(height: 8),
-            // Voice section — the integrated speech surface that
-            // replaced the floating bubble layer in the 2026-05
-            // redesign. Reads as a distinct "this is what the agent
-            // is saying" region inside the card. Drives off the
-            // shared `_idle` controller via `breathT` so the voice
-            // hairline pulses without a new vsync (landmine: do NOT
-            // add a per-card ticker for this section).
-            AgentVoicePanel(
-              key: ValueKey('voice-${agent.id}'),
-              agent: agent,
-              isOrchestrator: isOrchestrator,
-              breathT: idleT,
-            ),
-            // Subtask step indicator — only renders when the agent has
-            // declared a plan via `council_plan_subtasks`. Collapsed
-            // height when empty so the card layout stays stable across
-            // tasks with / without subtask plans.
-            _SubtaskStepIndicator(
-              agentId: agent.id,
-              accent: accent,
-              idleT: idleT,
-            ),
-            const SizedBox(height: 8),
-            _AgentStatusBlock(
-              agent: agent,
-              errored: errored,
-              accent: accent,
-            ),
-            const SizedBox(height: 10),
-            Expanded(
-              child: _TranscriptWell(
-                agentId: agent.id,
-                transcript: agent.transcript,
-                active: active,
-                done: done,
-                accent: accent,
-              ),
-            ),
-          ],
+            );
+          },
         ),
       ),
         ],
@@ -925,7 +909,7 @@ class _TranscriptWell extends StatelessWidget {
             height: 36,
             child: IgnorePointer(
               child: _LiveCadenceSpectrum(
-                transcript: transcript,
+                transcriptLength: transcript.length,
                 accent: accent,
                 active: active,
                 done: done,
@@ -1680,13 +1664,13 @@ class _Chip extends StatelessWidget {
 // ════════════════════════════════════════════════════════════════
 
 class _LiveCadenceSpectrum extends StatefulWidget {
-  final String transcript;
+  final int transcriptLength;
   final Color accent;
   final bool active;
   final bool done;
 
   const _LiveCadenceSpectrum({
-    required this.transcript,
+    required this.transcriptLength,
     required this.accent,
     required this.active,
     required this.done,
@@ -1712,7 +1696,7 @@ class _LiveCadenceSpectrumState extends State<_LiveCadenceSpectrum>
   @override
   void initState() {
     super.initState();
-    _lastLen = widget.transcript.length;
+    _lastLen = widget.transcriptLength;
     _ticker = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 1),
@@ -1723,7 +1707,7 @@ class _LiveCadenceSpectrumState extends State<_LiveCadenceSpectrum>
   @override
   void didUpdateWidget(covariant _LiveCadenceSpectrum old) {
     super.didUpdateWidget(old);
-    final len = widget.transcript.length;
+    final len = widget.transcriptLength;
     if (len > _lastLen) {
       final delta = len - _lastLen;
       _lastDeltaAt = DateTime.now();

@@ -314,16 +314,43 @@ class CopilotService {
     return raw.isEmpty ? _fallbackTitle(firstMessage) : raw;
   }
 
+  /// Shut the Copilot bridge down so its child Copilot-CLI node
+  /// processes get reaped instead of orphaning. The sequence matters:
+  ///
+  ///   1. Cancel every in-flight Dart-side stream (sends `cancel`
+  ///      messages to the bridge so any sessions abort cleanly).
+  ///   2. Close `process.stdin` — the bridge listens for stdin EOF
+  ///      and uses it as its graceful-shutdown trigger
+  ///      (`shutdownBridge('stdin-close')`), which `forceStop()`s the
+  ///      cached `CopilotClient` and reaps the CLI child.
+  ///   3. Wait up to ~800 ms for the bridge to exit on its own.
+  ///   4. If it's still alive, hard-kill (Windows `TerminateProcess`).
+  ///
+  /// The timeout matters because [AppCloseGuard] awaits this on the
+  /// close path with its own cap — a hung dispose must never keep
+  /// the IDE window from actually closing.
   Future<void> dispose() async {
     for (final id in _streams.keys.toList()) {
       await _cancel(id);
     }
+    final proc = _process;
+    _process = null;
+    if (proc != null) {
+      try {
+        await proc.stdin.close();
+      } catch (_) {
+        // Pipe already torn down; the bridge will see EOF anyway.
+      }
+      try {
+        await proc.exitCode.timeout(const Duration(milliseconds: 800));
+      } on TimeoutException {
+        try {
+          proc.kill();
+        } catch (_) {}
+      } catch (_) {}
+    }
     await _stdoutSub?.cancel();
     await _stderrSub?.cancel();
-    try {
-      _process?.kill();
-    } catch (_) {}
-    _process = null;
   }
 
   Future<Map<String, dynamic>> _request(String type) async {

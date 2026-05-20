@@ -2216,13 +2216,15 @@ class _ExplorerActivityBar extends StatelessWidget {
       // through `onSsh`) so the dropdown anchors to this specific
       // tile's RenderBox.
       const _SshActivityButton(),
-      // Knowledge Base — opens the workspace knowledgebase as an
-      // editor tab (markdown editor + preview + "Summarize"). This
-      // slot used to host the GitNexus status icon; the user removed
-      // GitNexus from the surfaced integrations so the KB now owns
-      // the slot. Always-on (not gated): the KB exists for every
-      // workspace, even before the file is created.
-      const _KnowledgeBaseButton(),
+      // Wiki — opens the project wiki (`.agents/wiki/` directory
+      // of per-topic markdown pages) as an editor tab. The view
+      // shows a listing of pages with a per-page editor on click,
+      // plus Generate Wiki / New Page / Summarize affordances.
+      // This slot used to host the GitNexus status icon, then the
+      // pre-1.0.8 single-file knowledgebase view; the wiki feature
+      // now owns it. Always-on (not gated): every workspace has a
+      // wiki, even before any pages exist on disk.
+      const _WikiButton(),
     ];
 
     return Container(
@@ -2302,19 +2304,22 @@ class _SshActivityButton extends StatelessWidget {
   }
 }
 
-/// Activity-bar tile for the workspace knowledgebase. Replaces the
-/// pre-1.0.8 GitNexus status icon — single tap opens the
-/// `KnowledgeBaseView` as an editor tab. Always visible (no master
-/// switch): every workspace has a knowledgebase, even before the
-/// markdown file is created.
-class _KnowledgeBaseButton extends StatelessWidget {
-  const _KnowledgeBaseButton();
+/// Activity-bar tile for the project wiki. Single tap opens the
+/// wiki library view (`WikiView`) as an editor tab — routed via
+/// the `knowledgeBaseSentinel` sentinel path in `AppState`. The
+/// sentinel keeps its historical `__knowledge_base__` value so
+/// persisted tab state from older sessions still resolves; only
+/// the user-facing label, tooltip, and class name reflect the
+/// "wiki" rename. Always visible (no master switch): every
+/// workspace has a wiki, even before any pages are created.
+class _WikiButton extends StatelessWidget {
+  const _WikiButton();
 
   @override
   Widget build(BuildContext context) {
     return BrightIconButton(
       icon: Icons.menu_book_outlined,
-      tooltip: 'Knowledgebase',
+      tooltip: S.wikiTooltip,
       onTap: () => context.read<AppState>().openKnowledgeBaseTab(),
     );
   }
@@ -2322,9 +2327,12 @@ class _KnowledgeBaseButton extends StatelessWidget {
 
 // Pre-1.0.8: a `_GitNexusStatusButton` and its `_DaemonDot` helper
 // lived in this slot. They were deleted when the GitNexus integration
-// was retired from the file-explorer activity bar — the slot now hosts
-// `_KnowledgeBaseButton` above. The deletion is local to this file;
-// `gitnexus_service.dart` itself is removed by Copilot Onboarder.
+// was retired from the file-explorer activity bar — the slot then
+// hosted the single-file `_KnowledgeBaseButton`, which v1.0.16
+// renamed to `_WikiButton` above when the KB feature was rebuilt as
+// a multi-page wiki under `.agents/wiki/`. The deletion is local to
+// this file; `gitnexus_service.dart` itself is removed by Copilot
+// Onboarder.
 
 /// Workspace-root header. The whole row is tappable — clicking toggles the
 /// tree collapse/expand exactly like a real folder row. New-file / new-folder

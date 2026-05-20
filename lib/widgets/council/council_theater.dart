@@ -707,29 +707,33 @@ class _CouncilStage extends StatelessWidget {
                       ),
                       _positioned(
                         layout[session.config.orchestrator.id]!,
-                        _AgentTapTarget(
-                          onTap: onTapAgent == null
-                              ? null
-                              : () =>
-                                    onTapAgent!(session.config.orchestrator.id),
-                          child: CouncilAgentSector(
-                            agent: session.config.orchestrator,
-                            isOrchestrator: true,
-                            spawnDelayMs: 0,
+                        RepaintBoundary(
+                          child: _AgentTapTarget(
+                            onTap: onTapAgent == null
+                                ? null
+                                : () =>
+                                      onTapAgent!(session.config.orchestrator.id),
+                            child: CouncilAgentSector(
+                              agent: session.config.orchestrator,
+                              isOrchestrator: true,
+                              spawnDelayMs: 0,
+                            ),
                           ),
                         ),
                       ),
                       for (var i = 0; i < agents.length; i++)
                         _positioned(
                           layout[agents[i].id]!,
-                          _AgentTapTarget(
-                            onTap: onTapAgent == null
-                                ? null
-                                : () => onTapAgent!(agents[i].id),
-                            child: CouncilAgentSector(
-                              key: ValueKey('agent-${agents[i].id}'),
-                              agent: agents[i],
-                              spawnDelayMs: 120 + i * 80,
+                          RepaintBoundary(
+                            child: _AgentTapTarget(
+                              onTap: onTapAgent == null
+                                  ? null
+                                  : () => onTapAgent!(agents[i].id),
+                              child: CouncilAgentSector(
+                                key: ValueKey('agent-${agents[i].id}'),
+                                agent: agents[i],
+                                spawnDelayMs: 120 + i * 80,
+                              ),
                             ),
                           ),
                         ),

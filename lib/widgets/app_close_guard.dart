@@ -128,12 +128,12 @@ class _AppCloseGuardState extends State<AppCloseGuard> with WindowListener {
   }
 
   Future<void> _closeForReal() async {
-    // Tear down every running PTY child the IDE spawned BEFORE we ask
-    // window_manager to destroy. `destroy()` skips Flutter's framework
-    // dispose chain, so anything left running at this point would
-    // outlive the parent process (Windows reparents the orphans to
-    // PID 0 and they keep squatting on ports / file handles). The
-    // shutdown method runs:
+    // Tear down every running PTY / node child the IDE spawned BEFORE
+    // we ask window_manager to destroy. `destroy()` skips Flutter's
+    // framework dispose chain, so anything left running at this point
+    // would outlive the parent process (Windows reparents the orphans
+    // to PID 0 and they keep squatting on ports / file handles). The
+    // shutdown sequence:
     //   1. `AgentTerminalBridge.shutdownAll` — kills hidden RUN_CMD
     //      sessions + promoted visible agent tabs.
     //   2. `IdeActions.shutdownAllTerminals` — interactive sessions
@@ -142,12 +142,27 @@ class _AppCloseGuardState extends State<AppCloseGuard> with WindowListener {
     //      hard-kill for any descendant that survived the graceful
     //      Ctrl+C path (only on the close-for-real path; workspace
     //      swaps pass `killTrackedPids: false`).
-    // Failures are swallowed inside the helper — we never want a
-    // straggling terminal to prevent the window from actually closing.
+    //   4. `CopilotService.dispose` — closes stdin on the bundled
+    //      Copilot bridge so the bridge can `forceStop()` its cached
+    //      `CopilotClient` and reap the Copilot CLI node child it
+    //      spawned. Without this, every Lumen close leaks one (and
+    //      sometimes several) `node` processes — destroy() doesn't
+    //      run Flutter's dispose chain, so `AppState.dispose` never
+    //      fires its own copilot teardown.
+    // Failures are swallowed — we never want a straggling helper
+    // process to prevent the window from actually closing. Each step
+    // is also time-capped so a hung child can't stall the close.
     if (mounted) {
+      final app = context.read<AppState>();
       try {
-        await context.read<AppState>().shutdownAllTerminals(
-          killTrackedPids: true,
+        await app.shutdownAllTerminals(killTrackedPids: true);
+      } catch (_) {
+        // proceed to destroy regardless
+      }
+      try {
+        await app.copilotService.dispose().timeout(
+          const Duration(seconds: 2),
+          onTimeout: () {},
         );
       } catch (_) {
         // proceed to destroy regardless

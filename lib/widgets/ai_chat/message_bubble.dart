@@ -434,8 +434,11 @@ class _MessageBubbleState extends State<MessageBubble> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (var i = 0; i < segments.length; i++)
+          for (var i = 0; i < segments.length; i++) ...[
+            if (i > 0 && _isSegmentTransition(segments[i - 1], segments[i]))
+              const SizedBox(height: 6),
             _segmentWidget(segments[i], i),
+          ],
           if (widget.isStreaming) ...[
             const SizedBox(height: 2),
             const _StreamingCursor(),
@@ -457,11 +460,26 @@ class _MessageBubbleState extends State<MessageBubble> {
     );
   }
 
+  /// Whether two adjacent segments represent a transition between
+  /// prose and non-prose content. Used to insert a small vertical
+  /// gap at boundaries so tool-call clusters visually detach from
+  /// surrounding prose.
+  static bool _isSegmentTransition(ChatSegment a, ChatSegment b) {
+    final aIsProse = a is ProseSegment;
+    final bIsProse = b is ProseSegment;
+    return aIsProse != bIsProse;
+  }
+
   Widget _segmentWidget(ChatSegment seg, int index) {
+    const toolIndent = EdgeInsets.only(left: 10);
+
     if (seg is ThinkingSegment) {
       return KeyedSubtree(
         key: ValueKey('think-$index'),
-        child: _ThinkingBlock(content: seg.content, isActive: seg.isActive),
+        child: Padding(
+          padding: toolIndent,
+          child: _ThinkingBlock(content: seg.content, isActive: seg.isActive),
+        ),
       );
     }
     if (seg is ProseSegment) {
@@ -473,7 +491,10 @@ class _MessageBubbleState extends State<MessageBubble> {
     if (seg is ToolSegment) {
       return KeyedSubtree(
         key: ValueKey('tool-$index-${seg.toolId}-${seg.firstArg}'),
-        child: ToolSegmentView(segment: seg),
+        child: Padding(
+          padding: toolIndent,
+          child: ToolSegmentView(segment: seg),
+        ),
       );
     }
     if (seg is ToolGroupSegment) {
@@ -482,7 +503,10 @@ class _MessageBubbleState extends State<MessageBubble> {
         key: ValueKey(
           'group-$index-${first.toolId}-${first.status}-${seg.tools.length}',
         ),
-        child: ToolGroupView(group: seg),
+        child: Padding(
+          padding: toolIndent,
+          child: ToolGroupView(group: seg),
+        ),
       );
     }
     if (seg is ProviderErrorSegment) {

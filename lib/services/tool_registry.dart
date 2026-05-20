@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'agent_terminal_bridge.dart';
 import 'kb_service.dart';
 import 'line_break_style.dart';
+import 'wiki_service.dart';
 import 'memory_service.dart';
 import 'ollama_service.dart' show CancellationToken;
 import 'ripgrep_provisioner.dart';
@@ -594,6 +595,9 @@ class ToolRegistry {
           await KbService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
+          WikiService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           // Whole-file line range — `lines 1-N`. Useful for overwrite
           // (the chip jumps to top of the rewritten file); for fresh
           // files `1-N` is mostly cosmetic but keeps the chip
@@ -769,6 +773,9 @@ class ToolRegistry {
           await KbService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
+          WikiService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           return 'EDIT_FILE $fileName: Success (1 replacement made, $lineHint)';
         } catch (e) {
           return 'EDIT_FILE $fileName: Error: $e';
@@ -901,6 +908,9 @@ class ToolRegistry {
           final toWrite = coerceLineBreakStyle(content, originalLineBreak);
           await f.writeAsString(toWrite);
           await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
+          WikiService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
           // Build the line hint. Single-edit case mirrors EDIT_FILE
@@ -1076,6 +1086,9 @@ class ToolRegistry {
           await KbService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
+          WikiService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
           final auditOld = _formatRangeAudit(
             startLine: start,
             content: removed,
@@ -1179,6 +1192,9 @@ class ToolRegistry {
           toWrite = coerceLineBreakStyle(toWrite, existingLineBreak);
           await f.writeAsString(toWrite, mode: FileMode.append);
           await KbService.maybeNotifyExternalWrite(
+            inv.workspaceDir ?? '', filePath,
+          );
+          WikiService.maybeNotifyExternalWrite(
             inv.workspaceDir ?? '', filePath,
           );
           final appendedLines = '\n'.allMatches(content).length + 1;

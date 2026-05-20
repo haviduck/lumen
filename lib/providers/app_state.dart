@@ -53,9 +53,9 @@ class AppState extends ChangeNotifier {
   /// open a code editor.
   static const String processManagerSentinel = '__process_manager__';
 
-  /// Sentinel file path for the Knowledge Base virtual tab. Routes
-  /// to `KnowledgeBaseView` (markdown editor + preview + summarize
-  /// header). Closed-set sentinel — exact-match only, never prefix.
+  /// Sentinel file path for the Wiki virtual tab. Routes to
+  /// `WikiView` (wiki library listing + per-page editor). Closed-set
+  /// sentinel — exact-match only, never prefix.
   static const String knowledgeBaseSentinel = '__knowledge_base__';
 
   /// Sentinel file path for the Council Theater virtual tab. Same
@@ -771,12 +771,12 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Opens the Knowledge Base viewer as a virtual editor tab. Same
-  /// sentinel pattern as `openSettingsTab` / `openProcessManagerTab`:
-  /// a fake `File` is materialised at [knowledgeBaseSentinel] so the
+  /// Opens the Wiki library as a virtual editor tab. Same sentinel
+  /// pattern as `openSettingsTab` / `openProcessManagerTab`: a fake
+  /// `File` is materialised at [knowledgeBaseSentinel] so the
   /// editor's tab strip has something to render, and the editor's
-  /// pane router swaps in `KnowledgeBaseView` when the active path
-  /// matches the sentinel. Re-opening focuses the existing tab.
+  /// pane router swaps in `WikiView` when the active path matches
+  /// the sentinel. Re-opening focuses the existing tab.
   void openKnowledgeBaseTab() {
     final sentinel = File(knowledgeBaseSentinel);
     if (!_openFiles.any((f) => f.path == knowledgeBaseSentinel)) {

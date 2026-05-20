@@ -157,3 +157,15 @@ venv/
 *.db
 CLAUDE.md
 AGENTS.md
+
+# FVM Version Cache. Ignore the cached SDK binaries / symlink (huge,
+# per-machine) but COMMIT the pin file (.fvm/fvm_config.json + the
+# .fvm/version / .fvm/release sidecars). That way `fvm use` after a
+# fresh clone resolves to the project-pinned Flutter automatically.
+# The project intentionally builds against Flutter 3.41.x (Dart 3.11)
+# because `re_editor 0.8.0` (the core editor widget) does NOT compile
+# on Flutter 3.44+ / Dart 3.12 — `_CodeInputController` is missing
+# overrides for new TextEditingController members. Bumping the pin
+# requires either a newer re_editor (none published) or a fork/patch.
+.fvm/flutter_sdk
+.fvm/versions/

@@ -24,20 +24,19 @@ should always follow. Bullet points or short paragraphs work well.
 - 
 
 <!-- LUMEN_KNOWLEDGEBASE_RULE -->
-## Knowledgebase (cross-chat memory)
+## Project Wiki (cross-chat memory)
 
-Every Lumen workspace has a shared knowledgebase at
-`.agents/knowledgebase.md` — the canonical place agents store and read
-durable project knowledge across chat sessions. Lumen reads it into your
-system prompt automatically when it exists, and surfaces a dedicated
-editor under the synthetic `__knowledge_base__` tab.
+Every Lumen workspace has a project wiki at `.agents/wiki/` — a directory
+of markdown files where agents store and read durable project knowledge
+across chat sessions. Each `.md` file is one topic. Lumen surfaces a
+dedicated Wiki library in the editor (book icon in the activity bar).
 
-**At the start of every chat**: read it if it exists. Treat it as
-authoritative project memory.
+**At the start of every chat**: list and read relevant wiki pages. Treat
+them as authoritative project memory.
 
-**After non-trivial work**: append/edit it with anything a future chat
-session would benefit from — architecture decisions, gotchas, file
-locations. Keep it concise and scannable. Remove stale entries.
+**After non-trivial work**: create or update relevant wiki pages with
+architecture decisions, gotchas, file locations. Keep pages focused (one
+topic per file) and scannable. Remove stale entries.
 ''';
 
   static const String _workspaceDefaultStub = '''# Lumen Workspace Rules
@@ -82,30 +81,34 @@ practical, and specific to this project.
 
   static const String _knowledgebaseRuleBlock =
       '''<!-- LUMEN_KNOWLEDGEBASE_RULE -->
-## Knowledgebase (cross-chat memory)
+## Project Wiki (cross-chat memory)
 
-A shared knowledgebase lives at `.agents/knowledgebase.md`. It is the only
-persistent memory between separate chat sessions in this workspace. Lumen
-exposes it to you automatically (read into your system prompt on every
-turn) and offers a dedicated editor under the synthetic
-`__knowledge_base__` tab. Treat it as authoritative project memory.
+A project wiki lives at `.agents/wiki/`. Each `.md` file is a standalone
+wiki page — one topic per file, filename is the slug (e.g.
+`architecture.md`, `conventions.md`, `api.md`). Lumen surfaces a dedicated
+Wiki library in the editor (the book icon in the activity bar). Treat the
+wiki as authoritative project memory that persists across chat sessions.
 
 **At the start of every chat:**
-- Read `.agents/knowledgebase.md` if it exists. Use it as context for the
-  current session — it describes architecture, conventions, recent changes,
+- List `.agents/wiki/` and read relevant pages. Use them as context for the
+  current session — they describe architecture, conventions, recent changes,
   and things that previous sessions learned the hard way.
 
 **After completing non-trivial work:**
-- Update `.agents/knowledgebase.md` with anything a future chat session would
-  benefit from knowing: new patterns introduced, architectural decisions made,
-  pitfalls discovered, conventions established, or important file locations.
-- Keep it concise and scannable (bullets, short sections). Remove stale entries
-  when they no longer apply.
-- Do not duplicate information already in rules.md — the knowledgebase is for
+- Create or update relevant wiki pages with anything a future chat session
+  would benefit from knowing: new patterns introduced, architectural
+  decisions made, pitfalls discovered, conventions established, or important
+  file locations.
+- Keep pages focused: one topic per file, clear `# Title` as the first line.
+- Common pages: `architecture.md`, `conventions.md`, `api.md`, `setup.md`,
+  `data-model.md`, `testing.md`, `decisions.md`.
+- Keep content concise and scannable (bullets, short paragraphs). Remove
+  stale entries when they no longer apply.
+- Do not duplicate information already in rules.md — the wiki is for
   evolving project knowledge, not static policy.
 
-If the file does not exist yet, create it on your first meaningful contribution
-to the workspace.
+If the wiki directory does not exist yet, create it and add your first page
+on your first meaningful contribution to the workspace.
 ''';
 
   /// Pre-`.agents` path string. Used by [migrateLegacyKnowledgebasePath]
@@ -192,14 +195,17 @@ to the workspace.
   Future<String> readWorkspace(String workspacePath) async {
     try {
       final f = await ensureWorkspaceRulesFile(workspacePath);
-      // Auto-install knowledgebase rule for existing workspaces that
-      // predate the feature. Idempotent — no-ops if already present.
+      // Auto-install knowledgebase/wiki rule for existing workspaces
+      // that predate the feature. Idempotent — no-ops if already present.
       await ensureKnowledgebaseRuleInstalled(workspacePath);
       // Rewrite the legacy `.lumen/knowledgebase.md` path to
       // `.agents/knowledgebase.md` in workspaces that were rule-installed
       // before the storage move. Idempotent — only writes when stale
       // text is found.
       await migrateLegacyKnowledgebasePath(workspacePath);
+      // Upgrade old "Knowledgebase (cross-chat memory)" rule block to
+      // the new "Project Wiki" block that references `.agents/wiki/`.
+      await migrateKnowledgebaseRuleToWiki(workspacePath);
       return await f.readAsString();
     } catch (e) {
       debugPrint('Failed to read workspace rules: $e');
@@ -245,6 +251,48 @@ to the workspace.
       return true;
     } catch (e) {
       debugPrint('RulesService.migrateLegacyKnowledgebasePath: $e');
+      return false;
+    }
+  }
+
+  /// One-shot upgrade: replaces old "Knowledgebase (cross-chat memory)"
+  /// rule block with the new "Project Wiki" block that references
+  /// `.agents/wiki/` instead of `.agents/knowledgebase.md`. Detects
+  /// the old block by the presence of `.agents/knowledgebase.md` in
+  /// the rule text (the new block never mentions that path). Returns
+  /// true on a meaningful rewrite.
+  static Future<bool> migrateKnowledgebaseRuleToWiki(
+      String workspacePath) async {
+    try {
+      final f = LumenWorkspaceConfig.rulesFile(workspacePath);
+      if (!await f.exists()) return false;
+      final text = await f.readAsString();
+      if (!text.contains(_canonicalKnowledgebasePath)) return false;
+      if (text.contains('.agents/wiki/')) return false;
+
+      // Replace the entire old block between the marker and the next
+      // marker-level heading (or EOF) with the new block.
+      final markerIdx = text.indexOf(knowledgebaseRuleMarker);
+      if (markerIdx < 0) return false;
+
+      // Find the end of the old block: next `<!-- ` or end of file
+      final afterMarker = markerIdx + knowledgebaseRuleMarker.length;
+      var endIdx = text.length;
+      final nextMarker = text.indexOf('\n<!-- ', afterMarker);
+      if (nextMarker >= 0) endIdx = nextMarker;
+
+      final before = text.substring(0, markerIdx);
+      final after = text.substring(endIdx);
+      final rewritten = '$before$_knowledgebaseRuleBlock$after';
+
+      if (rewritten == text) return false;
+      await f.writeAsString(rewritten);
+      debugPrint(
+        'RulesService: upgraded knowledgebase rule to wiki in ${f.path}',
+      );
+      return true;
+    } catch (e) {
+      debugPrint('RulesService.migrateKnowledgebaseRuleToWiki: $e');
       return false;
     }
   }

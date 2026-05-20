@@ -106,12 +106,17 @@ class _CouncilUserPromptPanelState extends State<CouncilUserPromptPanel> {
                 ],
               ),
               const SizedBox(height: 10),
-              Text(
-                widget.question.question,
-                style: const TextStyle(
-                  color: DuckColors.fgPrimary,
-                  fontSize: 12,
-                  height: 1.35,
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 120),
+                child: SingleChildScrollView(
+                  child: Text(
+                    widget.question.question,
+                    style: const TextStyle(
+                      color: DuckColors.fgPrimary,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
                 ),
               ),
               const SizedBox(height: 10),

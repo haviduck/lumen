@@ -3278,18 +3278,19 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
         'budget': '${_poolExchangeCount()}/$_maxPoolExchangesPerSession',
       },
     );
-    // Peer challenges = adversarial review starting. If the orchestrator
-    // never declared review, advance the strip so the user can see that
-    // attack-on-claims is underway. No-op once review (or later) is
-    // already current. _askPool is only reachable from a doer agent
-    // (orchestrator's tool surface doesn't include ask_pool), so the
-    // signal is structurally a peer-attack, not a planning question.
-    if (CouncilPhase.values.indexOf(session.currentPhase) <
-        CouncilPhase.values.indexOf(CouncilPhase.review)) {
+    // Peer challenges during build+ = adversarial review starting.
+    // Only auto-advance to review when the session is already in
+    // build or polish — pool questions during discovery/architecture
+    // are normal cross-referencing, not adversarial review. The old
+    // logic advanced on ANY pool question, which jumped the strip
+    // from discovery straight to review when a research agent asked
+    // a peer a factual question.
+    if (session.currentPhase == CouncilPhase.build ||
+        session.currentPhase == CouncilPhase.polish) {
       _autoAdvancePhase(
         CouncilPhase.review,
-        '${asker.name} fired council_ask_pool — peer adversarial '
-        'review has started.',
+        '${asker.name} fired council_ask_pool during ${session.currentPhase.name} '
+        '— peer adversarial review has started.',
       );
     }
     final askLinkId = _emitLinkStarted(
@@ -4159,10 +4160,26 @@ The draft report and agent transcripts are in your system prompt. You have every
   void _appendTranscript(CouncilAgent agent, String chunk) {
     final clean = _cleanTranscriptChunk(chunk);
     if (clean.isEmpty) return;
-    agent.transcript += clean;
+    agent.appendTranscript(clean);
     _event(CouncilEventType.agentChunk, fromAgentId: agent.id, message: clean);
     _detectAndEmitPeerMentions(agent, clean);
-    notifyListeners();
+    _scheduleTranscriptNotify();
+  }
+
+  /// Coalesce per-token notifyListeners into at most one call per frame.
+  /// Without this, 5 agents each streaming tokens at 30/s ≈ 150
+  /// notifyListeners/s → 150 full widget tree rebuilds/s. Coalescing
+  /// to one-per-frame caps it at 60 (display refresh) regardless of
+  /// token rate.
+  bool _transcriptNotifyScheduled = false;
+
+  void _scheduleTranscriptNotify() {
+    if (_transcriptNotifyScheduled) return;
+    _transcriptNotifyScheduled = true;
+    Future.microtask(() {
+      _transcriptNotifyScheduled = false;
+      notifyListeners();
+    });
   }
 
   /// Scan a freshly streamed chunk for peer-agent name references and

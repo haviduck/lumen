@@ -756,34 +756,37 @@ class _TranscriptBlock extends StatefulWidget {
   ///     stream-internal sentinels.
   /// Anything else passes through verbatim so the agent's prose +
   /// fenced code + headings render properly.
+  // Pre-compiled regexes — avoids re-parsing the patterns on every
+  // sanitize call (which fires at token rate during streaming).
+  static final _reThinking = RegExp(
+    r'<!-- LUMEN_THINKING[^>]*-->[\s\S]*?<!-- /LUMEN_THINKING -->',
+  );
+  static final _reTool = RegExp(r'<!-- LUMEN_TOOL:[^>]*-->');
+  static final _reErr = RegExp(r'<!-- LUMEN_ERR:[^>]*-->');
+  static final _reTruncated = RegExp(r'<!-- LUMEN_TRUNCATED:[^>]*-->');
+  static final _reToolBlock = RegExp(
+    r'<<<(?:EDIT_FILE|CREATE_FILE|MULTI_EDIT|APPEND_FILE|EDIT_RANGE):\s*.*?>>>[\s\S]*?<<<END_(?:FILE|EDIT|APPEND)>>>',
+    dotAll: true,
+  );
+  static final _reToolSentinel = RegExp(r'<<<[A-Z_]+(?::\s*[^>]*)?\s*>>>');
+  static final _reToolResult = RegExp(
+    r'<tool_result>[\s\S]*?</tool_result>',
+    dotAll: true,
+  );
+  static final _reFailed = RegExp(r'^\[FAILED\]\s*', multiLine: true);
+  static final _reBlankLines = RegExp(r'\n{3,}');
+
   static String _sanitize(String input) {
     var s = input;
-    s = s.replaceAll(
-      RegExp(r'<!-- LUMEN_THINKING[^>]*-->[\s\S]*?<!-- /LUMEN_THINKING -->'),
-      '',
-    );
-    s = s.replaceAll(RegExp(r'<!-- LUMEN_TOOL:[^>]*-->'), '');
-    s = s.replaceAll(RegExp(r'<!-- LUMEN_ERR:[^>]*-->'), '');
-    s = s.replaceAll(RegExp(r'<!-- LUMEN_TRUNCATED:[^>]*-->'), '');
-
-    s = s.replaceAll(
-      RegExp(
-        r'<<<(?:EDIT_FILE|CREATE_FILE|MULTI_EDIT|APPEND_FILE|EDIT_RANGE):\s*.*?>>>[\s\S]*?<<<END_(?:FILE|EDIT|APPEND)>>>',
-        dotAll: true,
-      ),
-      '[tool call]',
-    );
-    s = s.replaceAll(
-      RegExp(r'<<<[A-Z_]+(?::\s*[^>]*)?\s*>>>'),
-      '[tool call]',
-    );
-    s = s.replaceAll(
-      RegExp(r'<tool_result>[\s\S]*?</tool_result>', dotAll: true),
-      '',
-    );
-    s = s.replaceAll(RegExp(r'^\[FAILED\]\s*', multiLine: true), '');
-
-    s = s.replaceAll(RegExp(r'\n{3,}'), '\n\n');
+    s = s.replaceAll(_reThinking, '');
+    s = s.replaceAll(_reTool, '');
+    s = s.replaceAll(_reErr, '');
+    s = s.replaceAll(_reTruncated, '');
+    s = s.replaceAll(_reToolBlock, '[tool call]');
+    s = s.replaceAll(_reToolSentinel, '[tool call]');
+    s = s.replaceAll(_reToolResult, '');
+    s = s.replaceAll(_reFailed, '');
+    s = s.replaceAll(_reBlankLines, '\n\n');
     return s.trim();
   }
 
