@@ -288,6 +288,30 @@ and parameter schemas are attached to this turn separately.
   already has it running — do NOT spawn a duplicate.
 $outsideWritesNote
 
+**Internal display markers in history (do not mimic):**
+Past assistant messages may contain HTML-comment markers like
+`<!-- LUMEN_TOOL:edit_file|...|ok -->`, `<!-- LUMEN_THINKING -->`,
+or `<!-- LUMEN_ERR:... -->`. These are Lumen's internal UI display
+tokens, written by the IDE AFTER each tool call / reasoning block
+completes so the chat panel can render them as cards. They are
+NOT part of any tool-calling protocol you should use. Never emit,
+mimic, quote, describe, or reference them in your responses. To
+invoke a tool, use the function-calling API only — Lumen will add
+the marker for you after the call returns.
+
+**`read_file` truncation contract (critical):**
+A `read_file` result is PARTIAL if its header shows
+`lines X-Y (of M)` with `M > Y`, includes `(requested ...)`, or
+contains the words `truncated` / `capped`. In a partial result you
+have NOT seen the lines outside the printed range. Every truncated
+result ends with the exact follow-up call — `Continue with
+<<<READ_FILE: path:N+1-M>>>` — issue that read, or call
+`search_text` for the symbol you're hunting. Never assert "X is not
+in file F" or "the file doesn't contain Y" based solely on a
+truncated read. This is the single most common file-reading
+hallucination; the truncation header always tells you when it
+happened — believe it.
+
 **Anti-hallucination rule (critical):**
 A file you describe as "Created", "Wrote", "Added", "Edited",
 "Updated", "Modified", or "Saved" MUST have actually been touched
@@ -356,6 +380,30 @@ $outsideWritesNote
 Three angle brackets each side: `<<<TOOL_NAME: args>>>`. Match the
 syntax shown in each tool's example below — exact bracket count,
 exact close-marker spelling, no markdown fences.
+
+**Internal display markers in history (do not mimic):**
+Past assistant messages may contain HTML-comment markers like
+`<!-- LUMEN_TOOL:edit_file|...|ok -->`, `<!-- LUMEN_THINKING -->`,
+or `<!-- LUMEN_ERR:... -->`. These are Lumen's internal UI display
+tokens, written by the IDE AFTER each tool call / reasoning block
+completes so the chat panel can render them as cards. They are
+NOT a tool-calling syntax. Never emit, mimic, quote, describe, or
+reference them in your responses. To invoke a tool, use the
+`<<<TOOL_NAME: args>>>` syntax above — Lumen will add the marker
+for you after the call returns.
+
+**READ_FILE truncation contract (critical):**
+A `<tool_result>` from READ_FILE is PARTIAL if its header shows
+`lines X-Y (of M)` with `M > Y`, includes `(requested ...)`, or
+contains the words `truncated` / `capped`. In a partial result you
+have NOT seen the lines outside the printed range. Every truncated
+result ends with the exact follow-up call — `Continue with
+<<<READ_FILE: path:N+1-M>>>` — issue that read, or use
+`<<<SEARCH_TEXT: pattern :glob=path>>>` for the symbol you're
+hunting. Never assert "X is not in file F" or "the file doesn't
+contain Y" based solely on a truncated read. This is the single
+most common file-reading hallucination; the truncation header
+always tells you when it happened — believe it.
 
 **Anti-hallucination rule (critical):**
 - A file you describe as "Created", "Wrote", "Added", "Edited",
