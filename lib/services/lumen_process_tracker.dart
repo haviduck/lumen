@@ -28,6 +28,12 @@ class LumenProcessTracker extends ChangeNotifier {
   /// PIDs the IDE explicitly spawned (terminals, agent tools, etc).
   Set<int> get direct => Set.unmodifiable(_direct);
 
+  /// True when at least one PID is tracked. Cheaper than `direct`
+  /// when the caller only needs the existence check (e.g. the close
+  /// path skipping the "kill tracked PIDs" sweep on a welcome-screen
+  /// close where nothing was ever spawned).
+  bool get hasTrackedPids => _direct.isNotEmpty;
+
   /// Register a freshly spawned PID. Safe to call with a stale or
   /// already-exited PID — the tracker just keeps the entry until
   /// something explicitly removes it.

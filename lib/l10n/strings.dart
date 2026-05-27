@@ -1017,6 +1017,24 @@ class S {
   // controller writes to on every agent-loop iteration.
   // ──────────────────────────────────────────────────────────────
   static const String menuViewTokenUsage = 'View token usage';
+
+  // Shutdown overlay — shown by AppCloseGuard while Lumen tears down
+  // terminals / Copilot bridge / flushes the usage log. The card
+  // only appears when there's actually work to do, so on a clean
+  // welcome-screen close none of these strings ever render.
+  static const String shutdownTitle = 'Shutting down…';
+  static const String shutdownGenericStep = 'Finishing up.';
+  static const String shutdownStepTerminals =
+      'Closing running terminals and child processes.';
+  static const String shutdownStepCopilot =
+      'Stopping GitHub Copilot bridge.';
+  static const String shutdownStepUsageLog = 'Saving token usage log.';
+  // Command-palette-only labels — actions that exist as menu cases
+  // in `handleMenuAction` but have no visible menu item, so they
+  // need their own display string instead of borrowing `S.menu*`.
+  static const String menuNewTab = 'New Untitled Tab';
+  static const String menuFocusExplorer = 'Focus File Explorer';
+  static const String menuOpenWiki = 'Open Wiki';
   static const String llmUsageTitle = 'Token Usage';
 
   /// Compact summary line in the panel header. Two `%d` placeholders:

@@ -37,6 +37,13 @@ class CopilotService {
 
   bool get _hasAuth => apiKey.trim().isNotEmpty || useLoggedInUser;
 
+  /// True when the Node bridge subprocess is currently running. Used
+  /// by [AppCloseGuard] to skip the up-to-800 ms `dispose` wait when
+  /// no bridge was ever started in this Lumen process (the common
+  /// case for a welcome-screen close, or a workspace where the user
+  /// never opened a Copilot chat).
+  bool get isActive => _process != null;
+
   Map<String, dynamic> get _auth => <String, dynamic>{
     if (apiKey.trim().isNotEmpty) ...{
       'gitHubToken': apiKey.trim(),

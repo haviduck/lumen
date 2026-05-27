@@ -56,6 +56,25 @@ class CommandCatalog {
         run: (ctx) => handleMenuAction(ctx, 'open'),
       ),
       IdeCommand(
+        id: 'file.newFile',
+        title: S.menuNewFile,
+        icon: Icons.note_add_outlined,
+        shortcut: 'Ctrl+N',
+        category: 'File',
+        // `newFile` falls back to a toast when no workspace is open,
+        // so we mirror the menu's enablement rule rather than letting
+        // the palette dispatch into the toast path.
+        enabled: (s) => s.currentDirectory != null,
+        run: (ctx) => handleMenuAction(ctx, 'newFile'),
+      ),
+      IdeCommand(
+        id: 'file.newTab',
+        title: S.menuNewTab,
+        icon: Icons.tab_outlined,
+        category: 'File',
+        run: (ctx) => handleMenuAction(ctx, 'newTab'),
+      ),
+      IdeCommand(
         id: 'file.save',
         title: S.menuSaveFile,
         icon: Icons.save,
@@ -79,6 +98,13 @@ class CommandCatalog {
         run: (ctx) => handleMenuAction(ctx, 'backup'),
       ),
       IdeCommand(
+        id: 'file.lock',
+        title: S.menuLockIde,
+        icon: Icons.lock_outline,
+        category: 'File',
+        run: (ctx) => handleMenuAction(ctx, 'lock'),
+      ),
+      IdeCommand(
         id: 'agent.createSkill',
         title: S.manualSkillTitle,
         icon: Icons.auto_awesome,
@@ -91,6 +117,10 @@ class CommandCatalog {
         title: S.menuCloseWorkspace,
         icon: Icons.close,
         category: 'File',
+        // The menu greys this out when no workspace is open;
+        // mirror that here so a stray Ctrl+P → "close" doesn't
+        // dispatch a no-op.
+        enabled: (s) => s.currentDirectory != null,
         run: (ctx) => handleMenuAction(ctx, 'closeWorkspace'),
       ),
       IdeCommand(
@@ -119,6 +149,15 @@ class CommandCatalog {
         category: 'Edit',
         enabled: (s) => s.ideActions.hasEditor,
         run: (ctx) => handleMenuAction(ctx, 'find'),
+      ),
+      IdeCommand(
+        id: 'edit.findReplace',
+        title: S.menuFindReplace,
+        icon: Icons.find_replace,
+        shortcut: 'Ctrl+H',
+        category: 'Edit',
+        enabled: (s) => s.ideActions.hasEditor,
+        run: (ctx) => handleMenuAction(ctx, 'findReplace'),
       ),
       IdeCommand(
         id: 'edit.globalSearch',
@@ -160,6 +199,35 @@ class CommandCatalog {
         },
       ),
       IdeCommand(
+        id: 'view.focusExplorer',
+        title: S.menuFocusExplorer,
+        icon: Icons.folder_outlined,
+        category: 'View',
+        run: (ctx) => handleMenuAction(ctx, 'focusExplorer'),
+      ),
+      IdeCommand(
+        id: 'view.timeline',
+        title: S.menuTimeline,
+        icon: Icons.timeline,
+        category: 'View',
+        // Same enablement as the menu — the timeline tracks files,
+        // which needs a workspace to be open.
+        enabled: (s) => s.currentDirectory != null,
+        run: (ctx) => handleMenuAction(ctx, 'timeline'),
+      ),
+      IdeCommand(
+        id: 'view.wiki',
+        title: S.menuOpenWiki,
+        icon: Icons.menu_book_outlined,
+        category: 'View',
+        // `openKnowledgeBaseTab` lives directly on `AppState` — it
+        // isn't routed through `handleMenuAction` because no menu
+        // item points at it (the file-explorer ambient button does).
+        // We invoke the state method directly so the palette
+        // doesn't depend on a menu case being added.
+        run: (ctx) => ctx.read<AppState>().openKnowledgeBaseTab(),
+      ),
+      IdeCommand(
         id: 'terminal.new',
         title: S.menuNewTerminal,
         icon: Icons.add,
@@ -175,6 +243,13 @@ class CommandCatalog {
         category: 'Terminal',
         enabled: (s) => s.ideActions.hasTerminal,
         run: (ctx) => handleMenuAction(ctx, 'killTerm'),
+      ),
+      IdeCommand(
+        id: 'terminal.processManager',
+        title: S.menuProcessManager,
+        icon: Icons.memory_outlined,
+        category: 'Terminal',
+        run: (ctx) => handleMenuAction(ctx, 'processManager'),
       ),
       IdeCommand(
         id: 'agent.newChat',
@@ -205,11 +280,46 @@ class CommandCatalog {
         run: (ctx) => handleMenuAction(ctx, 'autoApprove'),
       ),
       IdeCommand(
+        id: 'agent.llmUsage',
+        title: S.menuViewTokenUsage,
+        icon: Icons.bar_chart_outlined,
+        category: 'Agent',
+        run: (ctx) => handleMenuAction(ctx, 'llmUsage'),
+      ),
+      IdeCommand(
+        id: 'agent.councilReports',
+        title: S.councilReportsMenuItem,
+        icon: Icons.article_outlined,
+        category: 'Agent',
+        run: (ctx) => handleMenuAction(ctx, 'councilReports'),
+      ),
+      IdeCommand(
+        id: 'agent.councilSessions',
+        title: S.councilSessionsMenuItem,
+        icon: Icons.forum_outlined,
+        category: 'Agent',
+        run: (ctx) => handleMenuAction(ctx, 'councilSessions'),
+      ),
+      IdeCommand(
         id: 'help.about',
         title: S.menuAbout,
         icon: Icons.info_outline,
         category: 'Help',
         run: (ctx) => handleMenuAction(ctx, 'about'),
+      ),
+      IdeCommand(
+        id: 'help.checkForUpdates',
+        title: S.menuCheckForUpdates,
+        icon: Icons.system_update_alt_outlined,
+        category: 'Help',
+        run: (ctx) => handleMenuAction(ctx, 'checkForUpdates'),
+      ),
+      IdeCommand(
+        id: 'help.welcomeSetup',
+        title: S.menuWelcomeSetup,
+        icon: Icons.flag_outlined,
+        category: 'Help',
+        run: (ctx) => handleMenuAction(ctx, 'welcomeSetup'),
       ),
 
       // Settings categories — each opens the in-editor Settings tab

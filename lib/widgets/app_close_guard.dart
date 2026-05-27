@@ -10,6 +10,7 @@ import '../l10n/strings.dart';
 import '../providers/app_state.dart';
 import 'common/duck_toast.dart';
 import 'editor/unsaved_changes_dialog.dart';
+import 'shutdown_overlay.dart';
 
 /// Wraps the root navigator and intercepts the native window-close
 /// intent so the user gets a Save / Don't Save / Cancel prompt before
@@ -132,33 +133,69 @@ class _AppCloseGuardState extends State<AppCloseGuard> with WindowListener {
     // we ask window_manager to destroy. `destroy()` skips Flutter's
     // framework dispose chain, so anything left running at this point
     // would outlive the parent process (Windows reparents the orphans
-    // to PID 0 and they keep squatting on ports / file handles). The
-    // shutdown sequence:
-    //   1. `AgentTerminalBridge.shutdownAll` — kills hidden RUN_CMD
-    //      sessions + promoted visible agent tabs.
-    //   2. `IdeActions.shutdownAllTerminals` — interactive sessions
-    //      registered by the terminal pane.
-    //   3. `LumenProcessTracker.killAllTracked` — defence-in-depth
-    //      hard-kill for any descendant that survived the graceful
-    //      Ctrl+C path (only on the close-for-real path; workspace
-    //      swaps pass `killTrackedPids: false`).
-    //   4. `CopilotService.dispose` — closes stdin on the bundled
-    //      Copilot bridge so the bridge can `forceStop()` its cached
-    //      `CopilotClient` and reap the Copilot CLI node child it
-    //      spawned. Without this, every Lumen close leaks one (and
-    //      sometimes several) `node` processes — destroy() doesn't
-    //      run Flutter's dispose chain, so `AppState.dispose` never
-    //      fires its own copilot teardown.
-    // Failures are swallowed — we never want a straggling helper
-    // process to prevent the window from actually closing. Each step
-    // is also time-capped so a hung child can't stall the close.
-    if (mounted) {
-      final app = context.read<AppState>();
+    // to PID 0 and they keep squatting on ports / file handles).
+    //
+    // The shutdown sequence is the same as before, but each step is
+    // now gated on a cheap "is there anything to do" check so a
+    // welcome-screen close (no terminals ever opened, no Copilot
+    // bridge ever started) doesn't wait through up-to-multiple-second
+    // timeouts on operations that would be pure no-ops. When any
+    // step has real work, we mount a "Shutting down…" overlay so
+    // the user gets feedback instead of staring at a frozen window
+    // during the cleanup.
+    if (!mounted) {
+      if (!_isWindowManagerSupported) return;
+      await windowManager.setPreventClose(false);
+      await windowManager.destroy();
+      return;
+    }
+    final app = context.read<AppState>();
+
+    // What actually needs doing?
+    //   - Terminal sweep — has agent bridge sessions OR the
+    //     terminal pane is registered (workspace open).
+    //   - PID sweep — tracker has at least one direct PID.
+    //   - Copilot dispose — bridge subprocess is running.
+    //   - Log flush — always cheap; instant when buffer is empty.
+    final hasTerminals = app.agentTerminals.hasActiveSessions ||
+        app.ideActions.hasTerminal;
+    final hasTrackedPids = app.lumenProcesses.hasTrackedPids;
+    final hasCopilot = app.copilotService.isActive;
+    final realWork = hasTerminals || hasTrackedPids || hasCopilot;
+
+    OverlayEntry? overlayEntry;
+    final stepNotifier = ValueNotifier<String?>(null);
+    if (realWork) {
+      // Mount the overlay on the root navigator so it sits above
+      // the welcome screen, the editor pane, the chat panel, every
+      // dialog — anything still painting. Held in a local so we
+      // can null-guard removal without leaking state when this
+      // method exits.
+      final overlay = Overlay.maybeOf(context, rootOverlay: true);
+      if (overlay != null) {
+        overlayEntry = OverlayEntry(
+          builder: (_) => ValueListenableBuilder<String?>(
+            valueListenable: stepNotifier,
+            builder: (_, step, _) => ShutdownOverlay(step: step),
+          ),
+        );
+        overlay.insert(overlayEntry);
+        // Give the framework one frame to paint the overlay before
+        // we block the UI thread on any cleanup work.
+        await Future<void>.delayed(const Duration(milliseconds: 16));
+      }
+    }
+
+    if (hasTerminals || hasTrackedPids) {
+      stepNotifier.value = S.shutdownStepTerminals;
       try {
-        await app.shutdownAllTerminals(killTrackedPids: true);
+        await app.shutdownAllTerminals(killTrackedPids: hasTrackedPids);
       } catch (_) {
         // proceed to destroy regardless
       }
+    }
+    if (hasCopilot) {
+      stepNotifier.value = S.shutdownStepCopilot;
       try {
         await app.copilotService.dispose().timeout(
           const Duration(seconds: 2),
@@ -167,18 +204,28 @@ class _AppCloseGuardState extends State<AppCloseGuard> with WindowListener {
       } catch (_) {
         // proceed to destroy regardless
       }
-      try {
-        // Flush any buffered LLM usage entries before destroy() so a
-        // turn that completed in the last ~300 ms (debounce window)
-        // doesn't get dropped from the "View token usage" log.
-        await app.llmUsageLog.flush().timeout(
-          const Duration(seconds: 1),
-          onTimeout: () {},
-        );
-      } catch (_) {
-        // proceed to destroy regardless
-      }
     }
+    // Always flush the LLM usage log — empty buffers fall through
+    // in microseconds, so there's no "skip" branch worth the
+    // complexity. If the buffer DID have entries, briefly surface
+    // that in the overlay (when one's mounted) so the user knows
+    // why their token-usage dashboard might lag for a split second.
+    try {
+      final pendingFlush = app.llmUsageLog.flush().timeout(
+        const Duration(seconds: 1),
+        onTimeout: () {},
+      );
+      if (realWork) {
+        stepNotifier.value = S.shutdownStepUsageLog;
+      }
+      await pendingFlush;
+    } catch (_) {
+      // proceed to destroy regardless
+    }
+
+    overlayEntry?.remove();
+    stepNotifier.dispose();
+
     if (!_isWindowManagerSupported) return;
     await windowManager.setPreventClose(false);
     await windowManager.destroy();

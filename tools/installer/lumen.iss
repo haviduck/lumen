@@ -115,7 +115,19 @@ Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
+; INTERACTIVE install: end-of-wizard "Launch Lumen" checkbox. Ticked
+; by default; `skipifsilent` makes this entry no-op on the auto-
+; update path (which always uses /SILENT), so it never produces a
+; double-launch when the silent entry below also fires.
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; SILENT install (auto-update path): unconditionally re-launch Lumen
+; once the file swap is done. Without this entry, the auto-update
+; downloads + installs cleanly but the app never comes back —
+; `/RESTARTAPPLICATIONS` ONLY restarts apps that Restart Manager
+; itself shut down, and Lumen exits gracefully BEFORE the installer
+; starts (so Restart Manager has nothing to restart). The fix is
+; to explicitly relaunch via `skipifnotsilent`.
+Filename: "{app}\{#AppExeName}"; Flags: nowait skipifnotsilent
 
 [UninstallDelete]
 ; Don't touch %APPDATA%\lumen or %LOCALAPPDATA%\Lumen — those carry

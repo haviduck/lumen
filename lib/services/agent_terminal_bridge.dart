@@ -54,6 +54,12 @@ class AgentTerminalBridge extends ChangeNotifier {
   /// this list into its own `_sessions`.
   List<TerminalSession> get visibleSessions => List.unmodifiable(_visible);
 
+  /// Cheap check used by the close path to decide whether the
+  /// "Shutting down terminals…" overlay step needs to run at all.
+  /// True iff either hidden RUN_CMD sessions or promoted visible
+  /// agent tabs exist.
+  bool get hasActiveSessions => _visible.isNotEmpty || _live.isNotEmpty;
+
   /// Spawn an agent command via [TerminalSession.agent]. The session
   /// stays hidden (not in [visibleSessions]) until either:
   ///   - [AgentRunHandle.promoteToVisible] is called (typically by
