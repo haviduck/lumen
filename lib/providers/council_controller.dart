@@ -3192,7 +3192,7 @@ Do NOT finalize yet. Resume orchestration, wait for in-flight work, and continue
     for (final entry in patterns.entries) {
       if (lower.contains(entry.key)) return entry.value;
     }
-    return '${agentName} — ${severity.name.toUpperCase()}';
+    return '$agentName — ${severity.name.toUpperCase()}';
   }
 
   /// Infer severity from agent output by scanning for keywords.

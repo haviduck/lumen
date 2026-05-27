@@ -198,10 +198,18 @@ Image _trimTransparent(Image src, {int alphaThreshold = 0}) {
     return true;
   }
 
-  while (top <= bottom && rowEmpty(top)) top++;
-  while (bottom >= top && rowEmpty(bottom)) bottom--;
-  while (left <= right && colEmpty(left)) left++;
-  while (right >= left && colEmpty(right)) right--;
+  while (top <= bottom && rowEmpty(top)) {
+    top++;
+  }
+  while (bottom >= top && rowEmpty(bottom)) {
+    bottom--;
+  }
+  while (left <= right && colEmpty(left)) {
+    left++;
+  }
+  while (right >= left && colEmpty(right)) {
+    right--;
+  }
 
   if (top > bottom || left > right) return src;
 

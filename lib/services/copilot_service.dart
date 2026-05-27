@@ -8,6 +8,7 @@ import '../l10n/strings.dart';
 import 'copilot_provisioner.dart';
 import 'ollama_service.dart' show CancellationToken, OllamaService;
 import 'reasoning_effort.dart';
+import 'token_usage.dart';
 import 'tools/native_tool_format.dart';
 
 /// Talks to GitHub Copilot through the official `@github/copilot-sdk`.
@@ -73,6 +74,7 @@ class CopilotService {
     String model = 'gpt-5',
     CancellationToken? token,
     ReasoningEffort? effort,
+    TokenUsageCallback? onUsage,
   }) async {
     final out = StringBuffer();
     await for (final chunk in generateChatStream(
@@ -80,6 +82,7 @@ class CopilotService {
       model: model,
       token: token,
       effort: effort,
+      onUsage: onUsage,
     )) {
       out.write(chunk);
     }
@@ -92,6 +95,7 @@ class CopilotService {
     CancellationToken? token,
     ReasoningEffort? effort,
     Set<String>? nativeToolIds,
+    TokenUsageCallback? onUsage,
   }) async* {
     if (token?.isCancelled == true) return;
     if (!_hasAuth) {
@@ -163,6 +167,21 @@ class CopilotService {
           }
           await _cancel(requestId);
           return;
+        } else if (type == 'usage') {
+          // Bridge forwards `assistant.usage` (per-LLM-call breakdown)
+          // and `session.usage_info` (current context-window snapshot).
+          // We translate both to the unified `TokenUsage` shape and hand
+          // them to the controller, which folds deltas into the
+          // running session totals and uses snapshots to drive the
+          // context-window gauge.
+          final usage = _parseUsageEvent(event, fallbackModel: model);
+          if (usage != null && onUsage != null && !usage.isEmpty) {
+            try {
+              onUsage(usage);
+            } catch (e) {
+              debugPrint('[Copilot] onUsage handler threw: $e');
+            }
+          }
         } else if (type == 'done' || type == 'cancelled') {
           break;
         } else if (type == 'error') {
@@ -450,13 +469,46 @@ class CopilotService {
 
   static String _shQuote(String value) => "'${value.replaceAll("'", "'\\''")}'";
 
+  /// Map Lumen's three-way dial onto Copilot's `reasoningEffort` API
+  /// param. `off` returns `null` (which the bridge then omits from
+  /// the session config entirely) — the previous mapping returned
+  /// `'low'` which still allocated reasoning budget against the
+  /// turn, billing the user for thinking they explicitly turned off.
+  /// `xhigh` is reserved for the adaptive-thinking Anthropic path
+  /// and isn't reachable from Lumen's dial yet.
   static String? _copilotEffort(ReasoningEffort? effort) {
     if (effort == null) return null;
     return switch (effort) {
-      ReasoningEffort.off => 'low',
+      ReasoningEffort.off => null,
       ReasoningEffort.standard => 'medium',
       ReasoningEffort.deep => 'high',
     };
+  }
+
+  /// Convert one `usage` event from the bridge into our cross-provider
+  /// [TokenUsage] shape. Returns `null` for malformed events so the
+  /// caller can cheaply skip them.
+  static TokenUsage? _parseUsageEvent(
+    Map<String, dynamic> event, {
+    String? fallbackModel,
+  }) {
+    final kindStr = event['kind'] as String? ?? 'delta';
+    final kind = kindStr == 'context'
+        ? TokenUsageKind.contextSnapshot
+        : TokenUsageKind.delta;
+    int? asInt(Object? v) => v is num ? v.toInt() : null;
+    final model = event['model'] as String? ?? fallbackModel;
+    return TokenUsage(
+      kind: kind,
+      inputTokens: asInt(event['inputTokens']),
+      outputTokens: asInt(event['outputTokens']),
+      cacheReadTokens: asInt(event['cacheReadTokens']),
+      cacheWriteTokens: asInt(event['cacheWriteTokens']),
+      reasoningTokens: asInt(event['reasoningTokens']),
+      contextWindowTokens: asInt(event['contextWindowTokens']),
+      tokenLimit: asInt(event['tokenLimit']),
+      model: model,
+    );
   }
 
   static List<Map<String, dynamic>> _toolsForBridge(

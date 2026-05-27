@@ -277,6 +277,7 @@ class DuckMenuBar extends StatelessWidget {
                     ),
                     _menuDivider,
                     _item(context, 'councilReports', S.councilReportsMenuItem),
+                    _item(context, 'llmUsage', S.menuViewTokenUsage),
                     _menuDivider,
                     _item(context, 'autoApprove', S.menuToggleAutoApprove),
                     _menuDivider,
@@ -873,6 +874,9 @@ Future<void> handleMenuAction(BuildContext context, String action) async {
     case 'councilReports':
       if (!context.mounted) return;
       await showCouncilReportsBrowser(context);
+      break;
+    case 'llmUsage':
+      state.openLlmUsageTab();
       break;
     case 'autoApprove':
       await state.chat.setAutoApprove(!state.chat.autoApprove);

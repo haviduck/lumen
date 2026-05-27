@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
+import 'token_usage.dart';
 import 'tools/native_tool_format.dart';
 
 /// Detect image MIME type from base64 data by inspecting magic bytes.
@@ -109,7 +110,7 @@ class GeminiService {
         parts.add({
           'inline_data': {
             'mime_type': _detectMediaType(img as String),
-            'data': img as String,
+            'data': img,
           },
         });
       }
@@ -331,6 +332,7 @@ class GeminiService {
     Duration idleTimeout = const Duration(minutes: 3),
     ReasoningEffort? effort,
     Set<String>? nativeToolIds,
+    TokenUsageCallback? onUsage,
   }) async* {
     if (token?.isCancelled == true) return;
     if (apiKey.isEmpty) {
@@ -400,7 +402,7 @@ class GeminiService {
           parts.add({
             'inline_data': {
               'mime_type': _detectMediaType(img as String),
-              'data': img as String,
+              'data': img,
             },
           });
         }
@@ -473,6 +475,14 @@ class GeminiService {
         timedOut = true;
         sink.close();
       });
+      // Gemini's `usageMetadata` appears on its FINAL stream frame
+      // (and sometimes on prior frames as a running tally — we treat
+      // the last seen as authoritative since it's cumulative).
+      // Reasoning models (2.5 family) also report `thoughtsTokenCount`
+      // for the silent extended-thinking budget. We surface that as
+      // `reasoningTokens` so the chip's tooltip can break it out.
+      Map<String, dynamic>? lastUsage;
+
       await for (final line in lineStream) {
         if (token?.isCancelled == true) return;
         if (line.isEmpty || !line.startsWith('data: ')) continue;
@@ -480,6 +490,10 @@ class GeminiService {
         if (data.isEmpty || data == '[DONE]') continue;
         try {
           final obj = jsonDecode(data) as Map<String, dynamic>;
+          final usageMeta = obj['usageMetadata'];
+          if (usageMeta is Map<String, dynamic>) {
+            lastUsage = usageMeta;
+          }
           final candidates = obj['candidates'] as List<dynamic>?;
           if (candidates == null || candidates.isEmpty) continue;
           final candidate = candidates[0] as Map<String, dynamic>;
@@ -535,6 +549,19 @@ class GeminiService {
         yield '\n\n_(generation paused — no response from Gemini for '
             '${idleTimeout.inMinutes} min. Network may be stalled — '
             'send a follow-up to continue.)_\n';
+      }
+      if (onUsage != null && lastUsage != null) {
+        int? asInt(Object? v) => v is num ? v.toInt() : null;
+        onUsage(
+          TokenUsage(
+            kind: TokenUsageKind.delta,
+            inputTokens: asInt(lastUsage['promptTokenCount']),
+            outputTokens: asInt(lastUsage['candidatesTokenCount']),
+            reasoningTokens: asInt(lastUsage['thoughtsTokenCount']),
+            cacheReadTokens: asInt(lastUsage['cachedContentTokenCount']),
+            model: model,
+          ),
+        );
       }
     } catch (e) {
       if (token?.isCancelled == true) return;

@@ -69,7 +69,7 @@ class CouncilSessionSummary {
   });
 
   Duration? get duration =>
-      finishedAt != null ? finishedAt!.difference(startedAt) : null;
+      finishedAt?.difference(startedAt);
 
   static CouncilSessionSummary fromJson(
     Map<String, dynamic> json,

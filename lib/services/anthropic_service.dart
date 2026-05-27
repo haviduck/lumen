@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import 'ollama_service.dart' show CancellationToken;
 import 'reasoning_effort.dart';
+import 'token_usage.dart';
 import 'tools/native_tool_format.dart';
 
 /// Detect image MIME type from base64 data by inspecting magic bytes.
@@ -133,7 +134,7 @@ class AnthropicService {
           'source': {
             'type': 'base64',
             'media_type': _detectMediaType(img as String),
-            'data': img as String,
+            'data': img,
           },
         });
       }
@@ -321,6 +322,7 @@ class AnthropicService {
     Duration idleTimeout = const Duration(minutes: 6),
     ReasoningEffort? effort,
     Set<String>? nativeToolIds,
+    TokenUsageCallback? onUsage,
   }) async* {
     if (token?.isCancelled == true) return;
     if (apiKey.isEmpty) {
@@ -373,6 +375,21 @@ class AnthropicService {
       final blockToolName = <int, String>{};
       final blockToolInput = <int, StringBuffer>{};
 
+      // Anthropic streams cumulative usage on message_start
+      // (`input_tokens`, `cache_creation_input_tokens`,
+      // `cache_read_input_tokens`) and partial output tokens on each
+      // `message_delta`. The input numbers don't change across
+      // deltas; the output number grows. We report message_start as
+      // a single one-shot block (since input is fully known up front)
+      // and emit a final delta with the residual output-token count
+      // when the stream completes. Reporting per-delta would be both
+      // expensive (every chunk) and misleading (the running count is
+      // the cumulative, not the delta-since-last-event).
+      int? capturedInputTokens;
+      int? capturedCacheReadTokens;
+      int? capturedCacheWriteTokens;
+      int? lastOutputTokens;
+
       await for (final line in lineStream) {
         if (token?.isCancelled == true) return;
         if (line.isEmpty || !line.startsWith('data: ')) continue;
@@ -382,6 +399,31 @@ class AnthropicService {
         try {
           final obj = jsonDecode(data) as Map<String, dynamic>;
           final type = obj['type'] as String? ?? '';
+          if (type == 'message_start') {
+            final msg = obj['message'] as Map<String, dynamic>? ?? const {};
+            final usage = msg['usage'] as Map<String, dynamic>? ?? const {};
+            int? asInt(Object? v) => v is num ? v.toInt() : null;
+            capturedInputTokens = asInt(usage['input_tokens']);
+            capturedCacheReadTokens = asInt(usage['cache_read_input_tokens']);
+            capturedCacheWriteTokens =
+                asInt(usage['cache_creation_input_tokens']);
+            lastOutputTokens = asInt(usage['output_tokens']);
+            if (onUsage != null &&
+                (capturedInputTokens != null ||
+                    capturedCacheReadTokens != null ||
+                    capturedCacheWriteTokens != null)) {
+              onUsage(
+                TokenUsage(
+                  kind: TokenUsageKind.delta,
+                  inputTokens: capturedInputTokens,
+                  cacheReadTokens: capturedCacheReadTokens,
+                  cacheWriteTokens: capturedCacheWriteTokens,
+                  model: model,
+                ),
+              );
+            }
+            continue;
+          }
           if (type == 'content_block_start') {
             final idx = (obj['index'] as int?) ?? -1;
             final cb =
@@ -456,6 +498,11 @@ class AnthropicService {
             if (stopReason == 'max_tokens') {
               yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
             }
+            final usage = obj['usage'] as Map<String, dynamic>? ?? const {};
+            final outRaw = usage['output_tokens'];
+            if (outRaw is num) {
+              lastOutputTokens = outRaw.toInt();
+            }
           } else if (type == 'error') {
             final error = obj['error'] as Map<String, dynamic>? ?? {};
             final message = error['message'] as String? ?? 'Unknown error';
@@ -471,6 +518,16 @@ class AnthropicService {
         yield '\n\n_(generation paused - no response from Anthropic for '
             '${idleTimeout.inMinutes} min. Network may be stalled - '
             'send a follow-up to continue.)_\n';
+      }
+      final outTotal = lastOutputTokens;
+      if (onUsage != null && outTotal != null && outTotal > 0) {
+        onUsage(
+          TokenUsage(
+            kind: TokenUsageKind.delta,
+            outputTokens: outTotal,
+            model: model,
+          ),
+        );
       }
     } catch (e) {
       if (token?.isCancelled == true) return;

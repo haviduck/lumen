@@ -987,6 +987,126 @@ class S {
       'reasoning param, so this just adds a "slow down and verify" '
       'directive to the system prompt. Click to cycle.';
 
+  // Token counter chip — live per-chat token usage indicator that
+  // sits next to the model picker in the composer row. Headline
+  // shows total billed tokens; tooltip breaks down input/output/
+  // cache/reasoning. Only providers that report usage (Anthropic
+  // SSE, GitHub Copilot SDK) populate the chip — others render
+  // SizedBox.shrink() until token-counting is wired for them too.
+  static const String chatTokenCounterUnit = 'tok';
+  static const String chatTokenCounterTooltipTitle = 'Tokens used in this chat';
+  static const String chatTokenCounterInput = 'Input';
+  static const String chatTokenCounterOutput = 'Output';
+  // Short labels for the inline pill ("in" / "out" alongside the
+  // arrow icons). Distinct from the tooltip-body labels above so
+  // the inline display can stay terse.
+  static const String chatTokenCounterInputShort = 'in';
+  static const String chatTokenCounterOutputShort = 'out';
+  static const String chatTokenCounterCacheRead = 'Cache read';
+  static const String chatTokenCounterCacheWrite = 'Cache write';
+  static const String chatTokenCounterReasoning = 'Reasoning';
+  static const String chatTokenCounterContext = 'Context window';
+  static const String chatTokenCounterFooter =
+      'Cache reads bill at a fraction of input. Headline = input + '
+      'output + cache-write + reasoning. Reset when the chat is '
+      'deleted; persisted across restarts.';
+
+  // ──────────────────────────────────────────────────────────────
+  // "View token usage" virtual tab — a workspace-wide dashboard of
+  // LLM consumption. Driven by `LlmUsageLogService` which the chat
+  // controller writes to on every agent-loop iteration.
+  // ──────────────────────────────────────────────────────────────
+  static const String menuViewTokenUsage = 'View token usage';
+  static const String llmUsageTitle = 'Token Usage';
+
+  /// Compact summary line in the panel header. Two `%d` placeholders:
+  /// (prompt count, billed token total). We DO format both numbers
+  /// inline here rather than via a helper because the placement of
+  /// the words around them differs per locale and the placeholders
+  /// keep the string translatable.
+  static String llmUsageHeaderSummary(int prompts, int billed) {
+    final p = _withSep(prompts);
+    final b = _withSep(billed);
+    return '$p prompts · $b tokens billed';
+  }
+
+  static const String llmUsageLive = 'LIVE';
+  static const String llmUsageIdle = 'idle';
+  static const String llmUsageEmpty =
+      'No usage logged yet. Send a chat message to start tracking.';
+  static const String llmUsageRefresh = 'Refresh';
+  static const String llmUsageReset = 'Reset';
+  static const String llmUsageResetConfirmTitle = 'Reset token usage log?';
+  static const String llmUsageResetConfirmBody =
+      'This permanently deletes every recorded prompt / token entry, '
+      'including rotated backup files. The in-chat token counter '
+      'chip is unaffected (it lives on each chat session). This '
+      'cannot be undone.';
+  static const String llmUsageResetConfirmAction = 'Reset log';
+  static String llmUsageResetDone(int filesRemoved) =>
+      'Token usage log reset ($filesRemoved file${filesRemoved == 1 ? '' : 's'} removed).';
+
+  // Filter bar.
+  static const String llmUsageRangeToday = 'Today';
+  static const String llmUsageRangeLast7 = '7 days';
+  static const String llmUsageRangeLast30 = '30 days';
+  static const String llmUsageRangeLast90 = '90 days';
+  static const String llmUsageRangeAllTime = 'All time';
+  static const String llmUsageFilterAllModels = 'All models';
+  static const String llmUsageFilterAllProviders = 'All providers';
+
+  // Summary cards.
+  static const String llmUsageStatPrompts = 'Prompts';
+  static const String llmUsageStatPromptsTooltip =
+      'Total LLM calls in the selected range. One prompt = one '
+      'agent-loop iteration (a turn with tools may count as several).';
+  static const String llmUsageStatInput = 'Input tokens';
+  static const String llmUsageStatInputTooltip =
+      'System + history + user prompt tokens consumed. Excludes '
+      'cache reads.';
+  static const String llmUsageStatOutput = 'Output tokens';
+  static const String llmUsageStatOutputTooltip =
+      'Model-emitted tokens. Some providers fold reasoning into this '
+      'count; see the Reasoning card when it shows up.';
+  static const String llmUsageStatBilledTotal = 'Billed total';
+  static const String llmUsageStatBilledTotalTooltip =
+      'Input + output + cache-write + reasoning. Cache reads are '
+      'billed at a fraction and excluded from this headline.';
+  static const String llmUsageStatCache = 'Cache reads';
+  static const String llmUsageStatCacheTooltip =
+      'Prompt-cache hits. Billed at a fraction of regular input — '
+      'the more you see here, the cheaper your turns get.';
+  static const String llmUsageStatReasoning = 'Reasoning';
+  static const String llmUsageStatReasoningTooltip =
+      'Extended-thinking tokens reported by providers that surface '
+      'them separately (Anthropic, Copilot, Gemini 2.5).';
+
+  // Daily chart + model table.
+  static const String llmUsageDailyChartTitle = 'Daily usage';
+  static String llmUsageDailyChartMaxLabel(String formatted) =>
+      'peak: $formatted';
+  static const String llmUsageByModelTitle = 'By model';
+  static String llmUsageRowCount(int n) => '$n row${n == 1 ? '' : 's'}';
+  static const String llmUsageColModel = 'Model';
+  static const String llmUsageColProvider = 'Provider';
+  static const String llmUsageColPrompts = 'Prompts';
+  static const String llmUsageColCache = 'Cache';
+  static const String llmUsageColBilled = 'Billed';
+  static const String llmUsageUnknownModel = '(unknown)';
+
+  // Helper that the formatter uses — keeps the locale-aware bit
+  // out of the surface code. Lumen has no i18n delegate yet, so
+  // we just use comma thousands separators.
+  static String _withSep(int n) {
+    final s = n.toString();
+    final buf = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
+      buf.write(s[i]);
+    }
+    return buf.toString();
+  }
+
   // Binary preview pane — shown in the editor area when a non-text
   // file is opened (image / audio / video / archive / executable).
   // The pane replaces the code editor for these tabs because

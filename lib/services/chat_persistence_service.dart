@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'reasoning_effort.dart';
+import 'token_usage.dart';
 
 enum ChatReferenceKind { file, folder }
 
@@ -80,6 +81,14 @@ class ChatSession {
   /// [cachedHistorySummary] is `null`.
   int? cachedHistorySummaryDroppedCount;
 
+  /// Cumulative token usage across every turn in this session.
+  /// Persisted so the chip in the composer keeps the count visible
+  /// across app restarts. Updated by [ChatController] whenever a
+  /// provider service emits a [TokenUsage] callback. Defaults to
+  /// zeroed totals on new sessions and on legacy sessions without
+  /// the field.
+  SessionTokenStats tokenStats;
+
   ChatSession({
     required this.id,
     required this.title,
@@ -91,7 +100,8 @@ class ChatSession {
     required this.messages,
     this.cachedHistorySummary,
     this.cachedHistorySummaryDroppedCount,
-  });
+    SessionTokenStats? tokenStats,
+  }) : tokenStats = tokenStats ?? SessionTokenStats();
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -105,6 +115,7 @@ class ChatSession {
     if (cachedHistorySummary != null) 'historySummary': cachedHistorySummary,
     if (cachedHistorySummaryDroppedCount != null)
       'historySummaryDropped': cachedHistorySummaryDroppedCount,
+    if (!tokenStats.isEmpty) 'tokenStats': tokenStats.toJson(),
   };
 
   factory ChatSession.fromJson(Map<String, dynamic> j) {
@@ -126,6 +137,9 @@ class ChatSession {
       cachedHistorySummary: j['historySummary'] as String?,
       cachedHistorySummaryDroppedCount: (j['historySummaryDropped'] as num?)
           ?.toInt(),
+      tokenStats: j['tokenStats'] is Map<String, dynamic>
+          ? SessionTokenStats.fromJson(j['tokenStats'] as Map<String, dynamic>)
+          : null,
     );
   }
 }

@@ -16,6 +16,7 @@ import '../services/council/council_persistence_service.dart';
 import '../services/file_kind.dart';
 import '../services/gemini_service.dart';
 import '../services/ide_actions.dart';
+import '../services/llm_usage_log_service.dart';
 import '../services/memory_service.dart';
 import '../services/lumen_process_tracker.dart';
 import '../services/ollama_service.dart';
@@ -71,6 +72,13 @@ class AppState extends ChangeNotifier {
   /// and report data for post-mortem review.
   static const String councilSessionsSentinel = '__council_sessions__';
 
+  /// Sentinel file path for the LLM Token Usage virtual tab. Routes
+  /// to `LlmUsageView` from the editor pane router — a dashboard
+  /// of daily token usage, per-model breakdown, and provider rollup
+  /// driven by `LlmUsageLogService` (which the chat controller
+  /// writes to on every prompt completion).
+  static const String llmUsageSentinel = '__llm_usage__';
+
   /// Prefix for untitled (unsaved) tabs created with Ctrl+T.
   static const String untitledPrefix = '__untitled__';
 
@@ -92,6 +100,9 @@ class AppState extends ChangeNotifier {
   static bool isCouncilSessionsTab(String? path) =>
       path == councilSessionsSentinel;
 
+  /// Returns `true` when the given path is the LLM usage sentinel.
+  static bool isLlmUsageTab(String? path) => path == llmUsageSentinel;
+
   /// All sentinel paths that should be excluded from real-file
   /// behaviours (filesystem watching, dirty-on-disk diffs, line-ref
   /// chips, accept/revoke decoration overlays). Closed enum — keep
@@ -102,6 +113,7 @@ class AppState extends ChangeNotifier {
     knowledgeBaseSentinel,
     councilTheaterSentinel,
     councilSessionsSentinel,
+    llmUsageSentinel,
   };
 
   static bool isSentinelPath(String? path) =>
@@ -196,6 +208,13 @@ class AppState extends ChangeNotifier {
   // the full design and `.agents/timeline.md` for the cross-feature
   // contract.
   final TimelineService timeline = TimelineService();
+
+  /// Per-prompt LLM usage log. Owned at the app-state level so the
+  /// chat controller (writer) and the "View token usage" tab
+  /// (reader) share a single instance — and so [AppCloseGuard] can
+  /// flush any buffered entries on the close path. See
+  /// `services/llm_usage_log_service.dart` for the storage format.
+  final LlmUsageLogService llmUsageLog = LlmUsageLogService();
 
   // "Last turn" agent-edit highlight tracker. Owned here so the
   // editor pane (consumer) and the chat controller (writer) share a
@@ -491,6 +510,7 @@ class AppState extends ChangeNotifier {
       skills: workspaceSkills,
       agentTerminals: agentTerminals,
       memoryService: _memoryService,
+      llmUsageLog: llmUsageLog,
     );
     council = CouncilController(
       anthropic: _anthropicService,
@@ -824,6 +844,20 @@ class AppState extends ChangeNotifier {
     _activeFile = _openFiles.firstWhere(
       (f) => f.path == councilSessionsSentinel,
     );
+    notifyListeners();
+  }
+
+  /// Opens the LLM Token Usage dashboard as a virtual editor tab.
+  /// Same sentinel pattern as the other virtual tabs — re-opening
+  /// focuses the existing instance instead of stacking duplicates.
+  void openLlmUsageTab() {
+    final sentinel = File(llmUsageSentinel);
+    if (!_openFiles.any((f) => f.path == llmUsageSentinel)) {
+      _openFiles.add(sentinel);
+      _fileContents[llmUsageSentinel] = '';
+      _savedFileContents[llmUsageSentinel] = '';
+    }
+    _activeFile = _openFiles.firstWhere((f) => f.path == llmUsageSentinel);
     notifyListeners();
   }
 

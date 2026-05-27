@@ -21,6 +21,7 @@ import '../../providers/ssh_controller.dart';
 import '../../services/chat_chip.dart';
 import '../../services/chat_persistence_service.dart';
 import '../../services/reasoning_effort.dart';
+import '../../services/token_usage.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_theme.dart';
 import '../common/ctrl_wheel_zoom.dart';
@@ -43,6 +44,7 @@ import 'chip_text_editing_controller.dart';
 import 'model_picker_popover.dart';
 import 'ollama_reachability_strip.dart';
 import 'stall_warning.dart';
+import 'token_counter_chip.dart';
 
 class AiChat extends StatefulWidget {
   const AiChat({super.key});
@@ -1167,27 +1169,52 @@ class _AiChatState extends State<AiChat> {
           // which now sits flush-left in a quieter row.
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
-            child: Row(
-              children: [
-                _ModelPicker(chat: chat),
-                // Reasoning-effort dial — lifted out of the composer's
-                // bottom toolbar so it sits next to the model picker
-                // (the "model watcher" row). Same cycle / native-vs-
-                // prompt semantics as before; see the pill class for
-                // the underlying API-param mapping. Hidden on Ollama
-                // for the same reason as before.
-                if (chat.reasoningEffortPillApplicableForCurrentModel) ...[
-                  const SizedBox(width: 6),
-                  _ReasoningEffortPill(
-                    effort: chat.reasoningEffort,
-                    isNative: chat.reasoningEffortIsNativeForCurrentModel,
-                    compact: false,
-                    onCycle: () => chat.setReasoningEffort(
-                      _cycleEffort(chat.reasoningEffort),
+            child: LayoutBuilder(
+              builder: (context, modelRowConstraints) {
+                // ~310 px is where the labelled "in" / "out" tags
+                // start crowding the picker; below it we collapse
+                // the counter to icon-only sub-clusters. Matches the
+                // visual density crossover in `_buildComposerBox`'s
+                // bottom toolbar (which uses 230 px) — counter
+                // gets a slightly higher threshold because it
+                // carries three numeric stats vs the toolbar's
+                // pills' single label.
+                final compactCounter = modelRowConstraints.maxWidth < 310;
+                final tokenStats =
+                    chat.currentSession?.tokenStats ?? SessionTokenStats();
+                return Row(
+                  children: [
+                    _ModelPicker(chat: chat),
+                    // Reasoning-effort dial — lifted out of the composer's
+                    // bottom toolbar so it sits next to the model picker
+                    // (the "model watcher" row). Same cycle / native-vs-
+                    // prompt semantics as before; see the pill class for
+                    // the underlying API-param mapping. Hidden on Ollama
+                    // for the same reason as before.
+                    if (chat.reasoningEffortPillApplicableForCurrentModel) ...[
+                      const SizedBox(width: 6),
+                      _ReasoningEffortPill(
+                        effort: chat.reasoningEffort,
+                        isNative: chat.reasoningEffortIsNativeForCurrentModel,
+                        compact: false,
+                        onCycle: () => chat.setReasoningEffort(
+                          _cycleEffort(chat.reasoningEffort),
+                        ),
+                      ),
+                    ],
+                    // Token-usage panel — peer element to the model
+                    // picker, right-aligned via `Spacer`. Always
+                    // visible (shows `—` placeholders before any
+                    // turn lands) so the row layout stays stable
+                    // and the slot is discoverable from chat-zero.
+                    const Spacer(),
+                    TokenCounterChip(
+                      stats: tokenStats,
+                      compact: compactCounter,
                     ),
-                  ),
-                ],
-              ],
+                  ],
+                );
+              },
             ),
           ),
           // ── Chat input box ──

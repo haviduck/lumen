@@ -20,6 +20,7 @@ import '../../theme/app_theme.dart';
 import '../common/ctrl_wheel_zoom.dart';
 import '../common/fast_popup_menu.dart';
 import '../menu_bar.dart';
+import '../llm_usage/llm_usage_view.dart';
 import '../process_manager/process_manager_view.dart';
 import '../settings_view.dart';
 import '../side_panes_column.dart';
@@ -316,6 +317,22 @@ class _EditorState extends State<Editor> {
           appState.setActiveFile(file);
         },
         child: const CouncilSessionsBrowser(),
+      );
+    }
+    // LLM token-usage dashboard sentinel. Same virtual-tab pattern as
+    // settings / council-sessions / process-manager: a sentinel path
+    // the router intercepts before any real-file branch, so the
+    // literal `__llm_usage__` path can never accidentally hit the
+    // code editor.
+    if (AppState.isLlmUsageTab(path)) {
+      return GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapDown: (_) {
+          setState(() => _focusedPane = paneIndex);
+          final file = appState.openFiles.firstWhere((f) => f.path == path);
+          appState.setActiveFile(file);
+        },
+        child: const LlmUsageView(),
       );
     }
 
@@ -1685,6 +1702,9 @@ class _EditorTabBar extends StatelessWidget {
                   final isProcessMgr = AppState.isProcessManagerTab(file.path);
                   final isKb = AppState.isKnowledgeBaseTab(file.path);
                   final isCouncil = AppState.isCouncilTheaterTab(file.path);
+                  final isCouncilSessions =
+                      AppState.isCouncilSessionsTab(file.path);
+                  final isLlmUsage = AppState.isLlmUsageTab(file.path);
                   final isUntitled = AppState.isUntitledTab(file.path);
                   // Remote-mirror tabs render as `<basename>  <host>:<path>`
                   // so the user sees what they're editing AND where it
@@ -1702,6 +1722,8 @@ class _EditorTabBar extends StatelessWidget {
                       ? S.wikiTabTitle
                       : isCouncil
                       ? S.councilTitle
+                      : isLlmUsage
+                      ? S.llmUsageTitle
                       : isUntitled
                       ? 'Untitled-${file.path.replaceAll(AppState.untitledPrefix, '')}'
                       : remoteOrigin != null
@@ -1722,7 +1744,12 @@ class _EditorTabBar extends StatelessWidget {
                       // council theater). The label alone is enough
                       // to identify them, and they aren't real files
                       // so the document icon would lie.
-                      isSettings: isSettings || isProcessMgr || isKb || isCouncil,
+                      isSettings: isSettings ||
+                          isProcessMgr ||
+                          isKb ||
+                          isCouncil ||
+                          isCouncilSessions ||
+                          isLlmUsage,
                       onActivate: () => onActivate(file),
                       onClose: () => onClose(file),
                       onCloseOthers: () => onCloseOthers(file),

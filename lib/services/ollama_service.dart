@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'token_usage.dart';
 import 'tools/native_tool_format.dart';
 
 /// Talks to Ollama. Supports cancellation via `CancellationToken` so the
@@ -332,6 +333,7 @@ class OllamaService {
     Map<String, dynamic>? options,
     bool forceCloud = false,
     Set<String>? nativeToolIds,
+    TokenUsageCallback? onUsage,
   }) async* {
     if (token?.isCancelled == true) return;
     final client = http.Client();
@@ -648,6 +650,28 @@ class OllamaService {
               yield '\n<!-- LUMEN_TRUNCATED:length -->\n';
             }
             _maybeLogMetrics('generateChatStream', model, obj);
+            // Token usage — Ollama's final frame carries
+            // `prompt_eval_count` (input tokens) and `eval_count`
+            // (output tokens including any thinking tokens it
+            // emitted inline). No separate reasoning bucket on the
+            // wire, but the chip's headline math treats output as
+            // billable so it still lands in the right place. Fires
+            // ONCE per stream, at done — Ollama doesn't stream
+            // incremental usage like Anthropic does.
+            if (onUsage != null) {
+              final pec = obj['prompt_eval_count'];
+              final ec = obj['eval_count'];
+              if (pec is num || ec is num) {
+                onUsage(
+                  TokenUsage(
+                    kind: TokenUsageKind.delta,
+                    inputTokens: pec is num ? pec.toInt() : null,
+                    outputTokens: ec is num ? ec.toInt() : null,
+                    model: model,
+                  ),
+                );
+              }
+            }
             return;
           }
         } catch (_) {

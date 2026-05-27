@@ -23,7 +23,9 @@ import '../services/reasoning_effort.dart';
 import '../services/rules_service.dart';
 import '../services/timeline_recorder.dart';
 import '../services/recent_edits_tracker.dart';
+import '../services/llm_usage_log_service.dart';
 import '../services/timeline_service.dart';
+import '../services/token_usage.dart';
 import '../services/tool_executor.dart';
 import '../services/tool_registry.dart';
 import '../services/tools/model_tier.dart';
@@ -504,6 +506,11 @@ class ChatController extends ChangeNotifier {
   /// via the `SAVE_MEMORY` tool. Optional so tests can omit it.
   final MemoryService? _memoryService;
 
+  /// Per-prompt LLM usage log. Receives one [LlmUsageEntry] per
+  /// agent-loop iteration that completed with non-zero token usage.
+  /// Optional so tests don't need to spin up the service.
+  final LlmUsageLogService? _llmUsageLog;
+
   ChatController({
     required this.ollama,
     required this.gemini,
@@ -518,9 +525,11 @@ class ChatController extends ChangeNotifier {
     this.agentTerminals,
     ExternalToolLoader? toolLoader,
     MemoryService? memoryService,
+    LlmUsageLogService? llmUsageLog,
   }) : _recentEdits = recentEdits,
        _toolLoader = toolLoader ?? ExternalToolLoader(),
-       _memoryService = memoryService;
+       _memoryService = memoryService,
+       _llmUsageLog = llmUsageLog;
 
   final ExternalToolLoader _toolLoader;
 
@@ -1408,6 +1417,7 @@ class ChatController extends ChangeNotifier {
     CancellationToken? token,
     ReasoningEffort? effort,
     Set<String>? nativeToolIds,
+    TokenUsageCallback? onUsage,
   }) async* {
     final (provider, rawModel) = _splitModel(model);
     final enabled = (await prefs.getEnabledProviders()).toSet();
@@ -1456,6 +1466,7 @@ class ChatController extends ChangeNotifier {
           token: token,
           effort: effort,
           nativeToolIds: nativeToolIds,
+          onUsage: onUsage,
         );
         return;
       case 'claude':
@@ -1465,6 +1476,7 @@ class ChatController extends ChangeNotifier {
           token: token,
           effort: effort,
           nativeToolIds: nativeToolIds,
+          onUsage: onUsage,
         );
         return;
       case 'copilot':
@@ -1474,6 +1486,7 @@ class ChatController extends ChangeNotifier {
           token: token,
           effort: effort,
           nativeToolIds: nativeToolIds,
+          onUsage: onUsage,
         );
         return;
       case 'ollama-cloud':
@@ -1486,6 +1499,7 @@ class ChatController extends ChangeNotifier {
           forceCloud: true,
           nativeToolIds: nativeToolIds,
           options: deepseekV4Options,
+          onUsage: onUsage,
         );
         return;
       case 'ollama':
@@ -1503,6 +1517,7 @@ class ChatController extends ChangeNotifier {
           token: token,
           nativeToolIds: nativeToolIds,
           options: deepseekV4Options,
+          onUsage: onUsage,
         );
         return;
     }
@@ -1999,6 +2014,27 @@ class ChatController extends ChangeNotifier {
       _sessions[idx] = session;
       _sessions.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     }
+  }
+
+  /// Fold a provider-reported [TokenUsage] into the named session's
+  /// running totals. Cheap and synchronous — does NOT write to disk.
+  /// The next `_persistSession` (always called at end-of-turn) carries
+  /// the updated [SessionTokenStats] to storage; persisting on every
+  /// `assistant.usage` event (which fires per LLM call inside a
+  /// single agent loop iteration) would thrash the chat-session
+  /// JSON file with no user-visible benefit.
+  ///
+  /// `sessionId` is the live id (which may not be the currently-
+  /// active tab — generation runs continue in the background on
+  /// backgrounded sessions); we look it up rather than reading
+  /// `_current` so the right session gets credited.
+  void _applyTokenUsage(String sessionId, TokenUsage usage) {
+    final idx = _sessions.indexWhere((s) => s.id == sessionId);
+    if (idx < 0) return;
+    final session = _sessions[idx];
+    final changed = session.tokenStats.merge(usage);
+    if (!changed) return;
+    notifyListeners();
   }
 
   // ---- attachments ----
@@ -3698,12 +3734,22 @@ class ChatController extends ChangeNotifier {
         // Stream this iteration's response into iterBuf, updating
         // the live message's content each chunk.
         iterationStartedAt = DateTime.now();
+        // Per-iteration usage accumulator — multiple provider events
+        // (Anthropic emits input+output across two SSE frames,
+        // Copilot emits usage + context-info separately) coalesce
+        // into ONE `LlmUsageEntry` per iteration so the
+        // "View token usage" tab's prompt-count = iteration-count.
+        final iterationUsage = IterationUsageAccumulator();
         await for (final chunk in _generateChatStream(
           wireMessages,
           model: modelForTurn,
           token: cancelToken,
           effort: effort,
           nativeToolIds: nativeToolIdsForTurn,
+          onUsage: (u) {
+            iterationUsage.add(u);
+            _applyTokenUsage(sessionId, u);
+          },
         )) {
           if (cancelToken.isCancelled) break;
 
@@ -3891,6 +3937,23 @@ class ChatController extends ChangeNotifier {
               false,
             ),
           );
+        }
+        // Log this iteration's token usage to the "View token usage"
+        // dashboard's NDJSON store. We log EVEN on the cancel /
+        // runaway branches below because the provider already
+        // charged for whatever it produced before we tripped the
+        // local guard — surfacing the cost is more honest than
+        // hiding it. Log is gated on usage being non-empty so a
+        // pre-stream cancel (no chunks received) doesn't show as
+        // a 0-token prompt in the dashboard.
+        final iterUsageEntry = iterationUsage.build(
+          provider: selectedProvider,
+          fallbackModel: selectedRawModel,
+          sessionId: session.id,
+          sessionTitle: session.title,
+        );
+        if (iterUsageEntry != null) {
+          _llmUsageLog?.log(iterUsageEntry);
         }
         if (cancelToken.isCancelled) {
           aggregated += '${aggregated.isEmpty ? '' : '\n\n'}_(stopped)_';

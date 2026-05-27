@@ -46,9 +46,9 @@ class ImageLightbox extends StatefulWidget {
         barrierDismissible: true,
         barrierColor: Colors.black.withValues(alpha: 0.78),
         barrierLabel: S.imageLightboxCloseTooltip,
-        pageBuilder: (_, __, ___) =>
+        pageBuilder: (_, _, _) =>
             ImageLightbox(base64Image: base64Image, caption: caption),
-        transitionsBuilder: (_, anim, __, child) =>
+        transitionsBuilder: (_, anim, _, child) =>
             FadeTransition(opacity: anim, child: child),
         transitionDuration: const Duration(milliseconds: 140),
       ),

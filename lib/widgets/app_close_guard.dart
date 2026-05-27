@@ -167,6 +167,17 @@ class _AppCloseGuardState extends State<AppCloseGuard> with WindowListener {
       } catch (_) {
         // proceed to destroy regardless
       }
+      try {
+        // Flush any buffered LLM usage entries before destroy() so a
+        // turn that completed in the last ~300 ms (debounce window)
+        // doesn't get dropped from the "View token usage" log.
+        await app.llmUsageLog.flush().timeout(
+          const Duration(seconds: 1),
+          onTimeout: () {},
+        );
+      } catch (_) {
+        // proceed to destroy regardless
+      }
     }
     if (!_isWindowManagerSupported) return;
     await windowManager.setPreventClose(false);
