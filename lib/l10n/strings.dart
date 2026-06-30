@@ -1083,6 +1083,7 @@ class S {
   static const String llmUsageFilterAllModels = 'All models';
   static const String llmUsageFilterAllProviders = 'All providers';
   static const String llmUsageFilterAllProjects = 'All projects';
+  static const String llmUsageFilterOlderEntries = 'Older entries (untagged)';
 
   // Summary cards.
   static const String llmUsageStatPrompts = 'Prompts';

@@ -267,6 +267,8 @@ class LlmUsageFilter {
   final String? model;
 
   /// Restrict to this workspace path only. `null` = any (global).
+  /// Set to [LlmUsageLogService.untaggedWorkspace] to match entries
+  /// logged before per-project tagging was added.
   final String? workspace;
 
   const LlmUsageFilter({
@@ -282,7 +284,13 @@ class LlmUsageFilter {
     if (until != null && e.timestamp.isAfter(until!)) return false;
     if (provider != null && e.provider != provider) return false;
     if (model != null && e.model != model) return false;
-    if (workspace != null && e.workspace != workspace) return false;
+    if (workspace != null) {
+      if (workspace == LlmUsageLogService.untaggedWorkspace) {
+        if (e.workspace != null) return false;
+      } else {
+        if (e.workspace != workspace) return false;
+      }
+    }
     return true;
   }
 }
@@ -293,6 +301,11 @@ class LlmUsageFilter {
 class LlmUsageLogService extends ChangeNotifier {
   static const String _logFileName = 'llm_usage.ndjson';
   static const int _rotateThresholdBytes = 5 * 1024 * 1024;
+
+  /// Sentinel value used in the workspace dropdown for entries logged
+  /// before per-project tagging was added (v1.0.22). The filter
+  /// translates this to "match entries where workspace is null".
+  static const String untaggedWorkspace = '__untagged__';
 
   Future<Directory> _resolveDir() async {
     final support = await getApplicationSupportDirectory();
@@ -552,6 +565,7 @@ class LlmUsageLogService extends ChangeNotifier {
     final lastSeenModel = <String, DateTime>{};
     final lastSeenProvider = <String, DateTime>{};
     final lastSeenWorkspace = <String, DateTime>{};
+    bool hasUntagged = false;
     for (final e in entries) {
       if (e.model != null) {
         final cur = lastSeenModel[e.model!];
@@ -568,6 +582,8 @@ class LlmUsageLogService extends ChangeNotifier {
         if (wsCur == null || e.timestamp.isAfter(wsCur)) {
           lastSeenWorkspace[e.workspace!] = e.timestamp;
         }
+      } else {
+        hasUntagged = true;
       }
     }
     final models = lastSeenModel.keys.toList()
@@ -576,6 +592,9 @@ class LlmUsageLogService extends ChangeNotifier {
       ..sort((a, b) => lastSeenProvider[b]!.compareTo(lastSeenProvider[a]!));
     final workspaces = lastSeenWorkspace.keys.toList()
       ..sort((a, b) => lastSeenWorkspace[b]!.compareTo(lastSeenWorkspace[a]!));
+    if (hasUntagged) {
+      workspaces.add(untaggedWorkspace);
+    }
     return (models: models, providers: providers, workspaces: workspaces);
   }
 

@@ -119,21 +119,21 @@ class UsageFilterBar extends StatelessWidget {
           _DropdownButton(
             icon: Icons.smart_toy_outlined,
             label: modelFilter ?? S.llmUsageFilterAllModels,
-            onTap: () => _pickModel(context),
+            onTapWithContext: (btnCtx) => _pickModel(btnCtx),
           ),
           _DropdownButton(
             icon: Icons.dns_outlined,
             label: providerFilter == null
                 ? S.llmUsageFilterAllProviders
                 : _providerLabel(providerFilter!),
-            onTap: () => _pickProvider(context),
+            onTapWithContext: (btnCtx) => _pickProvider(btnCtx),
           ),
           _DropdownButton(
             icon: Icons.folder_outlined,
             label: workspaceFilter == null
                 ? S.llmUsageFilterAllProjects
                 : _workspaceLabel(workspaceFilter!),
-            onTap: () => _pickWorkspace(context),
+            onTapWithContext: (btnCtx) => _pickWorkspace(btnCtx),
           ),
           const SizedBox(width: 4),
           _ActionButton(
@@ -260,10 +260,13 @@ class UsageFilterBar extends StatelessWidget {
   }
 
   static String _workspaceLabel(String path) {
+    if (path == _untaggedSentinel) return S.llmUsageFilterOlderEntries;
     final sep = RegExp(r'[\\/]');
     final parts = path.split(sep);
     return parts.isNotEmpty ? parts.last : path;
   }
+
+  static const String _untaggedSentinel = '__untagged__';
 
   static String _providerLabel(String p) {
     return switch (p) {
@@ -317,11 +320,11 @@ class _RangePill extends StatelessWidget {
 class _DropdownButton extends StatelessWidget {
   final IconData icon;
   final String label;
-  final VoidCallback onTap;
+  final void Function(BuildContext) onTapWithContext;
   const _DropdownButton({
     required this.icon,
     required this.label,
-    required this.onTap,
+    required this.onTapWithContext,
   });
 
   @override
@@ -329,7 +332,7 @@ class _DropdownButton extends StatelessWidget {
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
-        onTap: onTap,
+        onTap: () => onTapWithContext(context),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           decoration: BoxDecoration(
