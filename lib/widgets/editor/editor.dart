@@ -1773,6 +1773,8 @@ class _EditorTabBar extends StatelessWidget {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  _EditorZoomIndicator(appState: appState),
+                  const SizedBox(width: 4),
                   _ToolbarButton(
                     icon: Icons.search,
                     tooltip: S.editorFindInFile,
@@ -2055,6 +2057,94 @@ class _ToolbarButton extends StatelessWidget {
               borderRadius: BorderRadius.circular(DuckTheme.radiusS),
             ),
             child: Icon(icon, size: 14, color: DuckColors.fgMuted),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _EditorZoomIndicator extends StatelessWidget {
+  final AppState appState;
+  const _EditorZoomIndicator({required this.appState});
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (appState.editorFontSize / 13.5 * 100).round();
+    final isDefault = pct == 100;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+      decoration: BoxDecoration(
+        border: Border.all(color: DuckColors.glassSeam, width: 0.5),
+        borderRadius: BorderRadius.circular(DuckTheme.radiusS),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _ZoomButton(
+            icon: Icons.remove,
+            tooltip: S.zoomOut,
+            onTap: () => appState.bumpEditorFontSize(-1),
+          ),
+          Tooltip(
+            message: isDefault ? '' : S.zoomResetTooltip,
+            child: InkWell(
+              onTap: isDefault ? null : () => appState.resetEditorFontSize(),
+              hoverColor: Colors.transparent,
+              splashColor: Colors.transparent,
+              highlightColor: Colors.transparent,
+              borderRadius: BorderRadius.circular(2),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(
+                  '$pct%',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isDefault ? DuckColors.fgSubtle : DuckColors.fgMuted,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          _ZoomButton(
+            icon: Icons.add,
+            tooltip: S.zoomIn,
+            onTap: () => appState.bumpEditorFontSize(1),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ZoomButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  const _ZoomButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: InkWell(
+          onTap: onTap,
+          hoverColor: Colors.transparent,
+          splashColor: Colors.transparent,
+          highlightColor: Colors.transparent,
+          borderRadius: BorderRadius.circular(2),
+          child: Padding(
+            padding: const EdgeInsets.all(1),
+            child: Icon(icon, size: 12, color: DuckColors.fgMuted),
           ),
         ),
       ),

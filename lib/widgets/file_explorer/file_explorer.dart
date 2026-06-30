@@ -2203,13 +2203,12 @@ class _ExplorerActivityBar extends StatelessWidget {
         tooltip: S.explorerMediaHub,
         onTap: onMediaHub,
       ),
-      // Council launcher moved from chat composer to the explorer
-      // activity bar. This replaces the old timeline slot.
-      BrightIconButton(
-        icon: Icons.hub_outlined,
-        tooltip: S.councilConvene,
-        onTap: onCouncil,
-      ),
+      if (context.watch<AppState>().experimentalFeatures)
+        BrightIconButton(
+          icon: Icons.hub_outlined,
+          tooltip: S.councilConvene,
+          onTap: onCouncil,
+        ),
       // SSH host fast-menu. Tap opens an anchored host-picker
       // dropdown; a mint dot under the icon indicates at least one
       // live session. The button shows the picker itself (NOT routed

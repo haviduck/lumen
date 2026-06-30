@@ -62,6 +62,11 @@ abstract class SlashCommand {
   /// through the normal `ChatController.sendMessage` path.
   Future<SlashCommandResult> run(SlashCommandContext ctx);
 
+  /// When true, the command is hidden from the picker and won't
+  /// match any query. Subclasses can override to gate visibility
+  /// on runtime state (e.g. experimental features toggle).
+  bool get isHidden => false;
+
   /// `true` when the command's name (or description) matches [query].
   /// Empty query matches everything — used when the user has typed
   /// just `/` and is browsing.
@@ -88,10 +93,10 @@ class SlashCommandRegistry {
     _commands.add(command);
   }
 
-  /// All commands, sorted alphabetically by name. Picker filters on
-  /// top of this list.
+  /// All visible commands, sorted alphabetically by name. Picker
+  /// filters on top of this list.
   static List<SlashCommand> all() {
-    final sorted = List<SlashCommand>.from(_commands);
+    final sorted = _commands.where((c) => !c.isHidden).toList();
     sorted.sort((a, b) => a.name.compareTo(b.name));
     return sorted;
   }

@@ -10,6 +10,10 @@ class CouncilCommand extends SlashCommand {
 
   final String alias;
 
+  /// Controlled by `AppState.setExperimentalFeatures`. When false the
+  /// command is hidden from the slash-command picker.
+  static bool visible = false;
+
   @override
   String get name => alias;
 
@@ -18,6 +22,9 @@ class CouncilCommand extends SlashCommand {
 
   @override
   IconData get icon => Icons.hub_outlined;
+
+  @override
+  bool get isHidden => !visible;
 
   @override
   Future<SlashCommandResult> run(SlashCommandContext ctx) async {

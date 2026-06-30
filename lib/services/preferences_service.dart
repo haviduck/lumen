@@ -158,6 +158,7 @@ class PreferencesService {
   // Default true so existing installs are unaffected; users who never
   // installed Node or never want the integration can turn it off and
   // forget about it.
+  static const String _kExperimentalFeatures = 'ui.experimentalFeatures';
   static const String _kGitNexusEnabled = 'gitnexus.enabled';
 
   Future<SharedPreferences> get _p => SharedPreferences.getInstance();
@@ -611,6 +612,12 @@ class PreferencesService {
       (await _p).getBool(_kLockOnStartup) ?? false;
   Future<void> setLockOnStartup(bool v) async =>
       (await _p).setBool(_kLockOnStartup, v);
+
+  // --- Experimental features ---
+  Future<bool> getExperimentalFeatures() async =>
+      (await _p).getBool(_kExperimentalFeatures) ?? false;
+  Future<void> setExperimentalFeatures(bool v) async =>
+      (await _p).setBool(_kExperimentalFeatures, v);
 
   // --- GitNexus ---
   Future<bool> getGitNexusEnabled() async =>

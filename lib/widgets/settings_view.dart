@@ -75,6 +75,7 @@ class _SettingsViewState extends State<SettingsView> {
   late bool _reduceMotion;
   late bool _reduceTransparency;
   late bool _allowAgentOutsideWorkspaceWrites;
+  late bool _experimentalFeatures;
   late bool _autoVerifyAfterEdits;
   late bool _toolCompressionEnabled;
   late String _toolCompressionModel;
@@ -137,6 +138,7 @@ class _SettingsViewState extends State<SettingsView> {
     _reduceMotion = a.reduceMotion;
     _reduceTransparency = a.reduceTransparency;
     _allowAgentOutsideWorkspaceWrites = a.allowAgentOutsideWorkspaceWrites;
+    _experimentalFeatures = a.experimentalFeatures;
     _autoVerifyAfterEdits = a.autoVerifyAfterEdits;
     _toolCompressionEnabled = a.toolCompressionEnabled;
     _toolCompressionModel = a.toolCompressionModel;
@@ -207,6 +209,7 @@ class _SettingsViewState extends State<SettingsView> {
     await a.setAllowAgentOutsideWorkspaceWrites(
       _allowAgentOutsideWorkspaceWrites,
     );
+    await a.setExperimentalFeatures(_experimentalFeatures);
     await a.setAutoVerifyAfterEdits(_autoVerifyAfterEdits);
     final parsedCompressionThreshold = int.tryParse(
       _toolCompressionThresholdCtrl.text.trim(),
@@ -692,6 +695,13 @@ class _SettingsViewState extends State<SettingsView> {
             visible: _showOpenaiKey,
             onToggle: (v) => _showOpenaiKey = v,
           ),
+        ),
+        _divider(),
+        _settingToggle(
+          label: S.settingsExperimentalFeatures,
+          description: S.settingsExperimentalFeaturesDesc,
+          value: _experimentalFeatures,
+          onChanged: (v) => setState(() => _experimentalFeatures = v),
         ),
         _divider(),
         _settingRow(

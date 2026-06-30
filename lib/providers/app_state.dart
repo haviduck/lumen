@@ -29,6 +29,7 @@ import '../services/timeline_models.dart';
 import '../services/timeline_service.dart';
 import '../services/workspace_service.dart';
 import '../services/workspace_skills_service.dart';
+import '../widgets/ai_chat/slash_commands/council_command.dart';
 import 'chat_controller.dart';
 import 'council_controller.dart';
 import 'ssh_controller.dart';
@@ -398,6 +399,7 @@ class AppState extends ChangeNotifier {
   // UI accessibility / GPU escape hatches (drive `DuckGlass` and
   // `DuckMotion` so users on weak GPUs / on battery can opt out without
   // the IDE losing functionality).
+  bool _experimentalFeatures = false;
   bool _reduceMotion = false;
   bool _reduceTransparency = false;
   bool _allowAgentOutsideWorkspaceWrites = false;
@@ -487,6 +489,7 @@ class AppState extends ChangeNotifier {
   bool get isLocked => _isLocked;
   bool get lockOnStartup => _lockOnStartup;
 
+  bool get experimentalFeatures => _experimentalFeatures;
   bool get reduceMotion => _reduceMotion;
   bool get reduceTransparency => _reduceTransparency;
   bool get allowAgentOutsideWorkspaceWrites =>
@@ -671,6 +674,8 @@ class AppState extends ChangeNotifier {
     );
     _lockOnStartup = await prefs.getLockOnStartup();
     _isLocked = _lockOnStartup && await prefs.hasPin();
+    _experimentalFeatures = await prefs.getExperimentalFeatures();
+    CouncilCommand.visible = _experimentalFeatures;
     _reduceMotion = await prefs.getReduceMotion();
     _reduceTransparency = await prefs.getReduceTransparency();
     _allowAgentOutsideWorkspaceWrites = await prefs
@@ -678,6 +683,33 @@ class AppState extends ChangeNotifier {
     _autoVerifyAfterEdits = await prefs.getAgentAutoVerifyAfterEdits();
     _chatHidden = await prefs.getChatHidden();
     notifyListeners();
+  }
+
+  Future<void> setExperimentalFeatures(bool v) async {
+    _experimentalFeatures = v;
+    CouncilCommand.visible = v;
+    await prefs.setExperimentalFeatures(v);
+    if (!v) {
+      _closeCouncilTabsIfOpen();
+    }
+    notifyListeners();
+  }
+
+  void _closeCouncilTabsIfOpen() {
+    _openFiles.removeWhere(
+      (f) =>
+          f.path == councilTheaterSentinel ||
+          f.path == councilSessionsSentinel,
+    );
+    _fileContents.remove(councilTheaterSentinel);
+    _fileContents.remove(councilSessionsSentinel);
+    _savedFileContents.remove(councilTheaterSentinel);
+    _savedFileContents.remove(councilSessionsSentinel);
+    if (_activeFile != null &&
+        (isCouncilTheaterTab(_activeFile!.path) ||
+            isCouncilSessionsTab(_activeFile!.path))) {
+      _activeFile = _openFiles.isNotEmpty ? _openFiles.last : null;
+    }
   }
 
   Future<void> setReduceMotion(bool v) async {

@@ -291,6 +291,7 @@ class CommandCatalog {
         title: S.councilReportsMenuItem,
         icon: Icons.article_outlined,
         category: 'Agent',
+        enabled: (s) => s.experimentalFeatures,
         run: (ctx) => handleMenuAction(ctx, 'councilReports'),
       ),
       IdeCommand(
@@ -298,6 +299,7 @@ class CommandCatalog {
         title: S.councilSessionsMenuItem,
         icon: Icons.forum_outlined,
         category: 'Agent',
+        enabled: (s) => s.experimentalFeatures,
         run: (ctx) => handleMenuAction(ctx, 'councilSessions'),
       ),
       IdeCommand(

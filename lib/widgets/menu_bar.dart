@@ -231,11 +231,12 @@ class DuckMenuBar extends StatelessWidget {
                       S.menuTimeline,
                       enabled: state.currentDirectory != null,
                     ),
-                    _item(
-                      context,
-                      'councilSessions',
-                      S.councilSessionsMenuItem,
-                    ),
+                    if (state.experimentalFeatures)
+                      _item(
+                        context,
+                        'councilSessions',
+                        S.councilSessionsMenuItem,
+                      ),
                     _menuDivider,
                     _itemWithShortcut(
                       context,
@@ -276,7 +277,8 @@ class DuckMenuBar extends StatelessWidget {
                       enabled: state.currentDirectory != null,
                     ),
                     _menuDivider,
-                    _item(context, 'councilReports', S.councilReportsMenuItem),
+                    if (state.experimentalFeatures)
+                      _item(context, 'councilReports', S.councilReportsMenuItem),
                     _item(context, 'llmUsage', S.menuViewTokenUsage),
                     _menuDivider,
                     _item(context, 'autoApprove', S.menuToggleAutoApprove),

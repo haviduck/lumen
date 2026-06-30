@@ -33,6 +33,7 @@ const Set<String> _knownProviders = {
   'groq',
   'mistral',
   'ollama',
+  'ollama-cloud',
   'openai',
   'openrouter',
   'together',

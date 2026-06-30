@@ -48,6 +48,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   // and Cursor use to signal "this is followable".
   bool _terminalCtrlHoverOverUrl = false;
   Rect? _terminalCtrlHoverUrlRect;
+  // Click-to-recall: when Ctrl is held and the cursor is over a
+  // detected previous-command line (a line matching `_promptPattern`),
+  // we paint a subtle mint background fill across the command span
+  // and switch to a click cursor. Ctrl+click then writes the
+  // recalled command into the prompt — see `_recallCommandAtCell`.
+  Rect? _terminalCtrlHoverCommandRect;
+  // Cached command text for the cell currently under the cursor.
+  // Resolved during hover so the click path doesn't re-walk the
+  // buffer to find it.
+  String? _terminalCtrlHoverCommandText;
   TerminalSession? _termHoveredSession;
   Offset? _termHoverPos;
 
@@ -197,24 +207,42 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// Called from `MouseRegion.onHover` (mouse moved), `MouseRegion.onExit`
   /// (mouse left the terminal), and `_onHardwareKeyEvent` (ctrl
   /// pressed/released without mouse movement).
+  ///
+  /// Two Ctrl-hover affordances live here:
+  ///   - **URL** — a cyan underline + click cursor (since v1.0.x).
+  ///   - **Command recall** — a mint fill across the command span
+  ///     when the line matches a shell-prompt pattern. URLs take
+  ///     priority when both apply to the same cell (rare; a URL
+  ///     embedded in a shell command).
   void _recomputeCtrlUrlCursor() {
     if (!mounted) return;
     final s = _termHoveredSession;
     final pos = _termHoverPos;
-    bool next = false;
-    Rect? nextRect;
-    if (s != null && pos != null) {
-      final ctrl = HardwareKeyboard.instance.isControlPressed;
-      if (ctrl) {
-        nextRect = _urlRectAtLocalPos(s, pos);
-        next = nextRect != null;
+    Rect? urlRect;
+    Rect? cmdRect;
+    String? cmdText;
+    if (s != null &&
+        pos != null &&
+        HardwareKeyboard.instance.isControlPressed) {
+      urlRect = _urlRectAtLocalPos(s, pos);
+      if (urlRect == null) {
+        final hit = _commandHitAtLocalPos(s, pos);
+        if (hit != null) {
+          cmdRect = hit.rect;
+          cmdText = hit.command;
+        }
       }
     }
-    if (next != _terminalCtrlHoverOverUrl ||
-        nextRect != _terminalCtrlHoverUrlRect) {
+    final nextOverUrl = urlRect != null;
+    if (nextOverUrl != _terminalCtrlHoverOverUrl ||
+        urlRect != _terminalCtrlHoverUrlRect ||
+        cmdRect != _terminalCtrlHoverCommandRect ||
+        cmdText != _terminalCtrlHoverCommandText) {
       setState(() {
-        _terminalCtrlHoverOverUrl = next;
-        _terminalCtrlHoverUrlRect = nextRect;
+        _terminalCtrlHoverOverUrl = nextOverUrl;
+        _terminalCtrlHoverUrlRect = urlRect;
+        _terminalCtrlHoverCommandRect = cmdRect;
+        _terminalCtrlHoverCommandText = cmdText;
       });
     }
   }
@@ -252,6 +280,81 @@ class _TerminalPaneState extends State<TerminalPane> {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Hit-test the local pointer position against detected
+  /// shell-prompt command spans on the same buffer line. Returns
+  /// both the visual rect (mint fill) and the command text, so the
+  /// hover painter and the click-recall handler share one resolve
+  /// without re-walking the buffer.
+  _CommandHit? _commandHitAtLocalPos(TerminalSession s, Offset localPos) {
+    final state = s.viewKey.currentState;
+    if (state == null) return null;
+    try {
+      final dynamic render = (state as dynamic).renderTerminal;
+      if (render == null) return null;
+      final CellOffset cell = render.getCellOffset(localPos);
+      final lines = s.terminal.buffer.lines;
+      if (cell.y < 0 || cell.y >= lines.length) return null;
+      final lineText = lines[cell.y].getText();
+      final match = _promptPattern.firstMatch(lineText);
+      if (match == null) return null;
+      final command = match.group(2);
+      final prefix = match.group(1);
+      if (command == null || command.isEmpty) return null;
+      if (prefix == null) return null;
+      // Dart's `Match` exposes `start`/`end` for the whole match only —
+      // no per-group accessor. Locate the command span by hand: the
+      // prefix is anchored at column 0 (the regex starts with `^`), so
+      // the command begins at the first non-space cell at or after
+      // `prefix.length`. The end is `start + command.length`.
+      var cmdStart = prefix.length;
+      while (cmdStart < lineText.length && lineText[cmdStart] == ' ') {
+        cmdStart++;
+      }
+      final cmdEnd = cmdStart + command.length;
+      if (cell.x < cmdStart || cell.x >= cmdEnd) return null;
+      final Offset start = render.getOffset(CellOffset(cmdStart, cell.y));
+      final Offset end = render.getOffset(CellOffset(cmdEnd, cell.y));
+      final double lineHeight = render.lineHeight as double;
+      return _CommandHit(
+        command: command,
+        rect: Rect.fromLTWH(
+          start.dx - 1,
+          start.dy,
+          end.dx - start.dx + 2,
+          lineHeight,
+        ),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Recall a previously-typed shell command into the active prompt.
+  ///
+  /// Flow:
+  ///   1. Detect the command at the click position (returns early
+  ///      if it doesn't land on a recognised prompt).
+  ///   2. Activate the session so the recalled command goes to the
+  ///      visible tab and the user can immediately hit Enter.
+  ///   3. Write `\x15` (Ctrl+U) to the PTY — clears whatever the
+  ///      user has half-typed at the current prompt on bash / zsh /
+  ///      PowerShell + PSReadLine. cmd users see a stray byte but
+  ///      this is a niche shell at this point.
+  ///   4. Paste the command through xterm's bracketed-paste path so
+  ///      the shell treats it as a paste (no auto-execute) and the
+  ///      user can edit before pressing Enter.
+  ///   5. Toast a short confirmation so the user sees the recall
+  ///      happened even on a busy terminal where the new prompt
+  ///      isn't immediately visible.
+  void _recallCommandAtLocalPos(TerminalSession s, Offset localPos) {
+    final hit = _commandHitAtLocalPos(s, localPos);
+    if (hit == null) return;
+    s.focusNode.requestFocus();
+    s.sendKeystroke('\x15');
+    s.terminal.paste(hit.command);
+    showDuckToast(context, S.terminalCommandRecalled);
   }
 
   Future<void> _addSession(String wd, {String? shellOverride}) async {
@@ -664,10 +767,14 @@ class _TerminalPaneState extends State<TerminalPane> {
     final hoverRect = identical(_termHoveredSession, s)
         ? _terminalCtrlHoverUrlRect
         : null;
+    final hoverCmdRect = identical(_termHoveredSession, s)
+        ? _terminalCtrlHoverCommandRect
+        : null;
     return MouseRegion(
-      cursor: _terminalCtrlHoverOverUrl
-          ? SystemMouseCursors.click
-          : SystemMouseCursors.basic,
+      cursor:
+          _terminalCtrlHoverOverUrl || _terminalCtrlHoverCommandRect != null
+              ? SystemMouseCursors.click
+              : SystemMouseCursors.basic,
       onHover: (e) {
         _termHoveredSession = s;
         _termHoverPos = e.localPosition;
@@ -699,6 +806,12 @@ class _TerminalPaneState extends State<TerminalPane> {
               IgnorePointer(
                 child: CustomPaint(
                   painter: _TerminalUrlHoverPainter(hoverRect),
+                ),
+              ),
+            if (hoverCmdRect != null)
+              IgnorePointer(
+                child: CustomPaint(
+                  painter: _TerminalCommandHoverPainter(hoverCmdRect),
                 ),
               ),
           ],
@@ -770,8 +883,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     // Match VS Code / Cursor / Windows Terminal convention: URL navigation
     // is gated behind ctrl. Plain click stays a plain click so cursor
     // positioning + selection-start in the terminal still feel native.
+    //
+    // Ctrl+click priority (same as the hover painter):
+    //   1. If the click landed on a URL, open it (existing behaviour).
+    //   2. Otherwise, if the click landed on a shell-prompt command,
+    //      recall that command into the active prompt — see
+    //      `_recallCommandAtLocalPos` for the line-clear + paste
+    //      sequence.
     if (!HardwareKeyboard.instance.isControlPressed) return;
-    _openUrlAtLocalPos(s, localPos);
+    if (_openUrlAtLocalPos(s, localPos)) return;
+    _recallCommandAtLocalPos(s, localPos);
   }
 
   void _resetTermPointerState() {
@@ -944,43 +1065,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       child: Column(
         children: [
           Container(
-            height: 24,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            decoration: BoxDecoration(
-              color: focused ? DuckColors.bgRaised : DuckColors.bgDeeper,
-              border: Border(
-                top: BorderSide(
-                  color: focused ? DuckColors.accentCyan : Colors.transparent,
-                  width: 1.5,
-                ),
-                bottom: const BorderSide(
-                  color: DuckColors.glassSeam,
-                  width: 0.5,
-                ),
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.terminal,
-                  size: 12,
-                  color: focused ? DuckColors.accentCyan : DuckColors.fgSubtle,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    session.title + (session.usingFallback ? ' *' : ''),
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: focused
-                          ? DuckColors.fgPrimary
-                          : DuckColors.fgMuted,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            height: 2,
+            color: focused ? DuckColors.accentCyan : DuckColors.glassSeam,
           ),
           Expanded(
             child: Stack(
@@ -1251,6 +1337,22 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// (e.g. `see http://foo.bar/baz.`) doesn't swallow the trailing
   /// punctuation. Trailing `.,;:!?)>]}"'` is trimmed in
   /// `_extractUrlAtCell` after the regex match.
+  /// Shell-prompt detector for the click-to-recall feature. Capture
+  /// group 1 is the prompt prefix (e.g. `PS C:\foo>`, `user@host:~$`,
+  /// `(env) C:\src>`), capture group 2 is the command the user typed.
+  ///
+  /// Permissive on the prefix (any non-space stuff ending in
+  /// `>`/`$`/`#`/`%`) but anchors the command to a non-space start so
+  /// `PS C:\foo>` (bare prompt, no command yet) doesn't match.
+  /// Patterns covered:
+  ///   - PowerShell: `PS C:\path> command`
+  ///   - cmd:        `C:\path>command` (no space after `>`)
+  ///   - bash/zsh:   `user@host:~/path$ command`, `$ command`, `# command`
+  ///   - conda env:  `(env) C:\path> command`, `(env) $ command`
+  static final RegExp _promptPattern = RegExp(
+    r'^(\S.*?[>\$#%]|[>\$#%])\s*(\S.*?)\s*$',
+  );
+
   static final RegExp _urlPattern = RegExp(
     r'https?://[^\s<>()\[\]{}"'
     "'"
@@ -1695,4 +1797,46 @@ class _TerminalUrlHoverPainter extends CustomPainter {
   bool shouldRepaint(covariant _TerminalUrlHoverPainter oldDelegate) {
     return oldDelegate.rect != rect;
   }
+}
+
+/// Highlight painter for click-to-recall command spans. Visually
+/// distinct from the URL painter (full-cell mint fill vs. cyan
+/// underline) so the user reads them as separate affordances even
+/// though both are gated behind Ctrl+hover. Rounded corners +
+/// 1.1px outline so the highlight stays legible against any
+/// background color the line might already have (ANSI-coloured
+/// prompts in particular).
+class _TerminalCommandHoverPainter extends CustomPainter {
+  final Rect rect;
+
+  _TerminalCommandHoverPainter(this.rect);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final clamped = rect.intersect(Offset.zero & size);
+    if (clamped.isEmpty) return;
+    final rrect = RRect.fromRectAndRadius(clamped, const Radius.circular(3));
+    final fill = Paint()
+      ..color = DuckColors.accentMint.withValues(alpha: 0.16);
+    final stroke = Paint()
+      ..color = DuckColors.accentMint.withValues(alpha: 0.65)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1;
+    canvas.drawRRect(rrect, fill);
+    canvas.drawRRect(rrect, stroke);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TerminalCommandHoverPainter oldDelegate) {
+    return oldDelegate.rect != rect;
+  }
+}
+
+/// Result of hit-testing the pointer position against a shell-prompt
+/// command span. Returned by `_commandHitAtLocalPos` so the hover
+/// painter and click-recall path share a single buffer walk.
+class _CommandHit {
+  final String command;
+  final Rect rect;
+  const _CommandHit({required this.command, required this.rect});
 }

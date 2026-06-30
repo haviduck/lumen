@@ -1107,6 +1107,11 @@ class _ModelTile extends StatelessWidget {
       provider: provider,
       rawModel: raw,
     );
+    // Only show the raw-id subtitle when it carries information
+    // the compact title doesn't. After `compactModelLabel` strips
+    // the provider prefix, the two are identical for most models —
+    // repeating the same string in a smaller font is noise.
+    final showSubtitle = raw != compact;
 
     final bg = highlighted
         ? color.withValues(alpha: 0.10)
@@ -1168,17 +1173,19 @@ class _ModelTile extends StatelessWidget {
                         ],
                       ],
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      raw,
-                      overflow: TextOverflow.ellipsis,
-                      maxLines: 1,
-                      style: const TextStyle(
-                        fontSize: 10.5,
-                        color: DuckColors.fgSubtle,
-                        fontFamily: DuckTheme.monoFont,
+                    if (showSubtitle) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        raw,
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          fontSize: 10.5,
+                          color: DuckColors.fgSubtle,
+                          fontFamily: DuckTheme.monoFont,
+                        ),
                       ),
-                    ),
+                    ],
                   ],
                 ),
               ),

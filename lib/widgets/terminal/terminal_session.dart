@@ -88,6 +88,30 @@ class TerminalSession {
   bool get usingFallback => _usingFallback;
   ShellSpec? get activeShell => _activeShell;
 
+  /// Write raw bytes directly to the child's stdin — bypasses xterm's
+  /// `Terminal.paste()` (which auto-wraps text in bracketed-paste
+  /// markers when the shell has enabled it, defeating any embedded
+  /// control characters like `\x15` / Ctrl+U for clearing the line).
+  ///
+  /// Used by the click-to-recall command feature in `TerminalPane` to
+  /// (a) clear whatever the user has half-typed at the prompt and
+  /// (b) inject the recalled command's keystrokes verbatim.
+  /// Silently no-ops when the session has been disposed or never
+  /// finished starting — neither failure mode should crash the UI.
+  void sendKeystroke(String data) {
+    if (_disposed || data.isEmpty) return;
+    final bytes = const Utf8Encoder().convert(data);
+    try {
+      if (_pty != null) {
+        _pty!.write(bytes);
+      } else if (_proc != null) {
+        _proc!.stdin.add(bytes);
+      }
+    } catch (e) {
+      debugPrint('terminal sendKeystroke error: $e');
+    }
+  }
+
   /// True when this session was spawned to run a single agent command
   /// (vs an interactive shell). The terminal pane uses this to badge
   /// the tab and route close-tab events through the agent bridge.

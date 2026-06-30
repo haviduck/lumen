@@ -125,6 +125,10 @@ class S {
       'Search files, commands, settings (Ctrl+P)';
   static const String titleBarSearchShortcut = 'Ctrl+P';
 
+  static const String zoomResetTooltip = 'Click to reset zoom';
+  static const String zoomIn = 'Zoom in';
+  static const String zoomOut = 'Zoom out';
+
   // Unified search overlay. Replaces the separate Quick Open and
   // Command Palette UX with one entry point that bucket-sorts
   // results: Commands → Settings → Files.
@@ -927,9 +931,15 @@ class S {
   static const String terminalContextClear = 'Clear';
   static const String terminalContextCopyToChat = 'Copy to Chat';
   static const String terminalContextOpenUrl = 'Open URL in browser';
-  static const String terminalUrlHint = 'Ctrl+Click URLs to open';
+  static const String terminalUrlHint =
+      'Ctrl+Click URLs to open, Ctrl+Click a previous command to recall it';
   static const String terminalCopyHint =
       'Ctrl+Shift+C copies, Ctrl+Shift+V pastes';
+  // Toast confirmation shown when the user Ctrl+clicks a previously-
+  // typed shell command in the terminal scrollback to recall it
+  // into the active prompt. Visible because a busy terminal might
+  // scroll the recall out of view before the user notices it landed.
+  static const String terminalCommandRecalled = 'Recalled command at prompt';
   static const String terminalShellResetDefault = 'Reset to default';
   static const String terminalShellResetDone =
       'Shell preference cleared — using best available shell.';
@@ -1402,6 +1412,9 @@ class S {
   static const String settingsFontSize = 'Editor Font Size';
   static const String settingsTabSize = 'Tab Size';
   static const String settingsWordWrap = 'Word Wrap';
+  static const String settingsExperimentalFeatures = 'Experimental features';
+  static const String settingsExperimentalFeaturesDesc =
+      'Enable experimental features such as the Council multi-agent system. These features may be unstable or change without notice.';
   static const String settingsAppearanceSection = 'Appearance';
   static const String settingsReduceMotion = 'Reduce motion';
   static const String settingsReduceMotionDesc =
