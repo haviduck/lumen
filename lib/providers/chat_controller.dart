@@ -3951,6 +3951,7 @@ class ChatController extends ChangeNotifier {
           fallbackModel: selectedRawModel,
           sessionId: session.id,
           sessionTitle: session.title,
+          workspace: _currentWorkspace,
         );
         if (iterUsageEntry != null) {
           _llmUsageLog?.log(iterUsageEntry);

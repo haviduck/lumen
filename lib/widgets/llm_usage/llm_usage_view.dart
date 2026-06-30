@@ -51,10 +51,12 @@ class _LlmUsageViewState extends State<LlmUsageView> {
   UsageRange _range = UsageRange.last30;
   String? _modelFilter;
   String? _providerFilter;
+  String? _workspaceFilter;
 
   LlmUsageAggregate _agg = LlmUsageAggregate.empty;
   List<String> _availableModels = const [];
   List<String> _availableProviders = const [];
+  List<String> _availableWorkspaces = const [];
   bool _initialLoaded = false;
   bool _refreshing = false;
   Timer? _debounce;
@@ -106,6 +108,7 @@ class _LlmUsageViewState extends State<LlmUsageView> {
       until: _range.until(now),
       provider: _providerFilter,
       model: _modelFilter,
+      workspace: _workspaceFilter,
     );
   }
 
@@ -123,11 +126,13 @@ class _LlmUsageViewState extends State<LlmUsageView> {
       final distinct = results[1] as ({
         List<String> models,
         List<String> providers,
+        List<String> workspaces,
       });
       setState(() {
         _agg = agg;
         _availableModels = distinct.models;
         _availableProviders = distinct.providers;
+        _availableWorkspaces = distinct.workspaces;
         _initialLoaded = true;
         _refreshing = false;
       });
@@ -173,6 +178,7 @@ class _LlmUsageViewState extends State<LlmUsageView> {
     setState(() {
       _modelFilter = null;
       _providerFilter = null;
+      _workspaceFilter = null;
     });
     await _refresh();
   }
@@ -189,8 +195,10 @@ class _LlmUsageViewState extends State<LlmUsageView> {
             range: _range,
             modelFilter: _modelFilter,
             providerFilter: _providerFilter,
+            workspaceFilter: _workspaceFilter,
             availableModels: _availableModels,
             availableProviders: _availableProviders,
+            availableWorkspaces: _availableWorkspaces,
             onRangeChanged: (r) {
               setState(() => _range = r);
               _refresh();
@@ -201,6 +209,10 @@ class _LlmUsageViewState extends State<LlmUsageView> {
             },
             onProviderChanged: (p) {
               setState(() => _providerFilter = p);
+              _refresh();
+            },
+            onWorkspaceChanged: (w) {
+              setState(() => _workspaceFilter = w);
               _refresh();
             },
             onReset: _confirmReset,

@@ -1082,6 +1082,7 @@ class S {
   static const String llmUsageRangeAllTime = 'All time';
   static const String llmUsageFilterAllModels = 'All models';
   static const String llmUsageFilterAllProviders = 'All providers';
+  static const String llmUsageFilterAllProjects = 'All projects';
 
   // Summary cards.
   static const String llmUsageStatPrompts = 'Prompts';

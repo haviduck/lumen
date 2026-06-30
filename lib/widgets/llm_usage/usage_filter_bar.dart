@@ -52,11 +52,14 @@ class UsageFilterBar extends StatelessWidget {
   final UsageRange range;
   final String? modelFilter;
   final String? providerFilter;
+  final String? workspaceFilter;
   final List<String> availableModels;
   final List<String> availableProviders;
+  final List<String> availableWorkspaces;
   final ValueChanged<UsageRange> onRangeChanged;
   final ValueChanged<String?> onModelChanged;
   final ValueChanged<String?> onProviderChanged;
+  final ValueChanged<String?> onWorkspaceChanged;
   final VoidCallback onReset;
   final VoidCallback onRefresh;
   final bool refreshing;
@@ -66,11 +69,14 @@ class UsageFilterBar extends StatelessWidget {
     required this.range,
     required this.modelFilter,
     required this.providerFilter,
+    required this.workspaceFilter,
     required this.availableModels,
     required this.availableProviders,
+    required this.availableWorkspaces,
     required this.onRangeChanged,
     required this.onModelChanged,
     required this.onProviderChanged,
+    required this.onWorkspaceChanged,
     required this.onReset,
     required this.onRefresh,
     required this.refreshing,
@@ -121,6 +127,13 @@ class UsageFilterBar extends StatelessWidget {
                 ? S.llmUsageFilterAllProviders
                 : _providerLabel(providerFilter!),
             onTap: () => _pickProvider(context),
+          ),
+          _DropdownButton(
+            icon: Icons.folder_outlined,
+            label: workspaceFilter == null
+                ? S.llmUsageFilterAllProjects
+                : _workspaceLabel(workspaceFilter!),
+            onTap: () => _pickWorkspace(context),
           ),
           const SizedBox(width: 4),
           _ActionButton(
@@ -178,6 +191,29 @@ class UsageFilterBar extends StatelessWidget {
     onProviderChanged(picked);
   }
 
+  Future<void> _pickWorkspace(BuildContext context) async {
+    final position = _relativeRectFor(context);
+    final picked = await showFastMenu<String?>(
+      context: context,
+      position: position,
+      items: <PopupMenuEntry<String?>>[
+        _menuRow(
+          value: null,
+          label: S.llmUsageFilterAllProjects,
+          selected: workspaceFilter == null,
+        ),
+        if (availableWorkspaces.isNotEmpty) const PopupMenuDivider(),
+        for (final w in availableWorkspaces)
+          _menuRow(
+            value: w,
+            label: _workspaceLabel(w),
+            selected: workspaceFilter == w,
+          ),
+      ],
+    );
+    onWorkspaceChanged(picked);
+  }
+
   RelativeRect _relativeRectFor(BuildContext context) {
     final box = context.findRenderObject() as RenderBox?;
     final overlay =
@@ -221,6 +257,12 @@ class UsageFilterBar extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  static String _workspaceLabel(String path) {
+    final sep = RegExp(r'[\\/]');
+    final parts = path.split(sep);
+    return parts.isNotEmpty ? parts.last : path;
   }
 
   static String _providerLabel(String p) {

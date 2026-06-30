@@ -66,6 +66,11 @@ class LlmUsageEntry {
   /// session has since been deleted from disk.
   final String? sessionTitle;
 
+  /// Workspace directory path at log time. Used for per-project
+  /// filtering in the usage dashboard. Stored as the full path;
+  /// the UI extracts the basename for display.
+  final String? workspace;
+
   const LlmUsageEntry({
     required this.timestamp,
     required this.provider,
@@ -77,6 +82,7 @@ class LlmUsageEntry {
     this.reasoningTokens = 0,
     this.sessionId,
     this.sessionTitle,
+    this.workspace,
   });
 
   /// Total chargeable tokens — input + output + cache-write +
@@ -97,6 +103,7 @@ class LlmUsageEntry {
     if (reasoningTokens != 0) 'rsn': reasoningTokens,
     if (sessionId != null) 'sid': sessionId,
     if (sessionTitle != null) 'st': sessionTitle,
+    if (workspace != null) 'ws': workspace,
   };
 
   static LlmUsageEntry? tryFromJson(Map<String, dynamic> j) {
@@ -116,6 +123,7 @@ class LlmUsageEntry {
       reasoningTokens: asInt(j['rsn']),
       sessionId: j['sid'] as String?,
       sessionTitle: j['st'] as String?,
+      workspace: j['ws'] as String?,
     );
   }
 }
@@ -258,13 +266,23 @@ class LlmUsageFilter {
   /// Restrict to this model only. `null` = any.
   final String? model;
 
-  const LlmUsageFilter({this.since, this.until, this.provider, this.model});
+  /// Restrict to this workspace path only. `null` = any (global).
+  final String? workspace;
+
+  const LlmUsageFilter({
+    this.since,
+    this.until,
+    this.provider,
+    this.model,
+    this.workspace,
+  });
 
   bool matches(LlmUsageEntry e) {
     if (since != null && e.timestamp.isBefore(since!)) return false;
     if (until != null && e.timestamp.isAfter(until!)) return false;
     if (provider != null && e.provider != provider) return false;
     if (model != null && e.model != model) return false;
+    if (workspace != null && e.workspace != workspace) return false;
     return true;
   }
 }
@@ -528,11 +546,12 @@ class LlmUsageLogService extends ChangeNotifier {
   /// the log, for the filter dropdowns. Both lists are sorted by
   /// recency-of-last-use descending (newest first) so the user's
   /// current model floats to the top of the picker.
-  Future<({List<String> models, List<String> providers})>
+  Future<({List<String> models, List<String> providers, List<String> workspaces})>
   distinctFilters() async {
     final entries = await loadAll();
     final lastSeenModel = <String, DateTime>{};
     final lastSeenProvider = <String, DateTime>{};
+    final lastSeenWorkspace = <String, DateTime>{};
     for (final e in entries) {
       if (e.model != null) {
         final cur = lastSeenModel[e.model!];
@@ -544,12 +563,20 @@ class LlmUsageLogService extends ChangeNotifier {
       if (cur == null || e.timestamp.isAfter(cur)) {
         lastSeenProvider[e.provider] = e.timestamp;
       }
+      if (e.workspace != null) {
+        final wsCur = lastSeenWorkspace[e.workspace!];
+        if (wsCur == null || e.timestamp.isAfter(wsCur)) {
+          lastSeenWorkspace[e.workspace!] = e.timestamp;
+        }
+      }
     }
     final models = lastSeenModel.keys.toList()
       ..sort((a, b) => lastSeenModel[b]!.compareTo(lastSeenModel[a]!));
     final providers = lastSeenProvider.keys.toList()
       ..sort((a, b) => lastSeenProvider[b]!.compareTo(lastSeenProvider[a]!));
-    return (models: models, providers: providers);
+    final workspaces = lastSeenWorkspace.keys.toList()
+      ..sort((a, b) => lastSeenWorkspace[b]!.compareTo(lastSeenWorkspace[a]!));
+    return (models: models, providers: providers, workspaces: workspaces);
   }
 
   /// Wipe the entire history — bak files included. Called from the
@@ -639,6 +666,7 @@ class IterationUsageAccumulator {
     required String? fallbackModel,
     required String? sessionId,
     required String? sessionTitle,
+    String? workspace,
   }) {
     if (isEmpty) return null;
     return LlmUsageEntry(
@@ -652,6 +680,7 @@ class IterationUsageAccumulator {
       reasoningTokens: reasoningTokens,
       sessionId: sessionId,
       sessionTitle: sessionTitle,
+      workspace: workspace,
     );
   }
 }
