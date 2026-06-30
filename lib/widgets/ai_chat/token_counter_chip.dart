@@ -60,7 +60,8 @@ class TokenCounterChip extends StatelessWidget {
 
     final placeholder = '—';
     final inText = hasData ? _formatTokens(stats.inputTokens) : placeholder;
-    final outText = hasData ? _formatTokens(stats.outputTokens) : placeholder;
+    final effectiveOutput = stats.outputTokens + stats.streamingOutputEstimate;
+    final outText = hasData ? _formatTokens(effectiveOutput) : placeholder;
     final pctText = utilization != null
         ? '${(utilization * 100).toStringAsFixed(0)}%'
         : placeholder;

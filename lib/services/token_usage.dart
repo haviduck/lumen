@@ -134,9 +134,15 @@ class SessionTokenStats {
     this.tokenLimit,
   });
 
+  /// Approximate output tokens counted from streaming chunks before
+  /// the provider reports final usage. Not persisted — purely for
+  /// the live counter during streaming. Zeroed when real usage lands.
+  int streamingOutputEstimate = 0;
+
   bool get isEmpty =>
       inputTokens == 0 &&
       outputTokens == 0 &&
+      streamingOutputEstimate == 0 &&
       cacheReadTokens == 0 &&
       cacheWriteTokens == 0 &&
       reasoningTokens == 0 &&
@@ -170,6 +176,7 @@ class SessionTokenStats {
       }
       if ((u.outputTokens ?? 0) > 0) {
         outputTokens += u.outputTokens!;
+        streamingOutputEstimate = 0;
         changed = true;
       }
       if ((u.cacheReadTokens ?? 0) > 0) {

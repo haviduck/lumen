@@ -434,11 +434,7 @@ class _MessageBubbleState extends State<MessageBubble> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (var i = 0; i < segments.length; i++) ...[
-            if (i > 0 && _isSegmentTransition(segments[i - 1], segments[i]))
-              const SizedBox(height: 6),
-            _segmentWidget(segments[i], i),
-          ],
+          ..._buildSegmentWidgets(segments),
           if (widget.isStreaming) ...[
             const SizedBox(height: 2),
             const _StreamingCursor(),
@@ -464,10 +460,70 @@ class _MessageBubbleState extends State<MessageBubble> {
   /// prose and non-prose content. Used to insert a small vertical
   /// gap at boundaries so tool-call clusters visually detach from
   /// surrounding prose.
-  static bool _isSegmentTransition(ChatSegment a, ChatSegment b) {
-    final aIsProse = a is ProseSegment;
-    final bIsProse = b is ProseSegment;
-    return aIsProse != bIsProse;
+  List<Widget> _buildSegmentWidgets(List<ChatSegment> segments) {
+    final widgets = <Widget>[];
+    for (var i = 0; i < segments.length; i++) {
+      if (_isProseBeforeTool(segments, i)) {
+        final cleaned = _cleanedProseText(segments[i] as ProseSegment);
+        if (cleaned != null) {
+          if (widgets.isNotEmpty) widgets.add(const SizedBox(height: 6));
+          widgets.add(KeyedSubtree(
+            key: ValueKey('prose-$i'),
+            child: _buildProse(cleaned),
+          ));
+        }
+      } else {
+        if (i > 0 && _shouldAddGap(segments, i)) {
+          widgets.add(const SizedBox(height: 6));
+        }
+        widgets.add(_segmentWidget(segments[i], i));
+      }
+    }
+    return widgets;
+  }
+
+  /// True when this segment is prose immediately followed by a tool
+  /// card. Used to apply sentence-cleanup so terse native-tool-calling
+  /// fragments don't render as broken paragraphs.
+  static bool _isProseBeforeTool(List<ChatSegment> segments, int index) {
+    if (segments[index] is! ProseSegment) return false;
+    if (index + 1 >= segments.length) return false;
+    final next = segments[index + 1];
+    return next is ToolSegment || next is ToolGroupSegment;
+  }
+
+  /// Returns cleaned prose text, or null if the segment should be
+  /// hidden entirely (no sentence-ending punctuation at all).
+  static String? _cleanedProseText(ProseSegment seg) {
+    final text = seg.text.trim();
+    if (text.isEmpty) return null;
+
+    final lastChar = text[text.length - 1];
+    if ('.!?'.contains(lastChar)) return text;
+
+    final lastSentenceEnd = [
+      text.lastIndexOf('.'),
+      text.lastIndexOf('!'),
+      text.lastIndexOf('?'),
+    ].reduce((a, b) => a > b ? a : b);
+
+    if (lastSentenceEnd < 0) return null;
+
+    final trimmed = text.substring(0, lastSentenceEnd + 1).trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
+  /// Smart gap: skip the gap when the previous segment was a
+  /// prose-before-tool that got hidden.
+  static bool _shouldAddGap(List<ChatSegment> segments, int index) {
+    final prev = segments[index - 1];
+    final cur = segments[index];
+    if (prev is ProseSegment && _isProseBeforeTool(segments, index - 1)) {
+      if (_cleanedProseText(prev) == null) return false;
+    }
+    final prevIsProse = prev is ProseSegment;
+    final curIsProse = cur is ProseSegment;
+    return prevIsProse != curIsProse;
   }
 
   Widget _segmentWidget(ChatSegment seg, int index) {
@@ -1383,22 +1439,27 @@ class _ThinkingBlockState extends State<_ThinkingBlock>
               ),
             ),
           ),
-          if (_expanded && hasContent)
+          if ((widget.isActive && hasContent) || (_expanded && hasContent))
             Padding(
               padding: const EdgeInsets.only(top: 4, left: 4),
               child: Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(10),
-                constraints: const BoxConstraints(maxHeight: 200),
+                constraints: BoxConstraints(
+                  maxHeight: widget.isActive ? 66 : 200,
+                ),
                 decoration: BoxDecoration(
                   color: DuckColors.bgDeepest.withValues(alpha: 0.5),
                   borderRadius: BorderRadius.circular(DuckTheme.radiusS),
                   border: Border.all(
-                    color: DuckColors.fgSubtle.withValues(alpha: 0.25),
+                    color: widget.isActive
+                        ? DuckColors.accentPurple.withValues(alpha: 0.25)
+                        : DuckColors.fgSubtle.withValues(alpha: 0.25),
                     width: 0.5,
                   ),
                 ),
                 child: SingleChildScrollView(
+                  reverse: widget.isActive,
                   child: Text(
                     widget.content,
                     style: TextStyle(

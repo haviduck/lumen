@@ -408,6 +408,7 @@ class AppState extends ChangeNotifier {
   // that touched source files but didn't call VERIFY itself. See
   // `_kAgentAutoVerifyAfterEdits` for the rationale.
   bool _autoVerifyAfterEdits = true;
+  bool _forceTextGrammarTools = false;
 
   // Quick AI-chat panel collapse — independent of `viewMode`. The
   // user wants a one-click toggle without leaving normal layout
@@ -495,6 +496,7 @@ class AppState extends ChangeNotifier {
   bool get allowAgentOutsideWorkspaceWrites =>
       _allowAgentOutsideWorkspaceWrites;
   bool get autoVerifyAfterEdits => _autoVerifyAfterEdits;
+  bool get forceTextGrammarTools => _forceTextGrammarTools;
   bool get chatHidden => _chatHidden;
   String get settingsInitialCategory => _settingsInitialCategory;
   int get settingsOpenRevision => _settingsOpenRevision;
@@ -681,6 +683,7 @@ class AppState extends ChangeNotifier {
     _allowAgentOutsideWorkspaceWrites = await prefs
         .getAgentAllowOutsideWorkspaceWrites();
     _autoVerifyAfterEdits = await prefs.getAgentAutoVerifyAfterEdits();
+    _forceTextGrammarTools = await prefs.getForceTextGrammarTools();
     _chatHidden = await prefs.getChatHidden();
     notifyListeners();
   }
@@ -734,6 +737,13 @@ class AppState extends ChangeNotifier {
     if (_autoVerifyAfterEdits == v) return;
     _autoVerifyAfterEdits = v;
     await prefs.setAgentAutoVerifyAfterEdits(v);
+    notifyListeners();
+  }
+
+  Future<void> setForceTextGrammarTools(bool v) async {
+    if (_forceTextGrammarTools == v) return;
+    _forceTextGrammarTools = v;
+    await prefs.setForceTextGrammarTools(v);
     notifyListeners();
   }
 

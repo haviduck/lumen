@@ -4,6 +4,7 @@ import 'dart:math' show Random;
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import '../l10n/strings.dart';
 import '../services/agent_terminal_bridge.dart';
@@ -2037,6 +2038,81 @@ class ChatController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ---- pipeline debug log ----
+  // Writes raw vs processed content at each iteration boundary to
+  // `<appSupport>/chat_pipeline_debug.log`. Enable via the debug
+  // toggle below. The file is overwritten per turn so it stays small.
+  static bool debugPipelineLog = false;
+  IOSink? _debugSink;
+
+  Future<void> _openDebugSink() async {
+    if (!debugPipelineLog || _debugSink != null) return;
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final f = File(p.join(dir.path, 'chat_pipeline_debug.log'));
+      _debugSink = f.openWrite(mode: FileMode.write);
+      _debugSink!.writeln('=== Pipeline debug log — ${DateTime.now()} ===\n');
+    } catch (_) {}
+  }
+
+  Future<void> _debugIterationLog({
+    required int iteration,
+    required String sessionId,
+    required String rawIterBuf,
+    required int? cutAt,
+    required String thinkBuf,
+  }) async {
+    if (!debugPipelineLog) return;
+    await _openDebugSink();
+    final sink = _debugSink;
+    if (sink == null) return;
+    sink.writeln('--- ITERATION $iteration (session=$sessionId) ---');
+    sink.writeln('[RAW iterBuf] (${rawIterBuf.length} chars, cutAt=$cutAt):');
+    sink.writeln(rawIterBuf);
+    sink.writeln();
+    if (thinkBuf.isNotEmpty) {
+      sink.writeln('[THINKING] (${thinkBuf.length} chars):');
+      sink.writeln(thinkBuf);
+      sink.writeln();
+    }
+    if (cutAt != null) {
+      sink.writeln('[CUT AT $cutAt] — discarded tail:');
+      sink.writeln(rawIterBuf.substring(cutAt));
+      sink.writeln();
+    }
+    await sink.flush();
+  }
+
+  Future<void> _debugExecutorLog({
+    required int iteration,
+    required String sessionId,
+    required String executableRaw,
+    required String processedResponse,
+    String? nativeProcessed,
+  }) async {
+    if (!debugPipelineLog) return;
+    final sink = _debugSink;
+    if (sink == null) return;
+    sink.writeln('[EXECUTABLE RAW] (${executableRaw.length} chars):');
+    sink.writeln(executableRaw);
+    sink.writeln();
+    sink.writeln('[PROCESSED RESPONSE] (${processedResponse.length} chars):');
+    sink.writeln(processedResponse);
+    sink.writeln();
+    if (nativeProcessed != null) {
+      sink.writeln('[NATIVE PROCESSED]:');
+      sink.writeln(nativeProcessed);
+      sink.writeln();
+    }
+    sink.writeln('--- END ITERATION $iteration ---\n');
+    await sink.flush();
+  }
+
+  void _closeDebugSink() {
+    _debugSink?.close();
+    _debugSink = null;
+  }
+
   // ---- attachments ----
   void addPendingImage(String base64) {
     _pendingImages.add(base64);
@@ -3763,6 +3839,17 @@ class ChatController extends ChangeNotifier {
               .difference(turnStartedAt)
               .inMilliseconds;
 
+          // ── Live output token estimate ──
+          // Ollama (and some other providers) only report usage in the
+          // final frame. Count streaming chunks as ~1 token each so the
+          // counter chip updates during generation. The estimate is
+          // zeroed when real usage lands (see SessionTokenStats.merge).
+          if (chunk != OllamaService.thinkStartMarker &&
+              chunk != OllamaService.thinkEndMarker &&
+              !chunk.contains(NativeToolUseMarker.prefix)) {
+            session.tokenStats.streamingOutputEstimate++;
+          }
+
           // ── Thinking-marker state machine ──
           if (chunk == OllamaService.thinkStartMarker) {
             inThinkPhase = true;
@@ -3979,6 +4066,13 @@ class ChatController extends ChangeNotifier {
           break;
         }
         final raw = iterBuf.toString();
+        await _debugIterationLog(
+          iteration: i,
+          sessionId: sessionId,
+          rawIterBuf: raw,
+          cutAt: firstToolEnd ?? hallucinationCutAt,
+          thinkBuf: thinkBuf.toString(),
+        );
         // Provider services yield `<!-- LUMEN_TRUNCATED:length -->`
         // when the upstream API tells them the stream was cut at the
         // model's output token cap (Ollama `done_reason:length`,
@@ -4096,6 +4190,14 @@ class ChatController extends ChangeNotifier {
           halluHaltTriggered = true;
           keepLooping = false;
         }
+
+        await _debugExecutorLog(
+          iteration: i,
+          sessionId: sessionId,
+          executableRaw: executableRaw,
+          processedResponse: pass.processedResponse,
+          nativeProcessed: nativePass?.processedResponse,
+        );
 
         if (aggregated.isNotEmpty) aggregated += '\n\n';
         // Persist the thinking section in the displayed message so
@@ -4558,6 +4660,7 @@ class ChatController extends ChangeNotifier {
       );
       await _persistSession(session);
     } finally {
+      _closeDebugSink();
       _generatingSessionIds.remove(sessionId);
       _cancelTokens.remove(sessionId);
       _pendingApprovals.remove(sessionId);

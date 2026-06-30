@@ -1593,6 +1593,13 @@ class S {
       'Allow agent writes outside workspace';
   static const String settingsAgentOutsideWorkspaceWritesDesc =
       'When off, built-in file tools cannot create, edit, move, append, or delete outside the active workspace. Reading outside the workspace is still allowed. Shell commands remain separately approval-gated.';
+  static const String settingsForceTextGrammar = 'Native tool calling';
+  static const String settingsForceTextGrammarDesc =
+      'When on, tools are invoked via the model\'s structured function-calling API. '
+      'Faster and more reliable on capable models, but some models write terse or '
+      'cut-off prose before tool calls. Turn off to use inline text-based tool '
+      'syntax instead — the model writes tools as part of its response, which '
+      'typically produces fuller explanations.';
   static const String settingsAgentAutoVerify = 'Auto-verify after edits';
   static const String settingsAgentAutoVerifyDesc =
       'When on, the workspace analyzer (dart analyze, tsc --noEmit, eslint, ruff check) runs once at the end of any turn that edited source files but didn\'t call VERIFY. Errors are fed back as one extra round so the model can fix them before the turn closes. Costs ~2-30s per edit-heavy turn depending on workspace size.';

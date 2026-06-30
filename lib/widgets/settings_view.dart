@@ -76,6 +76,7 @@ class _SettingsViewState extends State<SettingsView> {
   late bool _reduceTransparency;
   late bool _allowAgentOutsideWorkspaceWrites;
   late bool _experimentalFeatures;
+  late bool _forceTextGrammarTools;
   late bool _autoVerifyAfterEdits;
   late bool _toolCompressionEnabled;
   late String _toolCompressionModel;
@@ -139,6 +140,7 @@ class _SettingsViewState extends State<SettingsView> {
     _reduceTransparency = a.reduceTransparency;
     _allowAgentOutsideWorkspaceWrites = a.allowAgentOutsideWorkspaceWrites;
     _experimentalFeatures = a.experimentalFeatures;
+    _forceTextGrammarTools = a.forceTextGrammarTools;
     _autoVerifyAfterEdits = a.autoVerifyAfterEdits;
     _toolCompressionEnabled = a.toolCompressionEnabled;
     _toolCompressionModel = a.toolCompressionModel;
@@ -210,6 +212,7 @@ class _SettingsViewState extends State<SettingsView> {
       _allowAgentOutsideWorkspaceWrites,
     );
     await a.setExperimentalFeatures(_experimentalFeatures);
+    await a.setForceTextGrammarTools(_forceTextGrammarTools);
     await a.setAutoVerifyAfterEdits(_autoVerifyAfterEdits);
     final parsedCompressionThreshold = int.tryParse(
       _toolCompressionThresholdCtrl.text.trim(),
@@ -1030,6 +1033,12 @@ class _SettingsViewState extends State<SettingsView> {
               ),
             );
           },
+        ),
+        _settingToggle(
+          label: S.settingsForceTextGrammar,
+          description: S.settingsForceTextGrammarDesc,
+          value: !_forceTextGrammarTools,
+          onChanged: (v) => setState(() => _forceTextGrammarTools = !v),
         ),
         _settingToggle(
           label: S.settingsToolCompressionToggle,
